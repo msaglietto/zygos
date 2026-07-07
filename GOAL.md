@@ -3,7 +3,7 @@
 mission: zygos
 created: 2026-07-06
 status: active
-milestone: M2
+milestone: M3
 budget:
   delegate_max_time_s: 900
   max_parallel_coding_agents: 2
@@ -83,8 +83,31 @@ messages (the FSM's steering path, driver-exposed). The real openai-compat
 HTTP client lands in `src/net/` under the Z-02 amendment, exercised only by an
 env-gated manual smoke (`OPENAI_API_KEY`), never by `zig build test`.
 
-Later milestones (M3 mission loop, M4 Tessera) get their own criteria tables
-when M2 closes; do not start them early.
+## Success criteria — milestone M3 (mission loop)
+
+M2 implemented 2026-07-07 (all U1–U6 green; see README) — its table above
+still awaits Mauricio's ok. M3 criteria drafted 2026-07-07 from the
+ARCHITECTURE.md M3 line, under Mauricio's `/goal` directive to implement M3 —
+**pending Mauricio's ratification** (GOAL.md edits are human-gated; flag
+stands until he ok's this table).
+
+| # | Criterion | Verified by |
+|---|-----------|-------------|
+| V1 | Mission FSM: `defining → planning → executing → verifying → gating → done\|failed`; every legal transition tested, illegal transitions rejected as errors; terminal states final | `zig build test` — table-driven FSM tests in `worker/mission.zig` |
+| V2 | Durable `.planning/` substrate: mission state persisted atomically (tmp+rename) after every transition; role artifacts (`MISSION.md`, `PLAN.md`, `VERIFY.md`) written under the planning root; state round-trips byte-equivalent semantics through save→load | `zig build test` — `worker/mission_store.zig` tests incl. crash-shaped overwrite |
+| V3 | Role turns: product-owner/planner/executor/verifier each run as one `zygos::turns::run` turn with a per-role `step_id` (so `zygos::models::resolve` routes each role to its own provider/model); structured role outputs parsed fail-closed — a malformed objective/plan/verdict fails the mission, never guesses | `zig build test` — mission driver tests with scripted fake provider |
+| V4 | mission-orchestrator worker: `zygos::missions::{start,status,abort}` on the bus; `start` drives the loop to a terminal state (or resumes one from disk with `resume:true` — earlier roles are not re-run); `abort` stops durably at the next role boundary; `status` reflects the live persisted state | `zig build test` — orchestrator tests incl. mid-mission resume |
+| V5 | Hard gates: reaching `done` requires a completion gate through a real approval call — no `gate_function`, an unreachable gate, or a malformed gate reply ⇒ the mission can never complete (fail closed); gate denial feeds back into replanning; `escalation.test_fail_threshold` consecutive verify failures (and likewise gate denials) stop the loop as `failed` | `zig build test` — gate + escalation tests |
+| V6 | e2e: a scripted mission (define → plan → execute with the real bash tool → verify → gate-approve) completes over the full M2+M3 stack in one process, and a second leg resumes a mid-flight mission from `.planning/` on a fresh orchestrator and finishes it | `test/e2e/m3/run.sh`; documented run in README |
+
+M3 notes: role prompts are assembled from the persisted artifacts (the GSD
+substrate is the context, not conversation memory); the executor is the only
+role handed tools. Mission-level budget rides the existing `budget_scope`
+passthrough — no new budget machinery. Multi-mission concurrency, context
+compaction, and session-store workers stay out of M3.
+
+Later milestones (M4 Tessera) get their own criteria tables when M3 closes;
+do not start them early.
 
 ## Non-goals
 
