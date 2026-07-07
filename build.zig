@@ -45,6 +45,11 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
 
+    // net/ws.zig only — kernel modules stay std-only (GOAL.md constraint).
+    // Dependency gate for websocket.zig approved by Mauricio 2026-07-06.
+    const websocket = b.dependency("websocket", .{ .target = target, .optimize = optimize });
+    mod.addImport("websocket", websocket.module("websocket"));
+
     // Here we define an executable. An executable needs to have a root module
     // which needs to expose a `main` function. While we could add a main function
     // to the module defined above, it's sometimes preferable to split business
