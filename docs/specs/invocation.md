@@ -45,7 +45,10 @@ pub const Invocations = struct {
     pub fn deinit(self: *Invocations) void;
 
     /// Park a pending call. deadline_ms is absolute (caller computes now+timeout).
-    pub fn add(self: *Invocations, id: Uuid, callee: WorkerId,
+    /// function_id is duped in: synthesized timeout/disconnect result frames
+    /// require it (wire-required field), so callbacks receive it as a fourth
+    /// parameter valid for the duration of the callback.
+    pub fn add(self: *Invocations, id: Uuid, callee: WorkerId, function_id: []const u8,
                reply: ReplyTarget, deadline_ms: i64) error{OutOfMemory, DuplicateId}!void;
 
     /// Correlate a result. Returns the ReplyTarget to route to, or null if
