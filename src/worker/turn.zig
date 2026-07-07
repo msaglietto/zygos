@@ -47,6 +47,8 @@ pub const Event = enum {
     steer_applied,
     abort,
     step_budget_exhausted,
+    provider_retry,
+    budget_exhausted,
 };
 
 const Transition = struct { from: State, event: Event, to: State };
@@ -56,10 +58,12 @@ const Transition = struct { from: State, event: Event, to: State };
 pub const transitions = [_]Transition{
     .{ .from = .provisioning, .event = .provider_started, .to = .streaming },
     .{ .from = .provisioning, .event = .step_budget_exhausted, .to = .stopped },
+    .{ .from = .provisioning, .event = .budget_exhausted, .to = .stopped },
     .{ .from = .provisioning, .event = .abort, .to = .stopped },
     .{ .from = .streaming, .event = .provider_end_turn, .to = .stopped },
     .{ .from = .streaming, .event = .provider_tool_use, .to = .dispatching },
     .{ .from = .streaming, .event = .provider_error, .to = .failed },
+    .{ .from = .streaming, .event = .provider_retry, .to = .provisioning },
     .{ .from = .streaming, .event = .steer, .to = .steering },
     .{ .from = .streaming, .event = .abort, .to = .stopped },
     .{ .from = .dispatching, .event = .needs_approval, .to = .awaiting_approval },
@@ -86,10 +90,22 @@ pub const Fsm = struct {
 // Driver
 // ---------------------------------------------------------------------------
 
+/// Cross-thread controls for one running turn (U2): `zygos::turns::abort`
+/// flips the flag, `zygos::turns::steer` queues text; the driver polls at
+/// step boundaries. ALL fields are guarded by the orchestrator's ctl_mutex —
+/// a per-control mutex would dangle when the owning turn untracks between a
+/// handler's map lookup and its lock.
+const TurnControl = struct {
+    aborted: bool = false,
+    steer_text: std.ArrayList(u8) = .empty,
+};
+
 pub const TurnOrchestrator = struct {
     gpa: std.mem.Allocator,
     actor: *actor_mod.Actor,
     worker: *inproc.Worker,
+    ctl_mutex: sync.Mutex = .{},
+    controls: std.StringHashMap(*TurnControl),
 
     pub fn start(
         gpa: std.mem.Allocator,
@@ -102,16 +118,180 @@ pub const TurnOrchestrator = struct {
             .gpa = gpa,
             .actor = actor,
             .worker = try inproc.Worker.spawn(gpa, actor, registry, "turn-orchestrator"),
+            .controls = std.StringHashMap(*TurnControl).init(gpa),
         };
         errdefer self.worker.stop();
         try self.worker.registerFunction("zygos::turns::run", self, &runTurnHandler);
+        try self.worker.registerFunction("zygos::turns::abort", self, &abortHandler);
+        try self.worker.registerFunction("zygos::turns::steer", self, &steerHandler);
         return self;
     }
 
     pub fn stop(self: *TurnOrchestrator) void {
+        // worker.stop() joins every runTurn handler thread; each untracks
+        // its own control on the way out, so the map must drain to empty.
         self.worker.stop();
+        std.debug.assert(self.controls.count() == 0);
+        self.controls.deinit();
+        self.ctl_mutex.deinit();
         const gpa = self.gpa;
         gpa.destroy(self);
+    }
+
+    fn trackTurn(self: *TurnOrchestrator, turn_id: []const u8) error{ OutOfMemory, MalformedRequest }!*TurnControl {
+        const ctl = try self.gpa.create(TurnControl);
+        errdefer self.gpa.destroy(ctl);
+        ctl.* = .{};
+        const key = try self.gpa.dupe(u8, turn_id);
+        errdefer self.gpa.free(key);
+
+        self.ctl_mutex.lock();
+        defer self.ctl_mutex.unlock();
+        const gop = try self.controls.getOrPut(key);
+        if (gop.found_existing) return error.MalformedRequest; // duplicate live turn_id
+        gop.value_ptr.* = ctl;
+        return ctl;
+    }
+
+    fn untrackTurn(self: *TurnOrchestrator, turn_id: []const u8) void {
+        const kv = blk: {
+            self.ctl_mutex.lock();
+            defer self.ctl_mutex.unlock();
+            break :blk self.controls.fetchRemove(turn_id) orelse return;
+        };
+        kv.value.steer_text.deinit(self.gpa);
+        self.gpa.destroy(kv.value);
+        self.gpa.free(kv.key);
+    }
+
+    /// Both control handlers: look up the turn by id and act while STILL
+    /// holding ctl_mutex, reply {"ok":bool}. Unknown/finished turns are
+    /// ok:false, not errors.
+    fn abortHandler(ctx: ?*anyopaque, arena: std.mem.Allocator, request_json: []const u8) error{ Failed, OutOfMemory }![]const u8 {
+        const self: *TurnOrchestrator = @ptrCast(@alignCast(ctx.?));
+        const tid = controlTarget(arena, request_json);
+        const ok = blk: {
+            self.ctl_mutex.lock();
+            defer self.ctl_mutex.unlock();
+            const ctl = self.controls.get(tid orelse break :blk false) orelse break :blk false;
+            ctl.aborted = true;
+            break :blk true;
+        };
+        return std.fmt.allocPrint(arena, "{{\"ok\":{}}}", .{ok});
+    }
+
+    fn steerHandler(ctx: ?*anyopaque, arena: std.mem.Allocator, request_json: []const u8) error{ Failed, OutOfMemory }![]const u8 {
+        const self: *TurnOrchestrator = @ptrCast(@alignCast(ctx.?));
+        const root = json.parseFromSliceLeaky(json.Value, arena, request_json, .{}) catch null;
+        const ok = blk: {
+            const obj = root orelse break :blk false;
+            if (obj != .object) break :blk false;
+            const tid = strField(obj.object, "turn_id") orelse break :blk false;
+            const text = strField(obj.object, "text") orelse break :blk false;
+            self.ctl_mutex.lock();
+            defer self.ctl_mutex.unlock();
+            const ctl = self.controls.get(tid) orelse break :blk false;
+            try ctl.steer_text.appendSlice(self.gpa, text);
+            break :blk true;
+        };
+        return std.fmt.allocPrint(arena, "{{\"ok\":{}}}", .{ok});
+    }
+
+    fn pollAborted(self: *TurnOrchestrator, ctl: ?*TurnControl) bool {
+        const c = ctl orelse return false;
+        self.ctl_mutex.lock();
+        defer self.ctl_mutex.unlock();
+        return c.aborted;
+    }
+
+    /// Drain-and-clear queued steer text (duped into the turn's arena so the
+    /// control can keep mutating). Distinct from pollAborted so an abort
+    /// check never silently discards queued steering.
+    fn drainSteer(self: *TurnOrchestrator, ctl: ?*TurnControl, arena: std.mem.Allocator) error{OutOfMemory}!?[]const u8 {
+        const c = ctl orelse return null;
+        self.ctl_mutex.lock();
+        defer self.ctl_mutex.unlock();
+        if (c.steer_text.items.len == 0) return null;
+        const copy = try arena.dupe(u8, c.steer_text.items);
+        c.steer_text.clearRetainingCapacity();
+        return copy;
+    }
+
+    const PolicyDecision = union(enum) { allow, ask, deny: []const u8 };
+
+    /// U1 — fail closed: any bus error, malformed reply, or unknown verdict
+    /// is a deny carrying the failure as its reason.
+    fn checkPolicy(
+        self: *TurnOrchestrator,
+        arena: std.mem.Allocator,
+        policy_fn: []const u8,
+        tool_name: []const u8,
+        function_id: []const u8,
+        input: json.Value,
+    ) error{OutOfMemory}!PolicyDecision {
+        const preq = try std.fmt.allocPrint(arena, "{{\"tool\":{f},\"function_id\":{f},\"input\":{s}}}", .{
+            json.fmt(tool_name, .{}),
+            json.fmt(function_id, .{}),
+            try rawJson(arena, input),
+        });
+        const res = self.worker.call(policy_fn, preq) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Shutdown => return .{ .deny = "policy unreachable" },
+        };
+        switch (res) {
+            .err => |code| {
+                defer self.gpa.free(code);
+                return .{ .deny = try arena.dupe(u8, code) };
+            },
+            .ok => |payload| {
+                defer self.gpa.free(payload);
+                const root = json.parseFromSliceLeaky(json.Value, arena, payload, .{}) catch
+                    return .{ .deny = "malformed policy verdict" };
+                if (root != .object) return .{ .deny = "malformed policy verdict" };
+                const verdict = strField(root.object, "verdict") orelse
+                    return .{ .deny = "malformed policy verdict" };
+                if (std.mem.eql(u8, verdict, "allow")) return .allow;
+                if (std.mem.eql(u8, verdict, "ask")) return .ask;
+                if (std.mem.eql(u8, verdict, "deny")) {
+                    const reason = strField(root.object, "reason") orelse "";
+                    return .{ .deny = try arena.dupe(u8, reason) };
+                }
+                return .{ .deny = "malformed policy verdict" };
+            },
+        }
+    }
+
+    /// U2 — no approval_function preserves M1 auto-approve (tested legacy);
+    /// with one, only an explicit {"approved":true} dispatches (fail closed).
+    fn requestApproval(
+        self: *TurnOrchestrator,
+        arena: std.mem.Allocator,
+        approval_fn: ?[]const u8,
+        tool_name: []const u8,
+        input: json.Value,
+    ) error{OutOfMemory}!bool {
+        const af = approval_fn orelse return true;
+        const areq = try std.fmt.allocPrint(arena, "{{\"tool\":{f},\"input\":{s},\"reason\":\"turn tool dispatch\"}}", .{
+            json.fmt(tool_name, .{}),
+            try rawJson(arena, input),
+        });
+        const res = self.worker.call(af, areq) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Shutdown => return false,
+        };
+        switch (res) {
+            .err => |code| {
+                self.gpa.free(code);
+                return false;
+            },
+            .ok => |payload| {
+                defer self.gpa.free(payload);
+                const root = json.parseFromSliceLeaky(json.Value, arena, payload, .{}) catch return false;
+                if (root != .object) return false;
+                const v = root.object.get("approved") orelse return false;
+                return v == .bool and v.bool;
+            },
+        }
     }
 
     /// The `output::compress` seam (ARCHITECTURE.md M1 line): every ok tool
@@ -197,6 +377,9 @@ fn runTurn(self: *TurnOrchestrator, arena: std.mem.Allocator, request_json: []co
     else
         8;
     const provider_fn = strField(obj, "provider_function") orelse return error.MalformedRequest;
+    const policy_fn = strField(obj, "policy_function");
+    const approval_fn = strField(obj, "approval_function");
+    const turn_id = strField(obj, "turn_id");
 
     // Tool routing table: name → {function_id, requires_approval}.
     var routes = std.StringHashMap(ToolRoute).init(arena);
@@ -226,12 +409,21 @@ fn runTurn(self: *TurnOrchestrator, arena: std.mem.Allocator, request_json: []co
         deltas.mutex.deinit();
     }
 
+    // Turns carrying an id are abortable/steerable over the bus (U2).
+    const ctl: ?*TurnControl = if (turn_id) |tid| try self.trackTurn(tid) else null;
+    defer if (turn_id) |tid| self.untrackTurn(tid);
+
     var state: State = .provisioning;
     var steps: usize = 0;
     var stop: []const u8 = "end_turn";
 
     turn: while (true) {
         std.debug.assert(state == .provisioning);
+        if (self.pollAborted(ctl)) {
+            state = try Fsm.apply(state, .abort); // → stopped
+            stop = "aborted";
+            break :turn;
+        }
         if (steps == max_steps) {
             state = try Fsm.apply(state, .step_budget_exhausted);
             stop = "max_steps";
@@ -318,15 +510,42 @@ fn runTurn(self: *TurnOrchestrator, arena: std.mem.Allocator, request_json: []co
                     const tool_name = strField(block.object, "name") orelse "";
                     const input = block.object.get("input") orelse json.Value.null;
 
+                    if (self.pollAborted(ctl)) {
+                        state = try Fsm.apply(state, .abort); // dispatching → stopped
+                        stop = "aborted";
+                        break :turn;
+                    }
+
                     const route = routes.get(tool_name) orelse {
                         try results.append(arena, try toolResult(arena, tool_id, "unknown tool", true));
                         continue;
                     };
-                    if (route.requires_approval) {
-                        // M2 owns real approval; M1 exercises the states.
-                        state = try Fsm.apply(state, .needs_approval); // → awaiting_approval
-                        state = try Fsm.apply(state, .approved); // → dispatching
+
+                    // U1 policy gate — only an explicit verdict dispatches.
+                    var ask = route.requires_approval;
+                    if (policy_fn) |pf| {
+                        switch (try self.checkPolicy(arena, pf, tool_name, route.function_id, input)) {
+                            .allow => {},
+                            .ask => ask = true,
+                            .deny => |reason| {
+                                const denied = try std.fmt.allocPrint(arena, "policy_denied: {s}", .{reason});
+                                try results.append(arena, try toolResult(arena, tool_id, denied, true));
+                                continue;
+                            },
+                        }
                     }
+
+                    if (ask) {
+                        state = try Fsm.apply(state, .needs_approval); // → awaiting_approval
+                        if (try self.requestApproval(arena, approval_fn, tool_name, input)) {
+                            state = try Fsm.apply(state, .approved); // → dispatching
+                        } else {
+                            state = try Fsm.apply(state, .denied); // → dispatching
+                            try results.append(arena, try toolResult(arena, tool_id, "approval_denied", true));
+                            continue;
+                        }
+                    }
+
                     const tool_res = self.worker.call(route.function_id, try rawJson(arena, input)) catch |err|
                         return err;
                     switch (tool_res) {
@@ -342,7 +561,19 @@ fn runTurn(self: *TurnOrchestrator, arena: std.mem.Allocator, request_json: []co
                     }
                 };
 
-                state = try Fsm.apply(state, .tools_done); // → provisioning
+                // U2 steering: text queued during this step joins the next
+                // user message through the FSM's steering path.
+                if (try self.drainSteer(ctl, arena)) |stext| {
+                    state = try Fsm.apply(state, .steer); // → steering
+                    try results.append(arena, try std.fmt.allocPrint(
+                        arena,
+                        "{{\"type\":\"text\",\"text\":{f}}}",
+                        .{json.fmt(stext, .{})},
+                    ));
+                    state = try Fsm.apply(state, .steer_applied); // → provisioning
+                } else {
+                    state = try Fsm.apply(state, .tools_done); // → provisioning
+                }
                 try transcript.append(arena, try std.fmt.allocPrint(
                     arena,
                     "{{\"role\":\"user\",\"content\":[{s}]}}",
@@ -374,6 +605,12 @@ fn toolResult(arena: std.mem.Allocator, tool_use_id: []const u8, content: []cons
 fn strField(obj: json.ObjectMap, key: []const u8) ?[]const u8 {
     const v = obj.get(key) orelse return null;
     return if (v == .string) v.string else null;
+}
+
+fn controlTarget(arena: std.mem.Allocator, request_json: []const u8) ?[]const u8 {
+    const root = json.parseFromSliceLeaky(json.Value, arena, request_json, .{}) catch return null;
+    if (root != .object) return null;
+    return strField(root.object, "turn_id");
 }
 
 fn joinComma(arena: std.mem.Allocator, items: []const []const u8) error{OutOfMemory}![]const u8 {
@@ -750,4 +987,211 @@ test "no leaks under a multi-step turn" {
 
     const res = try h.runTurnCall(baseRequest(""));
     res.deinit(testing.allocator);
+}
+
+// -- M2 driver: policy gate + approval + abort/steer (spec contract 13-25) ----
+
+const policy_mod = @import("policy.zig");
+const approval_mod = @import("approval.zig");
+
+/// baseRequest with extra top-level fields spliced in.
+fn requestWith(comptime top_extra: []const u8) []const u8 {
+    return
+    \\{"model":"fake-1","system":"you are a test","max_steps":4,
+    \\ "provider_function":"zygos::provider::fake::messages",
+    ++ top_extra ++
+        \\ "messages":[{"role":"user","content":"go"}],
+        \\ "tools":[{"name":"runner","function_id":"test::tool::run"}]}
+    ;
+}
+
+test "policy deny yields is_error tool_result and the turn continues" {
+    var h = try Harness.init(testing.allocator, &.{ tool_use_msg, end_turn_msg });
+    defer h.deinit();
+    // No rules at all: the gate's fail-closed default denies everything.
+    const pw = try policy_mod.PolicyWorker.start(testing.allocator, &h.actor, &h.registry, &.{});
+    defer pw.stop();
+
+    const res = try h.runTurnCall(requestWith("\"policy_function\":\"zygos::policy::check\","));
+    defer res.deinit(testing.allocator);
+    try testing.expect(res == .ok);
+
+    var p = try json.parseFromSlice(json.Value, testing.allocator, res.ok, .{});
+    defer p.deinit();
+    try testing.expectEqualStrings("end_turn", p.value.object.get("stop").?.string);
+    try testing.expectEqual(@as(i64, 2), p.value.object.get("steps").?.integer);
+    try testing.expect(std.mem.indexOf(u8, res.ok, "policy_denied") != null);
+
+    h.tool.mutex.lock();
+    defer h.tool.mutex.unlock();
+    try testing.expectEqual(@as(usize, 0), h.tool.calls); // never dispatched
+}
+
+test "policy ask + approval approve dispatches the tool" {
+    var h = try Harness.init(testing.allocator, &.{ tool_use_msg, end_turn_msg });
+    defer h.deinit();
+    const pw = try policy_mod.PolicyWorker.start(testing.allocator, &h.actor, &h.registry, &.{
+        .{ .tool = "runner", .verdict = .ask },
+    });
+    defer pw.stop();
+    const aw = try approval_mod.ApprovalWorker.start(testing.allocator, &h.actor, &h.registry, .auto_approve);
+    defer aw.stop();
+
+    const res = try h.runTurnCall(requestWith(
+        "\"policy_function\":\"zygos::policy::check\",\"approval_function\":\"zygos::approvals::request\",",
+    ));
+    defer res.deinit(testing.allocator);
+    try testing.expect(res == .ok);
+    try testing.expect(std.mem.indexOf(u8, res.ok, "\"stop\":\"end_turn\"") != null);
+
+    h.tool.mutex.lock();
+    defer h.tool.mutex.unlock();
+    try testing.expectEqual(@as(usize, 1), h.tool.calls);
+}
+
+test "policy ask + approval deny yields approval_denied result, no dispatch" {
+    var h = try Harness.init(testing.allocator, &.{ tool_use_msg, end_turn_msg });
+    defer h.deinit();
+    const pw = try policy_mod.PolicyWorker.start(testing.allocator, &h.actor, &h.registry, &.{
+        .{ .tool = "runner", .verdict = .ask },
+    });
+    defer pw.stop();
+    const aw = try approval_mod.ApprovalWorker.start(testing.allocator, &h.actor, &h.registry, .auto_deny);
+    defer aw.stop();
+
+    const res = try h.runTurnCall(requestWith(
+        "\"policy_function\":\"zygos::policy::check\",\"approval_function\":\"zygos::approvals::request\",",
+    ));
+    defer res.deinit(testing.allocator);
+    try testing.expect(res == .ok);
+    try testing.expect(std.mem.indexOf(u8, res.ok, "approval_denied") != null);
+
+    h.tool.mutex.lock();
+    defer h.tool.mutex.unlock();
+    try testing.expectEqual(@as(usize, 0), h.tool.calls);
+}
+
+test "policy function unreachable denies (fail closed)" {
+    var h = try Harness.init(testing.allocator, &.{ tool_use_msg, end_turn_msg });
+    defer h.deinit();
+    // No policy worker registered at all → function_not_found on the bus.
+
+    const res = try h.runTurnCall(requestWith("\"policy_function\":\"zygos::policy::check\","));
+    defer res.deinit(testing.allocator);
+    try testing.expect(res == .ok);
+    try testing.expect(std.mem.indexOf(u8, res.ok, "policy_denied") != null);
+
+    h.tool.mutex.lock();
+    defer h.tool.mutex.unlock();
+    try testing.expectEqual(@as(usize, 0), h.tool.calls);
+}
+
+fn weirdVerdict(_: ?*anyopaque, arena: std.mem.Allocator, _: []const u8) error{ Failed, OutOfMemory }![]const u8 {
+    return arena.dupe(u8, "{\"verdict\":\"maybe\",\"reason\":\"shrug\"}");
+}
+
+test "malformed policy verdict denies (fail closed)" {
+    var h = try Harness.init(testing.allocator, &.{ tool_use_msg, end_turn_msg });
+    defer h.deinit();
+    const weird = try inproc.Worker.spawn(testing.allocator, &h.actor, &h.registry, "weird-policy");
+    defer weird.stop();
+    try weird.registerFunction("zygos::policy::check", null, &weirdVerdict);
+
+    const res = try h.runTurnCall(requestWith("\"policy_function\":\"zygos::policy::check\","));
+    defer res.deinit(testing.allocator);
+    try testing.expect(res == .ok);
+    try testing.expect(std.mem.indexOf(u8, res.ok, "policy_denied") != null);
+
+    h.tool.mutex.lock();
+    defer h.tool.mutex.unlock();
+    try testing.expectEqual(@as(usize, 0), h.tool.calls);
+}
+
+/// A tool whose handler makes a bus call of its own before replying — the
+/// deterministic way to hit turns::abort/steer mid-turn (the blocking call
+/// completes before the tool result reaches the driver). Registers on
+/// test::tool::run AFTER the harness FakeTool: last-registration-wins (S2).
+const CallingTool = struct {
+    gpa: std.mem.Allocator,
+    worker: *inproc.Worker,
+    target: []const u8,
+    payload: []const u8,
+
+    fn start(
+        gpa: std.mem.Allocator,
+        actor: *actor_mod.Actor,
+        registry: *inproc.Registry,
+        target: []const u8,
+        payload: []const u8,
+    ) !*CallingTool {
+        const self = try gpa.create(CallingTool);
+        errdefer gpa.destroy(self);
+        self.* = .{
+            .gpa = gpa,
+            .worker = try inproc.Worker.spawn(gpa, actor, registry, "calling-tool"),
+            .target = target,
+            .payload = payload,
+        };
+        errdefer self.worker.stop();
+        try self.worker.registerFunction("test::tool::run", self, &handler);
+        return self;
+    }
+
+    fn stop(self: *CallingTool) void {
+        self.worker.stop();
+        const gpa = self.gpa;
+        gpa.destroy(self);
+    }
+
+    fn handler(ctx: ?*anyopaque, arena: std.mem.Allocator, _: []const u8) error{ Failed, OutOfMemory }![]const u8 {
+        const self: *CallingTool = @ptrCast(@alignCast(ctx.?));
+        const res = self.worker.call(self.target, self.payload) catch return error.Failed;
+        res.deinit(self.gpa);
+        return arena.dupe(u8, "{\"output\":\"called\"}");
+    }
+};
+
+test "abort between steps stops the turn with aborted" {
+    var h = try Harness.init(testing.allocator, &.{tool_use_msg}); // provider always wants tools
+    defer h.deinit();
+    const aborter = try CallingTool.start(
+        testing.allocator,
+        &h.actor,
+        &h.registry,
+        "zygos::turns::abort",
+        "{\"turn_id\":\"t-abort\"}",
+    );
+    defer aborter.stop();
+
+    const res = try h.runTurnCall(requestWith("\"turn_id\":\"t-abort\","));
+    defer res.deinit(testing.allocator);
+    try testing.expect(res == .ok);
+
+    var p = try json.parseFromSlice(json.Value, testing.allocator, res.ok, .{});
+    defer p.deinit();
+    try testing.expectEqualStrings("aborted", p.value.object.get("stop").?.string);
+    try testing.expectEqual(@as(i64, 1), p.value.object.get("steps").?.integer);
+}
+
+test "steer text lands in the next step's messages" {
+    var h = try Harness.init(testing.allocator, &.{ tool_use_msg, end_turn_msg });
+    defer h.deinit();
+    const steerer = try CallingTool.start(
+        testing.allocator,
+        &h.actor,
+        &h.registry,
+        "zygos::turns::steer",
+        "{\"turn_id\":\"t-steer\",\"text\":\"focus on X instead\"}",
+    );
+    defer steerer.stop();
+
+    const res = try h.runTurnCall(requestWith("\"turn_id\":\"t-steer\","));
+    defer res.deinit(testing.allocator);
+    try testing.expect(res == .ok);
+    try testing.expect(std.mem.indexOf(u8, res.ok, "\"stop\":\"end_turn\"") != null);
+
+    // The steered text rode the step-2 provider request.
+    h.provider.mutex.lock();
+    defer h.provider.mutex.unlock();
+    try testing.expect(std.mem.indexOf(u8, h.provider.last_request.?, "focus on X instead") != null);
 }
