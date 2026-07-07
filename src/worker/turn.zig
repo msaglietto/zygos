@@ -57,6 +57,9 @@ const Transition = struct { from: State, event: Event, to: State };
 /// listed is IllegalTransition; terminal states accept nothing.
 pub const transitions = [_]Transition{
     .{ .from = .provisioning, .event = .provider_started, .to = .streaming },
+    // Provisioning that cannot resolve a provider (routes exhausted, router
+    // down) is a provider_error before any stream exists.
+    .{ .from = .provisioning, .event = .provider_error, .to = .failed },
     .{ .from = .provisioning, .event = .step_budget_exhausted, .to = .stopped },
     .{ .from = .provisioning, .event = .budget_exhausted, .to = .stopped },
     .{ .from = .provisioning, .event = .abort, .to = .stopped },
@@ -215,6 +218,43 @@ pub const TurnOrchestrator = struct {
         const copy = try arena.dupe(u8, c.steer_text.items);
         c.steer_text.clearRetainingCapacity();
         return copy;
+    }
+
+    const Resolved = struct { provider_function: []const u8, model: []const u8 };
+
+    /// U3 — null means this turn has no more routes (ladder exhausted,
+    /// router down, malformed reply); the caller fails the turn.
+    fn resolveRoute(
+        self: *TurnOrchestrator,
+        arena: std.mem.Allocator,
+        router_fn: []const u8,
+        step_id: []const u8,
+        attempt: usize,
+    ) error{OutOfMemory}!?Resolved {
+        const rreq = try std.fmt.allocPrint(arena, "{{\"step_id\":{f},\"attempt\":{d}}}", .{
+            json.fmt(step_id, .{}), attempt,
+        });
+        const res = self.worker.call(router_fn, rreq) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Shutdown => return null,
+        };
+        switch (res) {
+            .err => |code| {
+                self.gpa.free(code);
+                return null;
+            },
+            .ok => |payload| {
+                defer self.gpa.free(payload);
+                const root = json.parseFromSliceLeaky(json.Value, arena, payload, .{}) catch return null;
+                if (root != .object) return null;
+                const pf = strField(root.object, "provider_function") orelse return null;
+                const m = strField(root.object, "model") orelse return null;
+                return .{
+                    .provider_function = try arena.dupe(u8, pf),
+                    .model = try arena.dupe(u8, m),
+                };
+            },
+        }
     }
 
     const PolicyDecision = union(enum) { allow, ask, deny: []const u8 };
@@ -376,7 +416,10 @@ fn runTurn(self: *TurnOrchestrator, arena: std.mem.Allocator, request_json: []co
         (if (v == .integer and v.integer > 0) @intCast(v.integer) else 8)
     else
         8;
-    const provider_fn = strField(obj, "provider_function") orelse return error.MalformedRequest;
+    const static_provider = strField(obj, "provider_function");
+    const router_fn = strField(obj, "router_function");
+    const step_id = strField(obj, "step_id") orelse "";
+    if (static_provider == null and router_fn == null) return error.MalformedRequest;
     const policy_fn = strField(obj, "policy_function");
     const approval_fn = strField(obj, "approval_function");
     const turn_id = strField(obj, "turn_id");
@@ -415,6 +458,7 @@ fn runTurn(self: *TurnOrchestrator, arena: std.mem.Allocator, request_json: []co
 
     var state: State = .provisioning;
     var steps: usize = 0;
+    var attempt: usize = 0; // provider failures so far (U3 escalation ladder)
     var stop: []const u8 = "end_turn";
 
     turn: while (true) {
@@ -430,6 +474,24 @@ fn runTurn(self: *TurnOrchestrator, arena: std.mem.Allocator, request_json: []co
             break :turn;
         }
 
+        // U3 routing: resolve this step's provider; without a router the
+        // request's static provider_function/model stand.
+        var step_provider = static_provider orelse "";
+        var step_model = model;
+        if (router_fn) |rf| {
+            if (try self.resolveRoute(arena, rf, step_id, attempt)) |r| {
+                step_provider = r.provider_function;
+                step_model = r.model;
+            } else {
+                state = try Fsm.apply(state, .provider_error); // → failed
+                return try std.fmt.allocPrint(
+                    arena,
+                    "{{\"stop\":\"failed\",\"steps\":{d},\"error\":\"route_exhausted\"}}",
+                    .{steps},
+                );
+            }
+        }
+
         // Stream channel for this step: driver keeps the receiver, the
         // writer ref rides in the provider request (PROTOCOL.md sub-types).
         const ch = self.actor.channelCreate(64, self.worker.id, 0) catch return error.Failed;
@@ -443,7 +505,7 @@ fn runTurn(self: *TurnOrchestrator, arena: std.mem.Allocator, request_json: []co
             \\{{"model":{f},"system":{f},"messages":[{s}],"tools":{s},
             \\ "stream_channel":{{"channel_id":{f},"access_key":{f},"direction":"write"}}}}
         , .{
-            json.fmt(model, .{}),
+            json.fmt(step_model, .{}),
             json.fmt(system, .{}),
             try joinComma(arena, transcript.items),
             tools_json,
@@ -455,13 +517,12 @@ fn runTurn(self: *TurnOrchestrator, arena: std.mem.Allocator, request_json: []co
         const drain_thread = std.Thread.spawn(.{}, DeltaLog.drain, .{ &deltas, self.gpa, &receiver }) catch
             return error.Failed;
 
-        const res = self.worker.call(provider_fn, provider_request) catch |err| {
+        const res = self.worker.call(step_provider, provider_request) catch |err| {
             receiver.close();
             drain_thread.join();
             receiver.deinit();
             return err;
         };
-        steps += 1;
         // Unblock the drain even if the provider never took the sender.
         receiver.close();
         drain_thread.join();
@@ -469,6 +530,15 @@ fn runTurn(self: *TurnOrchestrator, arena: std.mem.Allocator, request_json: []co
 
         switch (res) {
             .err => |code| {
+                // With a router, a failed provider escalates to the next
+                // ladder attempt instead of failing the turn; the failed
+                // call does not count as a step.
+                if (router_fn != null) {
+                    self.gpa.free(code);
+                    attempt += 1;
+                    state = try Fsm.apply(state, .provider_retry); // → provisioning
+                    continue :turn;
+                }
                 defer self.gpa.free(code);
                 state = try Fsm.apply(state, .provider_error); // → failed
                 return try std.fmt.allocPrint(
@@ -479,6 +549,7 @@ fn runTurn(self: *TurnOrchestrator, arena: std.mem.Allocator, request_json: []co
             },
             .ok => |payload| {
                 defer self.gpa.free(payload);
+                steps += 1;
                 const msg = json.parseFromSliceLeaky(json.Value, arena, payload, .{}) catch
                     return error.Failed;
                 if (msg != .object) return error.Failed;
@@ -1194,4 +1265,83 @@ test "steer text lands in the next step's messages" {
     h.provider.mutex.lock();
     defer h.provider.mutex.unlock();
     try testing.expect(std.mem.indexOf(u8, h.provider.last_request.?, "focus on X instead") != null);
+}
+
+// -- M2 driver: per-step routing + failover (spec contract 18-20) -----------
+
+const router_mod = @import("router.zig");
+
+fn startRouter(h: *Harness, zon: [:0]const u8) !*router_mod.RouterWorker {
+    const cfg = try router_mod.Config.parse(testing.allocator, zon);
+    return router_mod.RouterWorker.start(testing.allocator, &h.actor, &h.registry, cfg);
+}
+
+const routed_request =
+    \\{"router_function":"zygos::models::resolve","step_id":"exec","max_steps":4,
+    \\ "messages":[{"role":"user","content":"go"}],
+    \\ "tools":[{"name":"runner","function_id":"test::tool::run"}]}
+;
+
+test "router resolves the provider and model per step" {
+    var h = try Harness.init(testing.allocator, &.{end_turn_msg});
+    defer h.deinit();
+    const rw = try startRouter(h,
+        \\.{ .routes = .{ .{ .step_id = "exec", .attempts = .{
+        \\    .{ .provider_function = "zygos::provider::fake::messages", .model = "fake-routed" },
+        \\} } } }
+    );
+    defer rw.stop();
+
+    const res = try h.runTurnCall(routed_request);
+    defer res.deinit(testing.allocator);
+    try testing.expect(res == .ok);
+    try testing.expect(std.mem.indexOf(u8, res.ok, "\"stop\":\"end_turn\"") != null);
+
+    // The routed model rode the provider request.
+    h.provider.mutex.lock();
+    defer h.provider.mutex.unlock();
+    try testing.expect(std.mem.indexOf(u8, h.provider.last_request.?, "fake-routed") != null);
+}
+
+test "provider failure fails over to the next attempt and succeeds" {
+    var h = try Harness.init(testing.allocator, &.{end_turn_msg});
+    defer h.deinit();
+    const rw = try startRouter(h,
+        \\.{ .routes = .{ .{ .step_id = "exec", .attempts = .{
+        \\    .{ .provider_function = "zygos::provider::missing::messages", .model = "ghost" },
+        \\    .{ .provider_function = "zygos::provider::fake::messages", .model = "fallback-model" },
+        \\} } } }
+    );
+    defer rw.stop();
+
+    const res = try h.runTurnCall(routed_request);
+    defer res.deinit(testing.allocator);
+    try testing.expect(res == .ok);
+
+    var p = try json.parseFromSlice(json.Value, testing.allocator, res.ok, .{});
+    defer p.deinit();
+    try testing.expectEqualStrings("end_turn", p.value.object.get("stop").?.string);
+    // The failed attempt did not count as a step.
+    try testing.expectEqual(@as(i64, 1), p.value.object.get("steps").?.integer);
+
+    h.provider.mutex.lock();
+    defer h.provider.mutex.unlock();
+    try testing.expect(std.mem.indexOf(u8, h.provider.last_request.?, "fallback-model") != null);
+}
+
+test "routes exhausted fails the turn with route_exhausted" {
+    var h = try Harness.init(testing.allocator, &.{end_turn_msg});
+    defer h.deinit();
+    const rw = try startRouter(h,
+        \\.{ .routes = .{ .{ .step_id = "exec", .attempts = .{
+        \\    .{ .provider_function = "zygos::provider::missing::messages", .model = "ghost" },
+        \\} } } }
+    );
+    defer rw.stop();
+
+    const res = try h.runTurnCall(routed_request);
+    defer res.deinit(testing.allocator);
+    try testing.expect(res == .ok);
+    try testing.expect(std.mem.indexOf(u8, res.ok, "\"stop\":\"failed\"") != null);
+    try testing.expect(std.mem.indexOf(u8, res.ok, "route_exhausted") != null);
 }

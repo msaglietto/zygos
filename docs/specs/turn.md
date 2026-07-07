@@ -36,6 +36,7 @@ pub const Event = enum {
 | From | Event | To |
 |---|---|---|
 | provisioning | provider_started | streaming |
+| provisioning | provider_error | failed |
 | provisioning | step_budget_exhausted | stopped |
 | provisioning | budget_exhausted | stopped |
 | provisioning | abort | stopped |

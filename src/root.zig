@@ -14,6 +14,7 @@ pub const provider_fake = @import("worker/provider_fake.zig");
 pub const turn = @import("worker/turn.zig");
 pub const policy = @import("worker/policy.zig");
 pub const approval = @import("worker/approval.zig");
+pub const router = @import("worker/router.zig");
 pub const sse = @import("worker/sse.zig");
 pub const tools = @import("worker/tools.zig");
 pub const tools_ops = @import("worker/tools_ops.zig");
