@@ -1,18 +1,13 @@
-//! By convention, root.zig is the root source file when making a package.
+//! Zygos public module root. Re-exports kernel modules for consumers and is the
+//! root of the library's test binary. Importing `kernel/*` here makes their test
+//! blocks part of `zig build test`.
+
 const std = @import("std");
-const Io = std.Io;
 
-/// This is a documentation comment to explain the `printAnotherMessage` function below.
-///
-/// Accepting an `Io.Writer` instance is a handy way to write reusable code.
-pub fn printAnotherMessage(writer: *Io.Writer) Io.Writer.Error!void {
-    try writer.print("Run `zig build test` to run the tests.\n", .{});
-}
+pub const protocol = @import("kernel/protocol.zig");
 
-pub fn add(a: i32, b: i32) i32 {
-    return a + b;
-}
-
-test "basic add functionality" {
-    try std.testing.expect(add(3, 7) == 10);
+test {
+    // Pull every declaration (and thus every kernel module's test blocks) into the
+    // root test binary so `zig build test` discovers them.
+    std.testing.refAllDecls(@This());
 }
