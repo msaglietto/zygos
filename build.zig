@@ -155,6 +155,21 @@ pub fn build(b: *std.Build) void {
     const smoke_step = b.step("smoke-anthropic", "Manual: one real Anthropic streaming call (needs ANTHROPIC_API_KEY)");
     smoke_step.dependOn(&b.addRunArtifact(smoke).step);
 
+    // Env-gated manual smoke against a real openai-compat endpoint. Requires
+    // OPENAI_API_KEY; never part of `zig build test` (GOAL.md M2 notes).
+    const smoke_oa = b.addExecutable(.{
+        .name = "zygos-smoke-openai",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/e2e/openai/main.zig"),
+            .link_libc = true,
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "zygos", .module = mod }},
+        }),
+    });
+    const smoke_oa_step = b.step("smoke-openai", "Manual: one real openai-compat streaming call (needs OPENAI_API_KEY)");
+    smoke_oa_step.dependOn(&b.addRunArtifact(smoke_oa).step);
+
     // Creates an executable that will run `test` blocks from the provided module.
     // Here `mod` needs to define a target, which is why earlier we made sure to
     // set the releative field.
