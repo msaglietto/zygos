@@ -26,6 +26,8 @@ pub const Event = enum {
     steer_applied,      // steering merged into context
     abort,              // external cancel
     step_budget_exhausted, // max_steps reached at provisioning
+    provider_retry,     // M2: provider failed, router has a next attempt
+    budget_exhausted,   // M2: llm budget scope over limit at provisioning
 };
 ```
 
@@ -35,10 +37,12 @@ pub const Event = enum {
 |---|---|---|
 | provisioning | provider_started | streaming |
 | provisioning | step_budget_exhausted | stopped |
+| provisioning | budget_exhausted | stopped |
 | provisioning | abort | stopped |
 | streaming | provider_end_turn | stopped |
 | streaming | provider_tool_use | dispatching |
 | streaming | provider_error | failed |
+| streaming | provider_retry | provisioning |
 | streaming | steer | steering |
 | streaming | abort | stopped |
 | dispatching | needs_approval | awaiting_approval |
@@ -86,8 +90,57 @@ Loop per step (each arrow = an FSM event; state asserted after each):
    `{"stop":"end_turn|aborted|max_steps","steps":N,"transcript":[...],"deltas":"..."}`.
    **failed**: ErrorBody `turn_failed` with the provider error.
 
-Steering & abort land as bus functions (`zygos::turns::steer/abort`) in M2 —
-the FSM transitions are fully tested in M1; the driver doesn't expose them yet.
+## M2 driver extensions (U1–U3, U5; specs: policy.md, approval.md, router.md, budget.md)
+
+New optional request fields — every one absent ⇒ exact M1 behavior:
+
+```jsonc
+{"policy_function":"zygos::policy::check",       // U1 gate, consulted per dispatch
+ "approval_function":"zygos::approvals::request",// U2, called on ask/requires_approval
+ "router_function":"zygos::models::resolve",     // U3, replaces provider_function
+ "step_id":"execute",                            // U3, routing key
+ "budget_function":"zygos::budget::check",       // U5 (record goes to ::record)
+ "budget_scope":"turn-1",                        // U5 counter scope
+ "turn_id":"t-1"}                                 // U2 abort/steer handle
+```
+
+- **Policy (fail-closed).** With `policy_function` set, each tool_use block is
+  checked before dispatch: `deny` ⇒ is_error tool_result `policy_denied:
+  <reason>`, turn continues; `ask` ⇒ approval path; bus error / malformed
+  verdict ⇒ treated as deny. Without it, only `requires_approval` gates.
+- **Approval.** On `ask` (or `requires_approval:true`): `needs_approval` →
+  awaiting_approval; with `approval_function` the driver blocks on the real
+  bus call — `{"approved":true}` ⇒ `approved`, anything else (incl. bus
+  error: fail closed) ⇒ `denied` ⇒ is_error tool_result `approval_denied`.
+  Without `approval_function`, M1 auto-approve is preserved (tested legacy).
+- **Routing.** With `router_function`, provisioning resolves
+  `{step_id, attempt}` → `{provider_function, model}` (request-level
+  `provider_function`/`model` become fallbacks). A provider bus error then
+  fires `provider_retry` (→ provisioning) with `attempt+1` instead of
+  `provider_error`; `route_exhausted` (or resolver error) at provisioning ⇒
+  turn fails `route_exhausted`. Failed attempts do not count as steps.
+- **Budget.** With `budget_function`+`budget_scope`: check at each
+  provisioning — `ok:false` ⇒ `budget_exhausted` → stopped,
+  `stop:"budget_exhausted"`; a bus error on check also stops (fail closed).
+  After each provider result carrying `usage`, the driver casts
+  `zygos::budget::record` for input/output tokens (fire-and-forget).
+- **Abort/steer.** The orchestrator registers `zygos::turns::abort` and
+  `zygos::turns::steer` (`{"turn_id":...}`, steer adds `"text"`). Turns with
+  a `turn_id` are tracked; abort flips a flag the driver checks at
+  provisioning and before each dispatch (→ `abort`, stop `"aborted"`).
+  Steer text is drained after tool dispatch: `steer` → steering, the text
+  joins the next user message, `steer_applied` → provisioning.
+
+M2 test contract additions (RED first): 13 `policy deny yields is_error
+tool_result and turn continues`, 14 `policy ask + approval worker approve
+dispatches`, 15 `policy ask + approval deny yields approval_denied result`,
+16 `policy function unreachable ⇒ deny (fail closed)`, 17 `malformed policy
+verdict ⇒ deny`, 18 `router resolves provider per step`, 19 `provider failure
+fails over to attempt 1 and succeeds`, 20 `routes exhausted ⇒ turn fails
+route_exhausted`, 21 `budget exhausted stops the turn before the next step`,
+22 `budget check unreachable ⇒ stops (fail closed)`, 23 `usage recorded to
+the budget scope`, 24 `abort between steps stops with "aborted"`, 25 `steer
+text lands in the next step's messages`.
 
 ## Test contract (RED first)
 

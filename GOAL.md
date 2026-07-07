@@ -3,7 +3,7 @@
 mission: zygos
 created: 2026-07-06
 status: active
-milestone: M1
+milestone: M2
 budget:
   delegate_max_time_s: 900
   max_parallel_coding_agents: 2
@@ -62,8 +62,29 @@ is tested, the M1 driver auto-approves through it. The real Anthropic HTTP/SSE
 client lands in `src/net/` (Z-02 amendment covers it) but is exercised only by
 an env-gated manual smoke (`ANTHROPIC_API_KEY`), never by `zig build test`.
 
-Later milestones (M2 policy+routing, M3 mission loop, M4 Tessera) get their own
-criteria tables when M1 closes; do not start them early.
+## Success criteria — milestone M2 (policy + routing)
+
+M1 closed 2026-07-07 (all T1–T6 green; see README). M2 criteria drafted
+2026-07-07 from the ARCHITECTURE.md M2 line, under Mauricio's `/goal` directive
+to implement M2 — **pending Mauricio's ratification** (GOAL.md edits are
+human-gated; flag stands until he ok's this table).
+
+| # | Criterion | Verified by |
+|---|-----------|-------------|
+| U1 | Fail-closed policy gate: when a `policy_function` rides the turn request, every tool dispatch consults it first; `deny` ⇒ is_error tool_result (turn continues); `ask` ⇒ approval path; missing worker, malformed verdict, or handler error ⇒ deny — never dispatch | `zig build test` — policy worker tests + turn-driver fail-closed tests |
+| U2 | Approval worker: `zygos::approvals::{request,resolve,pending}`; an `ask` verdict blocks the turn in `awaiting_approval` on a real bus call until resolved (unresolved timeout ⇒ deny); `zygos::turns::abort` stops a running turn at the next boundary | `zig build test` — approval worker + turn integration tests |
+| U3 | Per-step routing: `zygos.zon` config parsed at startup; `zygos::models::resolve(step_id, attempt)` returns `{provider_function, model}`; the driver resolves each step and retries a failed provider with `attempt+1` until routes exhaust (then the turn fails) | `zig build test` — router tests incl. failover turn |
+| U4 | provider-openai: incremental chat-completions SSE decoding → channel deltas + assembled terminal message in the provider-neutral shape (finish_reason mapping, tool_calls with accumulated arguments JSON, usage); malformed SSE never crashes | `zig build test` — assembler tests over recorded fixtures, no network |
+| U5 | Budget enforcement: `zygos::budget::{configure,record,check}` per-scope counters; the driver records provider usage each step and stops with `stop:"budget_exhausted"` when the scope is over limit; a configured-but-unreachable budget worker also stops the turn (fail closed) | `zig build test` — budget worker + turn tests |
+| U6 | output-trim (Z-09): `zygos::output::compress` worker head/tail-trims oversized tool output and reports bytes saved via `zygos::budget::record`; e2e: a scripted turn through policy→approval→routing→budget→trim completes and stops cleanly | `zig build test` + `test/e2e/m2/` script; documented run in README |
+
+M2 notes: `zygos::turns::steer` merges mid-turn input into the next step's
+messages (the FSM's steering path, driver-exposed). The real openai-compat
+HTTP client lands in `src/net/` under the Z-02 amendment, exercised only by an
+env-gated manual smoke (`OPENAI_API_KEY`), never by `zig build test`.
+
+Later milestones (M3 mission loop, M4 Tessera) get their own criteria tables
+when M2 closes; do not start them early.
 
 ## Non-goals
 
