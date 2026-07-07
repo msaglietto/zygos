@@ -7,7 +7,7 @@ capabilities as replaceable workers. Wire-compatible with the unmodified iii
 SDKs. See `GOAL.md` for the mission, `docs/ARCHITECTURE.md` and
 `docs/PROTOCOL.md` for the design, `docs/specs/` for per-module contracts.
 
-## Status: M1 — the turn loop (M0 kernel closed)
+## Status: M2 — policy + routing (M0 kernel, M1 turn loop closed)
 
 | Milestone | Criterion | State |
 |---|---|---|
@@ -23,13 +23,19 @@ SDKs. See `GOAL.md` for the mission, `docs/ARCHITECTURE.md` and
 | M1 | T4 tool dispatch loop | ✅ turn driver tests (fake provider + fake tool) |
 | M1 | T5 agent-tools worker | ✅ `worker/tools{,_ops}.zig` (workspace-confined bash/read/write) |
 | M1 | T6 scripted turn e2e | ✅ `test/e2e/turn/run.sh` |
+| M2 | U1 fail-closed policy gate | ✅ `worker/policy.zig` + turn-driver fail-closed tests |
+| M2 | U2 approval worker, turns::abort/steer | ✅ `worker/approval.zig` (park/resolve/timeout) |
+| M2 | U3 zygos.zon per-step routing + failover | ✅ `worker/router.zig` (`models::resolve`, escalation ladder) |
+| M2 | U4 provider-openai (chat-completions SSE) | ✅ `worker/openai.zig` + `net/{openai,provider_openai}.zig` (fixtures, no network) |
+| M2 | U5 budget enforcement | ✅ `worker/budget.zig` (`stop:"budget_exhausted"`, fail closed) |
+| M2 | U6 output-trim (Z-09) + M2 e2e | ✅ `worker/trim.zig`; `test/e2e/m2/run.sh` |
 
 ## Build & test
 
 Requires Zig 0.16.0 (and libc — pthread + CSPRNG; macOS or Linux).
 
 ```bash
-zig build test   # full suite (185 tests, leak-checked, no network)
+zig build test   # full suite (256 tests, leak-checked, no network)
 zig build        # produces zig-out/bin/zygos
 ```
 
@@ -85,3 +91,24 @@ ANTHROPIC_API_KEY=... ./test/e2e/anthropic/run.sh   # zig build smoke-anthropic
 ```
 
 It exits 2 (skipped) without the key and is never part of `zig build test`.
+The openai-compat provider has the same arrangement (`OPENAI_BASE_URL` points
+it at any chat-completions-compatible endpoint):
+
+```bash
+OPENAI_API_KEY=... ./test/e2e/openai/run.sh   # zig build smoke-openai
+```
+
+## M2 policy+routing e2e (documented run)
+
+`test/e2e/m2/run.sh` (= `zig build e2e-m2`) runs a scripted 2-step tool-use
+turn through the full M2 stack in one process: the fail-closed policy gate
+(`ask` verdict on bash), the approval worker, `zygos.zon` routing parsed from
+a real file (`models::resolve`), budget enforcement with per-step usage
+accounting, and the Z-09 output-trim filter compressing the real bash tool's
+500-line output on the `zygos::output::compress` seam — savings reported to
+`zygos::budget::record`.
+
+```console
+$ ./test/e2e/m2/run.sh
+M2 E2E OK: stop=end_turn steps=2 used_tokens=30 saved_bytes=1861
+```
