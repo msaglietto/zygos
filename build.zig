@@ -125,6 +125,36 @@ pub fn build(b: *std.Build) void {
         run_cmd.addArgs(args);
     }
 
+    // T6 exit test (GOAL.md M1): the scripted 2-step tool-use turn.
+    // Run with `zig build e2e-turn` (or test/e2e/turn/run.sh).
+    const e2e_turn = b.addExecutable(.{
+        .name = "zygos-e2e-turn",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/e2e/turn/main.zig"),
+            .link_libc = true,
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "zygos", .module = mod }},
+        }),
+    });
+    const e2e_turn_step = b.step("e2e-turn", "Run the M1 turn-loop e2e (T6)");
+    e2e_turn_step.dependOn(&b.addRunArtifact(e2e_turn).step);
+
+    // Env-gated manual smoke against the real Anthropic API. Requires
+    // ANTHROPIC_API_KEY; never part of `zig build test` (GOAL.md M1 notes).
+    const smoke = b.addExecutable(.{
+        .name = "zygos-smoke-anthropic",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/e2e/anthropic/main.zig"),
+            .link_libc = true,
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "zygos", .module = mod }},
+        }),
+    });
+    const smoke_step = b.step("smoke-anthropic", "Manual: one real Anthropic streaming call (needs ANTHROPIC_API_KEY)");
+    smoke_step.dependOn(&b.addRunArtifact(smoke).step);
+
     // Creates an executable that will run `test` blocks from the provided module.
     // Here `mod` needs to define a target, which is why earlier we made sure to
     // set the releative field.
