@@ -113,6 +113,35 @@ pub const TurnOrchestrator = struct {
         const gpa = self.gpa;
         gpa.destroy(self);
     }
+
+    /// The `output::compress` seam (ARCHITECTURE.md M1 line): every ok tool
+    /// output is offered to `zygos::output::compress` on the bus —
+    /// `{"content":<str>}` in, `{"content":<str>}` out. Nothing registered
+    /// (function_not_found) or any malformed reply = pass-through. The real
+    /// output-trim filters land in M2 (decision Z-09).
+    fn compressSeam(
+        self: *TurnOrchestrator,
+        arena: std.mem.Allocator,
+        out: []const u8,
+    ) error{OutOfMemory}![]const u8 {
+        const request = try std.fmt.allocPrint(arena, "{{\"content\":{f}}}", .{json.fmt(out, .{})});
+        const res = self.worker.call("zygos::output::compress", request) catch
+            return arena.dupe(u8, out);
+        switch (res) {
+            .err => |code| {
+                self.gpa.free(code);
+                return arena.dupe(u8, out);
+            },
+            .ok => |payload| {
+                defer self.gpa.free(payload);
+                const root = json.parseFromSliceLeaky(json.Value, arena, payload, .{}) catch
+                    return arena.dupe(u8, out);
+                if (root == .object) if (root.object.get("content")) |v| if (v == .string)
+                    return v.string;
+                return arena.dupe(u8, out);
+            },
+        }
+    }
 };
 
 /// Per-turn tool table entry, resolved from the request's `tools` array.
@@ -303,7 +332,8 @@ fn runTurn(self: *TurnOrchestrator, arena: std.mem.Allocator, request_json: []co
                     switch (tool_res) {
                         .ok => |out| {
                             defer self.gpa.free(out);
-                            try results.append(arena, try toolResult(arena, tool_id, out, false));
+                            const final = try self.compressSeam(arena, out);
+                            try results.append(arena, try toolResult(arena, tool_id, final, false));
                         },
                         .err => |code| {
                             defer self.gpa.free(code);
@@ -683,6 +713,35 @@ test "deltas streamed over the kernel channel are captured in order" {
     var p = try json.parseFromSlice(json.Value, testing.allocator, res.ok, .{});
     defer p.deinit();
     try testing.expectEqualStrings("hello world", p.value.object.get("deltas").?.string);
+}
+
+fn shoutCompressor(_: ?*anyopaque, arena: std.mem.Allocator, request_json: []const u8) error{ Failed, OutOfMemory }![]const u8 {
+    const root = json.parseFromSliceLeaky(json.Value, arena, request_json, .{}) catch return error.Failed;
+    const content = root.object.get("content").?.string;
+    const upper = try arena.dupe(u8, content);
+    for (upper) |*ch| ch.* = std.ascii.toUpper(ch.*);
+    return std.fmt.allocPrint(arena, "{{\"content\":{f}}}", .{json.fmt(upper, .{})});
+}
+
+test "output::compress seam transforms tool_results when registered; pass-through otherwise" {
+    var h = try Harness.init(testing.allocator, &.{ tool_use_msg, end_turn_msg });
+    defer h.deinit();
+
+    // Pass-through is pinned by the other tool tests (no compressor there).
+    const compressor = try inproc.Worker.spawn(testing.allocator, &h.actor, &h.registry, "compressor");
+    defer compressor.stop();
+    try compressor.registerFunction("zygos::output::compress", null, &shoutCompressor);
+
+    const res = try h.runTurnCall(baseRequest(""));
+    defer res.deinit(testing.allocator);
+    try testing.expect(res == .ok);
+
+    // The fake tool replies {"output":"ran"}; the seam uppercased it before
+    // it entered the transcript's tool_result.
+    h.provider.mutex.lock();
+    defer h.provider.mutex.unlock();
+    try testing.expect(std.mem.indexOf(u8, h.provider.last_request.?, "OUTPUT") != null);
+    try testing.expect(std.mem.indexOf(u8, h.provider.last_request.?, "RAN") != null);
 }
 
 test "no leaks under a multi-step turn" {

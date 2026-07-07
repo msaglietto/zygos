@@ -45,10 +45,12 @@ new `zygos::*` bus functions, never frame changes.
 ## What comes after M0 (do not start early)
 
 - **M1**: turn FSM (`provisioning → streaming → dispatching → awaiting_approval
-  → steering → stopped|failed`), provider-anthropic (SSE→channel), agent-tools.
+  → steering → stopped|failed`), provider-anthropic (SSE→channel), agent-tools
+  with the `output::compress` seam in the tool-result path (pass-through).
 - **M2**: fail-closed policy gate, approval/question worker, `zygos.zon`
   per-step routing (`models::resolve(step_id, attempt)`), openai-compat
-  provider, budget enforcement.
+  provider, budget enforcement, `output-trim` filters (decision Z-09 —
+  rtk/ztk-style tool-output compression; savings via `budget::record`).
 - **M3**: mission loop — durable mission FSM over the GSD `.planning/`
   substrate; product-owner/planner/executor/verifier role turns; hard gates.
 - **M4**: Tessera workers (continuity/capture/orient/undo) + MCP gateway.
