@@ -1,0 +1,9 @@
+{
+  "name": "zygos-e2e-node-sdk",
+  "private": true,
+  "type": "module",
+  "description": "S6 exit test: the unmodified iii Node SDK against a running Zygos kernel",
+  "dependencies": {
+    "iii-sdk": "0.20.0"
+  }
+}
