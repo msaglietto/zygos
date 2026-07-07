@@ -8,6 +8,7 @@ pub const protocol = @import("kernel/protocol.zig");
 pub const types = @import("kernel/types.zig");
 pub const sync = @import("kernel/sync.zig");
 pub const catalog = @import("kernel/catalog.zig");
+pub const trigger = @import("kernel/trigger.zig");
 
 test {
     // Pull every declaration (and thus every kernel module's test blocks) into the
