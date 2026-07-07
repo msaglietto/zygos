@@ -44,6 +44,15 @@ pub const Condition = struct {
         check(c.pthread_cond_wait(&self.inner, &mutex.inner));
     }
 
+    /// Caller must hold `mutex`. Returns false on timeout, true on wake
+    /// (spurious wakeups possible — always re-check the predicate).
+    pub fn timedWait(self: *Condition, mutex: *Mutex, abstime: *const c.timespec) bool {
+        const rc = c.pthread_cond_timedwait(&self.inner, &mutex.inner, abstime);
+        if (rc == .TIMEDOUT) return false;
+        check(rc);
+        return true;
+    }
+
     pub fn signal(self: *Condition) void {
         check(c.pthread_cond_signal(&self.inner));
     }
@@ -78,6 +87,25 @@ pub const ResetEvent = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         while (!self.is_set) self.cond.wait(&self.mutex);
+    }
+
+    /// Wait at most `timeout_ms`; true iff the event was set in time.
+    /// REALTIME-based (matches pthread_cond_timedwait's default clock) —
+    /// wall-clock jumps can stretch or shrink the wait; acceptable for the
+    /// human-scale timeouts (approvals) this serves.
+    pub fn timedWait(self: *ResetEvent, timeout_ms: u64) bool {
+        var ts: c.timespec = undefined;
+        _ = c.clock_gettime(.REALTIME, &ts);
+        const ns = @as(u64, @intCast(ts.nsec)) + (timeout_ms % 1000) * std.time.ns_per_ms;
+        ts.sec += @intCast(timeout_ms / 1000 + ns / std.time.ns_per_s);
+        ts.nsec = @intCast(ns % std.time.ns_per_s);
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        while (!self.is_set) {
+            if (!self.cond.timedWait(&self.mutex, &ts)) break;
+        }
+        return self.is_set;
     }
 
     pub fn isSet(self: *ResetEvent) bool {
@@ -173,6 +201,27 @@ test "reset event: reset makes the next wait block again until set" {
     ev.wait();
     t.join();
     try testing.expect(ev.isSet());
+}
+
+test "reset event: timedWait returns false on timeout, true when set" {
+    var ev: ResetEvent = .{};
+    defer ev.deinit();
+
+    // Never set: must time out and report false.
+    try testing.expect(!ev.timedWait(10));
+
+    // Set before the deadline (from another thread): reports true.
+    const Setter = struct {
+        fn run(e: *ResetEvent) void {
+            e.set();
+        }
+    };
+    const t = try std.Thread.spawn(.{}, Setter.run, .{&ev});
+    try testing.expect(ev.timedWait(60_000)); // bounded by the join below
+    t.join();
+
+    // Already-set event returns true immediately.
+    try testing.expect(ev.timedWait(0));
 }
 
 test "condition: signal wakes a predicate waiter" {
