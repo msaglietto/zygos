@@ -18,9 +18,10 @@ const sync = @import("sync.zig");
 pub const WorkerId = types.WorkerId;
 pub const Uuid = types.Uuid;
 
-/// Result payload handed to an in-process waiter. Slices are NOT owned by the
-/// Waiter — the completing side guarantees their lifetime until the waiter
-/// wakes and copies what it needs.
+/// Result payload handed to an in-process waiter. Owned-by-recipient: the
+/// completing side dupes the bytes (actor gpa); the woken waiter frees them
+/// after copying what it needs. A null result slot after wake means the
+/// completer hit OOM — treat as unknown error.
 pub const Outcome = union(enum) {
     ok: []const u8,
     err: []const u8,

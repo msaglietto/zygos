@@ -24,9 +24,16 @@ pub const KERNEL_WORKER = types.KERNEL_WORKER;
 /// Errors a built-in function may return when invoked in-process.
 pub const BuiltinError = error{ OutOfMemory, Failed };
 
-/// Provisional signature for in-process built-in functions. actor.zig will
-/// define the real dispatch contract; M0 stores the pointer for routing only.
-pub const BuiltinFn = fn (gpa: std.mem.Allocator, request_json: []const u8) BuiltinError![]u8;
+/// In-process built-in function. `ctx` lets actor-owned builtins reach their
+/// state (e.g. the channels bridge); pure builtins pass null. Runs on the
+/// kernel thread — keep it small.
+pub const BuiltinFn = fn (ctx: ?*anyopaque, gpa: std.mem.Allocator, request_json: []const u8) BuiltinError![]u8;
+
+/// The stored builtin handler: function pointer + its context.
+pub const Builtin = struct {
+    ctx: ?*anyopaque = null,
+    f: *const BuiltinFn,
+};
 
 /// Invocation reference for an external-HTTP handler. M0 stores this for
 /// discovery only — it never dispatches HTTP. All three slices are owned
@@ -44,7 +51,7 @@ pub const Handler = union(enum) {
     /// Dispatch: send invokefunction to this connection.
     worker: WorkerId,
     /// Dispatch: call in-process on the kernel side.
-    builtin: *const BuiltinFn,
+    builtin: Builtin,
     /// Dispatch: HTTP call (M0: store only, no dispatch).
     external_http: HttpRef,
 };
@@ -523,7 +530,7 @@ fn makeWorker(comptime byte: u8) WorkerId {
 }
 
 /// Dummy built-in function for handler tests.
-fn dummyBuiltin(_: std.mem.Allocator, _: []const u8) BuiltinError![]u8 {
+fn dummyBuiltin(_: ?*anyopaque, _: std.mem.Allocator, _: []const u8) BuiltinError![]u8 {
     return error.Failed;
 }
 
@@ -745,10 +752,8 @@ test "builtin owned by KERNEL_WORKER survives removeAllOwnedBy of any worker" {
     var cat = Catalog.init(testing.allocator);
     defer cat.deinit();
 
-    const dummy_fn: *const BuiltinFn = &dummyBuiltin;
-
     _ = try cat.register("sys.echo", KERNEL_WORKER, .{
-        .handler = .{ .builtin = dummy_fn },
+        .handler = .{ .builtin = .{ .f = &dummyBuiltin } },
         .description = "built-in echo",
     });
     _ = try cat.register("user.fn", worker_a, .{

@@ -49,12 +49,52 @@ pub const Command = union(enum) {
     frame: Frame,
     tick: i64, // now_ms
     shutdown,
+    // Channel sync bridge (T1): registry ops must run on the kernel thread,
+    // but endpoints are cross-thread objects. The op structs live on the
+    // calling thread's stack; the kernel thread fills the slot and sets the
+    // event. Callers MUST NOT invoke these from the kernel thread (deadlock).
+    channel_create: *ChannelCreateOp,
+    channel_take_sender: *ChannelTakeSenderOp,
+    channel_take_receiver: *ChannelTakeReceiverOp,
 
     pub const Frame = struct {
         from: WorkerId,
         parsed: json.Parsed(protocol.Message),
         now_ms: i64,
     };
+};
+
+pub const CreatedChannel = struct {
+    writer: channel_mod.Ref,
+    reader: channel_mod.Ref,
+};
+
+pub const ChannelCreateOp = struct {
+    capacity: usize,
+    owner: WorkerId,
+    now_ms: i64,
+    event: sync.ResetEvent = .{},
+    /// null after event.set() means OOM (or kernel shutdown drain).
+    /// Ref slices are owned by the channels registry — valid until reap.
+    result: ?CreatedChannel = null,
+};
+
+pub const ChannelTakeError = error{ NotFound, BadKey, AlreadyTaken, Shutdown };
+
+pub const ChannelTakeSenderOp = struct {
+    id: []const u8, // caller-owned; caller blocks, so stack slices are safe
+    key: []const u8,
+    now_ms: i64,
+    event: sync.ResetEvent = .{},
+    result: union(enum) { pending, ok: channel_mod.Sender, err: ChannelTakeError } = .pending,
+};
+
+pub const ChannelTakeReceiverOp = struct {
+    id: []const u8,
+    key: []const u8,
+    now_ms: i64,
+    event: sync.ResetEvent = .{},
+    result: union(enum) { pending, ok: channel_mod.Receiver, err: ChannelTakeError } = .pending,
 };
 
 pub const Config = struct {
@@ -172,17 +212,71 @@ pub const Actor = struct {
 
     /// Register an in-process built-in function, owned by KERNEL_WORKER and
     /// therefore never removed by any disconnect path. Kernel thread (or
-    /// pre-`run` wiring) only.
+    /// pre-`run` wiring) only. `ctx` reaches the builtin on every call.
     pub fn registerBuiltin(
         self: *Actor,
         id: []const u8,
         description: []const u8,
+        ctx: ?*anyopaque,
         f: *const catalog_mod.BuiltinFn,
     ) error{OutOfMemory}!void {
         _ = try self.catalog.register(id, catalog_mod.KERNEL_WORKER, .{
-            .handler = .{ .builtin = f },
+            .handler = .{ .builtin = .{ .ctx = ctx, .f = f } },
             .description = description,
         });
+    }
+
+    // -- channel sync bridge (worker threads; NEVER the kernel thread) ------
+
+    /// Create a channel through the kernel thread. Blocking; the returned
+    /// Refs' slices are owned by the channels registry (valid until reap).
+    pub fn channelCreate(
+        self: *Actor,
+        capacity: usize,
+        owner: WorkerId,
+        now_ms: i64,
+    ) error{ OutOfMemory, Shutdown }!CreatedChannel {
+        var op: ChannelCreateOp = .{ .capacity = capacity, .owner = owner, .now_ms = now_ms };
+        defer op.event.deinit();
+        self.post(.{ .channel_create = &op });
+        op.event.wait();
+        return op.result orelse error.OutOfMemory;
+    }
+
+    /// Take the sender endpoint through the kernel thread. Blocking.
+    pub fn channelTakeSender(
+        self: *Actor,
+        id: []const u8,
+        key: []const u8,
+        now_ms: i64,
+    ) ChannelTakeError!channel_mod.Sender {
+        var op: ChannelTakeSenderOp = .{ .id = id, .key = key, .now_ms = now_ms };
+        defer op.event.deinit();
+        self.post(.{ .channel_take_sender = &op });
+        op.event.wait();
+        return switch (op.result) {
+            .ok => |s| s,
+            .err => |err| err,
+            .pending => unreachable,
+        };
+    }
+
+    /// Take the receiver endpoint through the kernel thread. Blocking.
+    pub fn channelTakeReceiver(
+        self: *Actor,
+        id: []const u8,
+        key: []const u8,
+        now_ms: i64,
+    ) ChannelTakeError!channel_mod.Receiver {
+        var op: ChannelTakeReceiverOp = .{ .id = id, .key = key, .now_ms = now_ms };
+        defer op.event.deinit();
+        self.post(.{ .channel_take_receiver = &op });
+        op.event.wait();
+        return switch (op.result) {
+            .ok => |r| r,
+            .err => |err| err,
+            .pending => unreachable,
+        };
     }
 
     // -- command handling ---------------------------------------------------
@@ -196,6 +290,26 @@ pub const Actor = struct {
             .frame => |f| {
                 defer f.parsed.deinit();
                 self.onFrame(f.from, f.parsed.value, f.now_ms);
+            },
+            .channel_create => |op| {
+                if (self.channels.create(op.capacity, op.owner, op.now_ms)) |refs| {
+                    op.result = .{ .writer = refs.writer, .reader = refs.reader };
+                } else |_| {}
+                op.event.set();
+            },
+            .channel_take_sender => |op| {
+                op.result = if (self.channels.takeSender(op.id, op.key, op.now_ms)) |s|
+                    .{ .ok = s }
+                else |err|
+                    .{ .err = err };
+                op.event.set();
+            },
+            .channel_take_receiver => |op| {
+                op.result = if (self.channels.takeReceiver(op.id, op.key, op.now_ms)) |r|
+                    .{ .ok = r }
+                else |err|
+                    .{ .err = err };
+                op.event.set();
             },
         }
         return true;
@@ -409,7 +523,7 @@ pub const Actor = struct {
                 }
                 self.sendMsg(callee, .{ .invokefunction = m });
             },
-            .builtin => |f| self.callBuiltin(from, f, m),
+            .builtin => |b| self.callBuiltin(from, b, m),
             .external_http => {
                 if (m.invocation_id) |iid|
                     self.sendErrorResult(from, iid, m, "external_http_unsupported", "external HTTP dispatch lands after M0");
@@ -420,7 +534,7 @@ pub const Actor = struct {
     fn callBuiltin(
         self: *Actor,
         from: WorkerId,
-        f: *const catalog_mod.BuiltinFn,
+        b: catalog_mod.Builtin,
         m: protocol.Message.InvokeFunction,
     ) void {
         var arena = std.heap.ArenaAllocator.init(self.gpa);
@@ -428,7 +542,7 @@ pub const Actor = struct {
         const scratch = arena.allocator();
 
         const request_json = rawJsonOf(scratch, m.data) catch return logOom("builtin");
-        const out = f(scratch, request_json) catch |err| {
+        const out = b.f(b.ctx, scratch, request_json) catch |err| {
             if (m.invocation_id) |iid| switch (err) {
                 error.OutOfMemory => self.sendErrorResult(from, iid, m, "builtin_failed", "out of memory"),
                 error.Failed => self.sendErrorResult(from, iid, m, "builtin_failed", "builtin reported failure"),
@@ -464,10 +578,23 @@ pub const Actor = struct {
         switch (reply) {
             .connection => |caller| self.sendMsg(caller, .{ .invocationresult = m }),
             .waiter => |w| {
-                // M1 wires real payloads; until then waiters only receive
-                // static-lifetime outcomes (the parsed frame dies with this
-                // command, so its slices must not cross the handoff).
-                w.result = if (m.err != null) .{ .err = "remote_error" } else .{ .ok = "" };
+                // Real payloads (T1): the parsed frame dies with this command,
+                // so the outcome is duped into gpa — Outcome slices are
+                // owned-by-recipient; the waiter side frees with the actor's
+                // gpa after waking. OOM → result stays null (unknown error).
+                if (m.err) |e| {
+                    if (self.gpa.dupe(u8, e.code)) |code| {
+                        w.result = .{ .err = code };
+                    } else |_| {}
+                } else if (m.result) |value| {
+                    if (rawJsonOf(self.gpa, value)) |payload| {
+                        w.result = .{ .ok = payload };
+                    } else |_| {}
+                } else {
+                    if (self.gpa.dupe(u8, "null")) |payload| {
+                        w.result = .{ .ok = payload };
+                    } else |_| {}
+                }
                 w.event.set();
             },
             .none => {},
@@ -507,7 +634,11 @@ pub const Actor = struct {
                 } });
             },
             .waiter => |w| {
-                w.result = .{ .err = code }; // static-lifetime slice, safe across the handoff
+                // Same owned-by-recipient convention as result routing; OOM
+                // leaves the slot null (unknown error).
+                if (self.gpa.dupe(u8, code)) |owned| {
+                    w.result = .{ .err = owned };
+                } else |_| {}
                 w.event.set();
             },
             .none => {},
@@ -541,9 +672,20 @@ pub const Actor = struct {
     }
 };
 
+/// Drain-path cleanup: frames own memory; bridge ops have a blocked caller
+/// that must be woken (with a shutdown-shaped result) or it hangs forever.
 fn freeCommand(cmd: Command) void {
     switch (cmd) {
         .frame => |f| f.parsed.deinit(),
+        .channel_create => |op| op.event.set(), // result stays null
+        .channel_take_sender => |op| {
+            op.result = .{ .err = error.Shutdown };
+            op.event.set();
+        },
+        .channel_take_receiver => |op| {
+            op.result = .{ .err = error.Shutdown };
+            op.event.set();
+        },
         else => {},
     }
 }
@@ -900,15 +1042,24 @@ test "ping answers pong" {
     try testing.expectEqualStrings("{\"type\":\"pong\"}", h.fake.sent.items[0].bytes);
 }
 
-fn echoBuiltin(gpa: std.mem.Allocator, request_json: []const u8) catalog_mod.BuiltinError![]u8 {
+fn echoBuiltin(_: ?*anyopaque, gpa: std.mem.Allocator, request_json: []const u8) catalog_mod.BuiltinError![]u8 {
     return gpa.dupe(u8, request_json) catch error.OutOfMemory;
+}
+
+/// ctx-carrying builtin for the T1 kernel test: replies with its counter and
+/// increments it, proving state reaches the call.
+fn countingBuiltin(ctx: ?*anyopaque, gpa: std.mem.Allocator, request_json: []const u8) catalog_mod.BuiltinError![]u8 {
+    _ = request_json;
+    const counter: *u32 = @ptrCast(@alignCast(ctx.?));
+    defer counter.* += 1;
+    return std.fmt.allocPrint(gpa, "{{\"count\":{d}}}", .{counter.*}) catch error.OutOfMemory;
 }
 
 test "builtin dispatch runs in-process and answers on the same tick" {
     var h = try Harness.init(testing.allocator);
     defer h.deinit();
 
-    try h.actor.registerBuiltin("zygos::echo", "echoes the request", &echoBuiltin);
+    try h.actor.registerBuiltin("zygos::echo", "echoes the request", null, &echoBuiltin);
     try h.frame(widOf(2),
         \\{"type":"invokefunction","invocation_id":"11111111-2222-3333-4444-555555555555",
         \\ "function_id":"zygos::echo","data":{"n":42}}
@@ -920,6 +1071,82 @@ test "builtin dispatch runs in-process and answers on the same tick" {
     const res = p.value.invocationresult;
     try testing.expectEqualStrings("zygos::echo", res.function_id);
     try testing.expectEqual(@as(i64, 42), res.result.?.object.get("n").?.integer);
+}
+
+test "builtin ctx reaches the call and persists across invocations" {
+    var h = try Harness.init(testing.allocator);
+    defer h.deinit();
+
+    var counter: u32 = 7;
+    try h.actor.registerBuiltin("zygos::count", "counts", &counter, &countingBuiltin);
+
+    try h.frame(widOf(2),
+        \\{"type":"invokefunction","invocation_id":"11111111-2222-3333-4444-555555555555",
+        \\ "function_id":"zygos::count","data":{}}
+    , 0);
+    try h.frame(widOf(2),
+        \\{"type":"invokefunction","invocation_id":"11111111-2222-3333-4444-555555555556",
+        \\ "function_id":"zygos::count","data":{}}
+    , 0);
+
+    try testing.expectEqual(@as(usize, 2), h.fake.sent.items.len);
+    var p1 = try h.fake.parseAt(0);
+    defer p1.deinit();
+    var p2 = try h.fake.parseAt(1);
+    defer p2.deinit();
+    try testing.expectEqual(@as(i64, 7), p1.value.invocationresult.result.?.object.get("count").?.integer);
+    try testing.expectEqual(@as(i64, 8), p2.value.invocationresult.result.?.object.get("count").?.integer);
+}
+
+test "waiter completion carries a real duped payload owned by the recipient" {
+    var h = try Harness.init(testing.allocator);
+    defer h.deinit();
+
+    var w: invocation_mod.Waiter = .{};
+    defer w.deinit();
+    const uuid = try types.parseUuid(caller_uuid_text);
+    // Kernel-internal path: park a waiter-target pending directly (the
+    // registry is actor-owned; step-driven tests run on one thread).
+    try h.actor.invocations.add(uuid, widOf(1), "f", .{ .waiter = &w }, 10_000);
+
+    try h.frame(widOf(1),
+        \\{"type":"invocationresult","invocation_id":"11111111-2222-3333-4444-555555555555",
+        \\ "function_id":"f","result":{"x":1}}
+    , 0);
+
+    w.event.wait(); // already set; must not block
+    const outcome = w.result.?;
+    try testing.expect(outcome == .ok);
+    try testing.expectEqualStrings("{\"x\":1}", outcome.ok);
+    testing.allocator.free(outcome.ok); // owned-by-recipient convention
+}
+
+test "channel bridge: create and take endpoints stream across threads" {
+    var h = try Harness.init(testing.allocator);
+    defer h.deinit();
+
+    const t = try std.Thread.spawn(.{}, Actor.run, .{&h.actor});
+
+    const refs = try h.actor.channelCreate(4, widOf(1), 0);
+    var sender = try h.actor.channelTakeSender(refs.writer.channel_id, refs.writer.access_key, 0);
+    var receiver = try h.actor.channelTakeReceiver(refs.reader.channel_id, refs.reader.access_key, 0);
+    try testing.expectError(
+        error.AlreadyTaken,
+        h.actor.channelTakeSender(refs.writer.channel_id, refs.writer.access_key, 0),
+    );
+
+    var payload = "delta".*;
+    try sender.push(.{ .text = &payload });
+    const item = try receiver.pop();
+    try testing.expectEqualStrings("delta", item.bytes());
+    item.deinit(testing.allocator);
+
+    sender.deinit();
+    try testing.expectError(error.EndOfStream, receiver.pop());
+    receiver.deinit();
+
+    h.actor.post(.shutdown);
+    t.join();
 }
 
 test "unknown invocation_id result is dropped without crash" {
