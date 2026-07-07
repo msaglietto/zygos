@@ -3,7 +3,7 @@
 mission: zygos
 created: 2026-07-06
 status: active
-milestone: M0
+milestone: M1
 budget:
   delegate_max_time_s: 900
   max_parallel_coding_agents: 2
@@ -43,8 +43,27 @@ objective completes, each step routable to a different model/provider.
 | S5 | Keyed byte channels: single-consumer take semantics, access-key gating, TTL sweep | `zig build test` — channel tests |
 | S6 | End-to-end: the unmodified **iii Node SDK** connects to a running Zygos kernel, registers a function, and invokes another worker's function successfully | `test/e2e/node-sdk/` script; documented run in README |
 
-Later milestones (M1 turn loop, M2 policy+routing, M3 mission loop, M4 Tessera)
-get their own criteria tables when M0 closes; do not start them early.
+## Success criteria — milestone M1 (the turn loop)
+
+M0 closed 2026-07-07 (all S1–S6 green; see README). M1 criteria approved by
+Mauricio 2026-07-07.
+
+| # | Criterion | Verified by |
+|---|-----------|-------------|
+| T1 | In-process workers ride the same bus semantics as WS workers: frame-path registration/invocation, no kernel special-casing beyond delivery; kernel Waiter completions carry real payloads | `zig build test` — inproc worker register/invoke round-trip through the actor |
+| T2 | Turn FSM: `provisioning → streaming → dispatching → awaiting_approval → steering → stopped\|failed`; every legal transition tested, illegal transitions rejected as errors | `zig build test` — table-driven FSM tests |
+| T3 | provider-anthropic: incremental SSE decoding → channel deltas + assembled terminal message (stop_reason, usage, tool_use with accumulated input JSON); malformed SSE never crashes | `zig build test` — decoder/assembler tests over recorded fixtures, no network |
+| T4 | Tool dispatch: model `tool_use` → bus invocation of the named tool function → `tool_result` fed into the next step's messages | `zig build test` — turn tests with fake provider + fake tool |
+| T5 | agent-tools worker: `zygos::tools::{bash,read_file,write_file}` registered on the bus, workspace-root confined (path escapes rejected) | `zig build test` — tools tests |
+| T6 | e2e: a scripted 2-step tool-use turn (fake provider streaming deltas over a kernel channel) completes and stops cleanly | `test/e2e/turn/` script; documented run in README |
+
+M1 notes: the approval worker is M2 — `awaiting_approval` exists in the FSM and
+is tested, the M1 driver auto-approves through it. The real Anthropic HTTP/SSE
+client lands in `src/net/` (Z-02 amendment covers it) but is exercised only by
+an env-gated manual smoke (`ANTHROPIC_API_KEY`), never by `zig build test`.
+
+Later milestones (M2 policy+routing, M3 mission loop, M4 Tessera) get their own
+criteria tables when M1 closes; do not start them early.
 
 ## Non-goals
 
