@@ -66,8 +66,7 @@ an env-gated manual smoke (`ANTHROPIC_API_KEY`), never by `zig build test`.
 
 M1 closed 2026-07-07 (all T1–T6 green; see README). M2 criteria drafted
 2026-07-07 from the ARCHITECTURE.md M2 line, under Mauricio's `/goal` directive
-to implement M2 — **pending Mauricio's ratification** (GOAL.md edits are
-human-gated; flag stands until he ok's this table).
+to implement M2 — **ratified by Mauricio 2026-07-07**. All U1–U6 green.
 
 | # | Criterion | Verified by |
 |---|-----------|-------------|
@@ -85,11 +84,10 @@ env-gated manual smoke (`OPENAI_API_KEY`), never by `zig build test`.
 
 ## Success criteria — milestone M3 (mission loop)
 
-M2 implemented 2026-07-07 (all U1–U6 green; see README) — its table above
-still awaits Mauricio's ok. M3 criteria drafted 2026-07-07 from the
-ARCHITECTURE.md M3 line, under Mauricio's `/goal` directive to implement M3 —
-**pending Mauricio's ratification** (GOAL.md edits are human-gated; flag
-stands until he ok's this table).
+M2 ratified and closed 2026-07-07 (all U1–U6 green; see README). M3 criteria
+drafted 2026-07-07 from the ARCHITECTURE.md M3 line, under Mauricio's `/goal`
+directive to implement M3 — **ratified by Mauricio 2026-07-07**. All V1–V6
+green.
 
 | # | Criterion | Verified by |
 |---|-----------|-------------|
