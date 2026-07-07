@@ -12,6 +12,7 @@ pub const net_anthropic = @import("net/anthropic.zig");
 pub const provider_anthropic = @import("net/provider_anthropic.zig");
 pub const provider_fake = @import("worker/provider_fake.zig");
 pub const turn = @import("worker/turn.zig");
+pub const policy = @import("worker/policy.zig");
 pub const sse = @import("worker/sse.zig");
 pub const tools = @import("worker/tools.zig");
 pub const tools_ops = @import("worker/tools_ops.zig");
