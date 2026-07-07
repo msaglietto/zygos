@@ -51,6 +51,9 @@ src/
   main.zig               binary entry (thin; kernel wiring only)
   kernel/
     protocol.zig         wire types + parse/serialize   (S1)
+    types.zig            shared WorkerId/Uuid identity types
+    sync.zig             pthread mutex/condvar/event (Zig 0.16 has no
+                         std.Thread primitives; std.Io ones barred by Z-02)
     catalog.zig          function registry, owner CAS   (S2)
     invocation.zig       pending map, timeouts          (S3)
     trigger.zig          trigger types + bindings       (S4)

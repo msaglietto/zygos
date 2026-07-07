@@ -6,6 +6,7 @@ const std = @import("std");
 
 pub const protocol = @import("kernel/protocol.zig");
 pub const types = @import("kernel/types.zig");
+pub const sync = @import("kernel/sync.zig");
 pub const catalog = @import("kernel/catalog.zig");
 
 test {

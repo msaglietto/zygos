@@ -39,6 +39,10 @@ pub fn build(b: *std.Build) void {
         // Later on we'll use this module as the root module of a test executable
         // which requires us to specify a target.
         .target = target,
+        // kernel/sync.zig wraps POSIX pthread primitives (Zig 0.16 moved the
+        // std blocking primitives into std.Io, which Z-02 keeps out of the
+        // kernel). macOS + Linux only per GOAL.md non-goals.
+        .link_libc = true,
     });
 
     // Here we define an executable. An executable needs to have a root module
@@ -64,6 +68,7 @@ pub fn build(b: *std.Build) void {
             // unlike b.addModule, it does not expose the module to consumers of
             // this package, which is why in this case we don't have to give it a name.
             .root_source_file = b.path("src/main.zig"),
+            .link_libc = true,
             // Target and optimization levels must be explicitly wired in when
             // defining an executable or library (in the root module), and you
             // can also hardcode a specific target for an executable or library

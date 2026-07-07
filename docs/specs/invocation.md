@@ -19,9 +19,11 @@ catalog spec for the threading rationale — same model).
        none,                        // fire-and-forget with an id we still track (rare)
    };
    ```
-   `Waiter` wraps `std.Thread.ResetEvent` + a result slot; it is the only
+   `Waiter` wraps `sync.ResetEvent` + a result slot; it is the only
    cross-thread object here and its handoff rule is: the actor writes the
    result slot, then sets the event; the waiting thread reads after wake.
+   (`kernel/sync.zig` wraps POSIX pthread — Zig 0.16 removed
+   `std.Thread.ResetEvent` and its std.Io replacement is barred by Z-02.)
 3. **Both disconnect directions matter.** Each pending records the **callee**
    (worker the call was dispatched to) and the **reply target** (who awaits):
    - callee disconnects → complete its pendings with ErrorBody
