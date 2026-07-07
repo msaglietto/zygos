@@ -79,4 +79,8 @@ get their own criteria tables when M0 closes; do not start them early.
 ## Amendments
 
 Append-only. Human-written.
-- (none yet)
+- 2026-07-07 (Mauricio, via session decision): Z-02 scoped exception — `std.Io.Threaded`
+  (the blocking OS-thread Io implementation, not async) is permitted in `src/net/` only,
+  because karlseguin/websocket.zig migrated to the std.Io interface. Kernel modules
+  (`src/kernel/*`) remain std.Io-free; the actor boundary insulates them. Rationale
+  discussed and accepted: churn exposure confined to one file + the pinned dep.
