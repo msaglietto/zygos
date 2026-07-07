@@ -123,8 +123,10 @@ New optional request fields — every one absent ⇒ exact M1 behavior:
 - **Budget.** With `budget_function`+`budget_scope`: check at each
   provisioning — `ok:false` ⇒ `budget_exhausted` → stopped,
   `stop:"budget_exhausted"`; a bus error on check also stops (fail closed).
-  After each provider result carrying `usage`, the driver casts
-  `zygos::budget::record` for input/output tokens (fire-and-forget).
+  After each provider result carrying `usage`, the driver records
+  input/output tokens via `zygos::budget::record` — synchronously, so the
+  next provisioning check observes this step's usage (fire-and-forget cast
+  is for callers whose accounting is not also their control flow).
 - **Abort/steer.** The orchestrator registers `zygos::turns::abort` and
   `zygos::turns::steer` (`{"turn_id":...}`, steer adds `"text"`). Turns with
   a `turn_id` are tracked; abort flips a flag the driver checks at

@@ -257,6 +257,58 @@ pub const TurnOrchestrator = struct {
         }
     }
 
+    /// U5 — fail closed: a bus error, malformed reply, or missing worker is
+    /// indistinguishable from "over budget" on purpose.
+    fn checkBudget(
+        self: *TurnOrchestrator,
+        arena: std.mem.Allocator,
+        budget_fn: []const u8,
+        scope: []const u8,
+    ) error{OutOfMemory}!bool {
+        const req = try std.fmt.allocPrint(arena, "{{\"scope\":{f}}}", .{json.fmt(scope, .{})});
+        const res = self.worker.call(budget_fn, req) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Shutdown => return false,
+        };
+        switch (res) {
+            .err => |code| {
+                self.gpa.free(code);
+                return false;
+            },
+            .ok => |payload| {
+                defer self.gpa.free(payload);
+                const root = json.parseFromSliceLeaky(json.Value, arena, payload, .{}) catch return false;
+                if (root != .object) return false;
+                const v = root.object.get("ok") orelse return false;
+                return v == .bool and v.bool;
+            },
+        }
+    }
+
+    /// Recording failures are ignored (accounting, not control flow) — the
+    /// fail-closed side lives in checkBudget.
+    fn recordUsage(
+        self: *TurnOrchestrator,
+        arena: std.mem.Allocator,
+        scope: []const u8,
+        usage: json.ObjectMap,
+    ) error{OutOfMemory}!void {
+        inline for (.{ "input_tokens", "output_tokens" }) |kind| {
+            if (usage.get(kind)) |v| if (v == .integer and v.integer > 0) {
+                const req = try std.fmt.allocPrint(
+                    arena,
+                    "{{\"scope\":{f},\"kind\":\"" ++ kind ++ "\",\"amount\":{d}}}",
+                    .{ json.fmt(scope, .{}), v.integer },
+                );
+                const res = self.worker.call("zygos::budget::record", req) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.Shutdown => return,
+                };
+                res.deinit(self.gpa);
+            };
+        }
+    }
+
     const PolicyDecision = union(enum) { allow, ask, deny: []const u8 };
 
     /// U1 — fail closed: any bus error, malformed reply, or unknown verdict
@@ -423,6 +475,8 @@ fn runTurn(self: *TurnOrchestrator, arena: std.mem.Allocator, request_json: []co
     const policy_fn = strField(obj, "policy_function");
     const approval_fn = strField(obj, "approval_function");
     const turn_id = strField(obj, "turn_id");
+    const budget_scope = strField(obj, "budget_scope");
+    const budget_fn = strField(obj, "budget_function") orelse "zygos::budget::check";
 
     // Tool routing table: name → {function_id, requires_approval}.
     var routes = std.StringHashMap(ToolRoute).init(arena);
@@ -472,6 +526,15 @@ fn runTurn(self: *TurnOrchestrator, arena: std.mem.Allocator, request_json: []co
             state = try Fsm.apply(state, .step_budget_exhausted);
             stop = "max_steps";
             break :turn;
+        }
+
+        // U5 budget gate — fail closed: an unanswerable check is "over".
+        if (budget_scope) |scope| {
+            if (!try self.checkBudget(arena, budget_fn, scope)) {
+                state = try Fsm.apply(state, .budget_exhausted); // → stopped
+                stop = "budget_exhausted";
+                break :turn;
+            }
         }
 
         // U3 routing: resolve this step's provider; without a router the
@@ -554,6 +617,13 @@ fn runTurn(self: *TurnOrchestrator, arena: std.mem.Allocator, request_json: []co
                     return error.Failed;
                 if (msg != .object) return error.Failed;
                 const stop_reason = strField(msg.object, "stop_reason") orelse "end_turn";
+
+                // U5 accounting — synchronous so the next provisioning
+                // check observes this step's usage.
+                if (budget_scope) |scope| {
+                    if (msg.object.get("usage")) |u| if (u == .object)
+                        try self.recordUsage(arena, scope, u.object);
+                }
                 const content = msg.object.get("content") orelse json.Value{ .array = .init(arena) };
 
                 // Assistant message joins the transcript either way.
@@ -1327,6 +1397,70 @@ test "provider failure fails over to the next attempt and succeeds" {
     h.provider.mutex.lock();
     defer h.provider.mutex.unlock();
     try testing.expect(std.mem.indexOf(u8, h.provider.last_request.?, "fallback-model") != null);
+}
+
+// -- M2 driver: budget enforcement (spec contract 21-23) --------------------
+
+const budget_mod = @import("budget.zig");
+
+const usage_tool_msg =
+    \\{"stop_reason":"tool_use","usage":{"input_tokens":10,"output_tokens":2},
+    \\ "content":[{"type":"tool_use","id":"toolu_b","name":"runner","input":{"command":"x"}}]}
+;
+const usage_end_msg =
+    \\{"stop_reason":"end_turn","usage":{"input_tokens":7,"output_tokens":3},
+    \\ "content":[{"type":"text","text":"ok"}]}
+;
+
+test "budget exhausted stops the turn before the next step" {
+    var h = try Harness.init(testing.allocator, &.{usage_tool_msg});
+    defer h.deinit();
+    const bw = try budget_mod.BudgetWorker.start(testing.allocator, &h.actor, &h.registry);
+    defer bw.stop();
+
+    const conf = try h.caller.call("zygos::budget::configure", "{\"scope\":\"turn-b\",\"max_tokens\":5}");
+    conf.deinit(testing.allocator);
+
+    const res = try h.runTurnCall(requestWith("\"budget_scope\":\"turn-b\","));
+    defer res.deinit(testing.allocator);
+    try testing.expect(res == .ok);
+
+    var p = try json.parseFromSlice(json.Value, testing.allocator, res.ok, .{});
+    defer p.deinit();
+    // Step 1 recorded 12 tokens against a 5-token budget; step 2 never ran.
+    try testing.expectEqualStrings("budget_exhausted", p.value.object.get("stop").?.string);
+    try testing.expectEqual(@as(i64, 1), p.value.object.get("steps").?.integer);
+}
+
+test "budget check unreachable stops the turn (fail closed)" {
+    var h = try Harness.init(testing.allocator, &.{end_turn_msg});
+    defer h.deinit();
+    // No budget worker on the bus at all.
+
+    const res = try h.runTurnCall(requestWith("\"budget_scope\":\"turn-b\","));
+    defer res.deinit(testing.allocator);
+    try testing.expect(res == .ok);
+
+    var p = try json.parseFromSlice(json.Value, testing.allocator, res.ok, .{});
+    defer p.deinit();
+    try testing.expectEqualStrings("budget_exhausted", p.value.object.get("stop").?.string);
+    try testing.expectEqual(@as(i64, 0), p.value.object.get("steps").?.integer);
+}
+
+test "provider usage is recorded to the budget scope" {
+    var h = try Harness.init(testing.allocator, &.{usage_end_msg});
+    defer h.deinit();
+    const bw = try budget_mod.BudgetWorker.start(testing.allocator, &h.actor, &h.registry);
+    defer bw.stop();
+
+    const res = try h.runTurnCall(requestWith("\"budget_scope\":\"turn-u\","));
+    defer res.deinit(testing.allocator);
+    try testing.expect(res == .ok);
+    try testing.expect(std.mem.indexOf(u8, res.ok, "\"stop\":\"end_turn\"") != null);
+
+    const c = try h.caller.call("zygos::budget::check", "{\"scope\":\"turn-u\"}");
+    defer c.deinit(testing.allocator);
+    try testing.expect(std.mem.indexOf(u8, c.ok, "\"used_tokens\":10") != null);
 }
 
 test "routes exhausted fails the turn with route_exhausted" {
