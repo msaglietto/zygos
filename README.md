@@ -7,7 +7,7 @@ capabilities as replaceable workers. Wire-compatible with the unmodified iii
 SDKs. See `GOAL.md` for the mission, `docs/ARCHITECTURE.md` and
 `docs/PROTOCOL.md` for the design, `docs/specs/` for per-module contracts.
 
-## Status: M2 — policy + routing (M0 kernel, M1 turn loop closed)
+## Status: M3 — mission loop (M0 kernel, M1 turn loop, M2 policy+routing closed)
 
 | Milestone | Criterion | State |
 |---|---|---|
@@ -29,13 +29,19 @@ SDKs. See `GOAL.md` for the mission, `docs/ARCHITECTURE.md` and
 | M2 | U4 provider-openai (chat-completions SSE) | ✅ `worker/openai.zig` + `net/{openai,provider_openai}.zig` (fixtures, no network) |
 | M2 | U5 budget enforcement | ✅ `worker/budget.zig` (`stop:"budget_exhausted"`, fail closed) |
 | M2 | U6 output-trim (Z-09) + M2 e2e | ✅ `worker/trim.zig`; `test/e2e/m2/run.sh` |
+| M3 | V1 mission FSM | ✅ `worker/mission.zig` (exhaustive legal/illegal transitions) |
+| M3 | V2 durable `.planning/` substrate | ✅ `worker/mission_store.zig` (tmp+rename atomic saves) |
+| M3 | V3 role turns (po/planner/executor/verifier) | ✅ per-role `step_id` routing, fail-closed output parsing |
+| M3 | V4 missions::{start,status,abort} + resume | ✅ mission driver tests incl. mid-flight resume |
+| M3 | V5 hard completion gate + escalation | ✅ fail-closed gate tests, verify/gate thresholds |
+| M3 | V6 mission e2e + resume leg | ✅ `test/e2e/m3/run.sh` |
 
 ## Build & test
 
 Requires Zig 0.16.0 (and libc — pthread + CSPRNG; macOS or Linux).
 
 ```bash
-zig build test   # full suite (256 tests, leak-checked, no network)
+zig build test   # full suite (281 tests, leak-checked, no network)
 zig build        # produces zig-out/bin/zygos
 ```
 
@@ -111,4 +117,24 @@ accounting, and the Z-09 output-trim filter compressing the real bash tool's
 ```console
 $ ./test/e2e/m2/run.sh
 M2 E2E OK: stop=end_turn steps=2 used_tokens=30 saved_bytes=1861
+```
+
+## M3 mission-loop e2e (documented run)
+
+`test/e2e/m3/run.sh` (= `zig build e2e-m3`) runs the mission loop over the
+full M2+M3 stack in one process, in two legs. Leg 1: a scripted mission
+(`zygos::missions::start`) walks define → plan → execute → verify → gate to
+`done` — the product-owner/planner/executor/verifier roles each run as one
+turn routed per-role through `zygos.zon` (`models::resolve`), the **real**
+bash tool executes both plan tasks in a scratch workspace behind the
+fail-closed policy gate (`ask` → approval worker), budget accounting sees
+every role turn, the Z-09 trim seam compresses the 500-line task output, and
+the hard completion gate goes through a real `zygos::approvals::request`
+call. Leg 2: a **fresh** orchestrator instance resumes a mid-flight
+`.planning/` substrate (`resume:true`) and finishes it without re-running
+the earlier roles.
+
+```console
+$ ./test/e2e/m3/run.sh
+M3 E2E OK: live=done/completed resumed=done/completed role_turns=5+5 used_tokens=105 saved_bytes=1861
 ```

@@ -155,6 +155,21 @@ pub fn build(b: *std.Build) void {
     const e2e_m2_step = b.step("e2e-m2", "Run the M2 policy+routing e2e (U6)");
     e2e_m2_step.dependOn(&b.addRunArtifact(e2e_m2).step);
 
+    // V6 exit test (GOAL.md M3): the mission loop + resume-from-disk leg.
+    // Run with `zig build e2e-m3` (or test/e2e/m3/run.sh).
+    const e2e_m3 = b.addExecutable(.{
+        .name = "zygos-e2e-m3",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/e2e/m3/main.zig"),
+            .link_libc = true,
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "zygos", .module = mod }},
+        }),
+    });
+    const e2e_m3_step = b.step("e2e-m3", "Run the M3 mission-loop e2e (V6)");
+    e2e_m3_step.dependOn(&b.addRunArtifact(e2e_m3).step);
+
     // Env-gated manual smoke against the real Anthropic API. Requires
     // ANTHROPIC_API_KEY; never part of `zig build test` (GOAL.md M1 notes).
     const smoke = b.addExecutable(.{
