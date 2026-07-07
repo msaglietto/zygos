@@ -16,6 +16,7 @@ pub const policy = @import("worker/policy.zig");
 pub const approval = @import("worker/approval.zig");
 pub const router = @import("worker/router.zig");
 pub const budget = @import("worker/budget.zig");
+pub const trim = @import("worker/trim.zig");
 pub const sse = @import("worker/sse.zig");
 pub const tools = @import("worker/tools.zig");
 pub const tools_ops = @import("worker/tools_ops.zig");
