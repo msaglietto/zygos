@@ -104,7 +104,28 @@ role handed tools. Mission-level budget rides the existing `budget_scope`
 passthrough — no new budget machinery. Multi-mission concurrency, context
 compaction, and session-store workers stay out of M3.
 
-Later milestones (M4 Tessera) get their own criteria tables when M3 closes;
+## Success criteria — milestone M4 (Tessera absorbed)
+
+M3 ratified and closed 2026-07-07 (all V1–V6 green; see README). M4 criteria
+drafted 2026-07-09 from the DESIGN.md M4 line (Layer 3b) — **pending
+ratification by Mauricio**. Do not start implementation before ratification.
+
+| # | Criterion | Verified by |
+|---|-----------|-------------|
+| W1 | Brief validation (Z-08 leftover from M3): `zygos::missions::start` lints the mission brief before the FSM runs — frontmatter budgets/gates present, success criteria non-empty and verifiable-shaped, non-goals non-empty; a failing lint refuses the mission with a structured reason (fail closed, never starts a mission on a malformed brief) | `zig build test` — brief-validate tests incl. malformed frontmatter |
+| W2 | tessera-orient worker: `zygos::tessera::{project_status,open_threads,stale_projects,reflect}` — deterministic filesystem reads of a config-rooted vault (SESSIONS.md / PROJECT.md parsing, stale >14d flagging, stalled-loop detection); no Obsidian dependency; tests run against a temp fixture vault, never the real one | `zig build test` — orient tests over fixture vault |
+| W3 | tessera-continuity worker: `zygos::tessera::{session_open,close}` — open reads the last SESSIONS.md entry and returns *Leaving behind* + open threads for prompt assembly; close prepends a session entry (reverse-chronological, frontmatter-safe on first creation) and promotes action items to PROJECT.md; mission phase boundaries auto-log via the existing turn/mission driver seam — continuity is a harness property, no model asked to remember | `zig build test` — continuity tests incl. first-session file creation + mission-boundary auto-log |
+| W4 | tessera-capture worker: `zygos::tessera::capture` routes raw input to a destination note using a taxonomy (destinations + tags) injected from `zygos.zon` config, never hardcoded (ADR-004); the classification turn runs through `zygos::turns::run` with `step_id:"tessera-capture"` (routable to a cheap model); malformed classifier output ⇒ fallback to the ideas destination with `#needs-review`, never a lost capture | `zig build test` — capture tests with scripted fake provider |
+| W5 | tessera-undo: `zygos::tessera::{checkpoint,undo}` — shadow-git (shell-out to `git`, no new dependency) checkpoint before every capture/continuity write; one-call undo restores the pre-checkpoint vault state; undo with no checkpoint is a structured error, not a crash | `zig build test` — checkpoint/undo tests over a temp git vault |
+| W6 | mcp-gateway worker: serves MCP (JSON-RPC 2.0 over stdio, `std` only) exposing exactly the `zygos::tessera::*` functions as MCP tools — `initialize`/`tools/list`/`tools/call` bridge to bus invocations, unknown tool or bus error ⇒ JSON-RPC error (fail closed); e2e: a mission run auto-logs a SESSIONS.md entry, then an external MCP client process calls `tessera::project_status` through the gateway and reads that same entry back | `zig build test` + `test/e2e/m4/run.sh`; documented run in README |
+
+M4 notes: the vault root is config (`zygos.zon`), and `zig build test` only ever
+touches temp fixture vaults. Suppression rules ride kernel state
+(ADR-007-shaped) but full suppression UX, session-store (SQLite), and
+compaction stay out of M4 (M5). No new dependencies anticipated; if zqlite or
+an MCP lib ever looks attractive, that's the `new_dependency` human gate.
+
+Later milestones (M5 thick) get their own criteria tables when M4 closes;
 do not start them early.
 
 ## Non-goals
