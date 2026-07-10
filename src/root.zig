@@ -18,6 +18,7 @@ pub const mission = @import("worker/mission.zig");
 pub const mission_store = @import("worker/mission_store.zig");
 pub const brief = @import("worker/brief.zig");
 pub const tessera_vault = @import("worker/tessera/vault.zig");
+pub const tessera_orient = @import("worker/tessera_orient.zig");
 pub const policy = @import("worker/policy.zig");
 pub const approval = @import("worker/approval.zig");
 pub const router = @import("worker/router.zig");
