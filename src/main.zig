@@ -9,6 +9,7 @@
 
 const std = @import("std");
 const zygos = @import("zygos");
+const cli_mission = @import("cli/mission.zig");
 
 pub fn main(proc: std.process.Init) !void {
     const gpa = std.heap.c_allocator;
@@ -17,7 +18,8 @@ pub fn main(proc: std.process.Init) !void {
     _ = args.next(); // argv[0]
     if (args.next()) |cmd| {
         if (std.mem.eql(u8, cmd, "mcp-gateway")) return runMcpGateway(gpa);
-        std.debug.print("unknown command: {s} (try: zygos | zygos mcp-gateway)\n", .{cmd});
+        if (std.mem.eql(u8, cmd, "mission")) std.process.exit(cli_mission.run(gpa, &args));
+        std.debug.print("unknown command: {s} (try: zygos | zygos mission | zygos mcp-gateway)\n", .{cmd});
         std.process.exit(2);
     }
 

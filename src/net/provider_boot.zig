@@ -20,6 +20,25 @@ pub const gemini_compat_base_url = "https://generativelanguage.googleapis.com/v1
 
 const providers_prefix = "zygos::providers::";
 
+/// Owns `std.Io.Threaded` so binary entry points (Z-02: no std.Io in main)
+/// can boot catalog providers without naming the Io type themselves.
+pub const IoBoot = struct {
+    backing: std.Io.Threaded,
+
+    pub fn start(gpa: std.mem.Allocator) IoBoot {
+        return .{ .backing = std.Io.Threaded.init(gpa, .{}) };
+    }
+
+    pub fn io(self: *IoBoot) std.Io {
+        return self.backing.io();
+    }
+
+    pub fn stop(self: *IoBoot) void {
+        self.backing.deinit();
+        self.* = undefined;
+    }
+};
+
 pub const CatalogBoot = struct {
     gpa: std.mem.Allocator,
     instances: []*provider_openai.OpenAiProvider,
