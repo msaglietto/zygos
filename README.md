@@ -201,6 +201,21 @@ routed to two different live providers:
 zig build smoke-providers -- <slug-a> <slug-b>
 ```
 
+## Scheduled (unattended) missions — the Y3 recipe
+
+The weekly-trigger decision (M4.6/Y3): scheduling lives **outside** the
+binary — cron/launchd invoke the CLI; the kernel stays schedule-free. The
+CLI's guarantees make this safe unattended: approvals fail closed on a
+closed stdin, a non-resume start over an existing substrate refuses (exit 2)
+instead of clobbering it, and `--run-stamp` gives every invocation its own
+planning root (`<root>-YYYYMMDD-HHMMSS`).
+
+```cron
+# weekly zahir-radar refresh, Mondays 07:00 — each run gets its own .planning
+0 7 * * 1  cd /path/to/workspace && ZYGOS_CONFIG=/path/to/zygos.zon \
+  /path/to/zygos mission start /path/to/brief.md --run-stamp < /dev/null
+```
+
 ## X5 dogfood run (documented, 2026-07-10)
 
 The M4.5 exit: `examples/x5-dogfood/brief.md` (a `wordfreq` POSIX CLI with a
