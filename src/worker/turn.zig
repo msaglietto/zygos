@@ -1248,6 +1248,82 @@ test "malformed policy verdict denies (fail closed)" {
     try testing.expectEqual(@as(usize, 0), h.tool.calls);
 }
 
+/// Y2: policy gate sees web_fetch's tool input (URL) on the policy request.
+/// Records the last check payload and always allows so the tool still dispatches.
+const RecordingPolicy = struct {
+    gpa: std.mem.Allocator,
+    worker: *inproc.Worker,
+    mutex: sync.Mutex = .{},
+    last_request: ?[]u8 = null,
+
+    fn start(gpa: std.mem.Allocator, actor: *actor_mod.Actor, registry: *inproc.Registry) !*RecordingPolicy {
+        const self = try gpa.create(RecordingPolicy);
+        errdefer gpa.destroy(self);
+        self.* = .{
+            .gpa = gpa,
+            .worker = try inproc.Worker.spawn(gpa, actor, registry, "recording-policy"),
+        };
+        errdefer self.worker.stop();
+        try self.worker.registerFunction("zygos::policy::check", self, &handler);
+        return self;
+    }
+
+    fn stop(self: *RecordingPolicy) void {
+        self.worker.stop();
+        if (self.last_request) |r| self.gpa.free(r);
+        self.mutex.deinit();
+        const gpa = self.gpa;
+        gpa.destroy(self);
+    }
+
+    fn handler(ctx: ?*anyopaque, arena: std.mem.Allocator, request_json: []const u8) error{ Failed, OutOfMemory }![]const u8 {
+        const self: *RecordingPolicy = @ptrCast(@alignCast(ctx.?));
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.last_request) |r| self.gpa.free(r);
+        self.last_request = self.gpa.dupe(u8, request_json) catch null;
+        return arena.dupe(u8, "{\"verdict\":\"allow\",\"reason\":\"recorded\"}");
+    }
+};
+
+const web_fetch_tool_use =
+    \\{"stop_reason":"tool_use","content":[
+    \\ {"type":"tool_use","id":"toolu_wf","name":"web_fetch","input":{"url":"https://example.com/page"}}]}
+;
+
+test "web_fetch dispatch consults policy with URL riding the policy request input" {
+    var h = try Harness.init(testing.allocator, &.{ web_fetch_tool_use, end_turn_msg });
+    defer h.deinit();
+    const rp = try RecordingPolicy.start(testing.allocator, &h.actor, &h.registry);
+    defer rp.stop();
+
+    // Map web_fetch → the harness FakeTool (test::tool::run). Policy still
+    // sees the model tool name + its input object with the URL.
+    const req =
+        \\{"model":"fake-1","system":"you are a test","max_steps":4,
+        \\ "provider_function":"zygos::provider::fake::messages",
+        \\ "policy_function":"zygos::policy::check",
+        \\ "messages":[{"role":"user","content":"fetch it"}],
+        \\ "tools":[{"name":"web_fetch","function_id":"test::tool::run"}]}
+    ;
+    const res = try h.runTurnCall(req);
+    defer res.deinit(testing.allocator);
+    try testing.expect(res == .ok);
+
+    rp.mutex.lock();
+    defer rp.mutex.unlock();
+    try testing.expect(rp.last_request != null);
+    const preq = rp.last_request.?;
+    try testing.expect(std.mem.indexOf(u8, preq, "web_fetch") != null);
+    try testing.expect(std.mem.indexOf(u8, preq, "https://example.com/page") != null);
+    try testing.expect(std.mem.indexOf(u8, preq, "\"input\"") != null);
+
+    h.tool.mutex.lock();
+    defer h.tool.mutex.unlock();
+    try testing.expectEqual(@as(usize, 1), h.tool.calls);
+    try testing.expect(std.mem.indexOf(u8, h.tool.last_input.?, "https://example.com/page") != null);
+}
+
 /// A tool whose handler makes a bus call of its own before replying — the
 /// deterministic way to hit turns::abort/steer mid-turn (the blocking call
 /// completes before the tool result reaches the driver). Registers on
