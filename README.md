@@ -7,7 +7,7 @@ capabilities as replaceable workers. Wire-compatible with the unmodified iii
 SDKs. See `GOAL.md` for the mission, `docs/ARCHITECTURE.md` and
 `docs/PROTOCOL.md` for the design, `docs/specs/` for per-module contracts.
 
-## Status: M4.5 — providers wired + mission CLI (M0–M4 closed)
+## Status: M4.6 — zahir-radar workload (M0–M4.5 closed)
 
 | Milestone | Criterion | State |
 |---|---|---|
@@ -46,6 +46,11 @@ SDKs. See `GOAL.md` for the mission, `docs/ARCHITECTURE.md` and
 | M4.5 | X3 `zygos mission start/resume` CLI | ✅ `cli/mission.zig`; `test/e2e/m45/run.sh` |
 | M4.5 | X4 multi-provider smoke (env-gated) | ✅ `test/smoke/providers.sh` (manual, real keys) |
 | M4.5 | X5 dogfood exit (real autonomous mission) | ✅ verified 2026-07-10 (see below) |
+| M4.6 | Y1 web-tools worker (`web_search`/`web_fetch`) | ✅ `net/web_tools.zig` (fixture-tested, no sockets) |
+| M4.6 | Y2 web tools through policy/trim/budget gates | ✅ turn-level policy-URL test + existing seams |
+| M4.6 | Y3 unattended reruns + cron recipe | ✅ refuse-if-existing, `--run-stamp`; recipe below |
+| M4.6 | Y4 zahir-radar Brief 2 → Z-08 mission brief | ✅ `examples/zahir-radar/` (passes W1 lint) |
+| M4.6 | Y5 unattended run vs the real Zahir vault | ⏳ human gate — staged, awaiting Mauricio |
 
 ## Build & test
 
