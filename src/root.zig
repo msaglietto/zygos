@@ -34,6 +34,7 @@ pub const sse = @import("worker/sse.zig");
 pub const tools = @import("worker/tools.zig");
 pub const tools_ops = @import("worker/tools_ops.zig");
 pub const anthropic = @import("worker/anthropic.zig");
+pub const providers_catalog = @import("config/providers.zig");
 pub const types = @import("kernel/types.zig");
 pub const sync = @import("kernel/sync.zig");
 pub const catalog = @import("kernel/catalog.zig");
