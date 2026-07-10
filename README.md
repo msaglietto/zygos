@@ -45,7 +45,7 @@ SDKs. See `GOAL.md` for the mission, `docs/ARCHITECTURE.md` and
 | M4.5 | X2 catalog → bus boot (`zygos::providers::<slug>`) | ✅ `net/provider_boot.zig` (Gemini compat base, checkRoutes refusal) |
 | M4.5 | X3 `zygos mission start/resume` CLI | ✅ `cli/mission.zig`; `test/e2e/m45/run.sh` |
 | M4.5 | X4 multi-provider smoke (env-gated) | ✅ `test/smoke/providers.sh` (manual, real keys) |
-| M4.5 | X5 dogfood exit (real autonomous mission) | ⏳ manual run pending |
+| M4.5 | X5 dogfood exit (real autonomous mission) | ✅ verified 2026-07-10 (see below) |
 
 ## Build & test
 
@@ -200,3 +200,16 @@ routed to two different live providers:
 ./test/smoke/providers.sh                  # auto-picks two keyed entries
 zig build smoke-providers -- <slug-a> <slug-b>
 ```
+
+## X5 dogfood run (documented, 2026-07-10)
+
+The M4.5 exit: `examples/x5-dogfood/brief.md` (a `wordfreq` POSIX CLI with a
+self-test) run through the real binary against live catalog providers, roles
+routed per `examples/x5-dogfood/zygos.zon` (GLM 5.2 / DeepSeek V4 Pro /
+Minimax M3 / Gemini 3.5-flash, with cross-provider failover ladders), the
+human at intake and the completion gate only. Both `mission start` and a
+mid-flight `mission resume` verified by Mauricio. Dogfood findings folded
+back the same day: provider warnings now name the failing instance
+(rate-limit attribution), and the CLI requests real-mission
+`role_max_steps`/`max_role_turns` instead of the scripted-test defaults that
+starved the first executor run.
