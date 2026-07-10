@@ -661,9 +661,20 @@ test "mux falls back to the fallback outbound for non-inproc ids" {
     const b = try Worker.spawn(testing.allocator, &h.actor, &h.registry, "worker-b");
     b.stop(); // forces at least one full kernel round-trip so the post above was handled
 
-    h.fallback.mutex.lock();
-    defer h.fallback.mutex.unlock();
-    try testing.expect(h.fallback.frames >= 1);
+    // The fallback write happens on the kernel thread; the round-trip above
+    // makes it imminent but not yet observed. Poll with a deadline instead of
+    // asserting instantly — same invariant, no timing sensitivity.
+    var waited_ms: usize = 0;
+    while (waited_ms < 5000) : (waited_ms += 10) {
+        h.fallback.mutex.lock();
+        const frames = h.fallback.frames;
+        h.fallback.mutex.unlock();
+        if (frames >= 1) return;
+        const interval: std.c.timespec = .{ .sec = 0, .nsec = 10 * std.time.ns_per_ms };
+        var rem: std.c.timespec = undefined;
+        _ = std.c.nanosleep(&interval, &rem);
+    }
+    return error.FallbackFrameNeverArrived;
 }
 
 test "no leaks under register/call loops" {
