@@ -3,7 +3,7 @@
 mission: zygos
 created: 2026-07-06
 status: active
-milestone: M3
+milestone: M4
 budget:
   delegate_max_time_s: 900
   max_parallel_coding_agents: 2
@@ -107,8 +107,9 @@ compaction, and session-store workers stay out of M3.
 ## Success criteria — milestone M4 (Tessera absorbed)
 
 M3 ratified and closed 2026-07-07 (all V1–V6 green; see README). M4 criteria
-drafted 2026-07-09 from the DESIGN.md M4 line (Layer 3b) — **pending
-ratification by Mauricio**. Do not start implementation before ratification.
+drafted 2026-07-09 from the DESIGN.md M4 line (Layer 3b), under Mauricio's
+`/goal` directive to implement M4 — **ratified by Mauricio 2026-07-09**.
+Implementation in progress.
 
 | # | Criterion | Verified by |
 |---|-----------|-------------|
