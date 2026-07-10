@@ -139,11 +139,22 @@ pub fn run(gpa: std.mem.Allocator, args: *std.process.Args.Iterator) u8 {
     const tools = zygos.tools.ToolsWorker.start(gpa, &actor, &registry, cwd) catch return boot_fail();
     _ = tools;
     // bash=allow for X3: the console gate is the human boundary here;
-    // per-tool asks return with X5's tightening pass.
+    // per-tool asks return with X5's tightening pass. Web tools (Y1) ride
+    // the same policy gate with the URL in the policy request (Y2).
     const policy = zygos.policy.PolicyWorker.start(gpa, &actor, &registry, &.{
         .{ .tool = "bash", .verdict = .allow },
+        .{ .tool = "web_fetch", .verdict = .allow },
+        .{ .tool = "web_search", .verdict = .allow },
     }) catch return boot_fail();
     _ = policy;
+    // Search backend is operator env config: ZYGOS_SEARCH_ENGINE
+    // (brave|searxng) + ZYGOS_SEARCH_ENDPOINT (+ ZYGOS_SEARCH_KEY_ENV,
+    // default BRAVE_API_KEY for brave). Unset ⇒ web_search replies a
+    // structured error per call; web_fetch always works.
+    const web = zygos.web_tools.WebToolsWorker.start(gpa, &actor, &registry, io_boot.io(), .{
+        .search = searchConfigFromEnv(env),
+    }) catch return boot_fail();
+    _ = web;
     const approvals = zygos.approval.ApprovalWorker.start(gpa, &actor, &registry, .{
         .manual = .{ .timeout_ms = @intCast(envInt(env, "ZYGOS_APPROVAL_TIMEOUT_MS", 300_000)) },
     }) catch return boot_fail();
@@ -184,7 +195,9 @@ pub fn run(gpa: std.mem.Allocator, args: *std.process.Args.Iterator) u8 {
         \\ "approval_function":"zygos::approvals::request",
         \\ "budget_scope":{f},
         \\ "role_max_steps":{d},"max_role_turns":{d}{s},
-        \\ "tools":[{{"name":"bash","function_id":"zygos::tools::bash"}}]}}
+        \\ "tools":[{{"name":"bash","function_id":"zygos::tools::bash"}},
+        \\  {{"name":"web_search","function_id":"zygos::tools::web_search"}},
+        \\  {{"name":"web_fetch","function_id":"zygos::tools::web_fetch"}}]}}
     , .{
         json.fmt(mission_id, .{}),                   json.fmt(planning, .{}),
         json.fmt(extractObjective(brief_text), .{}), json.fmt(brief_text, .{}),
@@ -383,6 +396,22 @@ fn envPairs(gpa: std.mem.Allocator) error{OutOfMemory}![]zygos.providers_catalog
 
 fn getEnv(env: []const zygos.providers_catalog.EnvPair, name: []const u8) ?[]const u8 {
     for (env) |p| if (std.mem.eql(u8, p.name, name)) return p.value;
+    return null;
+}
+
+fn searchConfigFromEnv(env: []const zygos.providers_catalog.EnvPair) ?zygos.web_tools.SearchConfig {
+    const engine_raw = getEnv(env, "ZYGOS_SEARCH_ENGINE") orelse return null;
+    if (std.mem.eql(u8, engine_raw, "brave")) return .{
+        .endpoint = getEnv(env, "ZYGOS_SEARCH_ENDPOINT") orelse "https://api.search.brave.com",
+        .key_env = getEnv(env, "ZYGOS_SEARCH_KEY_ENV") orelse "BRAVE_API_KEY",
+        .engine = .brave,
+    };
+    if (std.mem.eql(u8, engine_raw, "searxng")) {
+        return .{
+            .endpoint = getEnv(env, "ZYGOS_SEARCH_ENDPOINT") orelse return null,
+            .engine = .searxng,
+        };
+    }
     return null;
 }
 
