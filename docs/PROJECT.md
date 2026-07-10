@@ -23,6 +23,7 @@ Code: `~/Projects/Personal/zygos` — the repo's `GOAL.md` is the mission brief 
 
 ## Sessions
 
+- 2026-07-09 — M4 closed (W1–W6 ratified) and M4.5 ratified: shared provider catalog (`~/.agents/providers.toml`) wired to the CLI + `zygos mission start/resume` — the dogfood gate; X5 exit = DESIGN.md's real autonomous M3 exit test. Zahir web-tools + weekly trigger deferred to the post-M4.5 table.
 - 2026-07-09 — Decision Z-10: zahir-radar (Zahir's autonomous research pipeline) adopted as the flagship M3 mission workload; its vault is the portable contract, the SDK orchestrator disposable.
 - 2026-07-07 — Design addition: tool-output compression seam (Z-09) — rtk/ztk absorbed as a first-class `output::compress` dispatch step instead of a hook hack; raw output preserved in session store, savings reported to budget.
 - 2026-07-06 — Build started: repo scaffolded at `~/Projects/Personal/zygos` (Zig 0.16.0, `zig build test` green), GOAL.md mission brief + PROTOCOL.md wire spec + AGENTS.md TDD rules committed; S1 (protocol module) delegated to omp, TDD red-green-refactor.
@@ -44,14 +45,15 @@ Code: `~/Projects/Personal/zygos` — the repo's `GOAL.md` is the mission brief 
 
 ## Actions
 
-- [ ] M0 — Kernel: five primitives; exit test = unmodified iii Node SDK registers + invokes across two workers, ownership CAS verified under reconnect churn — **in progress 2026-07-06** (scaffold committed; S1 protocol module delegated)
-- [ ] M1 — One turn: 7-state FSM + provider-anthropic + read/bash tools + token streaming to CLI
-- [ ] M2 — Safety + routing: fail-closed policy, approval gate, `zygos.zon` step routing table, openai-compat provider, budget
-- [ ] M3 — Mission loop v1: mission-orchestrator + role turns on GSD substrate; exit = small objective goes brief → completed autonomously across 3+ providers, restart-safe mid-phase
+- [x] M0 — Kernel: five primitives; exit test = unmodified iii Node SDK registers + invokes across two workers, ownership CAS verified under reconnect churn — closed 2026-07-07
+- [x] M1 — One turn: 7-state FSM + provider-anthropic + read/bash tools + token streaming to CLI — closed 2026-07-07
+- [x] M2 — Safety + routing: fail-closed policy, approval gate, `zygos.zon` step routing table, openai-compat provider, budget — closed 2026-07-07
+- [x] M3 — Mission loop v1: mission-orchestrator + role turns on GSD substrate (scripted-provider criteria V1–V6; the real autonomous exit moved to M4.5/X5) — closed 2026-07-07
 - [x] Write the mission-brief template (objective, constraints, non-goals, success criteria, gate config) — done 2026-07-06, see [Mission Brief Template](Projects/Zygos/Mission Brief Template.md)
-- [ ] Implement `mission::brief::validate` lint alongside M3
-- [ ] M4 — Tessera absorbed: continuity/capture/orient/undo workers + mcp-gateway + shadow-git
-- [ ] Port zahir-radar area specs into mission briefs as the M3 exit workload (Z-10) — needs web-tools worker + weekly trigger decision
+- [x] Implement `mission::brief::validate` lint — landed as M4/W1 brief validation, 2026-07-09
+- [x] M4 — Tessera absorbed: continuity/capture/orient/undo workers + mcp-gateway + shadow-git — closed 2026-07-09
+- [ ] M4.5 — Dogfood gate: providers.toml catalog + `zygos mission start/resume` CLI; exit (X5) = small real objective brief → completed autonomously across 3+ catalog providers, killed + resumed once — **in progress 2026-07-09** (X1 delegated)
+- [ ] Port zahir-radar area specs into mission briefs (Z-10) — needs web-tools worker + weekly trigger decision; deferred to the post-M4.5 table
 
 ## Resources
 
