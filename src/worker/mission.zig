@@ -19,6 +19,7 @@ const actor_mod = @import("../kernel/actor.zig");
 const inproc = @import("../kernel/inproc.zig");
 const sync = @import("../kernel/sync.zig");
 const store_mod = @import("mission_store.zig");
+const brief_mod = @import("brief.zig");
 
 const log = std.log.scoped(.mission);
 
@@ -365,6 +366,22 @@ fn runMission(self: *MissionOrchestrator, arena: std.mem.Allocator, request_json
     const planning_root = strField(obj, "planning_root") orelse return error.MalformedRequest;
     if (planning_root.len < 2 or planning_root[0] != '/') return error.MalformedRequest;
     const resume_flag = if (obj.get("resume")) |v| v == .bool and v.bool else false;
+
+    // W1 (brief validation): when a mission brief document rides the start
+    // request, it is linted before anything is persisted or tracked. A
+    // malformed brief refuses the mission with a structured reason and never
+    // starts the FSM — fail closed. A brief-less start (raw objective, the M3
+    // path) is unaffected.
+    if (strField(obj, "brief")) |brief_text| {
+        switch (brief_mod.lint(brief_text)) {
+            .ok => {},
+            .invalid => |e| return std.fmt.allocPrint(
+                arena,
+                "{{\"refused\":true,\"reason\":\"{s}\",\"detail\":\"brief rejected: {s}\"}}",
+                .{ brief_mod.tag(e), brief_mod.tag(e) },
+            ),
+        }
+    }
 
     const cfg: RunConfig = .{
         .mission_id = mission_id,
@@ -1241,6 +1258,59 @@ test "provider error mid-role fails the mission as role_failed" {
     defer res.deinit(testing.allocator);
     try testing.expect(res == .ok);
     try expectTerminal(res.ok, "failed", "role_failed");
+}
+
+// -- W1: brief validation (driver side) --------------------------------------
+
+const good_brief =
+    "---\nbudget:\n  x: 1\ngates:\n  y: human\n---\n\n" ++
+    "# Mission\n\n## Success criteria\n\n" ++
+    "| # | Criterion | Verified by |\n|---|---|---|\n| 1 | it works | a test |\n\n" ++
+    "## Non-goals\n\n- not this\n";
+
+fn briefStartReq(h: *Harness, gpa: std.mem.Allocator, brief: []const u8) ![]u8 {
+    return std.fmt.allocPrint(
+        gpa,
+        "{{\"mission_id\":\"m-1\",\"planning_root\":{f}," ++
+            "\"provider_function\":\"zygos::provider::rec::messages\"," ++
+            "\"objective\":\"seed\",\"gate_function\":\"test::gate::request\"," ++
+            "\"brief\":{f}}}",
+        .{ json.fmt(h.root, .{}), json.fmt(brief, .{}) },
+    );
+}
+
+test "a malformed brief refuses the mission without starting the FSM" {
+    var h = try Harness.init(testing.allocator, &.{});
+    defer h.deinit();
+
+    // No frontmatter at all — the very first lint check fails.
+    const req = try briefStartReq(h, testing.allocator, "# just a heading\n\nno frontmatter here\n");
+    defer testing.allocator.free(req);
+    const res = try h.caller.call("zygos::missions::start", req);
+    defer res.deinit(testing.allocator);
+    try testing.expect(res == .ok);
+    try testing.expect(std.mem.indexOf(u8, res.ok, "\"refused\":true") != null);
+    try testing.expect(std.mem.indexOf(u8, res.ok, "no_frontmatter") != null);
+
+    // Fail closed: no mission record was persisted.
+    try testing.expectError(error.NotFound, h.store().load(testing.allocator));
+    // No provider turn ever ran.
+    try testing.expectEqual(@as(usize, 0), h.provider.callCount());
+}
+
+test "a well-formed brief starts the mission normally" {
+    var h = try Harness.init(testing.allocator, &.{ po_ok, plan1, exec_ok, verify_pass });
+    defer h.deinit();
+    const gate_worker = try FakeGate.start(testing.allocator, &h.actor, &h.registry, &.{"{\"approved\":true}"});
+    defer gate_worker.stop();
+
+    const req = try briefStartReq(h, testing.allocator, good_brief);
+    defer testing.allocator.free(req);
+    const res = try h.caller.call("zygos::missions::start", req);
+    defer res.deinit(testing.allocator);
+    try testing.expect(res == .ok);
+    try testing.expect(std.mem.indexOf(u8, res.ok, "refused") == null);
+    try expectTerminal(res.ok, "done", "completed");
 }
 
 const StartCtx = struct {
