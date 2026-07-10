@@ -20,6 +20,7 @@ pub const brief = @import("worker/brief.zig");
 pub const tessera_vault = @import("worker/tessera/vault.zig");
 pub const tessera_session_writer = @import("worker/tessera/session_writer.zig");
 pub const tessera_orient = @import("worker/tessera_orient.zig");
+pub const tessera_continuity = @import("worker/tessera_continuity.zig");
 pub const tessera_undo = @import("worker/tessera_undo.zig");
 pub const policy = @import("worker/policy.zig");
 pub const approval = @import("worker/approval.zig");
