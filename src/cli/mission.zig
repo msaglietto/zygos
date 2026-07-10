@@ -24,11 +24,14 @@ pub fn run(gpa: std.mem.Allocator, args: *std.process.Args.Iterator) u8 {
     }
     var brief_path: ?[]const u8 = null;
     var planning_opt: ?[]const u8 = null;
+    var run_stamp = false;
     while (args.next()) |a| {
         if (std.mem.eql(u8, a, "--planning")) {
             planning_opt = args.next() orelse return usage();
         } else if (std.mem.eql(u8, a, "--resume")) {
             resume_flag = true;
+        } else if (std.mem.eql(u8, a, "--run-stamp")) {
+            run_stamp = true;
         } else if (brief_path == null) {
             brief_path = a;
         } else {
@@ -115,7 +118,21 @@ pub fn run(gpa: std.mem.Allocator, args: *std.process.Args.Iterator) u8 {
     const cwd = std.mem.sliceTo(&cwd_buf, 0);
 
     const mission_id = stem(bp);
-    const planning = absPath(gpa, cwd, planning_opt orelse "./.planning") catch return oom();
+    const planning_base = absPath(gpa, cwd, planning_opt orelse "./.planning") catch return oom();
+    // Unattended-rerun semantics (Y3): --run-stamp gives every scheduled
+    // invocation its own planning root; without it, starting over an
+    // existing mission substrate refuses instead of clobbering it.
+    const planning = if (run_stamp)
+        std.fmt.allocPrint(gpa, "{s}-{s}", .{ planning_base, runStamp() }) catch return oom()
+    else
+        planning_base;
+    if (!resume_flag and !run_stamp and fileExists(gpa, planning, "mission.json")) {
+        eprint(
+            "mission: {s} already holds a mission; resume it, pick a fresh --planning, or pass --run-stamp\n",
+            .{planning},
+        );
+        return 2;
+    }
 
     const turns = zygos.turn.TurnOrchestrator.start(gpa, &actor, &registry) catch return boot_fail();
     _ = turns;
@@ -193,7 +210,7 @@ pub fn run(gpa: std.mem.Allocator, args: *std.process.Args.Iterator) u8 {
 }
 
 fn usage() u8 {
-    eprint("usage: zygos mission start|resume <brief.md> [--planning <dir>] [--resume]\n", .{});
+    eprint("usage: zygos mission start|resume <brief.md> [--planning <dir>] [--resume] [--run-stamp]\n", .{});
     return 2;
 }
 
@@ -233,6 +250,31 @@ fn stem(path: []const u8) []const u8 {
     const base = if (std.mem.lastIndexOfScalar(u8, path, '/')) |i| path[i + 1 ..] else path;
     const dot = std.mem.lastIndexOfScalar(u8, base, '.') orelse return base;
     return if (dot == 0) base else base[0..dot];
+}
+
+var stamp_buf: [15]u8 = undefined;
+
+/// Wall-clock "YYYYMMDD-HHMMSS" (UTC) for --run-stamp planning roots.
+fn runStamp() []const u8 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.REALTIME, &ts);
+    const ep: std.time.epoch.EpochSeconds = .{ .secs = @intCast(@max(0, ts.sec)) };
+    const yd = ep.getEpochDay().calculateYearDay();
+    const md = yd.calculateMonthDay();
+    const ds = ep.getDaySeconds();
+    _ = std.fmt.bufPrint(&stamp_buf, "{d:0>4}{d:0>2}{d:0>2}-{d:0>2}{d:0>2}{d:0>2}", .{
+        yd.year,              md.month.numeric(),      md.day_index + 1,
+        ds.getHoursIntoDay(), ds.getMinutesIntoHour(), ds.getSecondsIntoMinute(),
+    }) catch unreachable;
+    return &stamp_buf;
+}
+
+fn fileExists(gpa: std.mem.Allocator, dir: []const u8, name: []const u8) bool {
+    const path_z = std.fmt.allocPrintSentinel(gpa, "{s}/{s}", .{ dir, name }, 0) catch return false;
+    defer gpa.free(path_z);
+    const f = std.c.fopen(path_z.ptr, "r") orelse return false;
+    _ = std.c.fclose(f);
+    return true;
 }
 
 fn absPath(gpa: std.mem.Allocator, cwd: []const u8, path: []const u8) error{OutOfMemory}![]u8 {

@@ -132,4 +132,12 @@ set -e
 [ "$CODE" = "2" ] || { echo "M45 E2E FAIL leg3: expected exit 2, got $CODE"; cat "$TMP/err3.log"; exit 1; }
 grep -q "unknown zygos::providers" "$TMP/err3.log" || { echo "M45 E2E FAIL leg3: wrong error"; cat "$TMP/err3.log"; exit 1; }
 
-echo "M45 E2E OK: start→done, seeded resume→done, unknown-slug boot refusal"
+# ---- Leg 4 (Y3): a non-resume start over an existing substrate refuses ------
+set +e
+( cd "$TMP/ws" && "$BIN" mission start "$TMP/brief.md" --planning "$TMP/planning" > /dev/null 2> "$TMP/err4.log" < /dev/null )
+CODE=$?
+set -e
+[ "$CODE" = "2" ] || { echo "M45 E2E FAIL leg4: expected exit 2, got $CODE"; cat "$TMP/err4.log"; exit 1; }
+grep -q "already holds a mission" "$TMP/err4.log" || { echo "M45 E2E FAIL leg4: wrong error"; cat "$TMP/err4.log"; exit 1; }
+
+echo "M45 E2E OK: start→done, seeded resume→done, unknown-slug boot refusal, rerun refusal"
