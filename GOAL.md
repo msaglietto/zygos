@@ -132,9 +132,10 @@ M4 implementation complete 2026-07-09 (all W1–W6 green; closure ratification
 pending). M4.5 criteria drafted 2026-07-09 under Mauricio's directive to wire
 the shared provider catalog (`~/.agents/providers.toml`, schema
 `~/.agents/providers.schema.json`) into the CLI — **ratified by Mauricio
-2026-07-09**. Implementation in progress (X1 first). Zahir's web-tools worker
-and the weekly-trigger decision are explicitly deferred to the table after
-M4.5 (Mauricio, 2026-07-09).
+2026-07-09**. Zahir's web-tools worker and the weekly-trigger decision were
+explicitly deferred to the table after M4.5 (Mauricio, 2026-07-09).
+All X1–X5 green (X5 dogfood run verified by Mauricio; see README) —
+**closure ratified by Mauricio 2026-07-10**.
 
 | # | Criterion | Verified by |
 |---|-----------|-------------|
@@ -150,8 +151,29 @@ only. Real runs ride the existing budget worker; the brief's frontmatter caps
 are enforced as usual. Zahir/web-tools and scheduled triggers stay out of
 M4.5 — they are the next table once the dogfood exit proves the loop.
 
-Later milestones (M5 thick, zahir-radar workload) get their own criteria
-tables when M4.5 closes; do not start them early.
+## Success criteria — milestone M4.6 (zahir-radar: the research pipeline workload)
+
+M4.5 closed 2026-07-10 (all X1–X5; see README). M4.6 criteria drafted
+2026-07-10 from Z-10 and the Zahir Research Pipelines note, under Mauricio's
+`/goal` directive — **pending ratification; do not implement until Mauricio
+ratifies.**
+
+| # | Criterion | Verified by |
+|---|-----------|-------------|
+| Y1 | web-tools worker: `zygos::tools::{web_search,web_fetch}` on the bus — fetch: URL → size-capped readable text (tags stripped; non-2xx, oversize, or non-text ⇒ structured error, never a crash); search: config-backed HTTP endpoint (provider + key via `zygos.zon`/env — engine choice is config, no new dependency) normalized to `{title,url,snippet}[]`; both fail closed on malformed upstream responses | `zig build test` — tests over recorded fixtures, no network |
+| Y2 | Web tools ride the existing harness gates, not around them: policy consulted per call with the URL in the request (deny/ask verdicts honored), fetched pages compressed on the Z-09 trim seam, bytes reported to budget | `zig build test` — gated-dispatch tests + a scripted turn over a localhost stub |
+| Y3 | Weekly-trigger decision implemented: external scheduler (cron/launchd) invoking the CLI — `zygos mission start` gains unattended-rerun semantics (a run-stamped planning root or clean refuse-if-terminal, no double-start races); the decision + recipe recorded (GOAL.md amendment + README) | CLI rerun-semantics tests + documented recipe |
+| Y4 | zahir-radar brief port: one area spec (Brief 2, verifier infrastructure — the wedge) → a Z-08 mission brief in the Zahir vault's `briefs/`; coverage targets become verifiable success criteria, top-3 watch signals become open threads; passes W1 lint | brief committed to the vault + `missions::start` lint accepts it |
+| Y5 | Exit: an unattended weekly-shaped run (stdin closed, hard gates fail closed) completes the research mission against the real Zahir vault — executor researches with web tools, artifacts land in the vault behind a tessera-undo checkpoint, output diffed against the SDK-run brief as the Z-10 validation harness | documented run in README with the brief + diff pointers |
+
+M4.6 notes: context compaction (M5) is explicitly watched, not included — if
+the first real research mission blows context or budget, compaction jumps
+the queue as M4.7. The search engine choice (Brave/Tavily/etc.) is operator
+config; any SDK/library for it would trip the `new_dependency` human gate.
+`zig build test` never touches the network or the real Zahir vault.
+
+Later milestones (M5 thick) get their own criteria tables when M4.6 closes;
+do not start them early.
 
 ## Non-goals
 
