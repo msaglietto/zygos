@@ -157,18 +157,22 @@ pub fn run(gpa: std.mem.Allocator, args: *std.process.Args.Iterator) u8 {
     if (std.Thread.spawn(.{}, consoleLoop, .{ gpa, console_worker })) |t| t.detach() else |_| {}
 
     // ---- the mission ---------------------------------------------------------
+    // Scripted-test defaults (8 steps/turn, 16 turns) are too tight for real
+    // executors iterating with tools — a real mission gets room by default.
     const request = std.fmt.allocPrint(gpa,
         \\{{"mission_id":{f},"planning_root":{f},"objective":{f},"brief":{f},
         \\ "router_function":"zygos::models::resolve",
         \\ "gate_function":"zygos::approvals::request",
         \\ "policy_function":"zygos::policy::check",
         \\ "approval_function":"zygos::approvals::request",
-        \\ "budget_scope":{f}{s},
+        \\ "budget_scope":{f},
+        \\ "role_max_steps":{d},"max_role_turns":{d}{s},
         \\ "tools":[{{"name":"bash","function_id":"zygos::tools::bash"}}]}}
     , .{
         json.fmt(mission_id, .{}),                   json.fmt(planning, .{}),
         json.fmt(extractObjective(brief_text), .{}), json.fmt(brief_text, .{}),
-        json.fmt(mission_id, .{}),                   if (resume_flag) ",\"resume\":true" else "",
+        json.fmt(mission_id, .{}),                   envInt(env, "ZYGOS_ROLE_MAX_STEPS", 24),
+        envInt(env, "ZYGOS_MAX_ROLE_TURNS", 48),     if (resume_flag) ",\"resume\":true" else "",
     }) catch return oom();
 
     const res = caller.call("zygos::missions::start", request) catch {
