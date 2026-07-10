@@ -7,7 +7,7 @@ capabilities as replaceable workers. Wire-compatible with the unmodified iii
 SDKs. See `GOAL.md` for the mission, `docs/ARCHITECTURE.md` and
 `docs/PROTOCOL.md` for the design, `docs/specs/` for per-module contracts.
 
-## Status: M3 — mission loop (M0 kernel, M1 turn loop, M2 policy+routing closed)
+## Status: M4 — Tessera absorbed (M0 kernel, M1 turn loop, M2 policy+routing, M3 mission loop closed)
 
 | Milestone | Criterion | State |
 |---|---|---|
@@ -35,13 +35,19 @@ SDKs. See `GOAL.md` for the mission, `docs/ARCHITECTURE.md` and
 | M3 | V4 missions::{start,status,abort} + resume | ✅ mission driver tests incl. mid-flight resume |
 | M3 | V5 hard completion gate + escalation | ✅ fail-closed gate tests, verify/gate thresholds |
 | M3 | V6 mission e2e + resume leg | ✅ `test/e2e/m3/run.sh` |
+| M4 | W1 mission brief validation | ✅ `worker/brief.zig` (fail-closed lint before the FSM) |
+| M4 | W2 tessera-orient worker | ✅ `worker/tessera_orient.zig` + `worker/tessera/vault.zig` (fixture vault only) |
+| M4 | W3 tessera-continuity + mission auto-log | ✅ `worker/tessera_continuity.zig` + `worker/tessera/session_writer.zig`; continuity seam in the mission driver |
+| M4 | W4 tessera-capture (taxonomy from config) | ✅ `worker/tessera_capture.zig` (full fallback, capture never lost) |
+| M4 | W5 tessera-undo (shadow git) | ✅ `worker/tessera_undo.zig` (`.zygos-shadow`, checkpoint/undo) |
+| M4 | W6 mcp-gateway + M4 e2e | ✅ `worker/mcp/gateway.zig` + `zygos mcp-gateway`; `test/e2e/m4/run.sh` |
 
 ## Build & test
 
 Requires Zig 0.16.0 (and libc — pthread + CSPRNG; macOS or Linux).
 
 ```bash
-zig build test   # full suite (281 tests, leak-checked, no network)
+zig build test   # full suite (357 tests, leak-checked, no network)
 zig build        # produces zig-out/bin/zygos
 ```
 
@@ -137,4 +143,24 @@ the earlier roles.
 ```console
 $ ./test/e2e/m3/run.sh
 M3 E2E OK: live=done/completed resumed=done/completed role_turns=5+5 used_tokens=105 saved_bytes=1861
+```
+
+## M4 tessera e2e (documented run)
+
+`test/e2e/m4/run.sh` runs two legs against one temp vault. Leg 1
+(`zig build e2e-m4`): a scripted mission runs to `done` with the W3
+continuity seam (`continuity_function` + `continuity_project` on
+`zygos::missions::start`) — the terminal mission session-closes over the bus
+and the harness, not a model, writes the `SESSIONS.md` entry (phase log,
+accomplished, leaving-behind). Leg 2: this script acts as an **external MCP
+client**, piping a newline-JSON session (initialize → tools/list →
+tools/call `tessera_project_status`) into a separate `zygos mcp-gateway`
+process (stdio transport, `ZYGOS_VAULT_ROOT` pointing at the same vault) and
+asserts the auto-logged entry comes back; an unknown tool must return a
+JSON-RPC `-32602` error (fail closed).
+
+```console
+$ ./test/e2e/m4/run.sh
+M4 E2E leg 1 OK: mission auto-logged .../Projects/zygos-e2e/SESSIONS.md
+M4 E2E OK: mission auto-log read back through the MCP gateway
 ```
