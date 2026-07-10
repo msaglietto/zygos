@@ -1,0 +1,27 @@
+// X5 dogfood route table: roles spread across 3+ real catalog providers
+// (slugs derive from ~/.agents/providers.toml names — `zig build
+// smoke-providers` with no args lists them on skip). Each ladder has a
+// failover attempt on a different provider.
+.{
+    .default = .{
+        .{ .provider_function = "zygos::providers::glm-5-2", .model = "glm-5.2" },
+    },
+    .routes = .{
+        .{ .step_id = "product-owner", .attempts = .{
+            .{ .provider_function = "zygos::providers::glm-5-2", .model = "glm-5.2" },
+            .{ .provider_function = "zygos::providers::nvidia-deepseekv4-pro", .model = "deepseek-ai/deepseek-v4-pro" },
+        } },
+        .{ .step_id = "planner", .attempts = .{
+            .{ .provider_function = "zygos::providers::nvidia-deepseekv4-pro", .model = "deepseek-ai/deepseek-v4-pro" },
+            .{ .provider_function = "zygos::providers::glm-5-2", .model = "glm-5.2" },
+        } },
+        .{ .step_id = "executor", .attempts = .{
+            .{ .provider_function = "zygos::providers::nvidia-deepseekv4-pro", .model = "deepseek-ai/deepseek-v4-pro" },
+            .{ .provider_function = "zygos::providers::nvidia-minimax-m3", .model = "minimaxai/minimax-m3" },
+        } },
+        .{ .step_id = "verifier", .attempts = .{
+            .{ .provider_function = "zygos::providers::google-gemini-3-5-flash", .model = "gemini-3.5-flash" },
+            .{ .provider_function = "zygos::providers::glm-5-2", .model = "glm-5.2" },
+        } },
+    },
+}
