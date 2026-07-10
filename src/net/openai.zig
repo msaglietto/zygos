@@ -24,10 +24,51 @@ pub const StreamOptions = struct {
     /// Raw JSON array text of NEUTRAL-shaped tool definitions ("[]" = none).
     tools_json: []const u8 = "[]",
     max_tokens: u32 = 1024,
-    base_url: []const u8 = "https://api.openai.com",
+    /// Base URL including the version segment (e.g. `…/v1` or Gemini's
+    /// `…/v1beta/openai`). `chatUrl` appends only `/chat/completions`.
+    base_url: []const u8 = "https://api.openai.com/v1",
+    /// Emitted in the request body only when set.
+    temperature: ?f64 = null,
 };
 
 pub const StreamError = error{ OutOfMemory, HttpFailed, ApiError, BadStream, BadRequest };
+
+/// Join a version-carrying base URL with the chat completions path.
+/// Caller owns the result.
+pub fn chatUrl(gpa: std.mem.Allocator, base_url: []const u8) error{OutOfMemory}![]u8 {
+    return std.fmt.allocPrint(gpa, "{s}/chat/completions", .{base_url});
+}
+
+/// Pure request-body builder (network-free). `tools_part` is either empty or
+/// a preformatted `,"tools":…` fragment. Temperature is emitted only when set.
+pub fn buildChatBody(
+    gpa: std.mem.Allocator,
+    model: []const u8,
+    max_tokens: u32,
+    messages_inner: []const u8,
+    tools_part: []const u8,
+    temperature: ?f64,
+) error{OutOfMemory}![]u8 {
+    if (temperature) |temp| {
+        return std.fmt.allocPrint(gpa,
+            \\{{"model":{f},"max_completion_tokens":{d},"stream":true,"stream_options":{{"include_usage":true}},"messages":[{s}]{s},"temperature":{d}}}
+        , .{
+            json.fmt(model, .{}),
+            max_tokens,
+            messages_inner,
+            tools_part,
+            temp,
+        });
+    }
+    return std.fmt.allocPrint(gpa,
+        \\{{"model":{f},"max_completion_tokens":{d},"stream":true,"stream_options":{{"include_usage":true}},"messages":[{s}]{s}}}
+    , .{
+        json.fmt(model, .{}),
+        max_tokens,
+        messages_inner,
+        tools_part,
+    });
+}
 
 /// Blocking call: POST /v1/chat/completions with stream:true, push text
 /// deltas into `sender` (closed on return), return the assembled terminal
@@ -71,18 +112,11 @@ pub fn streamChat(
     else
         "";
 
-    const body = std.fmt.allocPrint(gpa,
-        \\{{"model":{f},"max_completion_tokens":{d},"stream":true,"stream_options":{{"include_usage":true}},"messages":[{s}]{s}}}
-    , .{
-        json.fmt(opts.model, .{}),
-        opts.max_tokens,
-        joined,
-        tools_part,
-    }) catch return error.OutOfMemory;
+    const body = buildChatBody(gpa, opts.model, opts.max_tokens, joined, tools_part, opts.temperature) catch
+        return error.OutOfMemory;
     defer gpa.free(body);
 
-    const url = std.fmt.allocPrint(gpa, "{s}/v1/chat/completions", .{opts.base_url}) catch
-        return error.OutOfMemory;
+    const url = chatUrl(gpa, opts.base_url) catch return error.OutOfMemory;
     defer gpa.free(url);
     const uri = std.Uri.parse(url) catch return error.HttpFailed;
 
@@ -274,4 +308,30 @@ test "truncated chat stream (no [DONE]) is BadStream, not a crash" {
         "data: {\"id\":\"cc-3\",\"model\":\"gpt-x\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n";
     var reader: std.Io.Reader = .fixed(fixture);
     try testing.expectError(error.BadStream, processSse(testing.allocator, &reader, null));
+}
+
+test "chatUrl: version-carrying base joins to <base>/chat/completions" {
+    const cases = [_]struct { base: []const u8, want: []const u8 }{
+        .{ .base = "https://api.openai.com/v1", .want = "https://api.openai.com/v1/chat/completions" },
+        .{ .base = "https://openrouter.ai/api/v1", .want = "https://openrouter.ai/api/v1/chat/completions" },
+        .{ .base = "https://generativelanguage.googleapis.com/v1beta/openai", .want = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions" },
+        .{ .base = "http://localhost:11434/v1", .want = "http://localhost:11434/v1/chat/completions" },
+    };
+    for (cases) |case| {
+        const url = try chatUrl(testing.allocator, case.base);
+        defer testing.allocator.free(url);
+        try testing.expectEqualStrings(case.want, url);
+    }
+}
+
+test "buildChatBody: temperature emitted only when set" {
+    const no_temp = try buildChatBody(testing.allocator, "gpt-x", 128, "", "", null);
+    defer testing.allocator.free(no_temp);
+    try testing.expect(std.mem.indexOf(u8, no_temp, "temperature") == null);
+    try testing.expect(std.mem.indexOf(u8, no_temp, "\"model\":\"gpt-x\"") != null);
+
+    const with_temp = try buildChatBody(testing.allocator, "gpt-x", 128, "", "", 0.7);
+    defer testing.allocator.free(with_temp);
+    try testing.expect(std.mem.indexOf(u8, with_temp, "\"temperature\":") != null);
+    try testing.expect(std.mem.indexOf(u8, with_temp, "0.7") != null);
 }
