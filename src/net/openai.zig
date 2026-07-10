@@ -134,7 +134,7 @@ pub fn streamChat(
             .{ .name = "accept", .value = "text/event-stream" },
         },
     }) catch |err| {
-        log.warn("request setup failed: {t}", .{err});
+        log.warn("{s} model {s}: request setup failed: {t}", .{ opts.base_url, opts.model, err });
         return error.HttpFailed;
     };
     defer req.deinit();
@@ -145,7 +145,9 @@ pub fn streamChat(
     var redirect_buf: [1024]u8 = undefined;
     var response = req.receiveHead(&redirect_buf) catch return error.HttpFailed;
     if (response.head.status != .ok) {
-        log.warn("openai-compat endpoint answered {d}", .{@intFromEnum(response.head.status)});
+        log.warn("{s} model {s}: endpoint answered {d}", .{
+            opts.base_url, opts.model, @intFromEnum(response.head.status),
+        });
         return error.ApiError;
     }
 

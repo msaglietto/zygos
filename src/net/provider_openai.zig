@@ -60,6 +60,7 @@ pub const OpenAiProvider = struct {
     actor: *actor_mod.Actor,
     worker: *inproc.Worker,
     io: std.Io,
+    name: []const u8, // owned; the catalog slug for boot instances
     api_key: []const u8, // owned
     base_url: []const u8, // owned
     default_model: ?[]const u8 = null, // owned when set
@@ -97,6 +98,7 @@ pub const OpenAiProvider = struct {
             .actor = actor,
             .worker = try inproc.Worker.spawn(gpa, actor, registry, opts.worker_name),
             .io = io,
+            .name = try gpa.dupe(u8, opts.worker_name),
             .api_key = try gpa.dupe(u8, opts.api_key),
             .base_url = try gpa.dupe(u8, opts.base_url),
             .default_model = if (opts.default_model) |m| try gpa.dupe(u8, m) else null,
@@ -104,6 +106,7 @@ pub const OpenAiProvider = struct {
             .default_temperature = opts.default_temperature,
         };
         errdefer {
+            self.gpa.free(self.name);
             self.gpa.free(self.api_key);
             self.gpa.free(self.base_url);
             if (self.default_model) |m| self.gpa.free(m);
@@ -115,6 +118,7 @@ pub const OpenAiProvider = struct {
 
     pub fn stop(self: *OpenAiProvider) void {
         self.worker.stop();
+        self.gpa.free(self.name);
         self.gpa.free(self.api_key);
         self.gpa.free(self.base_url);
         if (self.default_model) |m| self.gpa.free(m);
@@ -161,7 +165,7 @@ pub const OpenAiProvider = struct {
             .temperature = merged.temperature,
         }, if (sender) |*s| s else null) catch |err| {
             if (sender) |*s| s.deinit();
-            log.warn("openai-compat stream failed: {t}", .{err});
+            log.warn("{s} (model {s}): stream failed: {t}", .{ self.name, merged.model, err });
             return error.Failed;
         };
         if (sender) |*s| s.deinit();
