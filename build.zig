@@ -170,6 +170,22 @@ pub fn build(b: *std.Build) void {
     const e2e_m3_step = b.step("e2e-m3", "Run the M3 mission-loop e2e (V6)");
     e2e_m3_step.dependOn(&b.addRunArtifact(e2e_m3).step);
 
+    // W6 exit test (GOAL.md M4), leg 1: mission auto-logs a SESSIONS.md entry
+    // via the continuity seam. Leg 2 (MCP client over `zygos mcp-gateway`
+    // stdio) lives in test/e2e/m4/run.sh, which runs both.
+    const e2e_m4 = b.addExecutable(.{
+        .name = "zygos-e2e-m4",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/e2e/m4/main.zig"),
+            .link_libc = true,
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "zygos", .module = mod }},
+        }),
+    });
+    const e2e_m4_step = b.step("e2e-m4", "Run the M4 tessera e2e leg 1 (W6)");
+    e2e_m4_step.dependOn(&b.addRunArtifact(e2e_m4).step);
+
     // Env-gated manual smoke against the real Anthropic API. Requires
     // ANTHROPIC_API_KEY; never part of `zig build test` (GOAL.md M1 notes).
     const smoke = b.addExecutable(.{
