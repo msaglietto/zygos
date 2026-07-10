@@ -210,6 +210,8 @@ const RunConfig = struct {
     approval_function: ?[]const u8,
     budget_scope: ?[]const u8,
     tools_json: ?[]const u8,
+    continuity_function: ?[]const u8,
+    continuity_project: ?[]const u8,
     max_role_turns: usize,
     fail_threshold: usize,
     gate_threshold: usize,
@@ -392,6 +394,8 @@ fn runMission(self: *MissionOrchestrator, arena: std.mem.Allocator, request_json
         .policy_function = strField(obj, "policy_function"),
         .approval_function = strField(obj, "approval_function"),
         .budget_scope = strField(obj, "budget_scope"),
+        .continuity_function = strField(obj, "continuity_function"),
+        .continuity_project = strField(obj, "continuity_project"),
         .tools_json = blk: {
             const tv = obj.get("tools") orelse break :blk null;
             if (tv != .array) return error.MalformedRequest;
@@ -428,7 +432,9 @@ fn runMission(self: *MissionOrchestrator, arena: std.mem.Allocator, request_json
     // its first role turn still resumes.
     try self.persist(cfg.store, ctl, &m);
 
+    var phase_log: std.ArrayList([]const u8) = .empty;
     while (m.state != .done and m.state != .failed) {
+        const prev = m.state;
         // Role boundary: abort wins, then the role-turn budget (the gate
         // call is not a role turn and stays exempt).
         if (self.pollAborted(ctl)) {
@@ -448,9 +454,85 @@ fn runMission(self: *MissionOrchestrator, arena: std.mem.Allocator, request_json
             .done, .failed => unreachable,
         }
         try self.persist(cfg.store, ctl, &m);
+        if (m.state != prev)
+            try phase_log.append(arena, try std.fmt.allocPrint(arena, "{t} → {t}", .{ prev, m.state }));
     }
 
+    // Continuity is observability, not a gate: a failed session close warns
+    // and never changes the mission outcome (unlike gate/budget).
+    closeContinuity(self, arena, cfg, &m, phase_log.items) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => log.warn("continuity close failed (mission outcome unaffected): {t}", .{err}),
+    };
     return replyTerminal(arena, &m);
+}
+
+/// W3 seam: when a continuity function + project ride the start request, the
+/// terminal mission closes a vault session over the bus — the phase log and
+/// leftovers land in SESSIONS.md without any model being asked to remember.
+fn closeContinuity(
+    self: *MissionOrchestrator,
+    arena: std.mem.Allocator,
+    cfg: RunConfig,
+    m: *const Mission,
+    phase_log: []const []const u8,
+) error{ OutOfMemory, Failed, Shutdown }!void {
+    const function = cfg.continuity_function orelse return;
+    const project = cfg.continuity_project orelse return;
+
+    var req: std.Io.Writer.Allocating = .init(arena);
+    errdefer req.deinit();
+    const w = &req.writer;
+    w.print("{{\"project\":{f},\"date\":\"{s}\",\"intention\":{f}", .{
+        json.fmt(project, .{}),
+        &nowStamp(),
+        json.fmt(m.objective, .{}),
+    }) catch return error.OutOfMemory;
+    w.print(",\"accomplished\":\"{d}/{d} tasks done\"", .{ m.tasksDone(), m.tasks.len }) catch return error.OutOfMemory;
+    w.print(",\"leaving_behind\":{f}", .{json.fmt(
+        try std.fmt.allocPrint(arena, "mission {t} — stop: {t}; {s}", .{ m.state, m.stop, m.detail }),
+        .{},
+    )}) catch return error.OutOfMemory;
+    w.writeAll(",\"open_threads\":[") catch return error.OutOfMemory;
+    var first = true;
+    for (m.tasks) |t| {
+        if (t.done) continue;
+        if (!first) w.writeAll(",") catch return error.OutOfMemory;
+        first = false;
+        w.print("{f}", .{json.fmt(t.desc, .{})}) catch return error.OutOfMemory;
+    }
+    w.writeAll("],\"log\":[") catch return error.OutOfMemory;
+    for (phase_log, 0..) |line, i| {
+        if (i > 0) w.writeAll(",") catch return error.OutOfMemory;
+        w.print("{f}", .{json.fmt(line, .{})}) catch return error.OutOfMemory;
+    }
+    w.writeAll("]}") catch return error.OutOfMemory;
+
+    const res = self.worker.call(function, req.written()) catch |err| return err;
+    switch (res) {
+        .ok => |payload| self.gpa.free(payload),
+        .err => |code| {
+            defer self.gpa.free(code);
+            return error.Failed;
+        },
+    }
+}
+
+/// Wall-clock "YYYY-MM-DD HH:MM" (UTC). Continuity stamps are advisory
+/// prose, not ordering keys, so UTC without a zone suffix is acceptable.
+fn nowStamp() [16]u8 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.REALTIME, &ts);
+    const secs: u64 = @intCast(@max(0, ts.sec));
+    const ep: std.time.epoch.EpochSeconds = .{ .secs = secs };
+    const yd = ep.getEpochDay().calculateYearDay();
+    const md = yd.calculateMonthDay();
+    const ds = ep.getDaySeconds();
+    var out: [16]u8 = undefined;
+    _ = std.fmt.bufPrint(&out, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}", .{
+        yd.year, md.month.numeric(), md.day_index + 1, ds.getHoursIntoDay(), ds.getMinutesIntoHour(),
+    }) catch unreachable;
+    return out;
 }
 
 fn replyTerminal(arena: std.mem.Allocator, m: *const Mission) error{OutOfMemory}![]const u8 {
@@ -1505,4 +1587,93 @@ test "malformed start requests error without side effects" {
     const r4 = try h.caller.call("zygos::missions::start", res_req);
     defer r4.deinit(testing.allocator);
     try testing.expect(r4 == .err);
+}
+
+/// Records session_close calls on `test::continuity::close` (W3 seam).
+const RecContinuity = struct {
+    gpa: std.mem.Allocator,
+    worker: *inproc.Worker,
+    mutex: sync.Mutex = .{},
+    calls: usize = 0,
+    last_request: ?[]u8 = null,
+
+    fn start(gpa: std.mem.Allocator, actor: *actor_mod.Actor, registry: *inproc.Registry) !*RecContinuity {
+        const self = try gpa.create(RecContinuity);
+        self.* = .{
+            .gpa = gpa,
+            .worker = try inproc.Worker.spawn(gpa, actor, registry, "rec-continuity"),
+        };
+        try self.worker.registerFunction("test::continuity::close", self, &handler);
+        return self;
+    }
+
+    fn stop(self: *RecContinuity) void {
+        self.worker.stop();
+        if (self.last_request) |r| self.gpa.free(r);
+        self.mutex.deinit();
+        const gpa = self.gpa;
+        gpa.destroy(self);
+    }
+
+    fn handler(ctx: ?*anyopaque, arena: std.mem.Allocator, request_json: []const u8) error{ Failed, OutOfMemory }![]const u8 {
+        const self: *RecContinuity = @ptrCast(@alignCast(ctx.?));
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.calls += 1;
+        if (self.last_request) |r| self.gpa.free(r);
+        self.last_request = try self.gpa.dupe(u8, request_json);
+        return arena.dupe(u8, "{\"ok\":true}");
+    }
+};
+
+test "continuity seam: terminal mission session-closes once with the phase log" {
+    var h = try Harness.init(testing.allocator, &.{ po_ok, plan1, exec_ok, verify_pass });
+    defer h.deinit();
+    const approvals = try approval_mod.ApprovalWorker.start(testing.allocator, &h.actor, &h.registry, .auto_approve);
+    defer approvals.stop();
+    const cont = try RecContinuity.start(testing.allocator, &h.actor, &h.registry);
+    defer cont.stop();
+
+    const req = try h.startReq(testing.allocator, seed_and_gate ++
+        ",\"continuity_function\":\"test::continuity::close\",\"continuity_project\":\"zygos\"");
+    defer testing.allocator.free(req);
+    const res = try h.caller.call("zygos::missions::start", req);
+    defer res.deinit(testing.allocator);
+    try testing.expect(res == .ok);
+    try expectTerminal(res.ok, "done", "completed");
+
+    cont.mutex.lock();
+    defer cont.mutex.unlock();
+    try testing.expectEqual(@as(usize, 1), cont.calls);
+    var p = try json.parseFromSlice(json.Value, testing.allocator, cont.last_request.?, .{});
+    defer p.deinit();
+    const obj = p.value.object;
+    try testing.expectEqualStrings("zygos", obj.get("project").?.string);
+    // date "YYYY-MM-DD HH:MM"
+    try testing.expectEqual(@as(usize, 16), obj.get("date").?.string.len);
+    // leaving_behind never blank, names the terminal state
+    try testing.expect(std.mem.indexOf(u8, obj.get("leaving_behind").?.string, "done") != null);
+    try testing.expect(std.mem.indexOf(u8, obj.get("accomplished").?.string, "1/1") != null);
+    // phase log covers first and last transitions, in order
+    const log_arr = obj.get("log").?.array.items;
+    try testing.expect(log_arr.len >= 2);
+    try testing.expect(std.mem.indexOf(u8, log_arr[0].string, "defining") != null);
+    try testing.expect(std.mem.indexOf(u8, log_arr[log_arr.len - 1].string, "done") != null);
+    // no unfinished tasks => no open threads
+    try testing.expectEqual(@as(usize, 0), obj.get("open_threads").?.array.items.len);
+}
+
+test "continuity seam: unreachable continuity function does not change the mission outcome" {
+    var h = try Harness.init(testing.allocator, &.{ po_ok, plan1, exec_ok, verify_pass });
+    defer h.deinit();
+    const approvals = try approval_mod.ApprovalWorker.start(testing.allocator, &h.actor, &h.registry, .auto_approve);
+    defer approvals.stop();
+
+    const req = try h.startReq(testing.allocator, seed_and_gate ++
+        ",\"continuity_function\":\"test::continuity::missing\",\"continuity_project\":\"zygos\"");
+    defer testing.allocator.free(req);
+    const res = try h.caller.call("zygos::missions::start", req);
+    defer res.deinit(testing.allocator);
+    try testing.expect(res == .ok);
+    try expectTerminal(res.ok, "done", "completed");
 }
