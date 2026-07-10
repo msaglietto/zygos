@@ -20,7 +20,7 @@
             .{ .provider_function = "zygos::providers::nvidia-minimax-m3", .model = "minimaxai/minimax-m3" },
         } },
         .{ .step_id = "verifier", .attempts = .{
-            .{ .provider_function = "zygos::providers::google-gemini-3-5-flash", .model = "gemini-3.5-flash" },
+            .{ .provider_function = "zygos::providers::gemini-3-5-flash", .model = "gemini-3.5-flash" },
             .{ .provider_function = "zygos::providers::glm-5-2", .model = "glm-5.2" },
         } },
     },
