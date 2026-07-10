@@ -7,7 +7,7 @@ capabilities as replaceable workers. Wire-compatible with the unmodified iii
 SDKs. See `GOAL.md` for the mission, `docs/ARCHITECTURE.md` and
 `docs/PROTOCOL.md` for the design, `docs/specs/` for per-module contracts.
 
-## Status: M4 — Tessera absorbed (M0 kernel, M1 turn loop, M2 policy+routing, M3 mission loop closed)
+## Status: M4.5 — providers wired + mission CLI (M0–M4 closed)
 
 | Milestone | Criterion | State |
 |---|---|---|
@@ -41,13 +41,18 @@ SDKs. See `GOAL.md` for the mission, `docs/ARCHITECTURE.md` and
 | M4 | W4 tessera-capture (taxonomy from config) | ✅ `worker/tessera_capture.zig` (full fallback, capture never lost) |
 | M4 | W5 tessera-undo (shadow git) | ✅ `worker/tessera_undo.zig` (`.zygos-shadow`, checkpoint/undo) |
 | M4 | W6 mcp-gateway + M4 e2e | ✅ `worker/mcp/gateway.zig` + `zygos mcp-gateway`; `test/e2e/m4/run.sh` |
+| M4.5 | X1 provider catalog (`~/.agents/providers.toml`) | ✅ `config/providers.zig` (TOML subset, fail-closed validation) |
+| M4.5 | X2 catalog → bus boot (`zygos::providers::<slug>`) | ✅ `net/provider_boot.zig` (Gemini compat base, checkRoutes refusal) |
+| M4.5 | X3 `zygos mission start/resume` CLI | ✅ `cli/mission.zig`; `test/e2e/m45/run.sh` |
+| M4.5 | X4 multi-provider smoke (env-gated) | ✅ `test/smoke/providers.sh` (manual, real keys) |
+| M4.5 | X5 dogfood exit (real autonomous mission) | ⏳ manual run pending |
 
 ## Build & test
 
 Requires Zig 0.16.0 (and libc — pthread + CSPRNG; macOS or Linux).
 
 ```bash
-zig build test   # full suite (357 tests, leak-checked, no network)
+zig build test   # full suite (385 tests, leak-checked, no network)
 zig build        # produces zig-out/bin/zygos
 ```
 
@@ -163,4 +168,35 @@ JSON-RPC `-32602` error (fail closed).
 $ ./test/e2e/m4/run.sh
 M4 E2E leg 1 OK: mission auto-logged .../Projects/zygos-e2e/SESSIONS.md
 M4 E2E OK: mission auto-log read back through the MCP gateway
+```
+
+## M4.5 mission CLI e2e (documented run)
+
+`test/e2e/m45/run.sh` drives the real binary — `zygos mission start <brief.md>`
+— against a localhost SSE stub (node, 127.0.0.1) named by a fixture
+`~/.agents/providers.toml`-shaped catalog. Leg 1: brief lint → catalog +
+route-table boot (`zygos::providers::<slug>` instances) → the full mission
+loop to `state:"done"`, with the completion gate approved over piped stdin
+and the real bash tool writing into the workspace. Leg 2: a seeded mid-flight
+`.planning/` substrate finishes through `zygos mission resume` (earlier roles
+not re-run). Leg 3: a route table naming an unknown provider slug exits 2
+before any kernel boots (fail closed).
+
+```console
+$ ./test/e2e/m45/run.sh
+M45 E2E OK: start→done, seeded resume→done, unknown-slug boot refusal
+```
+
+The CLI reads the provider catalog from `AI_PROVIDERS_CONFIG` (else
+`~/.agents/providers.toml`) and the route table from `ZYGOS_CONFIG` (else
+`./zygos.zon`); approvals prompt on stderr and fail closed (manual timeout
+denies) when stdin closes. Knobs: `ZYGOS_APPROVAL_TIMEOUT_MS`,
+`ZYGOS_INVOKE_TIMEOUT_MS`, `ZYGOS_BUDGET_MAX_TOKENS`.
+
+The X4 companion is a manual smoke over the **real** catalog — two turns
+routed to two different live providers:
+
+```bash
+./test/smoke/providers.sh                  # auto-picks two keyed entries
+zig build smoke-providers -- <slug-a> <slug-b>
 ```
