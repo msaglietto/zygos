@@ -3,7 +3,7 @@
 mission: zygos
 created: 2026-07-06
 status: active
-milestone: M4.5
+milestone: M4.6
 budget:
   delegate_max_time_s: 900
   max_parallel_coding_agents: 2
@@ -155,8 +155,9 @@ M4.5 — they are the next table once the dogfood exit proves the loop.
 
 M4.5 closed 2026-07-10 (all X1–X5; see README). M4.6 criteria drafted
 2026-07-10 from Z-10 and the Zahir Research Pipelines note, under Mauricio's
-`/goal` directive — **pending ratification; do not implement until Mauricio
-ratifies.**
+`/goal` directive — **ratified by Mauricio 2026-07-10** (with a standing
+directive to implement Y1–Y5 autonomously; the Y5 real-vault run remains a
+human gate).
 
 | # | Criterion | Verified by |
 |---|-----------|-------------|
