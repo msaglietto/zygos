@@ -21,6 +21,7 @@ pub const StreamOptions = struct {
     /// Raw JSON array text of Anthropic-shaped tool definitions ("[]" = none).
     tools_json: []const u8 = "[]",
     max_tokens: u32 = 1024,
+    temperature: ?f64 = null,
     base_url: []const u8 = "https://api.anthropic.com",
     anthropic_version: []const u8 = "2023-06-01",
 };
@@ -39,14 +40,22 @@ pub fn streamMessages(
 ) StreamError![]u8 {
     defer if (sender) |s| s.close();
 
+    // temperature is emitted only when set (mirrors the openai client).
+    const temp_fragment = if (opts.temperature) |temp|
+        std.fmt.allocPrint(gpa, ",\"temperature\":{d}", .{temp}) catch return error.OutOfMemory
+    else
+        gpa.dupe(u8, "") catch return error.OutOfMemory;
+    defer gpa.free(temp_fragment);
+
     const body = std.fmt.allocPrint(gpa,
-        \\{{"model":{f},"system":{f},"max_tokens":{d},"stream":true,"messages":{s},"tools":{s}}}
+        \\{{"model":{f},"system":{f},"max_tokens":{d},"stream":true,"messages":{s},"tools":{s}{s}}}
     , .{
         json.fmt(opts.model, .{}),
         json.fmt(opts.system, .{}),
         opts.max_tokens,
         opts.messages_json,
         opts.tools_json,
+        temp_fragment,
     }) catch return error.OutOfMemory;
     defer gpa.free(body);
 

@@ -16,7 +16,7 @@ pub const Diag = struct {
     message: []const u8 = "",
 };
 
-pub const ProviderKind = enum { openai_compatible, google, ollama };
+pub const ProviderKind = enum { openai_compatible, anthropic_compatible, google, ollama };
 
 /// Injected environment: tests never touch the real process env.
 pub const EnvPair = struct { name: []const u8, value: []const u8 };
@@ -329,7 +329,7 @@ fn validateProviders(arena: std.mem.Allocator, builds: []const ProviderBuild, di
         const model = b.model orelse return fail(diag, b.line, "provider missing 'model'", error.InvalidCatalog);
         const kind = std.meta.stringToEnum(ProviderKind, kind_str) orelse
             return fail(diag, b.line, "unknown provider 'type'", error.InvalidCatalog);
-        if ((kind == .openai_compatible or kind == .ollama) and b.endpoint == null)
+        if ((kind == .openai_compatible or kind == .anthropic_compatible or kind == .ollama) and b.endpoint == null)
             return fail(diag, b.line, "provider missing 'endpoint'", error.InvalidCatalog);
         if (b.max_tokens) |mt| if (mt < 1)
             return fail(diag, b.line, "'max_tokens' must be >= 1", error.InvalidCatalog);
@@ -449,6 +449,15 @@ const fixture =
     \\max_tokens  = 8192
     \\temperature = 0.7
     \\
+    \\[[providers]]
+    \\name     = "Anthropic Claude Sonnet"
+    \\type     = "anthropic_compatible"
+    \\key_env  = "ANTHROPIC_API_KEY"
+    \\endpoint = "https://api.anthropic.com"
+    \\model    = "claude-sonnet-4"
+    \\max_tokens  = 8192
+    \\temperature = 1
+    \\
     \\[[clis]]
     \\name    = "claude"
     \\command = "claude"
@@ -460,11 +469,11 @@ const fixture =
     \\args    = ["run"]
 ;
 
-test "parse: real-shaped fixture (8 providers incl google + local, 2 clis) round-trips every field" {
+test "parse: real-shaped fixture (9 providers incl google + local + anthropic, 2 clis) round-trips every field" {
     var cat = try Catalog.parse(t.allocator, fixture, null);
     defer cat.deinit();
 
-    try t.expectEqual(@as(usize, 8), cat.providers.len);
+    try t.expectEqual(@as(usize, 9), cat.providers.len);
     try t.expectEqual(@as(usize, 2), cat.clis.len);
 
     const first = cat.providers[0];
@@ -486,6 +495,12 @@ test "parse: real-shaped fixture (8 providers incl google + local, 2 clis) round
     try t.expectEqual(@as(?[]const u8, null), local.key_env);
     try t.expectEqualStrings("qwen3-coder-next", local.key.?);
     try t.expectEqual(@as(f64, 0.7), local.temperature.?);
+
+    const anthropic = cat.providers[8];
+    try t.expectEqual(ProviderKind.anthropic_compatible, anthropic.kind);
+    try t.expectEqualStrings("ANTHROPIC_API_KEY", anthropic.key_env.?);
+    try t.expectEqualStrings("https://api.anthropic.com", anthropic.endpoint.?);
+    try t.expectEqualStrings("claude-sonnet-4", anthropic.model);
 
     try t.expectEqualStrings("claude", cat.clis[0].name);
     try t.expectEqualStrings("claude", cat.clis[0].command);
@@ -587,10 +602,14 @@ test "validate: missing name/type/model is InvalidCatalog, diag names the field"
     try t.expectEqualStrings("provider missing 'model'", diag.message);
 }
 
-test "validate: openai_compatible or ollama without endpoint is InvalidCatalog" {
+test "validate: openai_compatible, anthropic_compatible or ollama without endpoint is InvalidCatalog" {
     const oa = "[[providers]]\nname = \"a\"\ntype = \"openai_compatible\"\nmodel = \"m\"";
     var diag: Diag = .{};
     try t.expectError(error.InvalidCatalog, Catalog.parse(t.allocator, oa, &diag));
+    try t.expectEqualStrings("provider missing 'endpoint'", diag.message);
+
+    const an = "[[providers]]\nname = \"a\"\ntype = \"anthropic_compatible\"\nmodel = \"m\"";
+    try t.expectError(error.InvalidCatalog, Catalog.parse(t.allocator, an, &diag));
     try t.expectEqualStrings("provider missing 'endpoint'", diag.message);
 
     const ol = "[[providers]]\nname = \"a\"\ntype = \"ollama\"\nmodel = \"m\"";

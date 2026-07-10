@@ -13,12 +13,29 @@ const inproc = @import("../kernel/inproc.zig");
 const providers_catalog = @import("../config/providers.zig");
 const router = @import("../worker/router.zig");
 const provider_openai = @import("provider_openai.zig");
+const provider_anthropic = @import("provider_anthropic.zig");
 const openai = @import("openai.zig");
 
 /// Gemini OpenAI-compat base when a `google` entry has no endpoint.
 pub const gemini_compat_base_url = "https://generativelanguage.googleapis.com/v1beta/openai";
 
 const providers_prefix = "zygos::providers::";
+
+/// One booted provider worker. A catalog entry's `type` selects the backend:
+/// `anthropic_compatible` speaks the Anthropic Messages wire, everything else
+/// (incl. `google` via the Gemini compat base) speaks OpenAI chat-completions.
+/// Both register under the same `zygos::providers::<slug>` name so routing in
+/// zygos.zon stays uniform across provider types.
+const Instance = union(enum) {
+    openai: *provider_openai.OpenAiProvider,
+    anthropic: *provider_anthropic.AnthropicProvider,
+
+    fn stop(self: Instance) void {
+        switch (self) {
+            inline else => |inst| inst.stop(),
+        }
+    }
+};
 
 /// Owns `std.Io.Threaded` so binary entry points (Z-02: no std.Io in main)
 /// can boot catalog providers without naming the Io type themselves.
@@ -41,10 +58,12 @@ pub const IoBoot = struct {
 
 pub const CatalogBoot = struct {
     gpa: std.mem.Allocator,
-    instances: []*provider_openai.OpenAiProvider,
+    instances: []Instance,
 
     /// One instance per catalog provider entry. `[[clis]]` are ignored.
-    /// `api_key` is resolveKey(env) or `""` — never a boot error.
+    /// `api_key` is resolveKey(env) or `""` — never a boot error. The entry's
+    /// `type` selects the backend (anthropic_compatible ⇒ Anthropic Messages,
+    /// otherwise OpenAI chat-completions); both register `zygos::providers::<slug>`.
     pub fn start(
         gpa: std.mem.Allocator,
         actor: *actor_mod.Actor,
@@ -53,7 +72,7 @@ pub const CatalogBoot = struct {
         catalog: *const providers_catalog.Catalog,
         env: []const providers_catalog.EnvPair,
     ) !CatalogBoot {
-        const instances = try gpa.alloc(*provider_openai.OpenAiProvider, catalog.providers.len);
+        const instances = try gpa.alloc(Instance, catalog.providers.len);
         errdefer gpa.free(instances);
         var n: usize = 0;
         errdefer {
@@ -73,15 +92,26 @@ pub const CatalogBoot = struct {
             };
             const api_key = entry.resolveKey(env) orelse "";
 
-            instances[n] = try provider_openai.OpenAiProvider.startWith(gpa, actor, registry, io, .{
-                .worker_name = s,
-                .function_name = fn_name,
-                .api_key = api_key,
-                .base_url = base_url,
-                .default_model = entry.model,
-                .default_max_tokens = entry.max_tokens,
-                .default_temperature = entry.temperature,
-            });
+            instances[n] = switch (entry.kind) {
+                .anthropic_compatible => .{ .anthropic = try provider_anthropic.AnthropicProvider.startWith(gpa, actor, registry, io, .{
+                    .worker_name = s,
+                    .function_name = fn_name,
+                    .api_key = api_key,
+                    .base_url = base_url,
+                    .default_model = entry.model,
+                    .default_max_tokens = entry.max_tokens,
+                    .default_temperature = entry.temperature,
+                }) },
+                else => .{ .openai = try provider_openai.OpenAiProvider.startWith(gpa, actor, registry, io, .{
+                    .worker_name = s,
+                    .function_name = fn_name,
+                    .api_key = api_key,
+                    .base_url = base_url,
+                    .default_model = entry.model,
+                    .default_max_tokens = entry.max_tokens,
+                    .default_temperature = entry.temperature,
+                }) },
+            };
             n += 1;
         }
 
@@ -177,6 +207,15 @@ const fixture =
     \\max_tokens  = 8192
     \\temperature = 0.7
     \\
+    \\[[providers]]
+    \\name     = "Anthropic Claude Sonnet"
+    \\type     = "anthropic_compatible"
+    \\key_env  = "ANTHROPIC_API_KEY"
+    \\endpoint = "https://api.anthropic.com"
+    \\model    = "claude-sonnet-4"
+    \\max_tokens  = 8192
+    \\temperature = 1
+    \\
     \\[[clis]]
     \\name    = "claude"
     \\command = "claude"
@@ -228,7 +267,12 @@ test "boot: fixture catalog registers zygos::providers::<slug> per entry" {
     var boot = try CatalogBoot.start(testing.allocator, &h.actor, &h.registry, h.io(), &cat, &.{});
     defer boot.stop();
 
-    try testing.expectEqual(@as(usize, 3), boot.instances.len);
+    try testing.expectEqual(@as(usize, 4), boot.instances.len);
+
+    // The anthropic_compatible entry boots the Anthropic backend; all others
+    // (incl. google) the OpenAI backend — both under zygos::providers::<slug>.
+    try testing.expect(boot.instances[3] == .anthropic);
+    try testing.expect(boot.instances[0] == .openai);
 
     // Non-object JSON → handler returns Failed → bus error handler_failed.
     // Proves registration + handler wiring without any HTTP.
@@ -236,6 +280,7 @@ test "boot: fixture catalog registers zygos::providers::<slug> per entry" {
         "nvidia-deepseekv4-pro",
         "google-gemini-3-5-flash",
         "ollama-qwen3-coder-next",
+        "anthropic-claude-sonnet",
     };
     for (slugs) |s| {
         const fn_name = try std.fmt.allocPrint(testing.allocator, "{s}{s}", .{ providers_prefix, s });
@@ -264,9 +309,11 @@ test "boot: google entry with no endpoint gets the Gemini compat base_url" {
     defer boot.stop();
 
     // Index 1 is the google entry in the fixture.
-    try testing.expectEqualStrings(gemini_compat_base_url, boot.instances[1].base_url);
-    try testing.expectEqualStrings("https://integrate.api.nvidia.com/v1", boot.instances[0].base_url);
-    try testing.expectEqualStrings("http://localhost:11434/v1", boot.instances[2].base_url);
+    try testing.expectEqualStrings(gemini_compat_base_url, boot.instances[1].openai.base_url);
+    try testing.expectEqualStrings("https://integrate.api.nvidia.com/v1", boot.instances[0].openai.base_url);
+    try testing.expectEqualStrings("http://localhost:11434/v1", boot.instances[2].openai.base_url);
+    // Index 3 is the anthropic_compatible entry — endpoint verbatim.
+    try testing.expectEqualStrings("https://api.anthropic.com", boot.instances[3].anthropic.base_url);
 }
 
 test "boot: api_key resolution — env var wins, inline key falls back, neither ⇒ \"\"" {
@@ -276,16 +323,18 @@ test "boot: api_key resolution — env var wins, inline key falls back, neither 
     var cat = try providers_catalog.Catalog.parse(testing.allocator, fixture, null);
     defer cat.deinit();
 
-    // Env provides NVIDIA key; GOOGLE key missing → ""; ollama uses inline key.
+    // Env provides NVIDIA + ANTHROPIC keys; GOOGLE missing → ""; ollama inline.
     const env = [_]providers_catalog.EnvPair{
         .{ .name = "NVIDIA_API_KEY", .value = "nv-from-env" },
+        .{ .name = "ANTHROPIC_API_KEY", .value = "sk-ant-from-env" },
     };
     var boot = try CatalogBoot.start(testing.allocator, &h.actor, &h.registry, h.io(), &cat, &env);
     defer boot.stop();
 
-    try testing.expectEqualStrings("nv-from-env", boot.instances[0].api_key);
-    try testing.expectEqualStrings("", boot.instances[1].api_key);
-    try testing.expectEqualStrings("qwen3-coder-next", boot.instances[2].api_key);
+    try testing.expectEqualStrings("nv-from-env", boot.instances[0].openai.api_key);
+    try testing.expectEqualStrings("", boot.instances[1].openai.api_key);
+    try testing.expectEqualStrings("qwen3-coder-next", boot.instances[2].openai.api_key);
+    try testing.expectEqualStrings("sk-ant-from-env", boot.instances[3].anthropic.api_key);
 }
 
 test "boot: instance defaults carry the entry's model/max_tokens/temperature" {
@@ -298,15 +347,20 @@ test "boot: instance defaults carry the entry's model/max_tokens/temperature" {
     var boot = try CatalogBoot.start(testing.allocator, &h.actor, &h.registry, h.io(), &cat, &.{});
     defer boot.stop();
 
-    const first = boot.instances[0];
+    const first = boot.instances[0].openai;
     try testing.expectEqualStrings("deepseek-ai/deepseek-v4-pro", first.default_model.?);
     try testing.expectEqual(@as(u32, 16384), first.default_max_tokens.?);
     try testing.expectEqual(@as(f64, 1), first.default_temperature.?);
 
-    const local = boot.instances[2];
+    const local = boot.instances[2].openai;
     try testing.expectEqualStrings("qwen3-coder-next", local.default_model.?);
     try testing.expectEqual(@as(u32, 8192), local.default_max_tokens.?);
     try testing.expectEqual(@as(f64, 0.7), local.default_temperature.?);
+
+    const anthropic = boot.instances[3].anthropic;
+    try testing.expectEqualStrings("claude-sonnet-4", anthropic.default_model.?);
+    try testing.expectEqual(@as(u32, 8192), anthropic.default_max_tokens.?);
+    try testing.expectEqual(@as(f64, 1), anthropic.default_temperature.?);
 }
 
 test "merge helper: request model wins; absent model falls to default; neither ⇒ error; max_tokens/temperature likewise" {
