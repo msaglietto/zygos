@@ -216,6 +216,25 @@ pub fn build(b: *std.Build) void {
     const smoke_oa_step = b.step("smoke-openai", "Manual: one real openai-compat streaming call (needs OPENAI_API_KEY)");
     smoke_oa_step.dependOn(&b.addRunArtifact(smoke_oa).step);
 
+    // Env-gated manual smoke over the REAL provider catalog (X4, GOAL.md
+    // M4.5): two turns routed to two different catalog providers. Reads the
+    // real ~/.agents/providers.toml + real keys; never part of `zig build
+    // test`. `zig build smoke-providers -- <slug-a> <slug-b>`.
+    const smoke_pv = b.addExecutable(.{
+        .name = "zygos-smoke-providers",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/smoke/providers/main.zig"),
+            .link_libc = true,
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "zygos", .module = mod }},
+        }),
+    });
+    const smoke_pv_run = b.addRunArtifact(smoke_pv);
+    if (b.args) |args| smoke_pv_run.addArgs(args);
+    const smoke_pv_step = b.step("smoke-providers", "Manual: two turns on two real catalog providers (X4)");
+    smoke_pv_step.dependOn(&smoke_pv_run.step);
+
     // Creates an executable that will run `test` blocks from the provided module.
     // Here `mod` needs to define a target, which is why earlier we made sure to
     // set the releative field.
