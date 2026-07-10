@@ -3,7 +3,7 @@
 mission: zygos
 created: 2026-07-06
 status: active
-milestone: M4
+milestone: M4.5
 budget:
   delegate_max_time_s: 900
   max_parallel_coding_agents: 2
@@ -109,7 +109,7 @@ compaction, and session-store workers stay out of M3.
 M3 ratified and closed 2026-07-07 (all V1–V6 green; see README). M4 criteria
 drafted 2026-07-09 from the DESIGN.md M4 line (Layer 3b), under Mauricio's
 `/goal` directive to implement M4 — **ratified by Mauricio 2026-07-09**.
-Implementation in progress.
+All W1–W6 green; **closure ratified by Mauricio 2026-07-09**.
 
 | # | Criterion | Verified by |
 |---|-----------|-------------|
@@ -126,8 +126,32 @@ touches temp fixture vaults. Suppression rules ride kernel state
 compaction stay out of M4 (M5). No new dependencies anticipated; if zqlite or
 an MCP lib ever looks attractive, that's the `new_dependency` human gate.
 
-Later milestones (M5 thick) get their own criteria tables when M4 closes;
-do not start them early.
+## Success criteria — milestone M4.5 (providers wired + mission CLI — the dogfood gate)
+
+M4 implementation complete 2026-07-09 (all W1–W6 green; closure ratification
+pending). M4.5 criteria drafted 2026-07-09 under Mauricio's directive to wire
+the shared provider catalog (`~/.agents/providers.toml`, schema
+`~/.agents/providers.schema.json`) into the CLI — **ratified by Mauricio
+2026-07-09**. Implementation in progress (X1 first). Zahir's web-tools worker
+and the weekly-trigger decision are explicitly deferred to the table after
+M4.5 (Mauricio, 2026-07-09).
+
+| # | Criterion | Verified by |
+|---|-----------|-------------|
+| X1 | Provider catalog parsing: a minimal TOML-subset parser (std only — no new dependency, so no gate) reads the providers.toml shape (`[[providers]]`/`[[clis]]` array-of-tables, string/int/float values, comments); entries validated per providers.schema.json semantics (name/type/model required, endpoint required for `openai_compatible`, temperature 0–2); key resolution `key_env` → inline `key`; `AI_PROVIDERS_CONFIG` env override honored; a malformed or invalid file is a structured error, never a partial catalog (fail closed) | `zig build test` — parser + validation tests over fixture TOMLs incl. malformed input |
+| X2 | Catalog → bus wiring: each provider entry boots one openai-compat provider worker instance registered as `zygos::providers::<slug>` carrying the entry's endpoint/model/key/max_tokens/temperature as defaults; `type:"google"` maps through Gemini's OpenAI-compatible endpoint (native provider-google deferred); `[[clis]]` entries ignored; a `zygos.zon` route ladder naming an unknown provider slug refuses to boot — fail closed at startup, never mid-mission | `zig build test` — wiring tests incl. unknown-slug boot refusal |
+| X3 | `zygos mission start <brief.md>` subcommand: boots kernel + default worker set + catalog providers, W1-validates the brief, drives the mission loop to a terminal state with progress streamed to stderr; approval/gate requests prompt on the console and fail closed (deny) on EOF/non-tty; `zygos mission resume` continues a mid-flight `.planning/` state | `test/e2e/m45/run.sh` — full CLI run against a localhost SSE stub named by a fixture providers.toml (network-free) |
+| X4 | Multi-provider smoke, env-gated: with real keys present, a scripted 2-step turn resolves its two steps to two different catalog providers and both complete; skipped silently when keys are absent — never part of `zig build test` | manual `test/smoke/providers.sh`; documented in README |
+| X5 | Dogfood exit (the DESIGN.md M3 exit test, for real): a small real objective (a single-purpose CLI tool) goes brief → completed autonomously via `zygos mission start`, roles routed across ≥3 catalog providers, human touched only at intake and hard gates, and the mission is killed + resumed once mid-flight along the way | documented run in README with the brief, route table, and transcript pointers |
+
+M4.5 notes: the real catalog file is never read by tests and never committed
+(it can carry inline key fallbacks) — `zig build test` and e2e use fixtures
+only. Real runs ride the existing budget worker; the brief's frontmatter caps
+are enforced as usual. Zahir/web-tools and scheduled triggers stay out of
+M4.5 — they are the next table once the dogfood exit proves the loop.
+
+Later milestones (M5 thick, zahir-radar workload) get their own criteria
+tables when M4.5 closes; do not start them early.
 
 ## Non-goals
 
