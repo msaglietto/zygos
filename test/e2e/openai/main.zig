@@ -17,7 +17,8 @@ pub fn main(init: std.process.Init) !void {
     };
     const api_key = std.mem.span(key_z);
     const model = if (std.c.getenv("ZYGOS_SMOKE_MODEL")) |m| std.mem.span(m) else "gpt-4o-mini";
-    const base_url = if (std.c.getenv("OPENAI_BASE_URL")) |b| std.mem.span(b) else "https://api.openai.com";
+    // base_url carries the version segment (X2 chatUrl semantics).
+    const base_url = if (std.c.getenv("OPENAI_BASE_URL")) |b| std.mem.span(b) else "https://api.openai.com/v1";
 
     var io_backing = std.Io.Threaded.init(gpa, .{});
     defer io_backing.deinit();
