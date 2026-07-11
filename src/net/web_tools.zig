@@ -223,6 +223,9 @@ pub const WebToolsWorker = struct {
         if (!isTextContentType(body.content_type)) return errorReply(arena, "NonTextContent");
 
         const converted = try htmlToText(arena, body.bytes, self.max_text_bytes);
+        log.info("web_fetch {s}: {d} bytes → {d} text (truncated: {})", .{
+            url, body.bytes.len, converted.text.len, converted.truncated,
+        });
         return std.fmt.allocPrint(arena, "{{\"url\":{f},\"text\":{f},\"truncated\":{}}}", .{
             json.fmt(url, .{}),
             json.fmt(converted.text, .{}),

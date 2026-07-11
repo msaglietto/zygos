@@ -576,6 +576,9 @@ fn runTurn(self: *TurnOrchestrator, arena: std.mem.Allocator, request_json: []co
             json.fmt(ch.writer.access_key, .{}),
         });
 
+        log.info("turn {s} step {d}: {s} model {s} (attempt {d})", .{
+            turn_id orelse "?", steps + 1, step_provider, step_model, attempt,
+        });
         state = try Fsm.apply(state, .provider_started); // → streaming
         const drain_thread = std.Thread.spawn(.{}, DeltaLog.drain, .{ &deltas, self.gpa, &receiver }) catch
             return error.Failed;
@@ -650,6 +653,7 @@ fn runTurn(self: *TurnOrchestrator, arena: std.mem.Allocator, request_json: []co
                     const tool_id = strField(block.object, "id") orelse "unknown";
                     const tool_name = strField(block.object, "name") orelse "";
                     const input = block.object.get("input") orelse json.Value.null;
+                    log.info("turn {s} step {d}: tool {s}", .{ turn_id orelse "?", steps, tool_name });
 
                     if (self.pollAborted(ctl)) {
                         state = try Fsm.apply(state, .abort); // dispatching → stopped

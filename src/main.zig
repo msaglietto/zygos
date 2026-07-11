@@ -11,9 +11,36 @@ const std = @import("std");
 const zygos = @import("zygos");
 const cli_mission = @import("cli/mission.zig");
 
+// Runtime log filter: ZYGOS_LOG=err|warn|info|debug (default warn). The
+// comptime ceiling stays .debug so the filter decides at runtime; workers'
+// info-level progress lines are the harness's debug feed (stderr).
+pub const std_options: std.Options = .{
+    .log_level = .debug,
+    .logFn = filteredLog,
+};
+
+var log_filter: std.log.Level = .warn;
+
+fn filteredLog(
+    comptime level: std.log.Level,
+    comptime scope: @TypeOf(.enum_literal),
+    comptime format: []const u8,
+    args: anytype,
+) void {
+    if (@intFromEnum(level) > @intFromEnum(log_filter)) return;
+    std.log.defaultLog(level, scope, format, args);
+}
+
+fn initLogFilter() void {
+    const raw = std.c.getenv("ZYGOS_LOG") orelse return;
+    const s = std.mem.span(raw);
+    log_filter = std.meta.stringToEnum(std.log.Level, s) orelse log_filter;
+}
+
 pub fn main(proc: std.process.Init) !void {
     const gpa = std.heap.c_allocator;
 
+    initLogFilter();
     var args = std.process.Args.Iterator.init(proc.minimal.args);
     _ = args.next(); // argv[0]
     if (args.next()) |cmd| {

@@ -454,8 +454,12 @@ fn runMission(self: *MissionOrchestrator, arena: std.mem.Allocator, request_json
             .done, .failed => unreachable,
         }
         try self.persist(cfg.store, ctl, &m);
-        if (m.state != prev)
+        if (m.state != prev) {
+            log.info("mission {s}: {t} → {t} (role_turns {d}, tasks {d}/{d})", .{
+                m.mission_id, prev, m.state, m.role_turns_used, m.tasksDone(), m.tasks.len,
+            });
             try phase_log.append(arena, try std.fmt.allocPrint(arena, "{t} → {t}", .{ prev, m.state }));
+        }
     }
 
     // Continuity is observability, not a gate: a failed session close warns
@@ -560,6 +564,9 @@ fn runRole(
     with_tools: bool,
 ) MissionError!RoleOut {
     m.role_turns_used += 1;
+    log.info("mission {s}: role turn {d} — {s} (tools: {})", .{
+        m.mission_id, m.role_turns_used, role.stepId(), with_tools,
+    });
 
     var req: std.Io.Writer.Allocating = .init(arena);
     errdefer req.deinit();
