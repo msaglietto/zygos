@@ -31,12 +31,19 @@ Request `{"query":"...","count":5?}`; reply `{"results":[{"title","url","snippet
   ⇒ error reply (fail closed, never a crash). Missing key at start ⇒ the
   worker registers anyway and every call replies a structured error naming
   the env var (a mission fails a step, not the boot).
+- HTTP 429 (rate limit — Brave free tier is ~1 rps) gets up to
+  `search_retry_max` (default 1) polite retries after
+  `search_retry_delay_ms` (default 1100). Every other status still fails
+  closed immediately; exhausted retries reply the status as usual. Failed
+  attempts log at warn with the query, status, and attempt number.
 
 ## API
 
 `WebToolsWorker.start(gpa, actor, registry, io, opts: Options)` / `stop` —
 mirrors ToolsWorker. `Options{ search: ?SearchConfig, max_fetch_bytes,
-max_text_bytes }`. Pure layer (pub, fixture-tested): `htmlToText(arena,
+max_text_bytes, search_retry_max, search_retry_delay_ms }`. The HTTP leg is
+a `Transport` fn-pointer seam on the worker (default `httpGet`); tests swap
+in a socket-free scripted fake. Pure layer (pub, fixture-tested): `htmlToText(arena,
 bytes, max_out) {text, truncated}`, `parseBraveResults(arena, json_text)`,
 `parseSearxngResults(arena, json_text)`, `validateUrl(url)`.
 
@@ -50,6 +57,9 @@ bytes, max_out) {text, truncated}`, `parseBraveResults(arena, json_text)`,
 6. `bus: both functions registered; malformed request bytes ⇒ structured error reply`
 7. `search with no key configured ⇒ structured error naming the env var`
 8. `no leaks across handler loops`
+9. `search retries once on 429 and succeeds on the second attempt`
+10. `persistent 429 exhausts the retry budget and fails closed with the status`
+11. `non-429 status is never retried`
 
 Y2 (in `worker/turn.zig`-level tests or here): a scripted turn dispatching
 `web_fetch` consults policy with the URL riding the policy request's

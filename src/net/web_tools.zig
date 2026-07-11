@@ -32,6 +32,10 @@ pub const Options = struct {
     search: ?SearchConfig = null,
     max_fetch_bytes: usize = 512 * 1024,
     max_text_bytes: usize = 64 * 1024,
+    /// 429-only search retry budget: rate limits (Brave free tier is ~1 rps)
+    /// get one polite retry; every other status still fails closed at once.
+    search_retry_max: usize = 1,
+    search_retry_delay_ms: u64 = 1100,
 };
 
 pub const HtmlText = struct {
@@ -144,12 +148,39 @@ fn collectResults(
 // Worker
 // ---------------------------------------------------------------------------
 
+/// Injection seam for the HTTP leg: unit tests swap in a socket-free fake to
+/// exercise the retry path; real runs use `defaultTransport` (httpGet).
+pub const Transport = *const fn (
+    ctx: ?*anyopaque,
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    url: []const u8,
+    headers: []const std.http.Header,
+    max_bytes: usize,
+) HttpGetError!HttpBody;
+
+fn defaultTransport(
+    ctx: ?*anyopaque,
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    url: []const u8,
+    headers: []const std.http.Header,
+    max_bytes: usize,
+) HttpGetError!HttpBody {
+    _ = ctx;
+    return httpGet(gpa, io, url, headers, max_bytes);
+}
+
 pub const WebToolsWorker = struct {
     gpa: std.mem.Allocator,
     worker: *inproc.Worker,
     io: std.Io,
     max_fetch_bytes: usize,
     max_text_bytes: usize,
+    search_retry_max: usize,
+    search_retry_delay_ms: u64,
+    transport: Transport = defaultTransport,
+    transport_ctx: ?*anyopaque = null,
     /// Owned deep copy of search config, or null when search is unconfigured.
     search: ?OwnedSearch,
 
@@ -175,6 +206,8 @@ pub const WebToolsWorker = struct {
             .io = io,
             .max_fetch_bytes = opts.max_fetch_bytes,
             .max_text_bytes = opts.max_text_bytes,
+            .search_retry_max = opts.search_retry_max,
+            .search_retry_delay_ms = opts.search_retry_delay_ms,
             .search = null,
         };
         errdefer self.worker.stop();
@@ -213,9 +246,15 @@ pub const WebToolsWorker = struct {
 
         const body = httpGet(self.gpa, self.io, url, &.{}, self.max_fetch_bytes) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
-            error.HttpFailed => return errorReply(arena, "HttpFailed"),
+            error.HttpFailed => {
+                log.warn("web_fetch {s}: transport failure", .{url});
+                return errorReply(arena, "HttpFailed");
+            },
             error.NonTextContent => return errorReply(arena, "NonTextContent"),
-            error.HttpStatus => return statusReply(arena),
+            error.HttpStatus => {
+                log.warn("web_fetch {s}: HTTP {d}", .{ url, last_http_status });
+                return statusReply(arena);
+            },
         };
         defer self.gpa.free(body.bytes);
         defer self.gpa.free(body.content_type);
@@ -256,11 +295,32 @@ pub const WebToolsWorker = struct {
         const url = try buildSearchUrl(arena, sc, query, count);
         const headers = try buildSearchHeaders(arena, sc);
 
-        const body = httpGet(self.gpa, self.io, url, headers, self.max_fetch_bytes) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.HttpFailed => return errorReply(arena, "HttpFailed"),
-            error.NonTextContent => return errorReply(arena, "NonTextContent"),
-            error.HttpStatus => return statusReply(arena),
+        var attempt: usize = 0;
+        const body = while (true) {
+            break self.transport(self.transport_ctx, self.gpa, self.io, url, headers, self.max_fetch_bytes) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.HttpFailed => {
+                    log.warn("web_search \"{s}\": transport failure", .{query});
+                    return errorReply(arena, "HttpFailed");
+                },
+                error.NonTextContent => return errorReply(arena, "NonTextContent"),
+                error.HttpStatus => {
+                    log.warn("web_search \"{s}\": HTTP {d} (attempt {d})", .{ query, last_http_status, attempt });
+                    if (last_http_status == 429 and attempt < self.search_retry_max) {
+                        attempt += 1;
+                        if (self.search_retry_delay_ms > 0) {
+                            var interval: std.c.timespec = .{
+                                .sec = @intCast(self.search_retry_delay_ms / 1000),
+                                .nsec = @intCast((self.search_retry_delay_ms % 1000) * std.time.ns_per_ms),
+                            };
+                            var rem: std.c.timespec = undefined;
+                            _ = std.c.nanosleep(&interval, &rem);
+                        }
+                        continue;
+                    }
+                    return statusReply(arena);
+                },
+            };
         };
         defer self.gpa.free(body.bytes);
         defer self.gpa.free(body.content_type);
@@ -713,6 +773,94 @@ test "search with no key configured ⇒ structured error naming the env var" {
     try testing.expect(res == .ok);
     try testing.expect(std.mem.indexOf(u8, res.ok, "MissingSearchKey") != null);
     try testing.expect(std.mem.indexOf(u8, res.ok, "BRAVE_API_KEY") != null);
+}
+
+/// Socket-free fake transport: replays a scripted sequence of outcomes
+/// (either an HTTP status failure or a JSON body) and counts calls.
+const FakeTransport = struct {
+    script: []const Step,
+    calls: usize = 0,
+
+    const Step = union(enum) { status: u16, body: []const u8 };
+
+    fn transport(
+        ctx: ?*anyopaque,
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        url: []const u8,
+        headers: []const std.http.Header,
+        max_bytes: usize,
+    ) HttpGetError!HttpBody {
+        _ = io;
+        _ = url;
+        _ = headers;
+        _ = max_bytes;
+        const self: *FakeTransport = @ptrCast(@alignCast(ctx.?));
+        const step = self.script[@min(self.calls, self.script.len - 1)];
+        self.calls += 1;
+        switch (step) {
+            .status => |code| {
+                last_http_status = code;
+                return error.HttpStatus;
+            },
+            .body => |b| return .{
+                .bytes = try gpa.dupe(u8, b),
+                .content_type = try gpa.dupe(u8, "application/json"),
+            },
+        }
+    }
+};
+
+const brave_search_opts: Options = .{
+    .search = .{
+        .endpoint = "https://api.search.brave.com",
+        .key_env = "BRAVE_API_KEY",
+        .key = "test-key",
+        .engine = .brave,
+    },
+    .search_retry_delay_ms = 0,
+};
+
+test "search retries once on 429 and succeeds on the second attempt" {
+    var h = try Harness.init(testing.allocator, brave_search_opts);
+    defer h.deinit();
+    var fake = FakeTransport{ .script = &.{ .{ .status = 429 }, .{ .body = fixture_brave } } };
+    h.worker.transport = FakeTransport.transport;
+    h.worker.transport_ctx = &fake;
+
+    const res = try h.caller.call("zygos::tools::web_search", "{\"query\":\"zig\"}");
+    defer res.deinit(testing.allocator);
+    try testing.expect(res == .ok);
+    try testing.expect(std.mem.indexOf(u8, res.ok, "Zig Programming Language") != null);
+    try testing.expectEqual(@as(usize, 2), fake.calls);
+}
+
+test "persistent 429 exhausts the retry budget and fails closed with the status" {
+    var h = try Harness.init(testing.allocator, brave_search_opts);
+    defer h.deinit();
+    var fake = FakeTransport{ .script = &.{.{ .status = 429 }} };
+    h.worker.transport = FakeTransport.transport;
+    h.worker.transport_ctx = &fake;
+
+    const res = try h.caller.call("zygos::tools::web_search", "{\"query\":\"zig\"}");
+    defer res.deinit(testing.allocator);
+    try testing.expect(res == .ok);
+    try testing.expect(std.mem.indexOf(u8, res.ok, "\"status\":429") != null);
+    try testing.expectEqual(@as(usize, 2), fake.calls); // 1 attempt + 1 retry
+}
+
+test "non-429 status is never retried" {
+    var h = try Harness.init(testing.allocator, brave_search_opts);
+    defer h.deinit();
+    var fake = FakeTransport{ .script = &.{.{ .status = 500 }} };
+    h.worker.transport = FakeTransport.transport;
+    h.worker.transport_ctx = &fake;
+
+    const res = try h.caller.call("zygos::tools::web_search", "{\"query\":\"zig\"}");
+    defer res.deinit(testing.allocator);
+    try testing.expect(res == .ok);
+    try testing.expect(std.mem.indexOf(u8, res.ok, "\"status\":500") != null);
+    try testing.expectEqual(@as(usize, 1), fake.calls);
 }
 
 test "no leaks across handler loops" {
