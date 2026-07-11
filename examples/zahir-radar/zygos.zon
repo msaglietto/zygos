@@ -1,0 +1,29 @@
+// Route table for the zahir-radar research mission (Y5). Slugs verified
+// against the real catalog (`zig build smoke-providers -- x x` lists them).
+// The executor does the web research — it gets the big-context ladder
+// (GLM 131k, MiMo 131k); PO/planner/verifier are cheaper seats. Every
+// ladder fails over to a different provider (429s route to attempt+1).
+.{
+    .default = .{
+        .{ .provider_function = "zygos::providers::glm-5-2", .model = "glm-5.2" },
+        .{ .provider_function = "zygos::providers::nvidia-deepseekv4-pro", .model = "deepseek-ai/deepseek-v4-pro" },
+    },
+    .routes = .{
+        .{ .step_id = "product-owner", .attempts = .{
+            .{ .provider_function = "zygos::providers::glm-5-2", .model = "glm-5.2" },
+            .{ .provider_function = "zygos::providers::nvidia-deepseekv4-pro", .model = "deepseek-ai/deepseek-v4-pro" },
+        } },
+        .{ .step_id = "planner", .attempts = .{
+            .{ .provider_function = "zygos::providers::nvidia-deepseekv4-pro", .model = "deepseek-ai/deepseek-v4-pro" },
+            .{ .provider_function = "zygos::providers::glm-5-2", .model = "glm-5.2" },
+        } },
+        .{ .step_id = "executor", .attempts = .{
+            .{ .provider_function = "zygos::providers::glm-5-2", .model = "glm-5.2" },
+            .{ .provider_function = "zygos::providers::openrouter-mimo-v2-5", .model = "xiaomi/mimo-v2.5" },
+        } },
+        .{ .step_id = "verifier", .attempts = .{
+            .{ .provider_function = "zygos::providers::gemini-3-5-flash", .model = "gemini-3.5-flash" },
+            .{ .provider_function = "zygos::providers::nvidia-minimax-m3", .model = "minimaxai/minimax-m3" },
+        } },
+    },
+}
