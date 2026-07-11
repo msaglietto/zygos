@@ -2,7 +2,7 @@
 title: "Zygos"
 status: design
 created: 2026-07-06
-updated: 2026-07-09
+updated: 2026-07-10
 tags: [project, ai-agents, harness-engineering, agentic-coding]
 aliases: [zygos, zig-harness]
 ---
@@ -23,6 +23,8 @@ Code: `~/Projects/Personal/zygos` — the repo's `GOAL.md` is the mission brief 
 
 ## Sessions
 
+- 2026-07-10 — M4.6 (zahir-radar) ratified and driven to the gate: Y1 web-tools worker, Y2 policy/trim/budget gating, Y3 unattended-rerun semantics + external-cron recipe, Y4 Brief 2 → Z-08 brief port all green same day. Fence-unwrap fix for role JSON landed after the first Y5 attempt. Y5 (unattended run vs the real Zahir vault) staged at the human gate — needs search key, vault-location decision, and the Y3 GOAL.md amendment.
+- 2026-07-10 — M4.5 closed: X5 dogfood exit verified (real objective brief → completed autonomously across 3+ catalog providers, killed + resumed mid-flight); closure ratified.
 - 2026-07-09 — M4 closed (W1–W6 ratified) and M4.5 ratified: shared provider catalog (`~/.agents/providers.toml`) wired to the CLI + `zygos mission start/resume` — the dogfood gate; X5 exit = DESIGN.md's real autonomous M3 exit test. Zahir web-tools + weekly trigger deferred to the post-M4.5 table.
 - 2026-07-09 — Decision Z-10: zahir-radar (Zahir's autonomous research pipeline) adopted as the flagship M3 mission workload; its vault is the portable contract, the SDK orchestrator disposable.
 - 2026-07-07 — Design addition: tool-output compression seam (Z-09) — rtk/ztk absorbed as a first-class `output::compress` dispatch step instead of a hook hack; raw output preserved in session store, savings reported to budget.
@@ -52,8 +54,9 @@ Code: `~/Projects/Personal/zygos` — the repo's `GOAL.md` is the mission brief 
 - [x] Write the mission-brief template (objective, constraints, non-goals, success criteria, gate config) — done 2026-07-06, see [Mission Brief Template](Projects/Zygos/Mission Brief Template.md)
 - [x] Implement `mission::brief::validate` lint — landed as M4/W1 brief validation, 2026-07-09
 - [x] M4 — Tessera absorbed: continuity/capture/orient/undo workers + mcp-gateway + shadow-git — closed 2026-07-09
-- [ ] M4.5 — Dogfood gate: providers.toml catalog + `zygos mission start/resume` CLI; exit (X5) = small real objective brief → completed autonomously across 3+ catalog providers, killed + resumed once — **in progress 2026-07-09** (X1 delegated)
-- [ ] Port zahir-radar area specs into mission briefs (Z-10) — needs web-tools worker + weekly trigger decision; deferred to the post-M4.5 table
+- [x] M4.5 — Dogfood gate: providers.toml catalog + `zygos mission start/resume` CLI; exit (X5) = small real objective brief → completed autonomously across 3+ catalog providers, killed + resumed once — closed 2026-07-10
+- [x] Port zahir-radar area specs into mission briefs (Z-10) — Brief 2 (verifier infrastructure, the wedge) ported at `examples/zahir-radar/`, passes W1 lint; web-tools worker + external-cron trigger decision landed as M4.6 Y1–Y3 — done 2026-07-10
+- [ ] M4.6 — zahir-radar workload: Y1–Y4 green 2026-07-10; **Y5 (unattended run vs the real Zahir vault) is a human gate — awaiting search key, vault decision, GOAL.md amendment**
 
 ## Resources
 
