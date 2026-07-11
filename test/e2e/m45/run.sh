@@ -140,4 +140,20 @@ set -e
 [ "$CODE" = "2" ] || { echo "M45 E2E FAIL leg4: expected exit 2, got $CODE"; cat "$TMP/err4.log"; exit 1; }
 grep -q "already holds a mission" "$TMP/err4.log" || { echo "M45 E2E FAIL leg4: wrong error"; cat "$TMP/err4.log"; exit 1; }
 
-echo "M45 E2E OK: start→done, seeded resume→done, unknown-slug boot refusal, rerun refusal"
+# ---- Leg 5 (Y5 seam): ZYGOS_VAULT_ROOT checkpoints the vault pre-mission -----
+mkdir -p "$TMP/vault" "$TMP/ws5"
+printf 'seed\n' > "$TMP/vault/seed.md"
+( cd "$TMP/ws5" && printf 'y\ny\ny\n' | ZYGOS_VAULT_ROOT="$TMP/vault" "$BIN" mission start "$TMP/brief.md" --planning "$TMP/planning5" > "$TMP/out5.json" 2> "$TMP/err5.log" )
+grep -q '"state":"done"' "$TMP/out5.json" || { echo "M45 E2E FAIL leg5: $(cat "$TMP/out5.json")"; cat "$TMP/err5.log"; exit 1; }
+git --git-dir="$TMP/vault/.zygos-shadow" log --oneline | grep -q "brief" \
+  || { echo "M45 E2E FAIL leg5: no pre-mission checkpoint in the vault shadow repo"; exit 1; }
+
+# A vault root that cannot be checkpointed refuses the mission (fail closed).
+set +e
+( cd "$TMP/ws5" && ZYGOS_VAULT_ROOT="$TMP/no-such-vault" "$BIN" mission start "$TMP/brief.md" --planning "$TMP/planning6" > /dev/null 2> "$TMP/err6.log" < /dev/null )
+CODE=$?
+set -e
+[ "$CODE" = "2" ] || { echo "M45 E2E FAIL leg5b: expected exit 2, got $CODE"; cat "$TMP/err6.log"; exit 1; }
+grep -q "vault checkpoint" "$TMP/err6.log" || { echo "M45 E2E FAIL leg5b: wrong error"; cat "$TMP/err6.log"; exit 1; }
+
+echo "M45 E2E OK: start→done, seeded resume→done, unknown-slug boot refusal, rerun refusal, vault checkpoint"

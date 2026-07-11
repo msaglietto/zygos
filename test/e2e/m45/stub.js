@@ -21,6 +21,14 @@ const script = [
   // Resume leg: one executor turn + one verifier turn.
   text('resumed and finished the count'),
   text('{"passed":true,"reason":"acceptance met"}'),
+  // Leg 5 (vault checkpoint): the same mission shape as leg 1.
+  text('{"objective":"Ship the gizmo","acceptance":"greeting written and count run"}'),
+  text('{"tasks":["write a greeting file","count to 500"]}'),
+  tool('t-greet5', 'bash', '{"command":"echo hello > greeting.txt"}'),
+  text('wrote the greeting'),
+  tool('t-count5', 'bash', '{"command":"seq 1 500"}'),
+  text('counted'),
+  text('{"passed":true,"reason":"acceptance met"}'),
 ];
 let i = 0;
 

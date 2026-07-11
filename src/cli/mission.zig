@@ -180,6 +180,26 @@ pub fn run(gpa: std.mem.Allocator, args: *std.process.Args.Iterator) u8 {
     const conf = caller.call("zygos::budget::configure", budget_req) catch return boot_fail();
     conf.deinit(gpa);
 
+    // ZYGOS_VAULT_ROOT (Y5): mission artifacts land behind a tessera-undo
+    // checkpoint — an unusable vault refuses the run instead of writing
+    // into it unprotected (fail closed).
+    if (getEnv(env, "ZYGOS_VAULT_ROOT")) |vault_root| {
+        const undo = zygos.tessera_undo.UndoWorker.start(gpa, &actor, &registry, .{
+            .root = vault_root,
+        }) catch return boot_fail();
+        _ = undo;
+        const cp_req = std.fmt.allocPrint(gpa, "{{\"label\":\"pre-mission {s}\"}}", .{mission_id}) catch return oom();
+        const cp = caller.call("zygos::tessera::checkpoint", cp_req) catch {
+            eprint("mission: vault checkpoint failed for {s}\n", .{vault_root});
+            return 2;
+        };
+        defer cp.deinit(gpa);
+        if (cp == .err) {
+            eprint("mission: vault checkpoint failed for {s}\n", .{vault_root});
+            return 2;
+        }
+    }
+
     // ---- console approvals (detached; EOF ⇒ manual timeouts deny) -----------
     const console_worker = zygos.inproc.Worker.spawn(gpa, &actor, &registry, "mission-console") catch return boot_fail();
     if (std.Thread.spawn(.{}, consoleLoop, .{ gpa, console_worker })) |t| t.detach() else |_| {}
