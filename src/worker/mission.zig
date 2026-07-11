@@ -651,17 +651,35 @@ fn failRole(m: *Mission, reason: []const u8) error{IllegalTransition}!void {
     m.state = try Fsm.apply(m.state, .role_failed);
 }
 
+/// Fail-closed rejection of role output, with the raw text persisted to the
+/// planning root first — unattended runs have no console, so a rejection
+/// that discards the text is undiagnosable.
+fn rejectRole(
+    self: *MissionOrchestrator,
+    arena: std.mem.Allocator,
+    cfg: RunConfig,
+    m: *Mission,
+    role: Role,
+    text: []const u8,
+    reason: []const u8,
+) MissionError!void {
+    const name = try std.fmt.allocPrint(arena, "REJECTED-{s}.md", .{role.stepId()});
+    try putArtifact(self, cfg, name, text);
+    try failRole(m, reason);
+}
+
 fn roleDefine(self: *MissionOrchestrator, arena: std.mem.Allocator, cfg: RunConfig, m: *Mission) MissionError!void {
     switch (try runRole(self, arena, cfg, m, .product_owner, m.objective, false)) {
         .failed => |reason| try failRole(m, reason),
         .ok => |text| {
             const parsed = json.parseFromSliceLeaky(json.Value, arena, text, .{}) catch
-                return failRole(m, "product-owner output is not JSON");
-            if (parsed != .object) return failRole(m, "product-owner output is not an object");
+                return rejectRole(self, arena, cfg, m, .product_owner, text, "product-owner output is not JSON");
+            if (parsed != .object)
+                return rejectRole(self, arena, cfg, m, .product_owner, text, "product-owner output is not an object");
             const objective = strField(parsed.object, "objective") orelse
-                return failRole(m, "product-owner output lacks objective");
+                return rejectRole(self, arena, cfg, m, .product_owner, text, "product-owner output lacks objective");
             const acceptance = strField(parsed.object, "acceptance") orelse
-                return failRole(m, "product-owner output lacks acceptance");
+                return rejectRole(self, arena, cfg, m, .product_owner, text, "product-owner output lacks acceptance");
             m.objective = objective;
             m.acceptance = acceptance;
             const md = try std.fmt.allocPrint(
@@ -689,19 +707,20 @@ fn rolePlan(self: *MissionOrchestrator, arena: std.mem.Allocator, cfg: RunConfig
         .failed => |reason| try failRole(m, reason),
         .ok => |text| {
             const parsed = json.parseFromSliceLeaky(json.Value, arena, text, .{}) catch
-                return failRole(m, "planner output is not JSON");
-            if (parsed != .object) return failRole(m, "planner output is not an object");
+                return rejectRole(self, arena, cfg, m, .planner, text, "planner output is not JSON");
+            if (parsed != .object)
+                return rejectRole(self, arena, cfg, m, .planner, text, "planner output is not an object");
             const tasks_val = parsed.object.get("tasks") orelse
-                return failRole(m, "planner output lacks tasks");
+                return rejectRole(self, arena, cfg, m, .planner, text, "planner output lacks tasks");
             if (tasks_val != .array or tasks_val.array.items.len == 0 or tasks_val.array.items.len > 32)
-                return failRole(m, "planner tasks must be 1..32 entries");
+                return rejectRole(self, arena, cfg, m, .planner, text, "planner tasks must be 1..32 entries");
 
             const tasks = try arena.alloc(Task, tasks_val.array.items.len);
             var md: std.ArrayList(u8) = .empty;
             try md.appendSlice(arena, "# Plan\n\n");
             for (tasks_val.array.items, 0..) |tv, i| {
                 if (tv != .string or tv.string.len == 0)
-                    return failRole(m, "planner tasks must be non-empty strings");
+                    return rejectRole(self, arena, cfg, m, .planner, text, "planner tasks must be non-empty strings");
                 tasks[i] = .{ .desc = tv.string };
                 try md.appendSlice(arena, "- [ ] ");
                 try md.appendSlice(arena, tv.string);
@@ -747,11 +766,13 @@ fn roleVerify(self: *MissionOrchestrator, arena: std.mem.Allocator, cfg: RunConf
         .failed => |reason| try failRole(m, reason),
         .ok => |text| {
             const parsed = json.parseFromSliceLeaky(json.Value, arena, text, .{}) catch
-                return failRole(m, "verifier output is not JSON");
-            if (parsed != .object) return failRole(m, "verifier output is not an object");
+                return rejectRole(self, arena, cfg, m, .verifier, text, "verifier output is not JSON");
+            if (parsed != .object)
+                return rejectRole(self, arena, cfg, m, .verifier, text, "verifier output is not an object");
             const passed_val = parsed.object.get("passed") orelse
-                return failRole(m, "verifier output lacks passed");
-            if (passed_val != .bool) return failRole(m, "verifier passed must be a bool");
+                return rejectRole(self, arena, cfg, m, .verifier, text, "verifier output lacks passed");
+            if (passed_val != .bool)
+                return rejectRole(self, arena, cfg, m, .verifier, text, "verifier passed must be a bool");
             const passed = passed_val.bool;
             const reason = strField(parsed.object, "reason") orelse "";
 
@@ -1335,6 +1356,26 @@ test "malformed planner output fails the mission as role_failed" {
     try testing.expect(res == .ok);
     try expectTerminal(res.ok, "failed", "role_failed");
     try testing.expect(std.mem.indexOf(u8, res.ok, "planner") != null);
+}
+
+test "rejected role output lands in the planning root for diagnosis" {
+    // Unattended runs (Y5) have no console: the raw text a fail-closed
+    // parse rejected must survive on disk or the failure is undiagnosable.
+    var h = try Harness.init(testing.allocator, &.{
+        roleText("```json\n{\"objective\":\"x\",\"acceptance\":\"y\"}\n```"),
+    });
+    defer h.deinit();
+
+    const req = try h.startReq(testing.allocator, seed_and_gate);
+    defer testing.allocator.free(req);
+    const res = try h.caller.call("zygos::missions::start", req);
+    defer res.deinit(testing.allocator);
+    try testing.expect(res == .ok);
+    try expectTerminal(res.ok, "failed", "role_failed");
+
+    const rejected = try h.store().readArtifact(testing.allocator, "REJECTED-product-owner.md");
+    defer testing.allocator.free(rejected);
+    try testing.expect(std.mem.indexOf(u8, rejected, "```json") != null);
 }
 
 test "provider error mid-role fails the mission as role_failed" {
