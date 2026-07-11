@@ -645,6 +645,18 @@ fn assistantText(arena: std.mem.Allocator, msg: json.ObjectMap) error{OutOfMemor
     return out.toOwnedSlice(arena);
 }
 
+/// Real providers wrap role JSON in one whole-output markdown fence.
+/// Unwrapping exactly that shape is deterministic — anything else is
+/// returned untouched and must still parse as strict JSON (fail closed).
+fn unwrapFence(text: []const u8) []const u8 {
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    if (!std.mem.startsWith(u8, trimmed, "```")) return trimmed;
+    if (!std.mem.endsWith(u8, trimmed, "```")) return trimmed;
+    const open_end = std.mem.indexOfScalar(u8, trimmed, '\n') orelse return trimmed;
+    if (trimmed.len < open_end + 1 + 3) return trimmed;
+    return std.mem.trim(u8, trimmed[open_end + 1 .. trimmed.len - 3], " \t\r\n");
+}
+
 fn failRole(m: *Mission, reason: []const u8) error{IllegalTransition}!void {
     m.stop = .role_failed;
     m.detail = reason;
@@ -672,7 +684,7 @@ fn roleDefine(self: *MissionOrchestrator, arena: std.mem.Allocator, cfg: RunConf
     switch (try runRole(self, arena, cfg, m, .product_owner, m.objective, false)) {
         .failed => |reason| try failRole(m, reason),
         .ok => |text| {
-            const parsed = json.parseFromSliceLeaky(json.Value, arena, text, .{}) catch
+            const parsed = json.parseFromSliceLeaky(json.Value, arena, unwrapFence(text), .{}) catch
                 return rejectRole(self, arena, cfg, m, .product_owner, text, "product-owner output is not JSON");
             if (parsed != .object)
                 return rejectRole(self, arena, cfg, m, .product_owner, text, "product-owner output is not an object");
@@ -706,7 +718,7 @@ fn rolePlan(self: *MissionOrchestrator, arena: std.mem.Allocator, cfg: RunConfig
     switch (try runRole(self, arena, cfg, m, .planner, content, false)) {
         .failed => |reason| try failRole(m, reason),
         .ok => |text| {
-            const parsed = json.parseFromSliceLeaky(json.Value, arena, text, .{}) catch
+            const parsed = json.parseFromSliceLeaky(json.Value, arena, unwrapFence(text), .{}) catch
                 return rejectRole(self, arena, cfg, m, .planner, text, "planner output is not JSON");
             if (parsed != .object)
                 return rejectRole(self, arena, cfg, m, .planner, text, "planner output is not an object");
@@ -765,7 +777,7 @@ fn roleVerify(self: *MissionOrchestrator, arena: std.mem.Allocator, cfg: RunConf
     switch (try runRole(self, arena, cfg, m, .verifier, content, false)) {
         .failed => |reason| try failRole(m, reason),
         .ok => |text| {
-            const parsed = json.parseFromSliceLeaky(json.Value, arena, text, .{}) catch
+            const parsed = json.parseFromSliceLeaky(json.Value, arena, unwrapFence(text), .{}) catch
                 return rejectRole(self, arena, cfg, m, .verifier, text, "verifier output is not JSON");
             if (parsed != .object)
                 return rejectRole(self, arena, cfg, m, .verifier, text, "verifier output is not an object");
@@ -1362,7 +1374,7 @@ test "rejected role output lands in the planning root for diagnosis" {
     // Unattended runs (Y5) have no console: the raw text a fail-closed
     // parse rejected must survive on disk or the failure is undiagnosable.
     var h = try Harness.init(testing.allocator, &.{
-        roleText("```json\n{\"objective\":\"x\",\"acceptance\":\"y\"}\n```"),
+        roleText("I refined the objective for you:\n\nobjective: x\nacceptance: y"),
     });
     defer h.deinit();
 
@@ -1375,7 +1387,31 @@ test "rejected role output lands in the planning root for diagnosis" {
 
     const rejected = try h.store().readArtifact(testing.allocator, "REJECTED-product-owner.md");
     defer testing.allocator.free(rejected);
-    try testing.expect(std.mem.indexOf(u8, rejected, "```json") != null);
+    try testing.expect(std.mem.indexOf(u8, rejected, "I refined the objective") != null);
+}
+
+test "fenced role JSON is unwrapped deterministically" {
+    // Real models wrap role JSON in markdown code fences (observed on the
+    // first Y5 run). Unwrapping one whole-output fence is deterministic —
+    // the content must still parse as strict JSON or the mission fails.
+    var h = try Harness.init(testing.allocator, &.{
+        roleText("```json\n" ++
+            "{\"objective\": \"Ship the gizmo\", \"acceptance\": \"greeting written and count run\"}\n" ++
+            "```"),
+        roleText("```\n{\"tasks\": [\"build the gizmo\"]}\n```"),
+        exec_ok,
+        roleText("```json\n{\"passed\": true, \"reason\": \"acceptance met\"}\n```"),
+    });
+    defer h.deinit();
+    const approvals = try approval_mod.ApprovalWorker.start(testing.allocator, &h.actor, &h.registry, .auto_approve);
+    defer approvals.stop();
+
+    const req = try h.startReq(testing.allocator, seed_and_gate);
+    defer testing.allocator.free(req);
+    const res = try h.caller.call("zygos::missions::start", req);
+    defer res.deinit(testing.allocator);
+    try testing.expect(res == .ok);
+    try expectTerminal(res.ok, "done", "completed");
 }
 
 test "provider error mid-role fails the mission as role_failed" {
