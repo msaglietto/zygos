@@ -2,7 +2,7 @@
 title: "Zygos — Design"
 status: design
 created: 2026-07-06
-updated: 2026-07-07
+updated: 2026-07-11
 tags: [project, ai-agents, harness-engineering, agentic-coding, software-engineering]
 aliases: [zygos, zygos-design, zig-harness]
 ---
@@ -115,6 +115,7 @@ The article's 15 jobs, as Zygos workers. Every one is reachable through one or t
 | + | Sub-agent spawn | `turn-orchestrator` | `agent::spawn` (the Task-tool equivalent) |
 | + | Prompt pipeline (opt) | `prompt-refiner`, `fusion` | `prompt::transform`, `fusion::start` |
 | + | Tool-output compression | `output-trim` | `output::compress` |
+| + | Web research (Z-10) | `web-tools` | `tools::web_search/web_fetch` |
 | + | Mission loop | `mission-orchestrator` | `mission::start/steer/pause/resume/status` |
 
 Design points carried over from iii's production learnings, adopted as requirements:
@@ -123,6 +124,7 @@ Design points carried over from iii's production learnings, adopted as requireme
 - **One reactive approval trigger.** The orchestrator registers a single `turn::on_approval` state trigger on scope `approvals`. `approval::resolve` writes `approvals/<sid>/<cid> = {decision, reason}`; the state-change trigger wakes exactly the affected session. No per-call resume registration, no startup re-scan.
 - **Fail closed.** `dispatchWithHook` is the single tool-dispatch chokepoint. Policy unreachable or 5s timeout → deny with `gate_unavailable`. Hook publish failure → deny.
 - **Needs-approval parks the call, not the batch** — the rest of the tool batch keeps dispatching; the turn only transitions to `awaiting_approval` when entries are actually pending.
+- **Web tools ride the same gates and fail closed, with one carve-out for rate limits** (Z-10, decision 2026-07-11): `web-tools` returns every upstream failure as a structured tool-result error (never a crash), but HTTP 429 on search gets a small polite retry budget (default one retry, ~1.1s delay — sized to Brave's free-tier 1 rps) before failing, because burning executor turn steps on transient rate limits is spend, not safety. All other statuses fail immediately; failed attempts are logged with status and attempt number so unattended-run diagnosis doesn't need provider dashboards. The search engine is operator config (brave/searxng), never a dependency.
 - **Baggage-first tracing.** `traceparent` + `baggage` ride every invoke/result; a baggage span processor stamps session/message/function IDs onto every span so traces group without per-worker plumbing. When a call is re-targeted (enqueue, state fan-out), rewrite `zygos.function.id` to the target.
 
 ### Per-step model/provider routing (the requirement that shapes everything)
