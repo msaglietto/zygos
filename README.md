@@ -196,7 +196,9 @@ The CLI reads the provider catalog from `AI_PROVIDERS_CONFIG` (else
 `~/.agents/providers.toml`) and the route table from `ZYGOS_CONFIG` (else
 `./zygos.zon`); approvals prompt on stderr and fail closed (manual timeout
 denies) when stdin closes. Knobs: `ZYGOS_APPROVAL_TIMEOUT_MS`,
-`ZYGOS_INVOKE_TIMEOUT_MS`, `ZYGOS_BUDGET_MAX_TOKENS`.
+`ZYGOS_INVOKE_TIMEOUT_MS`, `ZYGOS_BUDGET_MAX_TOKENS`. Debugging: `ZYGOS_LOG=info`
+streams the harness's progress feed (mission transitions, role turns,
+per-step provider/model, tool dispatches) to stderr; `debug` for more.
 
 The X4 companion is a manual smoke over the **real** catalog — two turns
 routed to two different live providers:
