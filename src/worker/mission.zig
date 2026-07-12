@@ -19,6 +19,7 @@ const actor_mod = @import("../kernel/actor.zig");
 const inproc = @import("../kernel/inproc.zig");
 const sync = @import("../kernel/sync.zig");
 const store_mod = @import("mission_store.zig");
+const trace_mod = @import("trace.zig");
 const brief_mod = @import("brief.zig");
 
 const log = std.log.scoped(.mission);
@@ -216,6 +217,8 @@ const RunConfig = struct {
     fail_threshold: usize,
     gate_threshold: usize,
     role_max_steps: usize,
+    /// events.jsonl in the planning root (fail-open — see worker/trace.zig).
+    trace_path: ?[]const u8,
 };
 
 const mission_artifact = "MISSION.md";
@@ -405,6 +408,7 @@ fn runMission(self: *MissionOrchestrator, arena: std.mem.Allocator, request_json
         .fail_threshold = uintFieldOr(obj, "fail_threshold", 3),
         .gate_threshold = uintFieldOr(obj, "gate_threshold", 3),
         .role_max_steps = uintFieldOr(obj, "role_max_steps", 8),
+        .trace_path = strField(obj, "trace_path"),
     };
     if (cfg.provider_function == null and cfg.router_function == null)
         return error.MalformedRequest;
@@ -458,6 +462,12 @@ fn runMission(self: *MissionOrchestrator, arena: std.mem.Allocator, request_json
             log.info("mission {s}: {t} → {t} (role_turns {d}, tasks {d}/{d})", .{
                 m.mission_id, prev, m.state, m.role_turns_used, m.tasksDone(), m.tasks.len,
             });
+            try trace_mod.event(
+                arena,
+                cfg.trace_path,
+                "\"event\":\"mission\",\"from\":\"{t}\",\"to\":\"{t}\",\"role_turns\":{d},\"tasks_done\":{d},\"tasks\":{d}",
+                .{ prev, m.state, m.role_turns_used, m.tasksDone(), m.tasks.len },
+            );
             try phase_log.append(arena, try std.fmt.allocPrint(arena, "{t} → {t}", .{ prev, m.state }));
         }
     }
@@ -553,8 +563,45 @@ const RoleOut = union(enum) {
 };
 
 /// One role = one `zygos::turns::run` turn. Counts against max_role_turns
-/// whether it succeeds or not.
+/// whether it succeeds or not. Role boundaries bracket the turn's own events
+/// in the trace, so a stalled executor is attributable at a glance.
 fn runRole(
+    self: *MissionOrchestrator,
+    arena: std.mem.Allocator,
+    cfg: RunConfig,
+    m: *Mission,
+    role: Role,
+    content: []const u8,
+    with_tools: bool,
+) MissionError!RoleOut {
+    try trace_mod.event(
+        arena,
+        cfg.trace_path,
+        "\"event\":\"role_start\",\"role\":{f},\"role_turn\":{d},\"tools\":{},\"content\":{f}",
+        .{
+            json.fmt(role.stepId(), .{}),                      m.role_turns_used + 1, with_tools,
+            json.fmt(try trace_mod.clip(arena, content), .{}),
+        },
+    );
+    const out = try runRoleTurn(self, arena, cfg, m, role, content, with_tools);
+    switch (out) {
+        .ok => try trace_mod.event(
+            arena,
+            cfg.trace_path,
+            "\"event\":\"role_end\",\"role\":{f},\"outcome\":\"ok\"",
+            .{json.fmt(role.stepId(), .{})},
+        ),
+        .failed => |reason| try trace_mod.event(
+            arena,
+            cfg.trace_path,
+            "\"event\":\"role_end\",\"role\":{f},\"outcome\":\"failed\",\"reason\":{f}",
+            .{ json.fmt(role.stepId(), .{}), json.fmt(reason, .{}) },
+        ),
+    }
+    return out;
+}
+
+fn runRoleTurn(
     self: *MissionOrchestrator,
     arena: std.mem.Allocator,
     cfg: RunConfig,
@@ -590,6 +637,8 @@ fn runRole(
         w.print(",\"budget_scope\":{f}", .{json.fmt(v, .{})}) catch return error.OutOfMemory;
     if (with_tools) if (cfg.tools_json) |t|
         w.print(",\"tools\":{s}", .{t}) catch return error.OutOfMemory;
+    if (cfg.trace_path) |v|
+        w.print(",\"trace_path\":{f}", .{json.fmt(v, .{})}) catch return error.OutOfMemory;
     w.writeAll("}") catch return error.OutOfMemory;
 
     const res = self.worker.call("zygos::turns::run", req.written()) catch |err| switch (err) {
@@ -1188,6 +1237,54 @@ fn expectTerminal(payload: []const u8, state: []const u8, stop: []const u8) !voi
     defer p.deinit();
     try testing.expectEqualStrings(state, p.value.object.get("state").?.string);
     try testing.expectEqualStrings(stop, p.value.object.get("stop").?.string);
+}
+
+test "trace_path threads through role turns: role, mission and turn events land in one events.jsonl" {
+    var h = try Harness.init(testing.allocator, &.{ po_ok, plan1, exec_ok, verify_pass });
+    defer h.deinit();
+    const approvals = try approval_mod.ApprovalWorker.start(testing.allocator, &h.actor, &h.registry, .auto_approve);
+    defer approvals.stop();
+
+    const tpath = try std.fmt.allocPrint(testing.allocator, "{s}/events.jsonl", .{h.root});
+    defer testing.allocator.free(tpath);
+    const extra = try std.fmt.allocPrint(
+        testing.allocator,
+        seed_and_gate ++ ",\"trace_path\":{f}",
+        .{json.fmt(tpath, .{})},
+    );
+    defer testing.allocator.free(extra);
+
+    const req = try h.startReq(testing.allocator, extra);
+    defer testing.allocator.free(req);
+    const res = try h.caller.call("zygos::missions::start", req);
+    defer res.deinit(testing.allocator);
+    try testing.expect(res == .ok);
+    try expectTerminal(res.ok, "done", "completed");
+
+    const text = trace_mod.readFile(testing.allocator, tpath) orelse return error.ReadFailed;
+    defer testing.allocator.free(text);
+
+    // Role boundaries for all four roles, both edges.
+    try testing.expect(std.mem.indexOf(u8, text, "\"event\":\"role_start\"") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "\"event\":\"role_end\"") != null);
+    for ([_][]const u8{ "product-owner", "planner", "executor", "verifier" }) |role| {
+        const needle = try std.fmt.allocPrint(testing.allocator, "\"role\":\"{s}\"", .{role});
+        defer testing.allocator.free(needle);
+        try testing.expect(std.mem.indexOf(u8, text, needle) != null);
+    }
+    // Mission transitions.
+    try testing.expect(std.mem.indexOf(u8, text, "\"event\":\"mission\"") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "\"from\":\"defining\",\"to\":\"planning\"") != null);
+    // trace_path reached the turn driver: per-step provider events interleave.
+    try testing.expect(std.mem.indexOf(u8, text, "\"event\":\"step\"") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "\"event\":\"turn_end\"") != null);
+
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, text, "\n"), '\n');
+    while (lines.next()) |line| {
+        var p = try json.parseFromSlice(json.Value, testing.allocator, line, .{});
+        defer p.deinit();
+        try testing.expect(p.value == .object);
+    }
 }
 
 test "happy path: define, plan, execute x2, verify, gate approve; artifacts + terminal state on disk" {

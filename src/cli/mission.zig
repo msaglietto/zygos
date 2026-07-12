@@ -19,6 +19,8 @@ pub fn run(gpa: std.mem.Allocator, args: *std.process.Args.Iterator) u8 {
     var resume_flag = false;
     if (std.mem.eql(u8, verb, "resume")) {
         resume_flag = true;
+    } else if (std.mem.eql(u8, verb, "trace")) {
+        return runTrace(gpa, args);
     } else if (!std.mem.eql(u8, verb, "start")) {
         return usage();
     }
@@ -207,13 +209,15 @@ pub fn run(gpa: std.mem.Allocator, args: *std.process.Args.Iterator) u8 {
     // ---- the mission ---------------------------------------------------------
     // Scripted-test defaults (8 steps/turn, 16 turns) are too tight for real
     // executors iterating with tools — a real mission gets room by default.
+    const trace_path = std.fmt.allocPrint(gpa, "{s}/{s}", .{ planning, zygos.trace.file_name }) catch return oom();
+    eprint("mission: trace → {s} (view: zygos mission trace {s})\n", .{ trace_path, planning });
     const request = std.fmt.allocPrint(gpa,
         \\{{"mission_id":{f},"planning_root":{f},"objective":{f},"brief":{f},
         \\ "router_function":"zygos::models::resolve",
         \\ "gate_function":"zygos::approvals::request",
         \\ "policy_function":"zygos::policy::check",
         \\ "approval_function":"zygos::approvals::request",
-        \\ "budget_scope":{f},
+        \\ "budget_scope":{f},"trace_path":{f},
         \\ "role_max_steps":{d},"max_role_turns":{d}{s},
         \\ "tools":[{{"name":"bash","function_id":"zygos::tools::bash"}},
         \\  {{"name":"web_search","function_id":"zygos::tools::web_search"}},
@@ -221,8 +225,9 @@ pub fn run(gpa: std.mem.Allocator, args: *std.process.Args.Iterator) u8 {
     , .{
         json.fmt(mission_id, .{}),                   json.fmt(planning, .{}),
         json.fmt(extractObjective(brief_text), .{}), json.fmt(brief_text, .{}),
-        json.fmt(mission_id, .{}),                   envInt(env, "ZYGOS_ROLE_MAX_STEPS", 24),
-        envInt(env, "ZYGOS_MAX_ROLE_TURNS", 48),     if (resume_flag) ",\"resume\":true" else "",
+        json.fmt(mission_id, .{}),                   json.fmt(trace_path, .{}),
+        envInt(env, "ZYGOS_ROLE_MAX_STEPS", 24),     envInt(env, "ZYGOS_MAX_ROLE_TURNS", 48),
+        if (resume_flag) ",\"resume\":true" else "",
     }) catch return oom();
 
     const res = caller.call("zygos::missions::start", request) catch {
@@ -243,8 +248,31 @@ pub fn run(gpa: std.mem.Allocator, args: *std.process.Args.Iterator) u8 {
 }
 
 fn usage() u8 {
-    eprint("usage: zygos mission start|resume <brief.md> [--planning <dir>] [--resume] [--run-stamp]\n", .{});
+    eprint(
+        "usage: zygos mission start|resume <brief.md> [--planning <dir>] [--resume] [--run-stamp]\n" ++
+            "       zygos mission trace <planning-dir|events.jsonl>\n",
+        .{},
+    );
     return 2;
+}
+
+/// `zygos mission trace <planning-dir|events.jsonl>` — render the run's
+/// event log as a human view. Read-only; exits 2 when there is no trace.
+fn runTrace(gpa: std.mem.Allocator, args: *std.process.Args.Iterator) u8 {
+    const target = args.next() orelse return usage();
+    // Planning root first: fopen("r") on a directory succeeds with an empty
+    // read on macOS, so trying the bare target first would render nothing.
+    const joined = std.fmt.allocPrint(gpa, "{s}/{s}", .{
+        std.mem.trimEnd(u8, target, "/"), zygos.trace.file_name,
+    }) catch return oom();
+    defer gpa.free(joined);
+    const text = readWholeFile(gpa, joined) orelse readWholeFile(gpa, target) orelse {
+        eprint("mission: no trace at {s} (is this a planning root?)\n", .{target});
+        return 2;
+    };
+    const rendered = zygos.trace.render(gpa, text) catch return oom();
+    writeStdout(rendered);
+    return 0;
 }
 
 fn oom() u8 {

@@ -17,6 +17,7 @@ const actor_mod = @import("../kernel/actor.zig");
 const inproc = @import("../kernel/inproc.zig");
 const sync = @import("../kernel/sync.zig");
 const channel_mod = @import("../kernel/channel.zig");
+const trace_mod = @import("trace.zig");
 
 const log = std.log.scoped(.turn);
 
@@ -477,6 +478,7 @@ fn runTurn(self: *TurnOrchestrator, arena: std.mem.Allocator, request_json: []co
     const turn_id = strField(obj, "turn_id");
     const budget_scope = strField(obj, "budget_scope");
     const budget_fn = strField(obj, "budget_function") orelse "zygos::budget::check";
+    const trace_path = strField(obj, "trace_path");
 
     // Tool routing table: name → {function_id, requires_approval}.
     var routes = std.StringHashMap(ToolRoute).init(arena);
@@ -547,6 +549,12 @@ fn runTurn(self: *TurnOrchestrator, arena: std.mem.Allocator, request_json: []co
                 step_model = r.model;
             } else {
                 state = try Fsm.apply(state, .provider_error); // → failed
+                try trace_mod.event(
+                    arena,
+                    trace_path,
+                    "\"event\":\"turn_end\",\"turn_id\":{f},\"stop\":\"failed\",\"steps\":{d},\"error\":\"route_exhausted\"",
+                    .{ json.fmt(turn_id orelse "", .{}), steps },
+                );
                 return try std.fmt.allocPrint(
                     arena,
                     "{{\"stop\":\"failed\",\"steps\":{d},\"error\":\"route_exhausted\"}}",
@@ -579,6 +587,12 @@ fn runTurn(self: *TurnOrchestrator, arena: std.mem.Allocator, request_json: []co
         log.info("turn {s} step {d}: {s} model {s} (attempt {d})", .{
             turn_id orelse "?", steps + 1, step_provider, step_model, attempt,
         });
+        try trace_mod.event(
+            arena,
+            trace_path,
+            "\"event\":\"step\",\"turn_id\":{f},\"step\":{d},\"provider\":{f},\"model\":{f},\"attempt\":{d}",
+            .{ json.fmt(turn_id orelse "", .{}), steps + 1, json.fmt(step_provider, .{}), json.fmt(step_model, .{}), attempt },
+        );
         state = try Fsm.apply(state, .provider_started); // → streaming
         const drain_thread = std.Thread.spawn(.{}, DeltaLog.drain, .{ &deltas, self.gpa, &receiver }) catch
             return error.Failed;
@@ -607,6 +621,12 @@ fn runTurn(self: *TurnOrchestrator, arena: std.mem.Allocator, request_json: []co
                 }
                 defer self.gpa.free(code);
                 state = try Fsm.apply(state, .provider_error); // → failed
+                try trace_mod.event(
+                    arena,
+                    trace_path,
+                    "\"event\":\"turn_end\",\"turn_id\":{f},\"stop\":\"failed\",\"steps\":{d},\"error\":{f}",
+                    .{ json.fmt(turn_id orelse "", .{}), steps, json.fmt(code, .{}) },
+                );
                 return try std.fmt.allocPrint(
                     arena,
                     "{{\"stop\":\"failed\",\"steps\":{d},\"error\":{f}}}",
@@ -654,6 +674,15 @@ fn runTurn(self: *TurnOrchestrator, arena: std.mem.Allocator, request_json: []co
                     const tool_name = strField(block.object, "name") orelse "";
                     const input = block.object.get("input") orelse json.Value.null;
                     log.info("turn {s} step {d}: tool {s}", .{ turn_id orelse "?", steps, tool_name });
+                    try trace_mod.event(
+                        arena,
+                        trace_path,
+                        "\"event\":\"tool_call\",\"turn_id\":{f},\"step\":{d},\"tool\":{f},\"input\":{f}",
+                        .{
+                            json.fmt(turn_id orelse "", .{}),                                    steps, json.fmt(tool_name, .{}),
+                            json.fmt(try trace_mod.clip(arena, try rawJson(arena, input)), .{}),
+                        },
+                    );
 
                     if (self.pollAborted(ctl)) {
                         state = try Fsm.apply(state, .abort); // dispatching → stopped
@@ -662,6 +691,7 @@ fn runTurn(self: *TurnOrchestrator, arena: std.mem.Allocator, request_json: []co
                     }
 
                     const route = routes.get(tool_name) orelse {
+                        try traceToolResult(arena, trace_path, steps, tool_name, "unknown tool", true);
                         try results.append(arena, try toolResult(arena, tool_id, "unknown tool", true));
                         continue;
                     };
@@ -674,6 +704,7 @@ fn runTurn(self: *TurnOrchestrator, arena: std.mem.Allocator, request_json: []co
                             .ask => ask = true,
                             .deny => |reason| {
                                 const denied = try std.fmt.allocPrint(arena, "policy_denied: {s}", .{reason});
+                                try traceToolResult(arena, trace_path, steps, tool_name, denied, true);
                                 try results.append(arena, try toolResult(arena, tool_id, denied, true));
                                 continue;
                             },
@@ -686,6 +717,7 @@ fn runTurn(self: *TurnOrchestrator, arena: std.mem.Allocator, request_json: []co
                             state = try Fsm.apply(state, .approved); // → dispatching
                         } else {
                             state = try Fsm.apply(state, .denied); // → dispatching
+                            try traceToolResult(arena, trace_path, steps, tool_name, "approval_denied", true);
                             try results.append(arena, try toolResult(arena, tool_id, "approval_denied", true));
                             continue;
                         }
@@ -697,10 +729,12 @@ fn runTurn(self: *TurnOrchestrator, arena: std.mem.Allocator, request_json: []co
                         .ok => |out| {
                             defer self.gpa.free(out);
                             const final = try self.compressSeam(arena, out);
+                            try traceToolResult(arena, trace_path, steps, tool_name, final, false);
                             try results.append(arena, try toolResult(arena, tool_id, final, false));
                         },
                         .err => |code| {
                             defer self.gpa.free(code);
+                            try traceToolResult(arena, trace_path, steps, tool_name, code, true);
                             try results.append(arena, try toolResult(arena, tool_id, code, true));
                         },
                     }
@@ -729,6 +763,12 @@ fn runTurn(self: *TurnOrchestrator, arena: std.mem.Allocator, request_json: []co
     }
 
     std.debug.assert(state == .stopped);
+    try trace_mod.event(
+        arena,
+        trace_path,
+        "\"event\":\"turn_end\",\"turn_id\":{f},\"stop\":{f},\"steps\":{d}",
+        .{ json.fmt(turn_id orelse "", .{}), json.fmt(stop, .{}), steps },
+    );
     deltas.mutex.lock();
     const delta_text = deltas.buf.items;
     deltas.mutex.unlock();
@@ -736,6 +776,27 @@ fn runTurn(self: *TurnOrchestrator, arena: std.mem.Allocator, request_json: []co
         arena,
         "{{\"stop\":{f},\"steps\":{d},\"deltas\":{f},\"transcript\":[{s}]}}",
         .{ json.fmt(stop, .{}), steps, json.fmt(delta_text, .{}), try joinComma(arena, transcript.items) },
+    );
+}
+
+/// Trace twin of `toolResult`: what the model will see (post-compress),
+/// clipped for the event line, with the full size alongside.
+fn traceToolResult(
+    arena: std.mem.Allocator,
+    trace_path: ?[]const u8,
+    step: usize,
+    tool_name: []const u8,
+    content: []const u8,
+    is_error: bool,
+) error{OutOfMemory}!void {
+    try trace_mod.event(
+        arena,
+        trace_path,
+        "\"event\":\"tool_result\",\"step\":{d},\"tool\":{f},\"is_error\":{},\"bytes\":{d},\"output\":{f}",
+        .{
+            step,                                              json.fmt(tool_name, .{}), is_error, content.len,
+            json.fmt(try trace_mod.clip(arena, content), .{}),
+        },
     );
 }
 
@@ -1124,6 +1185,55 @@ test "output::compress seam transforms tool_results when registered; pass-throug
     defer h.provider.mutex.unlock();
     try testing.expect(std.mem.indexOf(u8, h.provider.last_request.?, "OUTPUT") != null);
     try testing.expect(std.mem.indexOf(u8, h.provider.last_request.?, "RAN") != null);
+}
+
+extern "c" fn realpath(path: [*:0]const u8, resolved: [*]u8) ?[*:0]u8;
+
+test "trace_path captures step, tool call/result and turn end as JSONL events" {
+    var h = try Harness.init(testing.allocator, &.{ tool_use_msg, end_turn_msg });
+    defer h.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var rel_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const rel = try std.fmt.bufPrintZ(&rel_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = std.mem.span(realpath(rel, &dir_buf) orelse return error.RealpathFailed);
+    const tpath = try std.fmt.allocPrint(testing.allocator, "{s}/events.jsonl", .{dir});
+    defer testing.allocator.free(tpath);
+
+    const req = try std.fmt.allocPrint(testing.allocator,
+        \\{{"model":"fake-1","system":"t","max_steps":4,"turn_id":"tr-1",
+        \\ "provider_function":"zygos::provider::fake::messages",
+        \\ "trace_path":{f},
+        \\ "messages":[{{"role":"user","content":"go"}}],
+        \\ "tools":[{{"name":"runner","function_id":"test::tool::run"}}]}}
+    , .{json.fmt(tpath, .{})});
+    defer testing.allocator.free(req);
+
+    const res = try h.runTurnCall(req);
+    defer res.deinit(testing.allocator);
+    try testing.expect(res == .ok);
+
+    const text = trace_mod.readFile(testing.allocator, tpath) orelse return error.ReadFailed;
+    defer testing.allocator.free(text);
+
+    // Every event kind fired, each line parses, payloads are visible.
+    try testing.expect(std.mem.indexOf(u8, text, "\"event\":\"step\"") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "\"event\":\"tool_call\"") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "echo hi") != null); // tool input
+    try testing.expect(std.mem.indexOf(u8, text, "\"event\":\"tool_result\"") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "ran") != null); // tool output
+    try testing.expect(std.mem.indexOf(u8, text, "\"event\":\"turn_end\"") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "\"stop\":\"end_turn\"") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "\"turn_id\":\"tr-1\"") != null);
+
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, text, "\n"), '\n');
+    while (lines.next()) |line| {
+        var p = try json.parseFromSlice(json.Value, testing.allocator, line, .{});
+        defer p.deinit();
+        try testing.expect(p.value == .object);
+    }
 }
 
 test "no leaks under a multi-step turn" {
