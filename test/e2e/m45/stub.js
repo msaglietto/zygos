@@ -29,6 +29,14 @@ const script = [
   tool('t-count5', 'bash', '{"command":"seq 1 500"}'),
   text('counted'),
   text('{"passed":true,"reason":"acceptance met"}'),
+  // Leg 7 (MCP servers boot): the same mission shape as leg 1.
+  text('{"objective":"Ship the gizmo","acceptance":"greeting written and count run"}'),
+  text('{"tasks":["write a greeting file","count to 500"]}'),
+  tool('t-greet7', 'bash', '{"command":"echo hello > greeting.txt"}'),
+  text('wrote the greeting'),
+  tool('t-count7', 'bash', '{"command":"seq 1 500"}'),
+  text('counted'),
+  text('{"passed":true,"reason":"acceptance met"}'),
 ];
 let i = 0;
 

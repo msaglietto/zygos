@@ -91,6 +91,10 @@ pub fn run(gpa: std.mem.Allocator, args: *std.process.Args.Iterator) u8 {
         eprint("mission: route table {s} names an unknown zygos::providers::* slug\n", .{zon_path});
         return 2;
     };
+    const mcp_cfg = zygos.mcp_client.McpConfig.parse(gpa, zon_text) catch {
+        eprint("mission: cannot parse .mcp_servers in {s}\n", .{zon_path});
+        return 2;
+    };
 
     // ---- kernel + roster (the e2e/m3 wiring, catalog + manual approvals) ----
     var registry = zygos.inproc.Registry.init(gpa, null);
@@ -140,14 +144,44 @@ pub fn run(gpa: std.mem.Allocator, args: *std.process.Args.Iterator) u8 {
     _ = turns;
     const tools = zygos.tools.ToolsWorker.start(gpa, &actor, &registry, cwd) catch return boot_fail();
     _ = tools;
+
+    // ---- MCP servers (.mcp_servers in zygos.zon): spawn + handshake ---------
+    // A configured-but-broken server refuses the run (fail closed); its tools
+    // land on the bus as zygos::mcp::<server>::<tool> and in the turn's tool
+    // list as <server>_<tool>, riding the same policy/trim/budget gates.
+    var mcp_handles: std.ArrayList(zygos.mcp_client.ServerHandle) = .empty;
+    for (mcp_cfg.servers()) |spec| {
+        const child = zygos.mcp_client.ChildProcess.spawn(gpa, spec.argv) catch {
+            eprint("mission: cannot spawn MCP server {s}\n", .{spec.name});
+            return 2;
+        };
+        const cl = gpa.create(zygos.mcp_client.Client) catch return oom();
+        cl.* = zygos.mcp_client.Client.init(gpa, child.transport());
+        mcp_handles.append(gpa, .{ .name = spec.name, .client = cl }) catch return oom();
+    }
+    const mcp: ?*zygos.mcp_client.McpClientWorker = if (mcp_handles.items.len > 0)
+        zygos.mcp_client.McpClientWorker.start(gpa, &actor, &registry, mcp_handles.items) catch {
+            eprint("mission: MCP server handshake failed (fail closed)\n", .{});
+            return 2;
+        }
+    else
+        null;
+
     // bash=allow for X3: the console gate is the human boundary here;
     // per-tool asks return with X5's tightening pass. Web tools (Y1) ride
-    // the same policy gate with the URL in the policy request (Y2).
-    const policy = zygos.policy.PolicyWorker.start(gpa, &actor, &registry, &.{
+    // the same policy gate with the URL in the policy request (Y2). MCP
+    // tools are operator-configured, so they boot as allow too.
+    var policy_rules: std.ArrayList(zygos.policy.Rule) = .empty;
+    policy_rules.appendSlice(gpa, &.{
         .{ .tool = "bash", .verdict = .allow },
         .{ .tool = "web_fetch", .verdict = .allow },
         .{ .tool = "web_search", .verdict = .allow },
-    }) catch return boot_fail();
+    }) catch return oom();
+    if (mcp) |m| {
+        const names = m.toolNames(gpa) catch return oom();
+        for (names) |n| policy_rules.append(gpa, .{ .tool = n, .verdict = .allow }) catch return oom();
+    }
+    const policy = zygos.policy.PolicyWorker.start(gpa, &actor, &registry, policy_rules.items) catch return boot_fail();
     _ = policy;
     // Search backend is operator env config: ZYGOS_SEARCH_ENGINE
     // (brave|searxng) + ZYGOS_SEARCH_ENDPOINT (+ ZYGOS_SEARCH_KEY_ENV,
@@ -221,13 +255,13 @@ pub fn run(gpa: std.mem.Allocator, args: *std.process.Args.Iterator) u8 {
         \\ "role_max_steps":{d},"max_role_turns":{d}{s},
         \\ "tools":[{{"name":"bash","function_id":"zygos::tools::bash"}},
         \\  {{"name":"web_search","function_id":"zygos::tools::web_search"}},
-        \\  {{"name":"web_fetch","function_id":"zygos::tools::web_fetch"}}]}}
+        \\  {{"name":"web_fetch","function_id":"zygos::tools::web_fetch"}}{s}]}}
     , .{
         json.fmt(mission_id, .{}),                   json.fmt(planning, .{}),
         json.fmt(extractObjective(brief_text), .{}), json.fmt(brief_text, .{}),
         json.fmt(mission_id, .{}),                   json.fmt(trace_path, .{}),
         envInt(env, "ZYGOS_ROLE_MAX_STEPS", 24),     envInt(env, "ZYGOS_MAX_ROLE_TURNS", 48),
-        if (resume_flag) ",\"resume\":true" else "",
+        if (resume_flag) ",\"resume\":true" else "", if (mcp) |m| m.toolEntriesJson(gpa) catch return oom() else "",
     }) catch return oom();
 
     const res = caller.call("zygos::missions::start", request) catch {

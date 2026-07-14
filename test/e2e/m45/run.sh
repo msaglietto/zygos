@@ -156,4 +156,51 @@ set -e
 [ "$CODE" = "2" ] || { echo "M45 E2E FAIL leg5b: expected exit 2, got $CODE"; cat "$TMP/err6.log"; exit 1; }
 grep -q "vault checkpoint" "$TMP/err6.log" || { echo "M45 E2E FAIL leg5b: wrong error"; cat "$TMP/err6.log"; exit 1; }
 
-echo "M45 E2E OK: start→done, seeded resume→done, unknown-slug boot refusal, rerun refusal, vault checkpoint"
+# ---- Leg 6: mission trace — events.jsonl written and rendered ----------------
+[ -s "$TMP/planning/events.jsonl" ] || { echo "M45 E2E FAIL leg6: no events.jsonl in the planning root"; exit 1; }
+grep -q '"event":"role_start"' "$TMP/planning/events.jsonl" || { echo "M45 E2E FAIL leg6: no role events"; exit 1; }
+grep -q '"event":"tool_call"' "$TMP/planning/events.jsonl" || { echo "M45 E2E FAIL leg6: no tool_call events"; exit 1; }
+"$BIN" mission trace "$TMP/planning" > "$TMP/trace.txt"
+grep -q "role product-owner" "$TMP/trace.txt" || { echo "M45 E2E FAIL leg6: renderer missing roles"; exit 1; }
+grep -q "tool bash" "$TMP/trace.txt" || { echo "M45 E2E FAIL leg6: renderer missing tool calls"; exit 1; }
+
+# ---- Leg 7: MCP servers from zygos.zon boot onto the bus ----------------------
+cat > "$TMP/mcp-stub.sh" <<'EOF'
+#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *'"initialize"'*) printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"protocolVersion\":\"2025-06-18\"}}" ;;
+    *'tools/list'*)   printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"tools\":[{\"name\":\"lookup\"}]}}" ;;
+    *'tools/call'*)   printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"stub says hi\"}],\"isError\":false}}" ;;
+  esac
+done
+EOF
+chmod +x "$TMP/mcp-stub.sh"
+sed '$d' "$TMP/zygos.zon" > "$TMP/zygos-mcp.zon" # drop the closing brace…
+cat >> "$TMP/zygos-mcp.zon" <<EOF
+    .mcp_servers = .{ .{ .name = "stub", .argv = .{ "$TMP/mcp-stub.sh" } } },
+}
+EOF
+mkdir -p "$TMP/ws7"
+( cd "$TMP/ws7" && printf 'y\ny\ny\n' | ZYGOS_CONFIG="$TMP/zygos-mcp.zon" ZYGOS_LOG=info \
+    "$BIN" mission start "$TMP/brief.md" --planning "$TMP/planning7" > "$TMP/out7.json" 2> "$TMP/err7.log" )
+grep -q '"state":"done"' "$TMP/out7.json" || { echo "M45 E2E FAIL leg7: $(cat "$TMP/out7.json")"; cat "$TMP/err7.log"; exit 1; }
+grep -q "registered zygos::mcp::stub::lookup" "$TMP/err7.log" \
+  || { echo "M45 E2E FAIL leg7: MCP tool not registered"; cat "$TMP/err7.log"; exit 1; }
+
+# A configured-but-broken MCP server refuses the run (fail closed).
+cat > "$TMP/zygos-mcp-bad.zon" <<EOF
+.{
+    .default = .{ .{ .provider_function = "zygos::providers::stub-one", .model = "stub-model-a" } },
+    .mcp_servers = .{ .{ .name = "dead", .argv = .{ "/bin/sh", "-c", "exit 0" } } },
+}
+EOF
+set +e
+( cd "$TMP/ws7" && ZYGOS_CONFIG="$TMP/zygos-mcp-bad.zon" "$BIN" mission start "$TMP/brief.md" --planning "$TMP/planning8" > /dev/null 2> "$TMP/err8.log" < /dev/null )
+CODE=$?
+set -e
+[ "$CODE" = "2" ] || { echo "M45 E2E FAIL leg7b: expected exit 2, got $CODE"; cat "$TMP/err8.log"; exit 1; }
+grep -q "MCP server handshake failed" "$TMP/err8.log" || { echo "M45 E2E FAIL leg7b: wrong error"; cat "$TMP/err8.log"; exit 1; }
+
+echo "M45 E2E OK: start→done, seeded resume→done, unknown-slug boot refusal, rerun refusal, vault checkpoint, trace, mcp"

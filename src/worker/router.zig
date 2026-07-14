@@ -35,7 +35,11 @@ pub const Config = struct {
     pub fn parse(gpa: std.mem.Allocator, zon_text: [:0]const u8) error{ OutOfMemory, ParseZon }!Config {
         return .{
             .gpa = gpa,
-            .data = try std.zon.parse.fromSliceAlloc(ConfigData, gpa, zon_text, null, .{}),
+            // ignore_unknown_fields: zygos.zon also carries non-routing
+            // tables (.mcp_servers) parsed by their own owners.
+            .data = try std.zon.parse.fromSliceAlloc(ConfigData, gpa, zon_text, null, .{
+                .ignore_unknown_fields = true,
+            }),
         };
     }
 

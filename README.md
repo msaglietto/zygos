@@ -200,6 +200,47 @@ denies) when stdin closes. Knobs: `ZYGOS_APPROVAL_TIMEOUT_MS`,
 streams the harness's progress feed (mission transitions, role turns,
 per-step provider/model, tool dispatches) to stderr; `debug` for more.
 
+## Mission trace — the harness view
+
+Every `zygos mission start` writes a structured event log to
+`<planning>/events.jsonl`: mission transitions, role boundaries, per-step
+provider/model, and **every tool call with its input and (clipped) output**.
+Emission is fail-open — an unwritable trace never changes a run's outcome.
+Render it live or post-mortem:
+
+```console
+$ zygos mission trace .planning-20260711-015510
+02:13:20 ── role executor (turn 3, tools on)
+02:13:22   step 1: glm-5.2 via zygos::providers::glm-5-2
+02:13:23     tool web_search {"query":"neural provers 2026"}
+02:13:24       → 5120B: [{"title":"DeepSeek-Prover-V4"},...]
+02:13:25   turn end: max_steps (24 steps)
+02:13:26 ── role executor: failed — executor turn stopped: max_steps
+```
+
+`zig build test` covers the emitters (turn + mission drivers) and the
+renderer; the raw JSONL is the source of truth, the renderer never hides
+unparseable lines.
+
+## MCP servers as tool providers
+
+`zygos.zon` may carry an `.mcp_servers` table; each entry is spawned over
+stdio (JSON-RPC 2.0, MCP `2025-06-18`), handshaken, and its tools registered
+on the bus as `zygos::mcp::<server>::<tool>` — exposed to the model as
+`<server>_<tool>` and riding the same policy/trim/budget gates as native
+tools (Y2 semantics). A configured-but-broken server refuses the run at boot
+(fail closed); a server dying mid-run yields structured
+`{"error":"McpServerUnavailable"}` tool results, never a hang.
+
+```zon
+.{
+    .routes = .{ ... },
+    .mcp_servers = .{
+        .{ .name = "tavily", .argv = .{ "npx", "-y", "tavily-mcp" } },
+    },
+}
+```
+
 The X4 companion is a manual smoke over the **real** catalog — two turns
 routed to two different live providers:
 
