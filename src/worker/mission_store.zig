@@ -136,12 +136,13 @@ fn serialize(gpa: std.mem.Allocator, m: *const mission_mod.Mission) StoreError![
 
     return std.fmt.allocPrint(gpa, "{{\"mission_id\":{f},\"state\":\"{t}\",\"stop\":\"{t}\"," ++
         "\"detail\":{f},\"objective\":{f},\"acceptance\":{f},\"feedback\":{f}," ++
-        "\"tasks\":[{s}],\"task_index\":{d},\"fail_count\":{d},\"gate_denials\":{d}," ++
-        "\"role_turns_used\":{d}}}", .{
+        "\"tasks\":[{s}],\"task_index\":{d},\"fail_count\":{d},\"exec_fail_count\":{d}," ++
+        "\"gate_denials\":{d},\"role_turns_used\":{d}}}", .{
         json.fmt(m.mission_id, .{}), m.state,                    m.stop,
         json.fmt(m.detail, .{}),     json.fmt(m.objective, .{}), json.fmt(m.acceptance, .{}),
         json.fmt(m.feedback, .{}),   tasks_json,                 m.task_index,
-        m.fail_count,                m.gate_denials,             m.role_turns_used,
+        m.fail_count,                m.exec_fail_count,          m.gate_denials,
+        m.role_turns_used,
     }) catch return error.OutOfMemory;
 }
 
@@ -209,6 +210,9 @@ fn deserialize(gpa: std.mem.Allocator, bytes: []const u8) StoreError!mission_mod
         .tasks = tasks,
         .task_index = try uintField(obj, "task_index"),
         .fail_count = try uintField(obj, "fail_count"),
+        // Absent in substrates written before the executor-retry change —
+        // default 0, never Corrupt (resume compatibility).
+        .exec_fail_count = uintField(obj, "exec_fail_count") catch 0,
         .gate_denials = try uintField(obj, "gate_denials"),
         .role_turns_used = try uintField(obj, "role_turns_used"),
     };
@@ -266,6 +270,7 @@ fn sampleMission() mission_mod.Mission {
         .tasks = @constCast(&sample_tasks),
         .task_index = 1,
         .fail_count = 2,
+        .exec_fail_count = 1,
         .gate_denials = 1,
         .role_turns_used = 5,
     };
@@ -299,8 +304,28 @@ test "save then load round-trips every Mission field" {
     }
     try testing.expectEqual(m.task_index, got.task_index);
     try testing.expectEqual(m.fail_count, got.fail_count);
+    try testing.expectEqual(m.exec_fail_count, got.exec_fail_count);
     try testing.expectEqual(m.gate_denials, got.gate_denials);
     try testing.expectEqual(m.role_turns_used, got.role_turns_used);
+}
+
+test "load defaults exec_fail_count to 0 for pre-retry substrates" {
+    var t = TestRoot.init();
+    defer t.deinit();
+    const store = Store.init(try t.path());
+
+    // A state file written before the executor-retry change: no
+    // exec_fail_count key. Loading must default it, never reject.
+    const legacy =
+        \\{"mission_id":"m-old","state":"executing","stop":"none","detail":"",
+        \\ "objective":"x","acceptance":"","feedback":"","tasks":[],
+        \\ "task_index":0,"fail_count":1,"gate_denials":0,"role_turns_used":2}
+    ;
+    try store.writeArtifact(testing.allocator, state_file, legacy);
+    var got = try store.load(testing.allocator);
+    defer got.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 0), got.exec_fail_count);
+    try testing.expectEqual(@as(usize, 1), got.fail_count);
 }
 
 test "save is atomic: no tmp residue, overwrite replaces cleanly" {

@@ -69,6 +69,9 @@ pub const transitions = [_]Transition{
     .{ .from = .planning, .event = .abort, .to = .failed },
     .{ .from = .executing, .event = .task_done, .to = .executing },
     .{ .from = .executing, .event = .tasks_done, .to = .verifying },
+    // Executor step-budget exhaustion past fail_threshold (retries happen
+    // without a transition — the state loops on .executing).
+    .{ .from = .executing, .event = .escalate, .to = .failed },
     .{ .from = .executing, .event = .role_failed, .to = .failed },
     .{ .from = .executing, .event = .role_turns_exhausted, .to = .failed },
     .{ .from = .executing, .event = .abort, .to = .failed },
@@ -126,6 +129,10 @@ pub const Mission = struct {
     tasks: []Task = &.{},
     task_index: usize = 0,
     fail_count: usize = 0,
+    /// Step-budget exhaustions on the current task (executor retries);
+    /// separate from fail_count so verify's "consecutive failures"
+    /// escalation semantics stay untouched. Reset when a task completes.
+    exec_fail_count: usize = 0,
     gate_denials: usize = 0,
     role_turns_used: usize = 0,
 
@@ -560,6 +567,7 @@ fn replyTerminal(arena: std.mem.Allocator, m: *const Mission) error{OutOfMemory}
 const RoleOut = union(enum) {
     ok: []const u8, // final assistant text, arena-owned
     failed: []const u8, // human-readable reason, arena-owned
+    exhausted, // the turn stopped on its step budget (max_steps), not an error
 };
 
 /// One role = one `zygos::turns::run` turn. Counts against max_role_turns
@@ -596,6 +604,12 @@ fn runRole(
             cfg.trace_path,
             "\"event\":\"role_end\",\"role\":{f},\"outcome\":\"failed\",\"reason\":{f}",
             .{ json.fmt(role.stepId(), .{}), json.fmt(reason, .{}) },
+        ),
+        .exhausted => try trace_mod.event(
+            arena,
+            cfg.trace_path,
+            "\"event\":\"role_end\",\"role\":{f},\"outcome\":\"exhausted\"",
+            .{json.fmt(role.stepId(), .{})},
         ),
     }
     return out;
@@ -656,6 +670,7 @@ fn runRoleTurn(
                 return .{ .failed = "malformed turn reply" };
             if (reply != .object) return .{ .failed = "malformed turn reply" };
             const stop = strField(reply.object, "stop") orelse "failed";
+            if (std.mem.eql(u8, stop, "max_steps")) return .exhausted;
             if (!std.mem.eql(u8, stop, "end_turn"))
                 return .{ .failed = try std.fmt.allocPrint(arena, "{s} turn stopped: {s}", .{ role.stepId(), stop }) };
 
@@ -732,6 +747,7 @@ fn rejectRole(
 fn roleDefine(self: *MissionOrchestrator, arena: std.mem.Allocator, cfg: RunConfig, m: *Mission) MissionError!void {
     switch (try runRole(self, arena, cfg, m, .product_owner, m.objective, false)) {
         .failed => |reason| try failRole(m, reason),
+        .exhausted => try failRole(m, "product-owner turn stopped: max_steps"),
         .ok => |text| {
             const parsed = json.parseFromSliceLeaky(json.Value, arena, unwrapFence(text), .{}) catch
                 return rejectRole(self, arena, cfg, m, .product_owner, text, "product-owner output is not JSON");
@@ -766,6 +782,7 @@ fn rolePlan(self: *MissionOrchestrator, arena: std.mem.Allocator, cfg: RunConfig
 
     switch (try runRole(self, arena, cfg, m, .planner, content, false)) {
         .failed => |reason| try failRole(m, reason),
+        .exhausted => try failRole(m, "planner turn stopped: max_steps"),
         .ok => |text| {
             const parsed = json.parseFromSliceLeaky(json.Value, arena, unwrapFence(text), .{}) catch
                 return rejectRole(self, arena, cfg, m, .planner, text, "planner output is not JSON");
@@ -798,14 +815,42 @@ fn rolePlan(self: *MissionOrchestrator, arena: std.mem.Allocator, cfg: RunConfig
 
 fn roleExecute(self: *MissionOrchestrator, arena: std.mem.Allocator, cfg: RunConfig, m: *Mission) MissionError!void {
     std.debug.assert(m.task_index < m.tasks.len);
-    const content = try std.fmt.allocPrint(
-        arena,
-        "Objective:\n{s}\n\nYour task:\n{s}\n",
-        .{ m.objective, m.tasks[m.task_index].desc },
-    );
+    const content = if (m.feedback.len > 0)
+        try std.fmt.allocPrint(
+            arena,
+            "Objective:\n{s}\n\nYour task:\n{s}\n\nFeedback on the previous attempt:\n{s}\n",
+            .{ m.objective, m.tasks[m.task_index].desc, m.feedback },
+        )
+    else
+        try std.fmt.allocPrint(
+            arena,
+            "Objective:\n{s}\n\nYour task:\n{s}\n",
+            .{ m.objective, m.tasks[m.task_index].desc },
+        );
     switch (try runRole(self, arena, cfg, m, .executor, content, true)) {
         .failed => |reason| try failRole(m, reason),
+        // A step-budget stop is exhaustion, not malfunction: retry the same
+        // task with feedback, counted against the same escalation threshold
+        // as verify failures — never an instant mission failure.
+        .exhausted => {
+            m.exec_fail_count += 1;
+            if (m.exec_fail_count >= cfg.fail_threshold) {
+                m.stop = .escalated;
+                m.detail = try std.fmt.allocPrint(
+                    arena,
+                    "executor step budget exhausted {d} times on task {d}",
+                    .{ m.exec_fail_count, m.task_index + 1 },
+                );
+                m.state = try Fsm.apply(m.state, .escalate);
+            } else {
+                m.feedback = "the previous attempt ran out of steps (max_steps); " ++
+                    "finish this task with fewer, more decisive tool calls and then stop";
+                // state stays .executing — the loop re-runs this task.
+            }
+        },
         .ok => {
+            m.feedback = "";
+            m.exec_fail_count = 0;
             m.tasks[m.task_index].done = true;
             m.task_index += 1;
             m.state = try Fsm.apply(m.state, if (m.task_index == m.tasks.len) .tasks_done else .task_done);
@@ -825,6 +870,7 @@ fn roleVerify(self: *MissionOrchestrator, arena: std.mem.Allocator, cfg: RunConf
     );
     switch (try runRole(self, arena, cfg, m, .verifier, content, false)) {
         .failed => |reason| try failRole(m, reason),
+        .exhausted => try failRole(m, "verifier turn stopped: max_steps"),
         .ok => |text| {
             const parsed = json.parseFromSliceLeaky(json.Value, arena, unwrapFence(text), .{}) catch
                 return rejectRole(self, arena, cfg, m, .verifier, text, "verifier output is not JSON");
@@ -944,6 +990,7 @@ fn cloneToArena(arena: std.mem.Allocator, m: *const Mission) error{OutOfMemory}!
         .tasks = tasks,
         .task_index = m.task_index,
         .fail_count = m.fail_count,
+        .exec_fail_count = m.exec_fail_count,
         .gate_denials = m.gate_denials,
         .role_turns_used = m.role_turns_used,
     };
@@ -1341,6 +1388,73 @@ test "happy path: define, plan, execute x2, verify, gate approve; artifacts + te
     try testing.expectEqual(State.done, m.state);
     try testing.expectEqual(StopReason.completed, m.stop);
     try testing.expectEqual(@as(usize, 2), m.tasksDone());
+}
+
+// An executor step that always wants another tool round: with role_max_steps
+// pinned low, the turn stops as max_steps instead of end_turn.
+const exec_toolspin =
+    \\{"stop_reason":"tool_use","content":[{"type":"tool_use","id":"t1","name":"noop","input":{}}]}
+;
+
+test "executor max_steps retries the task with feedback instead of failing the mission" {
+    var h = try Harness.init(testing.allocator, &.{
+        po_ok, plan1, exec_toolspin, exec_ok, verify_pass,
+    });
+    defer h.deinit();
+    const approvals = try approval_mod.ApprovalWorker.start(testing.allocator, &h.actor, &h.registry, .auto_approve);
+    defer approvals.stop();
+
+    const req = try h.startReq(testing.allocator, seed_and_gate ++ ",\"role_max_steps\":1");
+    defer testing.allocator.free(req);
+    const res = try h.caller.call("zygos::missions::start", req);
+    defer res.deinit(testing.allocator);
+    try testing.expect(res == .ok);
+    try expectTerminal(res.ok, "done", "completed");
+
+    // The retry executor turn (call 3, 0-based) carried step-budget feedback.
+    h.provider.mutex.lock();
+    const retry_req = h.provider.requests.items[3];
+    try testing.expect(std.mem.indexOf(u8, retry_req, "ran out of steps") != null);
+    h.provider.mutex.unlock();
+
+    var m = try h.store().load(testing.allocator);
+    defer m.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 0), m.fail_count); // reset on verify pass
+}
+
+test "executor exhausting its step budget fail_threshold times escalates to failed" {
+    var h = try Harness.init(testing.allocator, &.{ po_ok, plan1, exec_toolspin });
+    defer h.deinit();
+
+    const req = try h.startReq(
+        testing.allocator,
+        seed_and_gate ++ ",\"role_max_steps\":1,\"fail_threshold\":2",
+    );
+    defer testing.allocator.free(req);
+    const res = try h.caller.call("zygos::missions::start", req);
+    defer res.deinit(testing.allocator);
+    try testing.expect(res == .ok);
+    try expectTerminal(res.ok, "failed", "escalated");
+
+    var p = try json.parseFromSlice(json.Value, testing.allocator, res.ok, .{});
+    defer p.deinit();
+    try testing.expect(std.mem.indexOf(u8, p.value.object.get("detail").?.string, "step budget") != null);
+    // 2 setup turns + exactly fail_threshold executor attempts.
+    try testing.expectEqual(@as(i64, 4), p.value.object.get("role_turns").?.integer);
+}
+
+test "non-executor role hitting max_steps still fails the mission (no retry loop)" {
+    var h = try Harness.init(testing.allocator, &.{
+        \\{"stop_reason":"tool_use","content":[{"type":"tool_use","id":"t1","name":"noop","input":{}}]}
+    });
+    defer h.deinit();
+
+    const req = try h.startReq(testing.allocator, seed_and_gate ++ ",\"role_max_steps\":1");
+    defer testing.allocator.free(req);
+    const res = try h.caller.call("zygos::missions::start", req);
+    defer res.deinit(testing.allocator);
+    try testing.expect(res == .ok);
+    try expectTerminal(res.ok, "failed", "role_failed");
 }
 
 test "verify fail replans with the verdict as feedback, then passes" {
