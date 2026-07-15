@@ -253,9 +253,19 @@ pub fn run(gpa: std.mem.Allocator, args: *std.process.Args.Iterator) u8 {
         \\ "approval_function":"zygos::approvals::request",
         \\ "budget_scope":{f},"trace_path":{f},
         \\ "role_max_steps":{d},"max_role_turns":{d}{s},
-        \\ "tools":[{{"name":"bash","function_id":"zygos::tools::bash"}},
-        \\  {{"name":"web_search","function_id":"zygos::tools::web_search"}},
-        \\  {{"name":"web_fetch","function_id":"zygos::tools::web_fetch"}}{s}]}}
+        \\ "tools":[
+        \\  {{"name":"bash","function_id":"zygos::tools::bash",
+        \\   "description":"Run a shell command in the mission workspace and get its output.",
+        \\   "input_schema":{{"type":"object","properties":{{"command":{{"type":"string",
+        \\    "description":"the shell command to run"}}}},"required":["command"]}}}},
+        \\  {{"name":"web_search","function_id":"zygos::tools::web_search",
+        \\   "description":"Search the web; returns a list of {{title,url,snippet}} results.",
+        \\   "input_schema":{{"type":"object","properties":{{"query":{{"type":"string",
+        \\    "description":"the search query"}}}},"required":["query"]}}}},
+        \\  {{"name":"web_fetch","function_id":"zygos::tools::web_fetch",
+        \\   "description":"Fetch a URL and return its readable text content.",
+        \\   "input_schema":{{"type":"object","properties":{{"url":{{"type":"string",
+        \\    "description":"the absolute http(s) URL to fetch"}}}},"required":["url"]}}}}{s}]}}
     , .{
         json.fmt(mission_id, .{}),                   json.fmt(planning, .{}),
         json.fmt(extractObjective(brief_text), .{}), json.fmt(brief_text, .{}),

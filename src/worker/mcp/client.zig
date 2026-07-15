@@ -40,10 +40,17 @@ pub const Transport = struct {
 pub const ClientError = error{ OutOfMemory, Io, Protocol };
 
 pub const ToolDef = struct {
-    name: []u8, // gpa-owned
+    // All gpa-owned. Schema/description ride to the provider request —
+    // a tool without its input schema gets called with empty arguments by
+    // schema-following models (the first real Y5 failure mode).
+    name: []u8,
+    description: []u8,
+    schema_json: []u8, // raw inputSchema JSON; "{}" when the server omits it
 
     pub fn deinit(self: *ToolDef, gpa: std.mem.Allocator) void {
         gpa.free(self.name);
+        gpa.free(self.description);
+        gpa.free(self.schema_json);
     }
 };
 
@@ -96,7 +103,20 @@ pub const Client = struct {
             if (tv != .object) return error.Protocol;
             const name = strField(tv.object, "name") orelse return error.Protocol;
             if (name.len == 0) return error.Protocol;
-            try defs.append(self.gpa, .{ .name = try self.gpa.dupe(u8, name) });
+            const name_owned = try self.gpa.dupe(u8, name);
+            errdefer self.gpa.free(name_owned);
+            const desc_owned = try self.gpa.dupe(u8, strField(tv.object, "description") orelse "");
+            errdefer self.gpa.free(desc_owned);
+            const schema_owned = blk: {
+                const s = tv.object.get("inputSchema") orelse break :blk try self.gpa.dupe(u8, "{}");
+                break :blk try rawJsonGpa(self.gpa, s);
+            };
+            errdefer self.gpa.free(schema_owned);
+            try defs.append(self.gpa, .{
+                .name = name_owned,
+                .description = desc_owned,
+                .schema_json = schema_owned,
+            });
         }
         return defs.toOwnedSlice(self.gpa);
     }
@@ -186,6 +206,14 @@ pub const Client = struct {
 fn strField(obj: json.ObjectMap, key: []const u8) ?[]const u8 {
     const v = obj.get(key) orelse return null;
     return if (v == .string) v.string else null;
+}
+
+fn rawJsonGpa(gpa: std.mem.Allocator, value: json.Value) error{OutOfMemory}![]u8 {
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    errdefer out.deinit();
+    var ws: json.Stringify = .{ .writer = &out.writer, .options = .{ .whitespace = .minified } };
+    ws.write(value) catch return error.OutOfMemory;
+    return out.toOwnedSlice() catch return error.OutOfMemory;
 }
 
 // ---------------------------------------------------------------------------
@@ -386,6 +414,8 @@ pub const McpClientWorker = struct {
         tool: []u8,
         function_id: []u8,
         model_name: []u8, // "<server>_<tool>" — Anthropic tool-name-safe
+        description: []u8,
+        schema_json: []u8,
     };
 
     /// initialize + tools/list every server and register each tool as
@@ -425,11 +455,15 @@ pub const McpClientWorker = struct {
                     .tool = try gpa.dupe(u8, d.name),
                     .function_id = try std.fmt.allocPrint(gpa, "zygos::mcp::{s}::{s}", .{ srv.name, d.name }),
                     .model_name = try std.fmt.allocPrint(gpa, "{s}_{s}", .{ srv.name, d.name }),
+                    .description = try gpa.dupe(u8, d.description),
+                    .schema_json = try gpa.dupe(u8, d.schema_json),
                 };
                 errdefer {
                     gpa.free(b.tool);
                     gpa.free(b.function_id);
                     gpa.free(b.model_name);
+                    gpa.free(b.description);
+                    gpa.free(b.schema_json);
                 }
                 try self.bindings.append(gpa, b);
                 try self.worker.registerFunction(b.function_id, b, &callHandler);
@@ -452,6 +486,8 @@ pub const McpClientWorker = struct {
             self.gpa.free(b.tool);
             self.gpa.free(b.function_id);
             self.gpa.free(b.model_name);
+            self.gpa.free(b.description);
+            self.gpa.free(b.schema_json);
             self.gpa.destroy(b);
         }
         self.bindings.deinit(self.gpa);
@@ -463,9 +499,14 @@ pub const McpClientWorker = struct {
         var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(gpa);
         for (self.bindings.items) |b| {
-            const entry = try std.fmt.allocPrint(gpa, ",{{\"name\":{f},\"function_id\":{f}}}", .{
-                json.fmt(b.model_name, .{}), json.fmt(b.function_id, .{}),
-            });
+            const entry = try std.fmt.allocPrint(
+                gpa,
+                ",{{\"name\":{f},\"function_id\":{f},\"description\":{f},\"input_schema\":{s}}}",
+                .{
+                    json.fmt(b.model_name, .{}),  json.fmt(b.function_id, .{}),
+                    json.fmt(b.description, .{}), b.schema_json,
+                },
+            );
             defer gpa.free(entry);
             try out.appendSlice(gpa, entry);
         }
@@ -516,7 +557,9 @@ const init_reply =
     \\{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{},"serverInfo":{"name":"stub","version":"1"}}}
 ;
 const list_reply =
-    \\{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"search","inputSchema":{}},{"name":"fetch","inputSchema":{}}]}}
+    \\{"jsonrpc":"2.0","id":2,"result":{"tools":[
+    \\ {"name":"search","description":"web search","inputSchema":{"type":"object","properties":{"q":{"type":"string"}},"required":["q"]}},
+    \\ {"name":"fetch","inputSchema":{}}]}}
 ;
 
 /// Scripted transport: records written lines, replays scripted reads.
@@ -599,7 +642,11 @@ test "listTools parses names; notifications interleaved before the reply are ski
     }
     try testing.expectEqual(@as(usize, 2), defs.len);
     try testing.expectEqualStrings("search", defs[0].name);
+    try testing.expectEqualStrings("web search", defs[0].description);
+    try testing.expect(std.mem.indexOf(u8, defs[0].schema_json, "\"required\":[\"q\"]") != null);
     try testing.expectEqualStrings("fetch", defs[1].name);
+    try testing.expectEqualStrings("", defs[1].description);
+    try testing.expectEqualStrings("{}", defs[1].schema_json);
 }
 
 test "callTool concatenates text content and carries isError through" {
@@ -703,6 +750,15 @@ test "worker registers zygos::mcp::<server>::<tool> and bridges tools/call over 
     try testing.expect(std.mem.indexOf(u8, wire, "\"method\":\"tools/call\"") != null);
     try testing.expect(std.mem.indexOf(u8, wire, "\"name\":\"search\"") != null);
     try testing.expect(std.mem.indexOf(u8, wire, "\"q\":\"zig\"") != null);
+
+    // Turn-request entries carry the schema + description to the provider —
+    // schema-less tools get called with empty arguments by strict models.
+    const entries = try mcp.toolEntriesJson(testing.allocator);
+    defer testing.allocator.free(entries);
+    try testing.expect(std.mem.indexOf(u8, entries, "\"name\":\"stub_search\"") != null);
+    try testing.expect(std.mem.indexOf(u8, entries, "\"description\":\"web search\"") != null);
+    try testing.expect(std.mem.indexOf(u8, entries, "\"input_schema\":{") != null);
+    try testing.expect(std.mem.indexOf(u8, entries, "\"required\":[\"q\"]") != null);
 }
 
 test "worker maps MCP tool isError and dead transports to structured error payloads" {
