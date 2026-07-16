@@ -7,6 +7,7 @@
 const std = @import("std");
 
 pub const width = @import("width.zig");
+pub const term = @import("term.zig");
 
 test {
     std.testing.refAllDecls(@This());
