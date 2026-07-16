@@ -58,6 +58,22 @@ pub const Terminal = struct {
     }
 };
 
+/// Termios snapshot for the panic/signal path. One tty per process, so a
+/// module-level slot suffices; enterRaw fills it, restore clears it.
+var emergency_saved: ?std.c.termios = null;
+
+/// Best-effort terminal repair for panic and signal handlers: re-show the
+/// cursor, reset SGR, end synchronized output, restore cooked mode. Only
+/// async-signal-safe calls (write, tcsetattr). Idempotent, never fails.
+pub fn emergencyRestore() void {
+    const seq = esc.show_cursor ++ esc.sgr_reset ++ esc.sync_off ++ "\r\n";
+    _ = std.c.write(2, seq, seq.len);
+    if (emergency_saved) |t| {
+        _ = std.c.tcsetattr(0, .FLUSH, &t);
+        emergency_saved = null;
+    }
+}
+
 /// Real tty on fd 2 (out) / fd 0 (in). enterRaw/restore are idempotent;
 /// restore also re-shows the cursor and resets SGR so an aborted TUI never
 /// leaves the shell garbled.
@@ -76,6 +92,7 @@ pub const RealTerm = struct {
         var t: std.c.termios = undefined;
         if (std.c.tcgetattr(0, &t) != 0) return false;
         self.saved = t;
+        emergency_saved = t;
         t.lflag.ECHO = false;
         t.lflag.ICANON = false;
         t.lflag.ISIG = false;
@@ -98,6 +115,7 @@ pub const RealTerm = struct {
         if (self.saved) |t| {
             _ = std.c.tcsetattr(0, .FLUSH, &t);
             self.saved = null;
+            emergency_saved = null;
         }
     }
 

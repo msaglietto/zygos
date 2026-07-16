@@ -11,6 +11,11 @@ pub const term = @import("term.zig");
 pub const theme = @import("theme.zig");
 pub const frame = @import("frame.zig");
 pub const model = @import("model.zig");
+pub const loop = @import("loop.zig");
+pub const logbridge = @import("logbridge.zig");
+
+pub const Tui = loop.Tui;
+pub const emergencyRestore = term.emergencyRestore;
 
 test {
     std.testing.refAllDecls(@This());
