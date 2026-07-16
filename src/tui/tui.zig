@@ -9,6 +9,7 @@ const std = @import("std");
 pub const width = @import("width.zig");
 pub const term = @import("term.zig");
 pub const theme = @import("theme.zig");
+pub const frame = @import("frame.zig");
 
 test {
     std.testing.refAllDecls(@This());
