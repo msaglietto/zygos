@@ -192,6 +192,8 @@ fn renderLine(
             if (boolOf(obj, "is_error")) " ERROR" else "",
             str(obj, "output") orelse "",
         });
+    } else if (std.mem.eql(u8, ev, "usage")) {
+        try appendFmt(gpa, &w, "    usage: {d}↑ {d}↓", .{ int(obj, "input_tokens"), int(obj, "output_tokens") });
     } else if (std.mem.eql(u8, ev, "turn_end")) {
         try appendFmt(gpa, &w, "  turn end: {s} ({d} steps)", .{ str(obj, "stop") orelse "?", int(obj, "steps") });
         if (str(obj, "error")) |e| try appendFmt(gpa, &w, " — {s}", .{e});
@@ -290,6 +292,7 @@ test "render pretty-prints every event kind and passes unknown lines through raw
         \\{"ts":1752200002000,"event":"step","turn_id":"","step":1,"provider":"zygos::providers::glm-5-2","model":"glm-5.2","attempt":0}
         \\{"ts":1752200003000,"event":"tool_call","turn_id":"","step":1,"tool":"web_search","input":"{\"query\":\"zig allocators\"}"}
         \\{"ts":1752200004000,"event":"tool_result","step":1,"tool":"web_search","is_error":false,"bytes":5120,"output":"[{\"title\":\"Zig\"}]"}
+        \\{"ts":1752200004500,"event":"usage","turn_id":"","step":1,"input_tokens":12400,"output_tokens":3100}
         \\{"ts":1752200005000,"event":"turn_end","turn_id":"","stop":"max_steps","steps":24}
         \\{"ts":1752200006000,"event":"role_end","role":"executor","outcome":"failed","reason":"executor turn stopped: max_steps"}
         \\not-json garbage line
@@ -304,6 +307,7 @@ test "render pretty-prints every event kind and passes unknown lines through raw
     try testing.expect(std.mem.indexOf(u8, out, "web_search") != null);
     try testing.expect(std.mem.indexOf(u8, out, "zig allocators") != null); // tool input visible
     try testing.expect(std.mem.indexOf(u8, out, "5120B") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "12400↑ 3100↓") != null);
     try testing.expect(std.mem.indexOf(u8, out, "title") != null); // tool output visible
     try testing.expect(std.mem.indexOf(u8, out, "max_steps") != null);
     try testing.expect(std.mem.indexOf(u8, out, "failed") != null);

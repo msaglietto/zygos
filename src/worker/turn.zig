@@ -104,12 +104,22 @@ const TurnControl = struct {
     steer_text: std.ArrayList(u8) = .empty,
 };
 
+/// In-process observer of streamed text deltas (e.g. the mission TUI).
+/// Called on the per-step drain thread; `bytes` are valid only for the
+/// duration of the call — observers copy, never retain.
+pub const DeltaObserver = struct {
+    ctx: *anyopaque,
+    onDelta: *const fn (ctx: *anyopaque, turn_id: []const u8, bytes: []const u8) void,
+};
+
 pub const TurnOrchestrator = struct {
     gpa: std.mem.Allocator,
     actor: *actor_mod.Actor,
     worker: *inproc.Worker,
     ctl_mutex: sync.Mutex = .{},
     controls: std.StringHashMap(*TurnControl),
+    /// Set before any turn runs (unsynchronized: turns snapshot it at start).
+    delta_observer: ?DeltaObserver = null,
 
     pub fn start(
         gpa: std.mem.Allocator,
@@ -129,6 +139,12 @@ pub const TurnOrchestrator = struct {
         try self.worker.registerFunction("zygos::turns::abort", self, &abortHandler);
         try self.worker.registerFunction("zygos::turns::steer", self, &steerHandler);
         return self;
+    }
+
+    /// Install the live-delta observer. Call before any turn runs; runTurn
+    /// snapshots the field once at turn start.
+    pub fn setDeltaObserver(self: *TurnOrchestrator, obs: ?DeltaObserver) void {
+        self.delta_observer = obs;
     }
 
     pub fn stop(self: *TurnOrchestrator) void {
@@ -430,13 +446,23 @@ const ToolRoute = struct {
 const DeltaLog = struct {
     mutex: sync.Mutex = .{},
     buf: std.ArrayList(u8) = .empty,
+    /// Snapshot of the orchestrator's observer at turn start. `turn_id`
+    /// points into the request arena — safe because every drain thread is
+    /// joined before runTurn returns (the arena outlives the thread).
+    observer: ?DeltaObserver = null,
+    turn_id: []const u8 = "",
 
     fn drain(self: *DeltaLog, gpa: std.mem.Allocator, receiver: *channel_mod.Receiver) void {
         while (receiver.pop()) |item| {
             defer item.deinit(gpa);
-            self.mutex.lock();
-            defer self.mutex.unlock();
-            self.buf.appendSlice(gpa, item.bytes()) catch {};
+            {
+                self.mutex.lock();
+                defer self.mutex.unlock();
+                self.buf.appendSlice(gpa, item.bytes()) catch {};
+            }
+            // Outside the DeltaLog mutex: the observer takes its own locks
+            // (TUI model), and holding both invites ordering deadlocks.
+            if (self.observer) |o| o.onDelta(o.ctx, self.turn_id, item.bytes());
         } else |_| {} // EndOfStream
     }
 };
@@ -502,7 +528,10 @@ fn runTurn(self: *TurnOrchestrator, arena: std.mem.Allocator, request_json: []co
         for (msgs.array.items) |m| try transcript.append(arena, try rawJson(arena, m));
     }
 
-    var deltas: DeltaLog = .{};
+    var deltas: DeltaLog = .{
+        .observer = self.delta_observer,
+        .turn_id = turn_id orelse "",
+    };
     defer {
         deltas.buf.deinit(self.gpa);
         deltas.mutex.deinit();
@@ -642,11 +671,20 @@ fn runTurn(self: *TurnOrchestrator, arena: std.mem.Allocator, request_json: []co
                 const stop_reason = strField(msg.object, "stop_reason") orelse "end_turn";
 
                 // U5 accounting — synchronous so the next provisioning
-                // check observes this step's usage.
-                if (budget_scope) |scope| {
-                    if (msg.object.get("usage")) |u| if (u == .object)
-                        try self.recordUsage(arena, scope, u.object);
-                }
+                // check observes this step's usage. The usage trace event is
+                // independent of budgeting: token totals are observability.
+                if (msg.object.get("usage")) |u| if (u == .object) {
+                    if (budget_scope) |scope| try self.recordUsage(arena, scope, u.object);
+                    try trace_mod.event(
+                        arena,
+                        trace_path,
+                        "\"event\":\"usage\",\"turn_id\":{f},\"step\":{d},\"input_tokens\":{d},\"output_tokens\":{d}",
+                        .{
+                            json.fmt(turn_id orelse "", .{}),   steps,
+                            intField(u.object, "input_tokens"), intField(u.object, "output_tokens"),
+                        },
+                    );
+                };
                 const content = msg.object.get("content") orelse json.Value{ .array = .init(arena) };
 
                 // Assistant message joins the transcript either way.
@@ -811,6 +849,11 @@ fn toolResult(arena: std.mem.Allocator, tool_use_id: []const u8, content: []cons
 fn strField(obj: json.ObjectMap, key: []const u8) ?[]const u8 {
     const v = obj.get(key) orelse return null;
     return if (v == .string) v.string else null;
+}
+
+fn intField(obj: json.ObjectMap, key: []const u8) i64 {
+    const v = obj.get(key) orelse return 0;
+    return if (v == .integer) v.integer else 0;
 }
 
 fn controlTarget(arena: std.mem.Allocator, request_json: []const u8) ?[]const u8 {
@@ -1156,6 +1199,99 @@ test "deltas streamed over the kernel channel are captured in order" {
     var p = try json.parseFromSlice(json.Value, testing.allocator, res.ok, .{});
     defer p.deinit();
     try testing.expectEqualStrings("hello world", p.value.object.get("deltas").?.string);
+}
+
+const DeltaCapture = struct {
+    gpa: std.mem.Allocator,
+    mutex: sync.Mutex = .{},
+    turn_ids: std.ArrayList([]u8) = .empty,
+    chunks: std.ArrayList([]u8) = .empty,
+
+    fn onDelta(ctx: *anyopaque, turn_id: []const u8, bytes: []const u8) void {
+        const self: *DeltaCapture = @ptrCast(@alignCast(ctx));
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        // Copies only: the observer contract forbids retaining the slices.
+        const tid = self.gpa.dupe(u8, turn_id) catch return;
+        const chunk = self.gpa.dupe(u8, bytes) catch {
+            self.gpa.free(tid);
+            return;
+        };
+        self.turn_ids.append(self.gpa, tid) catch self.gpa.free(tid);
+        self.chunks.append(self.gpa, chunk) catch self.gpa.free(chunk);
+    }
+
+    fn observer(self: *DeltaCapture) DeltaObserver {
+        return .{ .ctx = @ptrCast(self), .onDelta = &onDelta };
+    }
+
+    fn deinit(self: *DeltaCapture) void {
+        for (self.turn_ids.items) |t| self.gpa.free(t);
+        self.turn_ids.deinit(self.gpa);
+        for (self.chunks.items) |c| self.gpa.free(c);
+        self.chunks.deinit(self.gpa);
+        self.mutex.deinit();
+    }
+};
+
+test "delta observer sees every delta in order with the turn id" {
+    var h = try Harness.init(testing.allocator, &.{end_turn_msg});
+    defer h.deinit();
+    var cap = DeltaCapture{ .gpa = testing.allocator };
+    defer cap.deinit();
+    h.orch.setDeltaObserver(cap.observer());
+
+    const res = try h.runTurnCall(
+        \\{"model":"fake-1","system":"s","max_steps":4,"turn_id":"t-obs",
+        \\ "provider_function":"zygos::provider::fake::messages",
+        \\ "messages":[{"role":"user","content":"go"}]}
+    );
+    defer res.deinit(testing.allocator);
+    try testing.expect(res == .ok);
+
+    try testing.expectEqual(@as(usize, 2), cap.chunks.items.len);
+    try testing.expectEqualStrings("hello ", cap.chunks.items[0]);
+    try testing.expectEqualStrings("world", cap.chunks.items[1]);
+    for (cap.turn_ids.items) |tid| try testing.expectEqualStrings("t-obs", tid);
+}
+
+test "usage trace event is emitted per step even without a budget scope" {
+    var h = try Harness.init(testing.allocator, &.{usage_end_msg});
+    defer h.deinit();
+
+    const UsageSink = struct {
+        gpa: std.mem.Allocator,
+        mutex: sync.Mutex = .{},
+        lines: std.ArrayList([]u8) = .empty,
+
+        fn onEvent(ctx: *anyopaque, line: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (std.mem.indexOf(u8, line, "\"event\":\"usage\"") == null) return;
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            const copy = self.gpa.dupe(u8, line) catch return;
+            self.lines.append(self.gpa, copy) catch self.gpa.free(copy);
+        }
+    };
+    var cap = UsageSink{ .gpa = testing.allocator };
+    defer {
+        for (cap.lines.items) |l| testing.allocator.free(l);
+        cap.lines.deinit(testing.allocator);
+        cap.mutex.deinit();
+    }
+    const token = trace_mod.registerSink(.{ .ctx = @ptrCast(&cap), .onEvent = &UsageSink.onEvent }) orelse
+        return error.NoSlot;
+    defer trace_mod.unregisterSink(token);
+
+    // No trace_path and no budget_scope in the request: usage still traces.
+    const res = try h.runTurnCall(baseRequest(""));
+    defer res.deinit(testing.allocator);
+    try testing.expect(res == .ok);
+
+    try testing.expectEqual(@as(usize, 1), cap.lines.items.len);
+    try testing.expect(std.mem.indexOf(u8, cap.lines.items[0], "\"input_tokens\":7") != null);
+    try testing.expect(std.mem.indexOf(u8, cap.lines.items[0], "\"output_tokens\":3") != null);
+    try testing.expect(std.mem.indexOf(u8, cap.lines.items[0], "\"step\":1") != null);
 }
 
 fn shoutCompressor(_: ?*anyopaque, arena: std.mem.Allocator, request_json: []const u8) error{ Failed, OutOfMemory }![]const u8 {
