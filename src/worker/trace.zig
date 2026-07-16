@@ -11,26 +11,78 @@
 const std = @import("std");
 const c = std.c;
 const json = std.json;
+const sync = @import("../kernel/sync.zig");
 
 pub const file_name = "events.jsonl";
+
+/// In-process observer of the event stream (e.g. the mission TUI). The line
+/// bytes are valid only for the duration of the call — sinks copy what they
+/// keep. Callbacks run on whatever worker thread emitted the event and must
+/// be fast and infallible (fail-open contract: a sink can't fail a run).
+pub const Sink = struct {
+    ctx: *anyopaque,
+    onEvent: *const fn (ctx: *anyopaque, line_json: []const u8) void,
+};
+
+// Registry is process state, not per-run state, because the trace target
+// travels across the bus as a path string inside request JSON — there is no
+// object to hang a sink on. Registered once by the CLI before the mission,
+// unregistered at teardown.
+var sink_mutex: sync.Mutex = .{};
+var sinks: [4]?Sink = .{ null, null, null, null };
+var sink_count = std.atomic.Value(u8).init(0);
+
+/// Returns a token for unregisterSink, or null when all slots are taken.
+pub fn registerSink(s: Sink) ?usize {
+    sink_mutex.lock();
+    defer sink_mutex.unlock();
+    for (&sinks, 0..) |*slot, i| {
+        if (slot.* == null) {
+            slot.* = s;
+            _ = sink_count.fetchAdd(1, .release);
+            return i;
+        }
+    }
+    return null;
+}
+
+/// Idempotent. After return no further onEvent calls are made for this token
+/// (delivery holds the same lock, so an in-flight callback finishes first).
+pub fn unregisterSink(token: usize) void {
+    sink_mutex.lock();
+    defer sink_mutex.unlock();
+    if (sinks[token] != null) {
+        sinks[token] = null;
+        _ = sink_count.fetchSub(1, .release);
+    }
+}
 
 /// Cap for embedded payload fields (tool inputs/outputs, role content).
 /// The full byte size rides alongside — the trace is a view, not an archive.
 pub const max_field_bytes: usize = 2048;
 
 /// Append one event line: `{"ts":<ms-epoch>,<body>}`. `body` is the caller's
-/// pre-encoded JSON fields, no surrounding braces. `path == null` is a no-op
-/// so call sites stay unconditional.
+/// pre-encoded JSON fields, no surrounding braces. The line also fans out to
+/// registered sinks (without the trailing newline) — so a sink receives
+/// events even when `path == null`; with no path and no sinks this is a
+/// no-op, keeping call sites unconditional.
 pub fn event(
     arena: std.mem.Allocator,
     path: ?[]const u8,
     comptime fmt: []const u8,
     args: anytype,
 ) error{OutOfMemory}!void {
-    const p = path orelse return;
+    if (path == null and sink_count.load(.acquire) == 0) return;
     const body = try std.fmt.allocPrint(arena, fmt, args);
     const line = try std.fmt.allocPrint(arena, "{{\"ts\":{d},{s}}}\n", .{ nowMs(), body });
-    append(p, line);
+    if (path) |p| append(p, line);
+    if (sink_count.load(.acquire) > 0) {
+        sink_mutex.lock();
+        defer sink_mutex.unlock();
+        for (sinks) |maybe| {
+            if (maybe) |s| s.onEvent(s.ctx, line[0 .. line.len - 1]);
+        }
+    }
 }
 
 /// Truncate a payload for embedding, cutting on a UTF-8 sequence boundary so
@@ -258,6 +310,144 @@ test "render pretty-prints every event kind and passes unknown lines through raw
     try testing.expect(std.mem.indexOf(u8, out, "not-json garbage line") != null);
     // Timestamps render as wall clock, one per line.
     try testing.expect(std.mem.indexOf(u8, out, "02:13:20") != null); // 1752200000 UTC
+}
+
+const SinkCapture = struct {
+    mutex: sync.Mutex = .{},
+    lines: std.ArrayList([]u8) = .empty,
+    gpa: std.mem.Allocator,
+
+    fn onEvent(ctx: *anyopaque, line_json: []const u8) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const copy = self.gpa.dupe(u8, line_json) catch return;
+        self.lines.append(self.gpa, copy) catch self.gpa.free(copy);
+    }
+
+    fn sink(self: *@This()) Sink {
+        return .{ .ctx = @ptrCast(self), .onEvent = &onEvent };
+    }
+
+    fn deinit(self: *@This()) void {
+        for (self.lines.items) |l| self.gpa.free(l);
+        self.lines.deinit(self.gpa);
+    }
+};
+
+test "a registered sink receives every event line even with a null path" {
+    var cap = SinkCapture{ .gpa = testing.allocator };
+    defer cap.deinit();
+    const token = registerSink(cap.sink()) orelse return error.NoSlot;
+    defer unregisterSink(token);
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    try event(arena, null, "\"event\":\"step\",\"step\":{d}", .{7});
+    try event(arena, null, "\"event\":\"turn_end\",\"steps\":{d}", .{3});
+
+    try testing.expectEqual(@as(usize, 2), cap.lines.items.len);
+    // Delivered without the trailing newline, parseable, ts present.
+    for (cap.lines.items) |line| {
+        try testing.expect(!std.mem.endsWith(u8, line, "\n"));
+        const v = try json.parseFromSliceLeaky(json.Value, arena, line, .{});
+        try testing.expect(v.object.get("ts").? == .integer);
+    }
+    try testing.expect(std.mem.indexOf(u8, cap.lines.items[0], "\"step\":7") != null);
+}
+
+test "sink and file both receive when a path is set" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var rel_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const rel = try std.fmt.bufPrintZ(&rel_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const dir = std.mem.span(realpath(rel, &dir_buf) orelse return error.RealpathFailed);
+    const path = try std.fmt.bufPrint(&buf, "{s}/{s}", .{ dir, file_name });
+
+    var cap = SinkCapture{ .gpa = testing.allocator };
+    defer cap.deinit();
+    const token = registerSink(cap.sink()) orelse return error.NoSlot;
+    defer unregisterSink(token);
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    try event(arena, path, "\"event\":\"step\",\"step\":{d}", .{1});
+    try testing.expectEqual(@as(usize, 1), cap.lines.items.len);
+    const text = readFile(arena, path) orelse return error.ReadFailed;
+    try testing.expect(std.mem.indexOf(u8, text, "\"step\":1") != null);
+}
+
+test "unregister stops delivery and slots are reusable" {
+    var cap = SinkCapture{ .gpa = testing.allocator };
+    defer cap.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const token = registerSink(cap.sink()) orelse return error.NoSlot;
+    unregisterSink(token);
+    unregisterSink(token); // idempotent
+    try event(arena, null, "\"event\":\"step\"", .{});
+    try testing.expectEqual(@as(usize, 0), cap.lines.items.len);
+
+    const token2 = registerSink(cap.sink()) orelse return error.NoSlot;
+    defer unregisterSink(token2);
+    try event(arena, null, "\"event\":\"step\"", .{});
+    try testing.expectEqual(@as(usize, 1), cap.lines.items.len);
+}
+
+test "two sinks both receive each event" {
+    var a = SinkCapture{ .gpa = testing.allocator };
+    defer a.deinit();
+    var b = SinkCapture{ .gpa = testing.allocator };
+    defer b.deinit();
+    const ta = registerSink(a.sink()) orelse return error.NoSlot;
+    defer unregisterSink(ta);
+    const tb = registerSink(b.sink()) orelse return error.NoSlot;
+    defer unregisterSink(tb);
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    try event(arena_state.allocator(), null, "\"event\":\"step\"", .{});
+    try testing.expectEqual(@as(usize, 1), a.lines.items.len);
+    try testing.expectEqual(@as(usize, 1), b.lines.items.len);
+}
+
+test "concurrent event emission delivers whole parseable lines to the sink" {
+    var cap = SinkCapture{ .gpa = testing.allocator };
+    defer cap.deinit();
+    const token = registerSink(cap.sink()) orelse return error.NoSlot;
+    defer unregisterSink(token);
+
+    const emitter = struct {
+        fn run(id: usize) void {
+            var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer arena_state.deinit();
+            var i: usize = 0;
+            while (i < 50) : (i += 1) {
+                event(arena_state.allocator(), null, "\"event\":\"step\",\"step\":{d},\"emitter\":{d}", .{ i, id }) catch return;
+            }
+        }
+    };
+    const t1 = try std.Thread.spawn(.{}, emitter.run, .{1});
+    const t2 = try std.Thread.spawn(.{}, emitter.run, .{2});
+    t1.join();
+    t2.join();
+
+    try testing.expectEqual(@as(usize, 100), cap.lines.items.len);
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    for (cap.lines.items) |line| {
+        const v = try json.parseFromSliceLeaky(json.Value, arena_state.allocator(), line, .{});
+        try testing.expect(v == .object);
+    }
 }
 
 test "clip passes short strings through untouched" {
