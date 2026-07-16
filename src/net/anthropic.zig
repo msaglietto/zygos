@@ -9,6 +9,7 @@ const json = std.json;
 const sse = @import("../worker/sse.zig");
 const assembler_mod = @import("../worker/anthropic.zig");
 const channel_mod = @import("../kernel/channel.zig");
+const stream_guard = @import("stream_guard.zig");
 
 const log = std.log.scoped(.anthropic);
 
@@ -24,6 +25,10 @@ pub const StreamOptions = struct {
     temperature: ?f64 = null,
     base_url: []const u8 = "https://api.anthropic.com",
     anthropic_version: []const u8 = "2023-06-01",
+    /// Abort the request when the socket is silent this long (0 disables).
+    /// Mirrors the openai client: a silent-but-open connection must not
+    /// park the worker thread forever.
+    idle_timeout_ms: u64 = stream_guard.default_idle_ms,
 };
 
 pub const StreamError = error{ OutOfMemory, HttpFailed, ApiError, BadStream };
@@ -80,11 +85,34 @@ pub fn streamMessages(
     };
     defer req.deinit();
 
+    // Declared after req so its deinit (stop + join) runs BEFORE req.deinit:
+    // the guard must never shut down a socket that has been freed.
+    var shutdown_ctx: ShutdownCtx = undefined;
+    var guard: ?stream_guard.StreamGuard = null;
+    defer if (guard) |*g| g.deinit();
+    if (opts.idle_timeout_ms > 0) {
+        if (req.connection) |conn| {
+            shutdown_ctx = .{ .stream = conn.stream_reader.stream, .io = io };
+            guard = stream_guard.StreamGuard.init(
+                opts.idle_timeout_ms,
+                @ptrCast(&shutdown_ctx),
+                &ShutdownCtx.fire,
+            );
+            // A guard that fails to spawn degrades to the old unguarded
+            // behavior rather than failing the request.
+            guard.?.start() catch {
+                guard.?.deinit();
+                guard = null;
+            };
+        }
+    }
+
     req.transfer_encoding = .{ .content_length = body.len };
     req.sendBodyComplete(body) catch return error.HttpFailed;
 
     var redirect_buf: [1024]u8 = undefined;
     var response = req.receiveHead(&redirect_buf) catch return error.HttpFailed;
+    if (guard) |*g| g.poke();
     if (response.head.status != .ok) {
         log.warn("anthropic answered {d}", .{@intFromEnum(response.head.status)});
         return error.ApiError;
@@ -92,8 +120,21 @@ pub fn streamMessages(
 
     var transfer_buf: [16 * 1024]u8 = undefined;
     const reader = response.reader(&transfer_buf);
-    return processSse(gpa, reader, sender);
+    return processSse(gpa, reader, sender, if (guard) |*g| g else null);
 }
+
+/// Fire target for the idle guard: erroring the blocked socket read is the
+/// only way to unpark a silent-but-open provider connection.
+const ShutdownCtx = struct {
+    stream: std.Io.net.Stream,
+    io: std.Io,
+
+    fn fire(ctx: *anyopaque) void {
+        const self: *ShutdownCtx = @ptrCast(@alignCast(ctx));
+        log.warn("stream idle timeout: shutting down provider socket", .{});
+        self.stream.shutdown(self.io, .both) catch {};
+    }
+};
 
 /// The network-free pump: read SSE bytes, decode events, assemble, push text
 /// deltas into `sender`, return the terminal message JSON (caller frees).
@@ -102,6 +143,7 @@ pub fn processSse(
     gpa: std.mem.Allocator,
     reader: *std.Io.Reader,
     sender: ?*channel_mod.Sender,
+    guard: ?*stream_guard.StreamGuard,
 ) StreamError![]u8 {
     var decoder = sse.Decoder.init(gpa);
     defer decoder.deinit();
@@ -112,6 +154,7 @@ pub fn processSse(
     stream: while (true) {
         const n = reader.readSliceShort(&chunk) catch return error.BadStream;
         if (n == 0) break :stream;
+        if (guard) |g| g.poke();
         decoder.feed(chunk[0..n]) catch return error.OutOfMemory;
 
         while (decoder.next() catch return error.OutOfMemory) |event| {
@@ -198,6 +241,21 @@ const fixture_text_stream =
     "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":7}}\n\n" ++
     "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
 
+test "processSse pokes the stream guard on every read so idle detection sees activity" {
+    var reader: std.Io.Reader = .fixed(fixture_text_stream);
+    var dummy: u8 = 0;
+    // Not started: poke() works without the watcher thread; only the
+    // activity contract is under test here.
+    var guard = stream_guard.StreamGuard.init(60_000, @ptrCast(&dummy), &noopFire);
+    defer guard.deinit();
+
+    const out = try processSse(testing.allocator, &reader, null, &guard);
+    defer testing.allocator.free(out);
+    try testing.expect(guard.pokes > 0);
+}
+
+fn noopFire(_: *anyopaque) void {}
+
 test "processSse pumps a text fixture into deltas and the terminal message" {
     var reader: std.Io.Reader = .fixed(fixture_text_stream);
 
@@ -208,7 +266,7 @@ test "processSse pumps a text fixture into deltas and the terminal message" {
     var receiver = try channels.takeReceiver(refs.reader.channel_id, refs.reader.access_key, 0);
     defer receiver.deinit();
 
-    const out = try processSse(testing.allocator, &reader, &sender);
+    const out = try processSse(testing.allocator, &reader, &sender, null);
     defer testing.allocator.free(out);
     sender.deinit();
 
@@ -244,7 +302,7 @@ test "processSse renders tool_use with accumulated input and works without a sen
         "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
     var reader: std.Io.Reader = .fixed(fixture);
 
-    const out = try processSse(testing.allocator, &reader, null);
+    const out = try processSse(testing.allocator, &reader, null, null);
     defer testing.allocator.free(out);
 
     var p = try json.parseFromSlice(json.Value, testing.allocator, out, .{});
@@ -259,7 +317,7 @@ test "processSse surfaces API error events" {
     const fixture =
         "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"later\"}}\n\n";
     var reader: std.Io.Reader = .fixed(fixture);
-    try testing.expectError(error.ApiError, processSse(testing.allocator, &reader, null));
+    try testing.expectError(error.ApiError, processSse(testing.allocator, &reader, null, null));
 }
 
 test "truncated stream (no message_stop) is BadStream, not a crash" {
@@ -267,5 +325,5 @@ test "truncated stream (no message_stop) is BadStream, not a crash" {
         "event: message_start\n" ++
         "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"model\":\"c\",\"usage\":{}}}\n\n";
     var reader: std.Io.Reader = .fixed(fixture);
-    try testing.expectError(error.BadStream, processSse(testing.allocator, &reader, null));
+    try testing.expectError(error.BadStream, processSse(testing.allocator, &reader, null, null));
 }

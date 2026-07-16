@@ -11,6 +11,7 @@ const json = std.json;
 const sse = @import("../worker/sse.zig");
 const assembler_mod = @import("../worker/openai.zig");
 const channel_mod = @import("../kernel/channel.zig");
+const stream_guard = @import("stream_guard.zig");
 
 const log = std.log.scoped(.openai);
 
@@ -29,6 +30,10 @@ pub const StreamOptions = struct {
     base_url: []const u8 = "https://api.openai.com/v1",
     /// Emitted in the request body only when set.
     temperature: ?f64 = null,
+    /// Abort the request when the socket is silent this long (0 disables).
+    /// Covers receiveHead too: a provider that accepts the connection and
+    /// never answers must not park the worker thread forever.
+    idle_timeout_ms: u64 = stream_guard.default_idle_ms,
 };
 
 pub const StreamError = error{ OutOfMemory, HttpFailed, ApiError, BadStream, BadRequest };
@@ -139,11 +144,34 @@ pub fn streamChat(
     };
     defer req.deinit();
 
+    // Declared after req so its deinit (stop + join) runs BEFORE req.deinit:
+    // the guard must never shut down a socket that has been freed.
+    var shutdown_ctx: ShutdownCtx = undefined;
+    var guard: ?stream_guard.StreamGuard = null;
+    defer if (guard) |*g| g.deinit();
+    if (opts.idle_timeout_ms > 0) {
+        if (req.connection) |conn| {
+            shutdown_ctx = .{ .stream = conn.stream_reader.stream, .io = io };
+            guard = stream_guard.StreamGuard.init(
+                opts.idle_timeout_ms,
+                @ptrCast(&shutdown_ctx),
+                &ShutdownCtx.fire,
+            );
+            // A guard that fails to spawn degrades to the old unguarded
+            // behavior rather than failing the request.
+            guard.?.start() catch {
+                guard.?.deinit();
+                guard = null;
+            };
+        }
+    }
+
     req.transfer_encoding = .{ .content_length = body.len };
     req.sendBodyComplete(body) catch return error.HttpFailed;
 
     var redirect_buf: [1024]u8 = undefined;
     var response = req.receiveHead(&redirect_buf) catch return error.HttpFailed;
+    if (guard) |*g| g.poke();
     if (response.head.status != .ok) {
         log.warn("{s} model {s}: endpoint answered {d}", .{
             opts.base_url, opts.model, @intFromEnum(response.head.status),
@@ -153,8 +181,21 @@ pub fn streamChat(
 
     var transfer_buf: [16 * 1024]u8 = undefined;
     const reader = response.reader(&transfer_buf);
-    return processSse(gpa, reader, sender);
+    return processSse(gpa, reader, sender, if (guard) |*g| g else null);
 }
+
+/// Fire target for the idle guard: erroring the blocked socket read is the
+/// only way to unpark a silent-but-open provider connection.
+const ShutdownCtx = struct {
+    stream: std.Io.net.Stream,
+    io: std.Io,
+
+    fn fire(ctx: *anyopaque) void {
+        const self: *ShutdownCtx = @ptrCast(@alignCast(ctx));
+        log.warn("stream idle timeout: shutting down provider socket", .{});
+        self.stream.shutdown(self.io, .both) catch {};
+    }
+};
 
 /// The network-free pump: read SSE bytes, decode `data:` events (the chat
 /// dialect has no event names), assemble, push text deltas into `sender`,
@@ -163,6 +204,7 @@ pub fn processSse(
     gpa: std.mem.Allocator,
     reader: *std.Io.Reader,
     sender: ?*channel_mod.Sender,
+    guard: ?*stream_guard.StreamGuard,
 ) StreamError![]u8 {
     var decoder = sse.Decoder.init(gpa);
     defer decoder.deinit();
@@ -173,6 +215,7 @@ pub fn processSse(
     stream: while (true) {
         const n = reader.readSliceShort(&chunk) catch return error.BadStream;
         if (n == 0) break :stream;
+        if (guard) |g| g.poke();
         decoder.feed(chunk[0..n]) catch return error.OutOfMemory;
 
         while (decoder.next() catch return error.OutOfMemory) |event| {
@@ -258,7 +301,7 @@ test "processSse pumps a chat fixture into deltas and the neutral terminal messa
     var receiver = try channels.takeReceiver(refs.reader.channel_id, refs.reader.access_key, 0);
     defer receiver.deinit();
 
-    const out = try processSse(testing.allocator, &reader, &sender);
+    const out = try processSse(testing.allocator, &reader, &sender, null);
     defer testing.allocator.free(out);
     sender.deinit();
 
@@ -286,7 +329,7 @@ test "processSse renders tool_calls with accumulated arguments, no sender" {
         "data: [DONE]\n\n";
     var reader: std.Io.Reader = .fixed(fixture);
 
-    const out = try processSse(testing.allocator, &reader, null);
+    const out = try processSse(testing.allocator, &reader, null, null);
     defer testing.allocator.free(out);
 
     var p = try json.parseFromSlice(json.Value, testing.allocator, out, .{});
@@ -298,18 +341,33 @@ test "processSse renders tool_calls with accumulated arguments, no sender" {
     try testing.expectEqualStrings("pwd", block.get("input").?.object.get("command").?.string);
 }
 
+test "processSse pokes the stream guard on every read so idle detection sees activity" {
+    var reader: std.Io.Reader = .fixed(fixture_text_stream);
+    var dummy: u8 = 0;
+    // Not started: poke() works without the watcher thread; only the
+    // activity contract is under test here.
+    var guard = stream_guard.StreamGuard.init(60_000, @ptrCast(&dummy), &noopFire);
+    defer guard.deinit();
+
+    const out = try processSse(testing.allocator, &reader, null, &guard);
+    defer testing.allocator.free(out);
+    try testing.expect(guard.pokes > 0);
+}
+
+fn noopFire(_: *anyopaque) void {}
+
 test "processSse surfaces API error bodies" {
     const fixture =
         "data: {\"error\":{\"message\":\"rate limited\",\"type\":\"rate_limit_error\"}}\n\n";
     var reader: std.Io.Reader = .fixed(fixture);
-    try testing.expectError(error.ApiError, processSse(testing.allocator, &reader, null));
+    try testing.expectError(error.ApiError, processSse(testing.allocator, &reader, null, null));
 }
 
 test "truncated chat stream (no [DONE]) is BadStream, not a crash" {
     const fixture =
         "data: {\"id\":\"cc-3\",\"model\":\"gpt-x\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n";
     var reader: std.Io.Reader = .fixed(fixture);
-    try testing.expectError(error.BadStream, processSse(testing.allocator, &reader, null));
+    try testing.expectError(error.BadStream, processSse(testing.allocator, &reader, null, null));
 }
 
 test "chatUrl: version-carrying base joins to <base>/chat/completions" {

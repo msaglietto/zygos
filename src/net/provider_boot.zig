@@ -15,6 +15,7 @@ const router = @import("../worker/router.zig");
 const provider_openai = @import("provider_openai.zig");
 const provider_anthropic = @import("provider_anthropic.zig");
 const openai = @import("openai.zig");
+const stream_guard = @import("stream_guard.zig");
 
 /// Gemini OpenAI-compat base when a `google` entry has no endpoint.
 pub const gemini_compat_base_url = "https://generativelanguage.googleapis.com/v1beta/openai";
@@ -80,6 +81,7 @@ pub const CatalogBoot = struct {
             while (i < n) : (i += 1) instances[i].stop();
         }
 
+        const idle_ms = streamIdleMs(env) orelse stream_guard.default_idle_ms;
         for (catalog.providers) |entry| {
             const s = try providers_catalog.slug(gpa, entry.name);
             defer gpa.free(s);
@@ -101,6 +103,7 @@ pub const CatalogBoot = struct {
                     .default_model = entry.model,
                     .default_max_tokens = entry.max_tokens,
                     .default_temperature = entry.temperature,
+                    .idle_timeout_ms = idle_ms,
                 }) },
                 else => .{ .openai = try provider_openai.OpenAiProvider.startWith(gpa, actor, registry, io, .{
                     .worker_name = s,
@@ -110,6 +113,7 @@ pub const CatalogBoot = struct {
                     .default_model = entry.model,
                     .default_max_tokens = entry.max_tokens,
                     .default_temperature = entry.temperature,
+                    .idle_timeout_ms = idle_ms,
                 }) },
             };
             n += 1;
@@ -124,6 +128,17 @@ pub const CatalogBoot = struct {
         self.* = undefined;
     }
 };
+
+/// ZYGOS_STREAM_IDLE_MS: per-request idle timeout override for every booted
+/// provider stream (0 disables the guard). Absent or unparsable ⇒ null and
+/// the client default applies.
+pub fn streamIdleMs(env: []const providers_catalog.EnvPair) ?u64 {
+    for (env) |p| {
+        if (!std.mem.eql(u8, p.name, "ZYGOS_STREAM_IDLE_MS")) continue;
+        return std.fmt.parseInt(u64, p.value, 10) catch null;
+    }
+    return null;
+}
 
 /// Fail closed at startup: every `zygos::providers::*` function in any ladder
 /// (including `.default`) must name a slug present in the catalog. Other
@@ -363,6 +378,25 @@ test "boot: instance defaults carry the entry's model/max_tokens/temperature" {
     try testing.expectEqual(@as(f64, 1), anthropic.default_temperature.?);
 }
 
+test "boot: ZYGOS_STREAM_IDLE_MS reaches every instance; absent env keeps the client default" {
+    var h = try Harness.init(testing.allocator);
+    defer h.deinit();
+
+    var cat = try providers_catalog.Catalog.parse(testing.allocator, fixture, null);
+    defer cat.deinit();
+
+    var boot = try CatalogBoot.start(testing.allocator, &h.actor, &h.registry, h.io(), &cat, &.{
+        .{ .name = "ZYGOS_STREAM_IDLE_MS", .value = "45000" },
+    });
+    defer boot.stop();
+    try testing.expectEqual(@as(u64, 45_000), boot.instances[0].openai.idle_timeout_ms);
+    try testing.expectEqual(@as(u64, 45_000), boot.instances[3].anthropic.idle_timeout_ms);
+
+    var boot_default = try CatalogBoot.start(testing.allocator, &h.actor, &h.registry, h.io(), &cat, &.{});
+    defer boot_default.stop();
+    try testing.expectEqual(stream_guard.default_idle_ms, boot_default.instances[0].openai.idle_timeout_ms);
+}
+
 test "merge helper: request model wins; absent model falls to default; neither ⇒ error; max_tokens/temperature likewise" {
     // Request model wins
     const a = try provider_openai.mergeRequestDefaults("req", 99, 0.1, "def", 50, 0.9);
@@ -467,6 +501,21 @@ test "temperature emitted in the request body only when set" {
     const with = try openai.buildChatBody(testing.allocator, "m", 64, "", "", 1.0);
     defer testing.allocator.free(with);
     try testing.expect(std.mem.indexOf(u8, with, "\"temperature\":") != null);
+}
+
+test "streamIdleMs: absent or garbage env is null; a number parses; 0 passes through" {
+    const P = providers_catalog.EnvPair;
+    try testing.expectEqual(@as(?u64, null), streamIdleMs(&.{}));
+    try testing.expectEqual(@as(?u64, null), streamIdleMs(&.{
+        .{ .name = "ZYGOS_STREAM_IDLE_MS", .value = "soon" },
+    }));
+    try testing.expectEqual(@as(?u64, 45_000), streamIdleMs(&[_]P{
+        .{ .name = "OTHER", .value = "1" },
+        .{ .name = "ZYGOS_STREAM_IDLE_MS", .value = "45000" },
+    }));
+    try testing.expectEqual(@as(?u64, 0), streamIdleMs(&.{
+        .{ .name = "ZYGOS_STREAM_IDLE_MS", .value = "0" },
+    }));
 }
 
 test "no leaks across boot/stop loops" {

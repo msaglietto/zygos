@@ -14,6 +14,8 @@ const channel_mod = @import("../kernel/channel.zig");
 const client = @import("anthropic.zig");
 const provider_openai = @import("provider_openai.zig");
 
+const stream_guard = @import("stream_guard.zig");
+
 const log = std.log.scoped(.provider_anthropic);
 
 /// Instance-parameterized start options (X2 catalog boot). Legacy `start()` is
@@ -27,6 +29,7 @@ pub const StartOptions = struct {
     default_model: ?[]const u8 = null,
     default_max_tokens: ?u32 = null,
     default_temperature: ?f64 = null,
+    idle_timeout_ms: u64 = stream_guard.default_idle_ms,
 };
 
 pub const AnthropicProvider = struct {
@@ -40,6 +43,7 @@ pub const AnthropicProvider = struct {
     default_model: ?[]const u8 = null, // owned when set
     default_max_tokens: ?u32 = null,
     default_temperature: ?f64 = null,
+    idle_timeout_ms: u64 = stream_guard.default_idle_ms,
 
     /// Legacy fixed name, no instance defaults. Thin wrapper over `startWith`.
     pub fn start(
@@ -78,6 +82,7 @@ pub const AnthropicProvider = struct {
             .default_model = if (opts.default_model) |m| try gpa.dupe(u8, m) else null,
             .default_max_tokens = opts.default_max_tokens,
             .default_temperature = opts.default_temperature,
+            .idle_timeout_ms = opts.idle_timeout_ms,
         };
         errdefer {
             self.gpa.free(self.name);
@@ -138,6 +143,7 @@ pub const AnthropicProvider = struct {
             .max_tokens = merged.max_tokens,
             .temperature = merged.temperature,
             .base_url = self.base_url,
+            .idle_timeout_ms = self.idle_timeout_ms,
         }, if (sender) |*s| s else null) catch |err| {
             if (sender) |*s| s.deinit();
             log.warn("{s} (model {s}): stream failed: {t}", .{ self.name, merged.model, err });
