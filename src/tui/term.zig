@@ -61,11 +61,19 @@ pub const Terminal = struct {
 /// Termios snapshot for the panic/signal path. One tty per process, so a
 /// module-level slot suffices; enterRaw fills it, restore clears it.
 var emergency_saved: ?std.c.termios = null;
+/// Dup of the original fd 2 (the tty) while stderr is redirected.
+var emergency_saved_stderr: ?c_int = null;
 
-/// Best-effort terminal repair for panic and signal handlers: re-show the
-/// cursor, reset SGR, end synchronized output, restore cooked mode. Only
-/// async-signal-safe calls (write, tcsetattr). Idempotent, never fails.
+/// Best-effort terminal repair for panic and signal handlers: put the real
+/// tty back on fd 2 (so the panic message is visible, not swallowed by the
+/// stderr log file), re-show the cursor, reset SGR, end synchronized
+/// output, restore cooked mode. Only async-signal-safe calls (dup2, write,
+/// tcsetattr). Idempotent, never fails.
 pub fn emergencyRestore() void {
+    if (emergency_saved_stderr) |tty| {
+        _ = std.c.dup2(tty, 2);
+        emergency_saved_stderr = null;
+    }
     const seq = esc.show_cursor ++ esc.sgr_reset ++ esc.sync_off ++ "\r\n";
     _ = std.c.write(2, seq, seq.len);
     if (emergency_saved) |t| {
@@ -79,9 +87,40 @@ pub fn emergencyRestore() void {
 /// leaves the shell garbled.
 pub const RealTerm = struct {
     saved: ?std.c.termios = null,
+    /// Where frames go: fd 2, or a dup of the tty while stderr is redirected.
+    out_fd: c_int = 2,
+    /// Dup of the original fd 2, kept to undo redirectStderr.
+    saved_stderr: ?c_int = null,
 
     pub fn isTty() bool {
         return std.c.isatty(2) != 0 and std.c.isatty(0) != 0;
+    }
+
+    /// Point fd 2 at `log_path` (append) and keep rendering on a dup of the
+    /// real tty. Anything that writes stderr directly — std.debug stack
+    /// dumps on unexpected errnos (Debug builds), stray prints from deps —
+    /// lands in the log instead of splicing into the repaint band. The
+    /// logbridge still captures std.log lines as footnotes; this catches
+    /// the writers that bypass std.log entirely. Best-effort: any failure
+    /// leaves fd 2 untouched.
+    pub fn redirectStderr(self: *RealTerm, log_path: [*:0]const u8) void {
+        if (self.saved_stderr != null) return;
+        const tty = std.c.dup(2);
+        if (tty < 0) return;
+        const log_fd = std.c.open(log_path, .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true }, @as(std.c.mode_t, 0o644));
+        if (log_fd < 0) {
+            _ = std.c.close(tty);
+            return;
+        }
+        if (std.c.dup2(log_fd, 2) < 0) {
+            _ = std.c.close(tty);
+            _ = std.c.close(log_fd);
+            return;
+        }
+        _ = std.c.close(log_fd);
+        self.out_fd = tty;
+        self.saved_stderr = tty;
+        emergency_saved_stderr = tty;
     }
 
     /// Byte-in-byte-out mode on fd 0: no echo, no line buffering, signals
@@ -109,13 +148,21 @@ pub const RealTerm = struct {
         return true;
     }
 
-    /// Idempotent; safe to call without a prior enterRaw.
+    /// Idempotent; safe to call without a prior enterRaw. Also undoes
+    /// redirectStderr, putting the real tty back on fd 2.
     pub fn restore(self: *RealTerm) void {
-        writeFd2(esc.show_cursor ++ esc.sgr_reset ++ esc.sync_off);
+        writeFd(self.out_fd, esc.show_cursor ++ esc.sgr_reset ++ esc.sync_off);
         if (self.saved) |t| {
             _ = std.c.tcsetattr(0, .FLUSH, &t);
             self.saved = null;
             emergency_saved = null;
+        }
+        if (self.saved_stderr) |tty| {
+            _ = std.c.dup2(tty, 2);
+            _ = std.c.close(tty);
+            self.saved_stderr = null;
+            self.out_fd = 2;
+            emergency_saved_stderr = null;
         }
     }
 
@@ -128,13 +175,15 @@ pub const RealTerm = struct {
         };
     }
 
-    fn realWrite(_: *anyopaque, bytes: []const u8) void {
-        writeFd2(bytes);
+    fn realWrite(ctx: *anyopaque, bytes: []const u8) void {
+        const self: *RealTerm = @ptrCast(@alignCast(ctx));
+        writeFd(self.out_fd, bytes);
     }
 
-    fn realSize(_: *anyopaque) Size {
+    fn realSize(ctx: *anyopaque) Size {
+        const self: *RealTerm = @ptrCast(@alignCast(ctx));
         var ws: std.c.winsize = undefined;
-        if (std.c.ioctl(2, std.c.T.IOCGWINSZ, &ws) == 0 and ws.col > 0 and ws.row > 0) {
+        if (std.c.ioctl(self.out_fd, std.c.T.IOCGWINSZ, &ws) == 0 and ws.col > 0 and ws.row > 0) {
             return .{ .cols = ws.col, .rows = ws.row };
         }
         return .{ .cols = 80, .rows = 24 };
@@ -148,10 +197,10 @@ pub const RealTerm = struct {
         return b[0];
     }
 
-    fn writeFd2(bytes: []const u8) void {
+    fn writeFd(fd: c_int, bytes: []const u8) void {
         var off: usize = 0;
         while (off < bytes.len) {
-            const n = std.c.write(2, bytes.ptr + off, bytes.len - off);
+            const n = std.c.write(fd, bytes.ptr + off, bytes.len - off);
             if (n <= 0) return;
             off += @intCast(n);
         }

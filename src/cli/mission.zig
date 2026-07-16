@@ -270,6 +270,14 @@ pub fn run(gpa: std.mem.Allocator, args: *std.process.Args.Iterator) u8 {
     var ui_sink: ?usize = null;
     var ui_tap: ?usize = null;
     if (want_tui and real_term.enterRaw()) {
+        // fd 2 points into the planning root while the TUI owns the screen:
+        // writers that bypass std.log (std.debug stack dumps on unexpected
+        // errnos in Debug builds) would otherwise splice into the band.
+        mkdirQuiet(gpa, planning);
+        if (std.fmt.allocPrintSentinel(gpa, "{s}/tui-stderr.log", .{planning}, 0)) |errlog| {
+            real_term.redirectStderr(errlog.ptr);
+            gpa.free(errlog);
+        } else |_| {}
         const t = zygos.tui.Tui.create(gpa, real_term.terminal()) catch return oom();
         if (t.start()) {
             ui = t;
@@ -289,7 +297,7 @@ pub fn run(gpa: std.mem.Allocator, args: *std.process.Args.Iterator) u8 {
                 .ctx = @ptrCast(&t.model),
                 .onLine = &zygos.tui.model.Model.hookOnLine,
             });
-            if (std.fmt.allocPrint(gpa, "trace → {s}", .{trace_path})) |note| {
+            if (std.fmt.allocPrint(gpa, "trace → {s} · stderr → {s}/tui-stderr.log", .{ trace_path, planning })) |note| {
                 t.model.onLog(note);
                 gpa.free(note);
             } else |_| {}
@@ -464,6 +472,12 @@ fn runStamp() []const u8 {
         ds.getHoursIntoDay(), ds.getMinutesIntoHour(), ds.getSecondsIntoMinute(),
     }) catch unreachable;
     return &stamp_buf;
+}
+
+fn mkdirQuiet(gpa: std.mem.Allocator, path: []const u8) void {
+    const path_z = std.fmt.allocPrintSentinel(gpa, "{s}", .{path}, 0) catch return;
+    defer gpa.free(path_z);
+    _ = std.c.mkdir(path_z.ptr, 0o755); // EEXIST and friends: fine, best-effort
 }
 
 fn fileExists(gpa: std.mem.Allocator, dir: []const u8, name: []const u8) bool {
