@@ -200,6 +200,24 @@ denies) when stdin closes. Knobs: `ZYGOS_APPROVAL_TIMEOUT_MS`,
 streams the harness's progress feed (mission transitions, role turns,
 per-step provider/model, tool dispatches) to stderr; `debug` for more.
 
+Timeouts are tiered — one flat deadline cannot serve both a whole mission
+and the calls inside it:
+
+- `ZYGOS_MISSION_TIMEOUT_MS` (default 24h) — ceiling on the blocking
+  mission call itself; the only knob that bounds total mission duration.
+- `ZYGOS_INVOKE_TIMEOUT_MS` (default 1h) — every other bus invocation
+  (role turns, provider calls, gates). A provider call that times out
+  escalates the route ladder like any provider failure.
+- `ZYGOS_STREAM_IDLE_MS` (default 120s, `0` disables) — HTTP-level idle
+  guard on provider streams: a connection that goes this long without
+  sending a byte is shut down and the call fails over. This is the hang
+  protection; the invoke timeout is only the outer net.
+
+`test/e2e/timeouts/run.sh` locks the contract in: a silent localhost
+provider (accepts, never responds) must trip the idle guard, must not let
+a tight invoke timeout kill the mission call, and must still honor the
+mission ceiling.
+
 ## Mission trace — the harness view
 
 Every `zygos mission start` writes a structured event log to
