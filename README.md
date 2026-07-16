@@ -218,6 +218,33 @@ provider (accepts, never responds) must trip the idle guard, must not let
 a tight invoke timeout kill the mission call, and must still honor the
 mission ceiling.
 
+## Mission TUI — live progress view
+
+When `zygos mission start` runs on a real terminal (tty on stdin and
+stderr), it takes over the screen with a live progress view instead of the
+plain banner: a spinner header with mission state, tasks, and elapsed time;
+role/step lines with the routed model; running tool calls that collapse
+into ✓/✗ summary lines as results land; assistant tokens streaming live;
+captured warn/err log lines as dim footnotes; and a token counter fed by
+per-step `usage` trace events. History scrolls into the terminal's own
+scrollback (no alternate screen) — only the bottom band repaints, wrapped
+in synchronized output (`?2026`).
+
+Approvals resolve on a single keypress: the pending ask renders as a
+highlighted `approve <tool>: <reason>? [y/N]` band (`y` approves; `n`,
+Enter, or the server-side `ZYGOS_APPROVAL_TIMEOUT_MS` denies — fail
+closed). Ctrl-C restores the terminal before exiting. The final mission
+JSON still prints to stdout after the TUI tears down, so `| jq` pipelines
+and exit codes are unchanged.
+
+Opt out with `--no-tui` or `ZYGOS_NO_TUI=1`; piped/CI runs (no tty) keep
+the plain path automatically — the `trace →` banner, stderr approval
+prompts, and stdout JSON are byte-identical to before. The TUI is a second
+consumer of the same trace event stream (`src/worker/trace.zig` sinks) plus
+a live delta observer on the turn loop; rendering is hand-rolled ANSI in
+`src/tui/` (no deps, libc terminal control confined there like the `net/`
+exception).
+
 ## Mission trace — the harness view
 
 Every `zygos mission start` writes a structured event log to
