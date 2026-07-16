@@ -7,8 +7,8 @@
 //!
 //! Connection lifecycle (spec): accept → fresh WorkerId (UUID v4) → register
 //! in the conn table → post worker_connected (actor answers workerregistered).
-//! Text frame → parse → post .frame with poster-stamped now_ms — the only
-//! wall-clock reads in the system live in this file. Parse failure → log,
+//! Text frame → parse → post .frame with poster-stamped now_ms — the kernel
+//! never reads a clock; posters stamp time (clock lives in ticker.zig). Parse failure → log,
 //! drop the frame, keep the connection. Binary telemetry magic (OTLP/MTRC/
 //! LOGS) → accept + drop (M0 stub); other binary falls through to JSON.
 //! Close → post worker_disconnected exactly once.
@@ -19,6 +19,7 @@ const actor_mod = @import("../kernel/actor.zig");
 const protocol = @import("../kernel/protocol.zig");
 const types = @import("../kernel/types.zig");
 const sync = @import("../kernel/sync.zig");
+const ticker_mod = @import("ticker.zig");
 
 const log = std.log.scoped(.ws);
 
@@ -32,12 +33,9 @@ pub const Config = struct {
 };
 
 /// Wall-clock milliseconds. The gateway stamps commands so the kernel never
-/// reads a clock (actor spec boundary contract 3).
-pub fn nowMs() i64 {
-    var ts: std.c.timespec = undefined;
-    _ = std.c.clock_gettime(.REALTIME, &ts);
-    return @as(i64, @intCast(ts.sec)) * 1000 + @divTrunc(@as(i64, @intCast(ts.nsec)), std.time.ns_per_ms);
-}
+/// reads a clock (actor spec boundary contract 3). Shared with the headless
+/// tick pump in ticker.zig — the same poster-stamped clock everywhere.
+pub const nowMs = ticker_mod.nowMs;
 
 /// Fresh worker identity: 16 random bytes with RFC 4122 v4 version/variant
 /// bits, so the uuid text the SDK sees is well-formed.
@@ -67,8 +65,7 @@ pub const Gateway = struct {
     io_backing: std.Io.Threaded,
     server: ?websocket.Server(Handler) = null,
     listen_thread: ?std.Thread = null,
-    timer_thread: ?std.Thread = null,
-    timer_stop: sync.ResetEvent = .{},
+    tick_timer: ?ticker_mod.Ticker = null,
 
     /// Two-phase construction (Actor and Gateway reference each other):
     /// create the Gateway with a placeholder, init the Actor with
@@ -94,7 +91,7 @@ pub const Gateway = struct {
         self.io_backing.deinit();
         self.conns.map.deinit();
         self.conns.mutex.deinit();
-        self.timer_stop.deinit();
+        if (self.tick_timer) |*t| t.deinit();
         const gpa = self.gpa;
         gpa.destroy(self);
     }
@@ -112,13 +109,13 @@ pub const Gateway = struct {
             .handshake = .{ .timeout = 10 },
         });
         self.listen_thread = try self.server.?.listenInNewThread(self);
-        self.timer_thread = try std.Thread.spawn(.{}, timerLoop, .{self});
+        self.tick_timer = ticker_mod.Ticker.init(self.actor, self.config.tick_interval_ms);
+        try self.tick_timer.?.start();
         log.info("zygos kernel listening on ws://{s}:{d}", .{ self.config.address, self.config.port });
     }
 
     pub fn stop(self: *Gateway) void {
-        self.timer_stop.set();
-        if (self.timer_thread) |t| t.join();
+        if (self.tick_timer) |*t| t.stop();
         if (self.server) |*s| s.stop();
         if (self.listen_thread) |t| t.join();
     }
@@ -163,20 +160,6 @@ pub const Gateway = struct {
         defer self.conns.mutex.unlock();
         const conn = self.conns.map.get(to) orelse return error.Disconnected;
         conn.writeText(frame) catch return error.Disconnected;
-    }
-
-    // -- timer ----------------------------------------------------------------
-
-    fn timerLoop(self: *Gateway) void {
-        const interval: std.c.timespec = .{
-            .sec = @intCast(self.config.tick_interval_ms / 1000),
-            .nsec = @intCast((self.config.tick_interval_ms % 1000) * std.time.ns_per_ms),
-        };
-        while (!self.timer_stop.isSet()) {
-            var rem: std.c.timespec = undefined;
-            _ = std.c.nanosleep(&interval, &rem);
-            self.actor.post(.{ .tick = nowMs() });
-        }
     }
 };
 

@@ -8,6 +8,7 @@ pub const protocol = @import("kernel/protocol.zig");
 pub const actor = @import("kernel/actor.zig");
 pub const inproc = @import("kernel/inproc.zig");
 pub const net = @import("net/ws.zig");
+pub const ticker = @import("net/ticker.zig");
 pub const net_anthropic = @import("net/anthropic.zig");
 pub const provider_anthropic = @import("net/provider_anthropic.zig");
 pub const net_openai = @import("net/openai.zig");

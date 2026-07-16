@@ -109,6 +109,15 @@ pub fn run(gpa: std.mem.Allocator, args: *std.process.Args.Iterator) u8 {
     };
     _ = kernel;
 
+    // Without a tick source the kernel never sweeps invocation deadlines and
+    // ZYGOS_INVOKE_TIMEOUT_MS silently never fires (the WS gateway has its
+    // own timer; this headless path must pump ticks itself).
+    var tick_timer = zygos.ticker.Ticker.init(&actor, 250);
+    tick_timer.start() catch {
+        eprint("mission: cannot spawn tick timer\n", .{});
+        return 2;
+    };
+
     var io_boot = zygos.provider_boot.IoBoot.start(gpa);
     var boot = zygos.provider_boot.CatalogBoot.start(gpa, &actor, &registry, io_boot.io(), &catalog, env) catch {
         eprint("mission: provider boot failed\n", .{});
