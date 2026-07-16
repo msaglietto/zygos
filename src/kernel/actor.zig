@@ -102,6 +102,17 @@ pub const Config = struct {
     ack_timeout_ms: i64 = 10_000,
     channel_ttl_ms: i64 = 300_000,
     inbox_capacity: usize = 1024,
+    /// Per-function deadline policy, matched by function-id prefix (first
+    /// match wins; fallback `invoke_timeout_ms`). The embedder supplies the
+    /// naming — the kernel stays worker-agnostic. Motivation: one global
+    /// timeout cannot serve both a whole-mission blocking call and the
+    /// provider calls inside it. Entries must outlive the actor.
+    invoke_timeout_overrides: []const TimeoutOverride = &.{},
+};
+
+pub const TimeoutOverride = struct {
+    prefix: []const u8,
+    timeout_ms: i64,
 };
 
 // ---------------------------------------------------------------------------
@@ -515,7 +526,7 @@ pub const Actor = struct {
                         callee,
                         m.function_id,
                         .{ .connection = from },
-                        now_ms + self.config.invoke_timeout_ms,
+                        now_ms + self.invokeTimeoutFor(m.function_id),
                     ) catch |err| {
                         log.warn("invoke {s}: {t}, frame dropped", .{ m.function_id, err });
                         return;
@@ -602,6 +613,12 @@ pub const Actor = struct {
     }
 
     // -- invocation callbacks (sweeps / disconnects) -------------------------
+
+    fn invokeTimeoutFor(self: *const Actor, function_id: []const u8) i64 {
+        for (self.config.invoke_timeout_overrides) |o|
+            if (std.mem.startsWith(u8, function_id, o.prefix)) return o.timeout_ms;
+        return self.config.invoke_timeout_ms;
+    }
 
     fn onInvokeTimeout(self: *Actor, id: types.Uuid, reply: invocation_mod.ReplyTarget, function_id: []const u8) void {
         self.completeExceptionally(id, reply, function_id, "timeout", "invocation deadline exceeded");
@@ -754,9 +771,13 @@ const Harness = struct {
     actor: Actor,
 
     fn init(gpa: std.mem.Allocator) !*Harness {
+        return initWith(gpa, .{});
+    }
+
+    fn initWith(gpa: std.mem.Allocator, config: Config) !*Harness {
         const self = try gpa.create(Harness);
         self.fake = .{ .gpa = gpa };
-        self.actor = try Actor.init(gpa, .{}, self.fake.outbound());
+        self.actor = try Actor.init(gpa, config, self.fake.outbound());
         return self;
     }
 
@@ -897,6 +918,55 @@ test "timeout tick synthesizes timeout error; late result then dropped" {
         \\ "function_id":"f","result":{}}
     , 40_000);
     try testing.expectEqual(@as(usize, 2), h.fake.sent.items.len);
+}
+
+test "invoke timeout overrides: prefixed functions get their own deadline, others keep the default" {
+    var h = try Harness.initWith(testing.allocator, .{
+        .invoke_timeout_ms = 30_000,
+        .invoke_timeout_overrides = &.{
+            .{ .prefix = "long::", .timeout_ms = 300_000 },
+        },
+    });
+    defer h.deinit();
+
+    try h.frame(widOf(1), "{\"type\":\"registerfunction\",\"id\":\"long::f\",\"description\":\"\"}", 0);
+    try h.frame(widOf(1), "{\"type\":\"registerfunction\",\"id\":\"short::f\",\"description\":\"\"}", 0);
+    try h.frame(widOf(2),
+        \\{"type":"invokefunction","invocation_id":"11111111-2222-3333-4444-555555555555",
+        \\ "function_id":"long::f","data":{}}
+    , 1_000);
+    try h.frame(widOf(3),
+        \\{"type":"invokefunction","invocation_id":"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        \\ "function_id":"short::f","data":{}}
+    , 1_000);
+    try testing.expectEqual(@as(usize, 2), h.fake.sent.items.len); // both forwarded
+    try testing.expectEqual(@as(usize, 2), h.actor.invocations.count());
+
+    // Past the default deadline: only the non-overridden call times out.
+    h.actor.post(.{ .tick = 1_000 + 30_000 });
+    try testing.expect(h.actor.step());
+    try testing.expectEqual(@as(usize, 3), h.fake.sent.items.len);
+    try testing.expectEqual(@as(usize, 1), h.actor.invocations.count());
+    {
+        var p = try h.fake.parseAt(2);
+        defer p.deinit();
+        try testing.expect(std.mem.eql(u8, &h.fake.sent.items[2].to, &widOf(3)));
+        try testing.expectEqualStrings("timeout", p.value.invocationresult.err.?.code);
+        try testing.expectEqualStrings("short::f", p.value.invocationresult.function_id);
+    }
+
+    // Past the override deadline: the long call times out too.
+    h.actor.post(.{ .tick = 1_000 + 300_000 });
+    try testing.expect(h.actor.step());
+    try testing.expectEqual(@as(usize, 4), h.fake.sent.items.len);
+    try testing.expectEqual(@as(usize, 0), h.actor.invocations.count());
+    {
+        var p = try h.fake.parseAt(3);
+        defer p.deinit();
+        try testing.expect(std.mem.eql(u8, &h.fake.sent.items[3].to, &widOf(2)));
+        try testing.expectEqualStrings("timeout", p.value.invocationresult.err.?.code);
+        try testing.expectEqualStrings("long::f", p.value.invocationresult.function_id);
+    }
 }
 
 test "callee disconnect fails its pendings with worker_disconnected" {

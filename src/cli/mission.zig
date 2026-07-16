@@ -98,10 +98,19 @@ pub fn run(gpa: std.mem.Allocator, args: *std.process.Args.Iterator) u8 {
 
     // ---- kernel + roster (the e2e/m3 wiring, catalog + manual approvals) ----
     var registry = zygos.inproc.Registry.init(gpa, null);
+    // The blocking missions::start call spans the WHOLE mission — under the
+    // flat invoke timeout it doubled as a mission duration cap (a 1h default
+    // killed hour-long research runs mid-flight). It gets its own ceiling;
+    // everything else (role turns, providers, gates) keeps
+    // ZYGOS_INVOKE_TIMEOUT_MS. Must outlive the actor: function-local.
+    const timeout_overrides = [_]zygos.actor.TimeoutOverride{
+        .{ .prefix = "zygos::missions::", .timeout_ms = envInt(env, "ZYGOS_MISSION_TIMEOUT_MS", 86_400_000) },
+    };
     var actor = zygos.actor.Actor.init(gpa, .{
-        // Role turns and the blocking missions::start ride bus invocations;
-        // real providers and console gates outlive the 30s default.
+        // Role turns ride bus invocations; real providers and console gates
+        // outlive the 30s default.
         .invoke_timeout_ms = envInt(env, "ZYGOS_INVOKE_TIMEOUT_MS", 3_600_000),
+        .invoke_timeout_overrides = &timeout_overrides,
     }, registry.outbound()) catch return oom();
     const kernel = std.Thread.spawn(.{}, zygos.actor.Actor.run, .{&actor}) catch {
         eprint("mission: cannot spawn kernel thread\n", .{});
