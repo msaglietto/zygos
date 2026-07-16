@@ -10,6 +10,7 @@
 
 const std = @import("std");
 const json = std.json;
+const stream_tap = @import("stream_tap.zig");
 
 pub const AssembleError = error{ OutOfMemory, MalformedEvent, ApiError, Incomplete };
 
@@ -153,6 +154,7 @@ pub const Assembler = struct {
                     // The start's "input" value is ignored by contract; the
                     // real input is the concatenated partial_json fragments.
                     try self.blocks.append(self.gpa, .{ .tool_use = .{ .id = id, .name = name, .input = .empty } });
+                    stream_tap.emit(.tool_name, name);
                 } else {
                     // Unknown block kind: keep indexes aligned with a text acc.
                     try self.blocks.append(self.gpa, .{ .text = .empty });
@@ -178,6 +180,15 @@ pub const Assembler = struct {
                     switch (self.blocks.items[@intCast(index)]) {
                         .tool_use => |*tu| try tu.input.appendSlice(self.gpa, fragment),
                         .text => return error.MalformedEvent,
+                    }
+                    stream_tap.emit(.tool_args, fragment);
+                    return null;
+                } else if (std.mem.eql(u8, dtype, "thinking_delta")) {
+                    // Extended-thinking text: live observability only, never
+                    // part of the terminal message (the block acc at this
+                    // index is the unknown-kind text placeholder — untouched).
+                    if (strField(delta, "thinking")) |thought| {
+                        if (thought.len > 0) stream_tap.emit(.thinking, thought);
                     }
                     return null;
                 }
@@ -383,6 +394,100 @@ test "ping and unknown events return null and change nothing" {
     try testing.expect((try a.onEvent("ping", "{\"type\":\"ping\"}")) == null);
     try testing.expect((try a.onEvent("future_event", "{\"whatever\":1}")) == null);
     try testing.expect(!a.isDone());
+}
+
+const TapCapture = struct {
+    gpa: std.mem.Allocator,
+    kinds: std.ArrayList(stream_tap.Kind) = .empty,
+    chunks: std.ArrayList([]u8) = .empty,
+
+    fn onDelta(ctx: *anyopaque, kind: stream_tap.Kind, bytes: []const u8) void {
+        const self: *TapCapture = @ptrCast(@alignCast(ctx));
+        const copy = self.gpa.dupe(u8, bytes) catch return;
+        self.chunks.append(self.gpa, copy) catch {
+            self.gpa.free(copy);
+            return;
+        };
+        self.kinds.append(self.gpa, kind) catch {};
+    }
+
+    fn tap(self: *TapCapture) stream_tap.Tap {
+        return .{ .ctx = @ptrCast(self), .onDelta = &onDelta };
+    }
+
+    fn deinit(self: *TapCapture) void {
+        for (self.chunks.items) |c| self.gpa.free(c);
+        self.chunks.deinit(self.gpa);
+        self.kinds.deinit(self.gpa);
+    }
+};
+
+test "thinking_delta reaches the stream tap and never the final message" {
+    var cap = TapCapture{ .gpa = testing.allocator };
+    defer cap.deinit();
+    const token = stream_tap.register(cap.tap()) orelse return error.NoSlot;
+    defer stream_tap.unregister(token);
+
+    var a = Assembler.init(testing.allocator);
+    defer a.deinit();
+    _ = try a.onEvent("message_start", start_ev);
+    _ = try a.onEvent("content_block_start",
+        \\{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}
+    );
+    _ = try a.onEvent("content_block_delta",
+        \\{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"weighing the options"}}
+    );
+    _ = try a.onEvent("content_block_stop",
+        \\{"type":"content_block_stop","index":0}
+    );
+    _ = try a.onEvent("content_block_start",
+        \\{"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}
+    );
+    _ = try a.onEvent("content_block_delta",
+        \\{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"Answer."}}
+    );
+    _ = try a.onEvent("message_delta",
+        \\{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":9}}
+    );
+    _ = try a.onEvent("message_stop",
+        \\{"type":"message_stop"}
+    );
+
+    try testing.expectEqual(@as(usize, 1), cap.chunks.items.len);
+    try testing.expectEqual(stream_tap.Kind.thinking, cap.kinds.items[0]);
+    try testing.expectEqualStrings("weighing the options", cap.chunks.items[0]);
+
+    const msg = try a.message();
+    // Thinking placeholder block stays empty; the answer text is intact.
+    try testing.expectEqualStrings("", msg.content[0].text);
+    try testing.expectEqualStrings("Answer.", msg.content[1].text);
+}
+
+test "tool_use start and input_json_delta fragments reach the stream tap" {
+    var cap = TapCapture{ .gpa = testing.allocator };
+    defer cap.deinit();
+    const token = stream_tap.register(cap.tap()) orelse return error.NoSlot;
+    defer stream_tap.unregister(token);
+
+    var a = Assembler.init(testing.allocator);
+    defer a.deinit();
+    _ = try a.onEvent("message_start", start_ev);
+    _ = try a.onEvent("content_block_start",
+        \\{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"tu_1","name":"bash","input":{}}}
+    );
+    _ = try a.onEvent("content_block_delta",
+        \\{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"command\":"}}
+    );
+    _ = try a.onEvent("content_block_delta",
+        \\{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"\"pwd\"}"}}
+    );
+
+    try testing.expectEqual(@as(usize, 3), cap.chunks.items.len);
+    try testing.expectEqual(stream_tap.Kind.tool_name, cap.kinds.items[0]);
+    try testing.expectEqualStrings("bash", cap.chunks.items[0]);
+    try testing.expectEqual(stream_tap.Kind.tool_args, cap.kinds.items[1]);
+    try testing.expectEqualStrings("{\"command\":", cap.chunks.items[1]);
+    try testing.expectEqualStrings("\"pwd\"}", cap.chunks.items[2]);
 }
 
 test "error event returns ApiError" {

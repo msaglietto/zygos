@@ -11,6 +11,7 @@
 //! usable, an {"error":...} body is ApiError; input bytes never crash.
 
 const std = @import("std");
+const stream_tap = @import("stream_tap.zig");
 const json = std.json;
 
 pub const AssembleError = error{ OutOfMemory, MalformedEvent, ApiError, Incomplete };
@@ -122,12 +123,22 @@ pub const Assembler = struct {
                 if (strField(f, "name")) |n| {
                     acc.name.clearRetainingCapacity();
                     try acc.name.appendSlice(self.gpa, n);
+                    stream_tap.emit(.tool_name, n);
                 }
                 // Accumulate, never parse: arguments arrive as JSON-text
                 // fragments (same rule as anthropic's partial_json).
-                if (strField(f, "arguments")) |frag| try acc.args.appendSlice(self.gpa, frag);
+                if (strField(f, "arguments")) |frag| {
+                    try acc.args.appendSlice(self.gpa, frag);
+                    stream_tap.emit(.tool_args, frag);
+                }
             }
         };
+
+        // Reasoning-model deltas (DeepSeek/GLM/Minimax dialects) are live
+        // observability only — never part of the terminal message.
+        if (strField(delta, "reasoning_content") orelse strField(delta, "reasoning")) |thought| {
+            if (thought.len > 0) stream_tap.emit(.thinking, thought);
+        }
 
         if (strField(delta, "content")) |text| if (text.len > 0) {
             try self.text.appendSlice(self.gpa, text);
@@ -372,6 +383,86 @@ test "text-only stream: ordered deltas, joined final text, stop end_turn" {
     try testing.expectEqual(StopReason.end_turn, msg.stop_reason);
     try testing.expectEqual(@as(usize, 1), msg.content.len);
     try testing.expectEqualStrings("Hello", msg.content[0].text);
+}
+
+const TapCapture = struct {
+    gpa: std.mem.Allocator,
+    kinds: std.ArrayList(stream_tap.Kind) = .empty,
+    chunks: std.ArrayList([]u8) = .empty,
+
+    fn onDelta(ctx: *anyopaque, kind: stream_tap.Kind, bytes: []const u8) void {
+        const self: *TapCapture = @ptrCast(@alignCast(ctx));
+        const copy = self.gpa.dupe(u8, bytes) catch return;
+        self.chunks.append(self.gpa, copy) catch {
+            self.gpa.free(copy);
+            return;
+        };
+        self.kinds.append(self.gpa, kind) catch {};
+    }
+
+    fn tap(self: *TapCapture) stream_tap.Tap {
+        return .{ .ctx = @ptrCast(self), .onDelta = &onDelta };
+    }
+
+    fn deinit(self: *TapCapture) void {
+        for (self.chunks.items) |c| self.gpa.free(c);
+        self.chunks.deinit(self.gpa);
+        self.kinds.deinit(self.gpa);
+    }
+};
+
+test "reasoning_content deltas reach the stream tap, never the final message" {
+    var cap = TapCapture{ .gpa = testing.allocator };
+    defer cap.deinit();
+    const token = stream_tap.register(cap.tap()) orelse return error.NoSlot;
+    defer stream_tap.unregister(token);
+
+    var a = Assembler.init(testing.allocator);
+    defer a.deinit();
+    const d1 = try a.onEvent(
+        \\{"id":"c","model":"deepseek-v4","choices":[{"index":0,"delta":{"reasoning_content":"let me think about "},"finish_reason":null}]}
+    );
+    try testing.expectEqual(@as(?[]const u8, null), d1); // not a text delta
+    _ = try a.onEvent(
+        \\{"id":"c","model":"deepseek-v4","choices":[{"index":0,"delta":{"reasoning":"allocators"},"finish_reason":null}]}
+    );
+    _ = try a.onEvent(
+        \\{"id":"c","model":"deepseek-v4","choices":[{"index":0,"delta":{"content":"Answer."},"finish_reason":"stop"}]}
+    );
+    _ = try a.onEvent("[DONE]");
+
+    try testing.expectEqual(@as(usize, 2), cap.chunks.items.len);
+    try testing.expectEqual(stream_tap.Kind.thinking, cap.kinds.items[0]);
+    try testing.expectEqualStrings("let me think about ", cap.chunks.items[0]);
+    try testing.expectEqualStrings("allocators", cap.chunks.items[1]);
+
+    // The terminal message holds only the answer text.
+    const msg = try a.message();
+    try testing.expectEqual(@as(usize, 1), msg.content.len);
+    try testing.expectEqualStrings("Answer.", msg.content[0].text);
+}
+
+test "tool_calls stream taps the name and each arguments fragment live" {
+    var cap = TapCapture{ .gpa = testing.allocator };
+    defer cap.deinit();
+    const token = stream_tap.register(cap.tap()) orelse return error.NoSlot;
+    defer stream_tap.unregister(token);
+
+    var a = Assembler.init(testing.allocator);
+    defer a.deinit();
+    _ = try a.onEvent(
+        \\{"id":"c","model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"bash","arguments":"{\"comm"}}]},"finish_reason":null}]}
+    );
+    _ = try a.onEvent(
+        \\{"id":"c","model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"and\":\"ls\"}"}}]},"finish_reason":"tool_calls"}]}
+    );
+
+    try testing.expectEqual(@as(usize, 3), cap.chunks.items.len);
+    try testing.expectEqual(stream_tap.Kind.tool_name, cap.kinds.items[0]);
+    try testing.expectEqualStrings("bash", cap.chunks.items[0]);
+    try testing.expectEqual(stream_tap.Kind.tool_args, cap.kinds.items[1]);
+    try testing.expectEqualStrings("{\"comm", cap.chunks.items[1]);
+    try testing.expectEqualStrings("and\":\"ls\"}", cap.chunks.items[2]);
 }
 
 test "tool_calls stream: arguments fragments accumulate into input JSON" {
