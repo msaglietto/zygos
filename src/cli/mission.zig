@@ -27,6 +27,7 @@ pub fn run(gpa: std.mem.Allocator, args: *std.process.Args.Iterator) u8 {
     var brief_path: ?[]const u8 = null;
     var planning_opt: ?[]const u8 = null;
     var run_stamp = false;
+    var no_tui = false;
     while (args.next()) |a| {
         if (std.mem.eql(u8, a, "--planning")) {
             planning_opt = args.next() orelse return usage();
@@ -34,6 +35,8 @@ pub fn run(gpa: std.mem.Allocator, args: *std.process.Args.Iterator) u8 {
             resume_flag = true;
         } else if (std.mem.eql(u8, a, "--run-stamp")) {
             run_stamp = true;
+        } else if (std.mem.eql(u8, a, "--no-tui")) {
+            no_tui = true;
         } else if (brief_path == null) {
             brief_path = a;
         } else {
@@ -159,7 +162,6 @@ pub fn run(gpa: std.mem.Allocator, args: *std.process.Args.Iterator) u8 {
     }
 
     const turns = zygos.turn.TurnOrchestrator.start(gpa, &actor, &registry) catch return boot_fail();
-    _ = turns;
     const tools = zygos.tools.ToolsWorker.start(gpa, &actor, &registry, cwd) catch return boot_fail();
     _ = tools;
 
@@ -255,14 +257,53 @@ pub fn run(gpa: std.mem.Allocator, args: *std.process.Args.Iterator) u8 {
     }
 
     // ---- console approvals (detached; EOF ⇒ manual timeouts deny) -----------
+    // With a tty on both ends (and no opt-out) the live TUI takes over the
+    // terminal: trace events + streamed deltas feed its model, approvals
+    // resolve on a single keypress, std.log reroutes through the logbridge.
+    // Piped/CI runs keep the plain path byte-identical.
     const console_worker = zygos.inproc.Worker.spawn(gpa, &actor, &registry, "mission-console") catch return boot_fail();
-    if (std.Thread.spawn(.{}, consoleLoop, .{ gpa, console_worker })) |t| t.detach() else |_| {}
+    const trace_path = std.fmt.allocPrint(gpa, "{s}/{s}", .{ planning, zygos.trace.file_name }) catch return oom();
+
+    const want_tui = !no_tui and getEnv(env, "ZYGOS_NO_TUI") == null and zygos.tui.term.RealTerm.isTty();
+    var real_term: zygos.tui.term.RealTerm = .{};
+    var ui: ?*zygos.tui.Tui = null;
+    var ui_sink: ?usize = null;
+    if (want_tui and real_term.enterRaw()) {
+        const t = zygos.tui.Tui.create(gpa, real_term.terminal()) catch return oom();
+        if (t.start()) {
+            ui = t;
+            ui_sink = zygos.trace.registerSink(.{
+                .ctx = @ptrCast(&t.model),
+                .onEvent = &zygos.tui.model.Model.sinkOnEvent,
+            });
+            turns.setDeltaObserver(.{
+                .ctx = @ptrCast(&t.model),
+                .onDelta = &zygos.tui.model.Model.observerOnDelta,
+            });
+            zygos.tui.logbridge.install(.{
+                .ctx = @ptrCast(&t.model),
+                .onLine = &zygos.tui.model.Model.hookOnLine,
+            });
+            if (std.fmt.allocPrint(gpa, "trace → {s}", .{trace_path})) |note| {
+                t.model.onLog(note);
+                gpa.free(note);
+            } else |_| {}
+            if (std.Thread.spawn(.{}, tuiApprovalLoop, .{
+                gpa, console_worker, t, real_term.terminal(),
+            })) |thr| thr.detach() else |_| {}
+        } else |_| {
+            real_term.restore();
+            t.stop();
+        }
+    }
+    if (ui == null) {
+        if (std.Thread.spawn(.{}, consoleLoop, .{ gpa, console_worker })) |t| t.detach() else |_| {}
+        eprint("mission: trace → {s} (view: zygos mission trace {s})\n", .{ trace_path, planning });
+    }
 
     // ---- the mission ---------------------------------------------------------
     // Scripted-test defaults (8 steps/turn, 16 turns) are too tight for real
     // executors iterating with tools — a real mission gets room by default.
-    const trace_path = std.fmt.allocPrint(gpa, "{s}/{s}", .{ planning, zygos.trace.file_name }) catch return oom();
-    eprint("mission: trace → {s} (view: zygos mission trace {s})\n", .{ trace_path, planning });
     const request = std.fmt.allocPrint(gpa,
         \\{{"mission_id":{f},"planning_root":{f},"objective":{f},"brief":{f},
         \\ "router_function":"zygos::models::resolve",
@@ -293,9 +334,13 @@ pub fn run(gpa: std.mem.Allocator, args: *std.process.Args.Iterator) u8 {
     }) catch return oom();
 
     const res = caller.call("zygos::missions::start", request) catch {
+        if (ui) |t| tuiStop(t, ui_sink, turns, &real_term);
         eprint("mission: bus call failed\n", .{});
         return 1;
     };
+    // ALWAYS before touching stdout/stderr: the final JSON must print onto a
+    // restored (cooked, cursor-visible) terminal, below the TUI's last frame.
+    if (ui) |t| tuiStop(t, ui_sink, turns, &real_term);
     switch (res) {
         .err => |code| {
             eprint("mission: errored: {s}\n", .{code});
@@ -309,9 +354,21 @@ pub fn run(gpa: std.mem.Allocator, args: *std.process.Args.Iterator) u8 {
     }
 }
 
+/// Unhook the model from every producer, stop rendering (paints the final
+/// frame), restore the terminal. Deliberately never destroys the Tui: the
+/// detached approval thread may still hold the model, and the process exits
+/// right after (run() leaks its workers the same way).
+fn tuiStop(ui: *zygos.tui.Tui, sink: ?usize, turns: *zygos.turn.TurnOrchestrator, real: *zygos.tui.term.RealTerm) void {
+    turns.setDeltaObserver(null);
+    if (sink) |token| zygos.trace.unregisterSink(token);
+    zygos.tui.logbridge.clear();
+    ui.stop();
+    real.restore();
+}
+
 fn usage() u8 {
     eprint(
-        "usage: zygos mission start|resume <brief.md> [--planning <dir>] [--resume] [--run-stamp]\n" ++
+        "usage: zygos mission start|resume <brief.md> [--planning <dir>] [--resume] [--run-stamp] [--no-tui]\n" ++
             "       zygos mission trace <planning-dir|events.jsonl>\n",
         .{},
     );
@@ -444,6 +501,81 @@ fn consoleLoop(gpa: std.mem.Allocator, worker: *zygos.inproc.Worker) void {
             rr.deinit(gpa);
             handled.put(gpa.dupe(u8, id) catch return, {}) catch return;
         }
+    }
+}
+
+/// TUI twin of consoleLoop: the pending ask renders as the model's approval
+/// band and resolves on a single keypress (raw mode). Ctrl-C arrives as byte
+/// 0x03 (ISIG is off) — repair the terminal and re-raise SIGINT. If the
+/// approval worker's manual timeout denies the ask first, the band clears on
+/// the next poll — fail closed, same as the console path.
+fn tuiApprovalLoop(
+    gpa: std.mem.Allocator,
+    worker: *zygos.inproc.Worker,
+    ui: *zygos.tui.Tui,
+    keys: zygos.tui.term.Terminal,
+) void {
+    var handled = std.StringHashMap(void).init(gpa);
+    var current_id: ?[]u8 = null;
+    while (true) {
+        // The 100ms key poll doubles as the loop interval.
+        if (keys.readKey(100)) |k| {
+            if (k == 0x03) {
+                zygos.tui.emergencyRestore();
+                _ = std.c.raise(.INT);
+                return;
+            }
+            const id = current_id orelse continue;
+            const approved = switch (k) {
+                'y', 'Y' => true,
+                'n', 'N', '\r', '\n' => false,
+                else => continue,
+            };
+            const req = std.fmt.allocPrint(gpa, "{{\"id\":{f},\"approved\":{}}}", .{
+                json.fmt(id, .{}), approved,
+            }) catch return;
+            defer gpa.free(req);
+            const rr = worker.call("zygos::approvals::resolve", req) catch return;
+            rr.deinit(gpa);
+            ui.model.setPendingApproval(null);
+            handled.put(id, {}) catch return; // key ownership moves to the map
+            current_id = null;
+            continue;
+        }
+
+        const res = worker.call("zygos::approvals::pending", "{}") catch return;
+        defer res.deinit(gpa);
+        if (res != .ok) return;
+        var p = json.parseFromSlice(json.Value, gpa, res.ok, .{}) catch continue;
+        defer p.deinit();
+        const list = p.value.object.get("pending") orelse continue;
+        if (list != .array) continue;
+
+        if (current_id) |id| {
+            var still_pending = false;
+            for (list.array.items) |item| {
+                if (item != .object) continue;
+                const pid = strOf(item.object.get("id")) orelse continue;
+                if (std.mem.eql(u8, pid, id)) still_pending = true;
+            }
+            if (!still_pending) { // timed out server-side: denied
+                ui.model.setPendingApproval(null);
+                handled.put(id, {}) catch return;
+                current_id = null;
+            }
+        }
+        if (current_id == null) for (list.array.items) |item| {
+            if (item != .object) continue;
+            const id = strOf(item.object.get("id")) orelse continue;
+            if (handled.contains(id)) continue;
+            const tool = strOf(item.object.get("tool")) orelse "?";
+            const reason = strOf(item.object.get("reason")) orelse "";
+            const summary = std.fmt.allocPrint(gpa, "{s}: {s}", .{ tool, reason }) catch return;
+            defer gpa.free(summary);
+            ui.model.setPendingApproval(summary);
+            current_id = gpa.dupe(u8, id) catch return;
+            break;
+        };
     }
 }
 
