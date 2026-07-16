@@ -19,6 +19,16 @@ pub const std_options: std.Options = .{
     .logFn = filteredLog,
 };
 
+/// A panic mid-TUI must repair the terminal (cooked mode, cursor, end
+/// synchronized output) BEFORE printing, or the message lands invisibly
+/// inside a ?2026 frame on a raw-mode screen.
+pub const panic = std.debug.FullPanic(zygosPanic);
+
+fn zygosPanic(msg: []const u8, first_trace_addr: ?usize) noreturn {
+    zygos.tui.emergencyRestore();
+    std.debug.defaultPanic(msg, first_trace_addr);
+}
+
 var log_filter: std.log.Level = .warn;
 
 fn filteredLog(
@@ -28,6 +38,17 @@ fn filteredLog(
     args: anytype,
 ) void {
     if (@intFromEnum(level) > @intFromEnum(log_filter)) return;
+    // While the TUI owns stderr, raw log writes would corrupt the repaint
+    // band: warn/err become model footnotes, the rest drop.
+    if (zygos.tui.logbridge.active()) {
+        if (comptime (level == .err or level == .warn)) {
+            const prefix = "[" ++ @tagName(scope) ++ "] (" ++ comptime level.asText() ++ "): ";
+            var buf: [1024]u8 = undefined;
+            const line = std.fmt.bufPrint(&buf, prefix ++ format, args) catch prefix ++ "<line too long>";
+            _ = zygos.tui.logbridge.capture(line);
+        }
+        return;
+    }
     std.log.defaultLog(level, scope, format, args);
 }
 

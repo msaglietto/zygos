@@ -27,6 +27,13 @@ pub fn clear() void {
     hook = null;
 }
 
+/// True while a hook is installed (the TUI owns stderr).
+pub fn active() bool {
+    mutex.lock();
+    defer mutex.unlock();
+    return hook != null;
+}
+
 /// True when the line was consumed by an installed hook; false tells the
 /// caller to fall back to its normal stderr path. The line bytes are valid
 /// only for the duration of the call.

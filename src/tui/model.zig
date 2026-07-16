@@ -89,6 +89,12 @@ pub const Model = struct {
         self.onDelta(bytes);
     }
 
+    /// logbridge.Hook adapter.
+    pub fn hookOnLine(ctx: *anyopaque, line: []const u8) void {
+        const self: *Model = @ptrCast(@alignCast(ctx));
+        self.onLog(line);
+    }
+
     pub fn onEvent(self: *Model, line_json: []const u8) void {
         var arena_state = std.heap.ArenaAllocator.init(self.gpa);
         defer arena_state.deinit();
