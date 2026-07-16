@@ -11,6 +11,7 @@ pub const term = @import("term.zig");
 pub const theme = @import("theme.zig");
 pub const frame = @import("frame.zig");
 pub const model = @import("model.zig");
+pub const partialjson = @import("partialjson.zig");
 pub const loop = @import("loop.zig");
 pub const logbridge = @import("logbridge.zig");
 

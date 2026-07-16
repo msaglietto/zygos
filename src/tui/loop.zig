@@ -92,7 +92,7 @@ pub const Tui = struct {
 
     fn paint(self: *Tui, arena: std.mem.Allocator) void {
         self.renderer.resizeIfNeeded();
-        const f = self.model.render(arena, nowMs()) catch return;
+        const f = self.model.render(arena, self.renderer.cols, nowMs()) catch return;
         self.renderer.drawLog(f.chat, f.bottom) catch {};
     }
 };

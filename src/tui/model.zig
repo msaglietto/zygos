@@ -13,11 +13,25 @@ const std = @import("std");
 const json = std.json;
 const sync = @import("../kernel/sync.zig");
 const theme = @import("theme.zig");
+const width = @import("width.zig");
+const partialjson = @import("partialjson.zig");
 
 /// Streamed-text tail lines shown live in the bottom band.
-const live_tail_lines: usize = 6;
+const live_tail_lines: usize = 8;
+/// Thinking tail lines shown while the model reasons.
+const thinking_tail_lines: usize = 4;
+/// Live tool box body rows (high-water padded up to this cap).
+const tool_box_max_rows: usize = 5;
 /// Cap for tool input previews in the step list.
 const input_preview_bytes: usize = 72;
+
+const italic = "\x1b[3m";
+
+fn defaultNow() i64 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.REALTIME, &ts);
+    return @as(i64, @intCast(ts.sec)) * 1000 + @divTrunc(@as(i64, @intCast(ts.nsec)), std.time.ns_per_ms);
+}
 
 pub const Frame = struct {
     chat: []const []const u8,
@@ -54,6 +68,17 @@ pub const Model = struct {
     tools: std.ArrayList(ToolView) = .empty,
     /// Current step's streamed assistant text.
     live: std.ArrayList(u8) = .empty,
+    /// Live reasoning stream (thinking_delta / reasoning_content) — shown
+    /// while it runs, collapsed to a "thought for Ns" line at the next
+    /// text/tool/step boundary.
+    thinking: std.ArrayList(u8) = .empty,
+    thinking_started_ms: ?i64 = null,
+    /// Tool call still streaming its arguments (pre-dispatch): live box.
+    live_tool_name: ?[]u8 = null,
+    live_tool_args: std.ArrayList(u8) = .empty,
+    live_tool_high: usize = 0,
+    /// Injectable clock (tests); render timestamps still come from callers.
+    now_fn: *const fn () i64 = &defaultNow,
 
     pub fn init(gpa: std.mem.Allocator, started_ms: i64) Model {
         return .{ .gpa = gpa, .started_ms = started_ms };
@@ -65,6 +90,9 @@ pub const Model = struct {
         self.clearTools();
         self.tools.deinit(self.gpa);
         self.live.deinit(self.gpa);
+        self.thinking.deinit(self.gpa);
+        self.live_tool_args.deinit(self.gpa);
+        if (self.live_tool_name) |n| self.gpa.free(n);
         if (self.mission_state) |s| self.gpa.free(s);
         if (self.role) |r| self.gpa.free(r);
         if (self.step_model) |m| self.gpa.free(m);
@@ -114,7 +142,39 @@ pub const Model = struct {
     pub fn onDelta(self: *Model, bytes: []const u8) void {
         self.mutex.lock();
         defer self.mutex.unlock();
+        // The answer starting is the end of the thinking phase.
+        self.flushThinking() catch {};
         self.live.appendSlice(self.gpa, bytes) catch {};
+        self.dirty.set();
+    }
+
+    /// Reasoning stream (worker/stream_tap.zig `.thinking`).
+    pub fn onThinking(self: *Model, bytes: []const u8) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.thinking_started_ms == null) self.thinking_started_ms = self.now_fn();
+        self.thinking.appendSlice(self.gpa, bytes) catch {};
+        self.dirty.set();
+    }
+
+    /// A tool call opened on the stream (`.tool_name`): start a live box.
+    pub fn onToolName(self: *Model, name: []const u8) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.flushThinking() catch {};
+        const copy = self.gpa.dupe(u8, name) catch return;
+        if (self.live_tool_name) |old| self.gpa.free(old);
+        self.live_tool_name = copy;
+        self.live_tool_args.clearRetainingCapacity();
+        self.live_tool_high = 0;
+        self.dirty.set();
+    }
+
+    /// Streaming tool-arguments fragment (`.tool_args`).
+    pub fn onToolArgs(self: *Model, fragment: []const u8) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.live_tool_args.appendSlice(self.gpa, fragment) catch {};
         self.dirty.set();
     }
 
@@ -160,7 +220,9 @@ pub const Model = struct {
                 theme.fg(&color, theme.Color.accent), role, theme.reset, self.role_turn,
             });
         } else if (std.mem.eql(u8, ev, "role_end")) {
+            try self.flushThinking();
             try self.flushLive();
+            self.clearLiveTool();
             try self.collapseOpenTools();
             const outcome = str(obj, "outcome") orelse "?";
             const failed = !std.mem.eql(u8, outcome, "ok");
@@ -186,11 +248,16 @@ pub const Model = struct {
                 self.role = null;
             }
         } else if (std.mem.eql(u8, ev, "step")) {
+            try self.flushThinking();
             try self.flushLive();
+            self.clearLiveTool();
             self.step = int(obj, "step");
             self.attempt = int(obj, "attempt");
             try self.replaceOwned(&self.step_model, str(obj, "model") orelse "?");
         } else if (std.mem.eql(u8, ev, "tool_call")) {
+            // Dispatch: the streaming box (if any) hands over to the running
+            // tool list fed by this event.
+            self.clearLiveTool();
             const name = try self.gpa.dupe(u8, str(obj, "tool") orelse "?");
             errdefer self.gpa.free(name);
             const raw_input = str(obj, "input") orelse "";
@@ -215,7 +282,9 @@ pub const Model = struct {
             self.tokens_in += int(obj, "input_tokens");
             self.tokens_out += int(obj, "output_tokens");
         } else if (std.mem.eql(u8, ev, "turn_end")) {
+            try self.flushThinking();
             try self.flushLive();
+            self.clearLiveTool();
             try self.collapseOpenTools();
             self.step = 0;
             var buf: [64]u8 = undefined;
@@ -234,9 +303,11 @@ pub const Model = struct {
     // -- rendering (render thread) -------------------------------------------
 
     /// Snapshot the frame into `arena`. Chat lines accumulate; bottom is the
-    /// repainting band: header spinner line, step line, open tools, live
-    /// tail, approval ask, status line.
-    pub fn render(self: *Model, arena: std.mem.Allocator, now_ms: i64) error{OutOfMemory}!Frame {
+    /// repainting band: header spinner line, step line, dispatched tools,
+    /// live streaming tool box, thinking block, live answer text, approval
+    /// ask, status line. `cols` shapes the tool box borders; the renderer
+    /// still truncates every row defensively.
+    pub fn render(self: *Model, arena: std.mem.Allocator, cols: usize, now_ms: i64) error{OutOfMemory}!Frame {
         self.mutex.lock();
         defer self.mutex.unlock();
 
@@ -275,7 +346,7 @@ pub const Model = struct {
             }
         }
 
-        // Open tool calls.
+        // Dispatched tool calls awaiting results.
         for (self.tools.items) |t| {
             var tcolor: [16]u8 = undefined;
             try bottom.append(arena, try std.fmt.allocPrint(arena, "  {s} {s}{s}{s} {s}{s}{s}", .{
@@ -289,20 +360,22 @@ pub const Model = struct {
             }));
         }
 
-        // Live streamed text: last N lines, dim.
-        var tail = std.mem.splitBackwardsScalar(u8, std.mem.trimEnd(u8, self.live.items, "\n"), '\n');
-        var tail_lines: [live_tail_lines][]const u8 = undefined;
-        var n: usize = 0;
-        while (n < live_tail_lines) : (n += 1) {
-            tail_lines[n] = tail.next() orelse break;
-        }
-        while (n > 0) {
-            n -= 1;
-            if (tail_lines[n].len == 0) continue;
-            try bottom.append(arena, try std.fmt.allocPrint(arena, "  {s}{s}{s}", .{
-                theme.dim, tail_lines[n], theme.reset,
+        try self.renderLiveToolBox(arena, &bottom, cols);
+
+        // Thinking block: label + italic tail while the model reasons.
+        if (self.thinking.items.len > 0) {
+            var t_buf: [32]u8 = undefined;
+            const started = self.thinking_started_ms orelse now_ms;
+            try bottom.append(arena, try std.fmt.allocPrint(arena, "  {s}✳ thinking… {s}{s}", .{
+                theme.fg(&color, theme.Color.accent),
+                theme.elapsed(&t_buf, started, now_ms),
+                theme.reset,
             }));
+            try appendTail(arena, &bottom, self.thinking.items, thinking_tail_lines, theme.dim ++ italic);
         }
+
+        // Live answer text: last N lines, full color — this is the payload.
+        try appendTail(arena, &bottom, self.live.items, live_tail_lines, "");
 
         // Approval ask.
         if (self.approval) |ask| {
@@ -324,12 +397,79 @@ pub const Model = struct {
         return .{ .chat = chat, .bottom = bottom.items };
     }
 
+    /// Bordered live box for a tool call still composing its arguments —
+    /// the headline field (command/path/content…) extracted from the
+    /// partial JSON streams into the body. Body height is high-water padded
+    /// so the box never shrinks mid-stream (zot's liveBodyHigh).
+    fn renderLiveToolBox(
+        self: *Model,
+        arena: std.mem.Allocator,
+        bottom: *std.ArrayList([]const u8),
+        cols: usize,
+    ) error{OutOfMemory}!void {
+        const name = self.live_tool_name orelse return;
+        const inner = @min(cols -| 6, 74); // box body cells between the │ rails
+        if (inner < 8) return;
+
+        var tcolor: [16]u8 = undefined;
+        const rail = try dashes(arena, inner -| (width.visibleWidth(name) + 3));
+        try bottom.append(arena, try std.fmt.allocPrint(arena, "  ╭─ {s}{s}{s} {s}╮", .{
+            theme.fg(&tcolor, theme.Color.tool), name, theme.reset, rail,
+        }));
+
+        const body = try partialjson.extractDisplayField(arena, self.live_tool_args.items) orelse
+            self.live_tool_args.items;
+        var lines: std.ArrayList([]const u8) = .empty;
+        var it = std.mem.splitScalar(u8, std.mem.trimEnd(u8, body, "\n"), '\n');
+        while (it.next()) |line| try lines.append(arena, line);
+        const start = lines.items.len -| tool_box_max_rows;
+        var shown = lines.items[start..];
+        if (shown.len == 1 and shown[0].len == 0) shown = shown[0..0];
+        self.live_tool_high = @min(@max(self.live_tool_high, shown.len), tool_box_max_rows);
+
+        var row: usize = 0;
+        while (row < self.live_tool_high) : (row += 1) {
+            const text = if (row < shown.len) shown[row] else "";
+            const clipped = try width.truncateToWidth(arena, text, inner);
+            const pad = try spaces(arena, inner -| width.visibleWidth(clipped));
+            try bottom.append(arena, try std.fmt.allocPrint(arena, "  │{s}{s}{s}{s}│", .{
+                theme.dim, clipped, theme.reset, pad,
+            }));
+        }
+        try bottom.append(arena, try std.fmt.allocPrint(arena, "  ╰{s}╯", .{try dashes(arena, inner)}));
+    }
+
     // -- internals (mutex held) ----------------------------------------------
 
     fn appendChatFmt(self: *Model, comptime fmt: []const u8, args: anytype) error{OutOfMemory}!void {
         const line = try std.fmt.allocPrint(self.gpa, fmt, args);
         errdefer self.gpa.free(line);
         try self.chat.append(self.gpa, line);
+    }
+
+    /// Collapse the reasoning phase into one history line, claude-code
+    /// style: the content was visible live; scrollback keeps the duration.
+    fn flushThinking(self: *Model) error{OutOfMemory}!void {
+        if (self.thinking.items.len == 0) {
+            self.thinking_started_ms = null;
+            return;
+        }
+        var e_buf: [32]u8 = undefined;
+        const started = self.thinking_started_ms orelse self.now_fn();
+        try self.appendChatFmt("  {s}{s}✳ thought for {s}{s}", .{
+            theme.dim, italic, theme.elapsed(&e_buf, started, self.now_fn()), theme.reset,
+        });
+        self.thinking.clearRetainingCapacity();
+        self.thinking_started_ms = null;
+    }
+
+    fn clearLiveTool(self: *Model) void {
+        if (self.live_tool_name) |n| {
+            self.gpa.free(n);
+            self.live_tool_name = null;
+        }
+        self.live_tool_args.clearRetainingCapacity();
+        self.live_tool_high = 0;
     }
 
     /// Move the streamed text into chat history, one dim line per text line.
@@ -378,6 +518,43 @@ pub const Model = struct {
     }
 };
 
+/// Last `max` non-empty-tail lines of `text` into the band, prefixed and
+/// wrapped in `sgr` (empty = terminal default).
+fn appendTail(
+    arena: std.mem.Allocator,
+    bottom: *std.ArrayList([]const u8),
+    text: []const u8,
+    max: usize,
+    comptime sgr: []const u8,
+) error{OutOfMemory}!void {
+    if (text.len == 0) return;
+    var tail = std.mem.splitBackwardsScalar(u8, std.mem.trimEnd(u8, text, "\n"), '\n');
+    var collected: [16][]const u8 = undefined;
+    var n: usize = 0;
+    while (n < @min(max, collected.len)) : (n += 1) {
+        collected[n] = tail.next() orelse break;
+    }
+    while (n > 0) {
+        n -= 1;
+        if (collected[n].len == 0) continue;
+        try bottom.append(arena, try std.fmt.allocPrint(arena, "  " ++ sgr ++ "{s}" ++
+            (if (sgr.len > 0) theme.reset else ""), .{collected[n]}));
+    }
+}
+
+fn dashes(arena: std.mem.Allocator, n: usize) error{OutOfMemory}![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var i: usize = 0;
+    while (i < n) : (i += 1) try out.appendSlice(arena, "─");
+    return out.items;
+}
+
+fn spaces(arena: std.mem.Allocator, n: usize) error{OutOfMemory}![]const u8 {
+    const buf = try arena.alloc(u8, n);
+    @memset(buf, ' ');
+    return buf;
+}
+
 /// Cut an input preview on a UTF-8 boundary, first line only.
 fn previewLen(s: []const u8) usize {
     var end: usize = @min(s.len, input_preview_bytes);
@@ -411,7 +588,7 @@ fn boolOf(obj: json.ObjectMap, key: []const u8) bool {
 const testing = std.testing;
 
 fn renderJoined(m: *Model, arena: std.mem.Allocator) ![]const u8 {
-    const f = try m.render(arena, 0);
+    const f = try m.render(arena, 80, 0);
     var out: std.ArrayList(u8) = .empty;
     for (f.chat) |l| {
         try out.appendSlice(arena, l);
@@ -473,7 +650,7 @@ test "step event flushes streamed text into chat" {
     );
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
-    const f = try m.render(arena_state.allocator(), 0);
+    const f = try m.render(arena_state.allocator(), 80, 0);
     // Flushed into chat...
     var found = false;
     for (f.chat) |l| {
@@ -613,7 +790,7 @@ test "log lines land in chat as dim footnotes" {
     m.onLog("[mission] (warn): something odd");
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
-    const f = try m.render(arena_state.allocator(), 0);
+    const f = try m.render(arena_state.allocator(), 80, 0);
     var found = false;
     for (f.chat) |l| {
         if (std.mem.indexOf(u8, l, "something odd") != null) found = true;
@@ -642,6 +819,97 @@ test "every mutation sets the dirty event" {
 
     m.onLog("y");
     try testing.expect(m.dirty.isSet());
+}
+
+var fake_now: i64 = 0;
+fn fakeNow() i64 {
+    return fake_now;
+}
+
+test "thinking streams live, then collapses to a thought-for line when text starts" {
+    var m = Model.init(testing.allocator, 0);
+    defer m.deinit();
+    m.now_fn = &fakeNow;
+    fake_now = 1000;
+
+    m.onThinking("weighing allocator ");
+    m.onThinking("strategies");
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var view = try renderJoined(&m, arena_state.allocator());
+    const marker = std.mem.indexOf(u8, view, "---").?;
+    try testing.expect(std.mem.indexOf(u8, view[marker..], "✳ thinking…") != null);
+    try testing.expect(std.mem.indexOf(u8, view[marker..], "weighing allocator strategies") != null);
+
+    fake_now = 13_000; // 12s of thinking
+    m.onDelta("The answer is arenas.");
+    view = try renderJoined(&m, arena_state.allocator());
+    // Collapsed into history with the duration...
+    try testing.expect(std.mem.indexOf(u8, view, "✳ thought for 12s") != null);
+    // ...content gone from the band, answer text present at full color.
+    const m2 = std.mem.indexOf(u8, view, "---").?;
+    try testing.expect(std.mem.indexOf(u8, view[m2..], "weighing allocator") == null);
+    try testing.expect(std.mem.indexOf(u8, view[m2..], "The answer is arenas.") != null);
+    try testing.expect(std.mem.indexOf(u8, view[m2..], theme.dim ++ "The answer") == null);
+}
+
+test "a streaming tool call renders a live box with the extracted field" {
+    var m = Model.init(testing.allocator, 0);
+    defer m.deinit();
+    m.onToolName("bash");
+    m.onToolArgs("{\"command\":\"cat src/ker");
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var view = try renderJoined(&m, arena_state.allocator());
+    const marker = std.mem.indexOf(u8, view, "---").?;
+    try testing.expect(std.mem.indexOf(u8, view[marker..], "╭─ ") != null);
+    try testing.expect(std.mem.indexOf(u8, view[marker..], "bash") != null);
+    try testing.expect(std.mem.indexOf(u8, view[marker..], "cat src/ker") != null);
+    try testing.expect(std.mem.indexOf(u8, view[marker..], "╰") != null);
+
+    // Dispatch (the tool_call trace event) hands over to the running list.
+    m.onEvent(
+        \\{"ts":1,"event":"tool_call","turn_id":"t","step":1,"tool":"bash","input":"{\"command\":\"cat src/kernel/actor.zig\"}"}
+    );
+    view = try renderJoined(&m, arena_state.allocator());
+    const m2 = std.mem.indexOf(u8, view, "---").?;
+    try testing.expect(std.mem.indexOf(u8, view[m2..], "╭─ ") == null);
+    try testing.expect(std.mem.indexOf(u8, view[m2..], "bash") != null); // running entry
+}
+
+test "thinking flushes when a tool call opens on the stream" {
+    var m = Model.init(testing.allocator, 0);
+    defer m.deinit();
+    m.now_fn = &fakeNow;
+    fake_now = 0;
+    m.onThinking("should I list files?");
+    fake_now = 3000;
+    m.onToolName("bash");
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const view = try renderJoined(&m, arena_state.allocator());
+    try testing.expect(std.mem.indexOf(u8, view, "✳ thought for 3s") != null);
+    const marker = std.mem.indexOf(u8, view, "---").?;
+    try testing.expect(std.mem.indexOf(u8, view[marker..], "should I list files") == null);
+}
+
+test "tool box body falls back to raw args and pads its rails" {
+    var m = Model.init(testing.allocator, 0);
+    defer m.deinit();
+    m.onToolName("mcp_thing");
+    m.onToolArgs("{\"weird\":\"sha");
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const f = try m.render(arena_state.allocator(), 80, 0);
+    // Every box row ends at the right rail (aligned padding).
+    var box_rows: usize = 0;
+    for (f.bottom) |line| {
+        if (std.mem.indexOf(u8, line, "│") != null) {
+            box_rows += 1;
+            try testing.expect(std.mem.endsWith(u8, line, "│"));
+        }
+    }
+    try testing.expect(box_rows >= 1);
 }
 
 test "tool input preview clips on the first line and a UTF-8 boundary" {
