@@ -223,10 +223,15 @@ mission ceiling.
 When `zygos mission start` runs on a real terminal (tty on stdin and
 stderr), it takes over the screen with a live progress view instead of the
 plain banner: a spinner header with mission state, tasks, and elapsed time;
-role/step lines with the routed model; running tool calls that collapse
-into ✓/✗ summary lines as results land; assistant tokens streaming live;
-captured warn/err log lines as dim footnotes; and a token counter fed by
-per-step `usage` trace events. History scrolls into the terminal's own
+role/step lines with the routed model; a **live `✳ thinking…` block**
+streaming the model's reasoning (anthropic `thinking_delta`,
+openai-compatible `reasoning_content` — DeepSeek/GLM/Minimax) that
+collapses to `✳ thought for Ns` in history; **bordered live tool boxes**
+showing the command/file being composed as the arguments stream (extracted
+from the partial JSON); running tool calls that collapse into ✓/✗ summary
+lines as results land; assistant tokens streaming at full color; captured
+warn/err log lines as dim footnotes; and a token counter fed by per-step
+`usage` trace events. History scrolls into the terminal's own
 scrollback (no alternate screen) — only the bottom band repaints, wrapped
 in synchronized output (`?2026`).
 

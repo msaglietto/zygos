@@ -268,6 +268,7 @@ pub fn run(gpa: std.mem.Allocator, args: *std.process.Args.Iterator) u8 {
     var real_term: zygos.tui.term.RealTerm = .{};
     var ui: ?*zygos.tui.Tui = null;
     var ui_sink: ?usize = null;
+    var ui_tap: ?usize = null;
     if (want_tui and real_term.enterRaw()) {
         const t = zygos.tui.Tui.create(gpa, real_term.terminal()) catch return oom();
         if (t.start()) {
@@ -279,6 +280,10 @@ pub fn run(gpa: std.mem.Allocator, args: *std.process.Args.Iterator) u8 {
             turns.setDeltaObserver(.{
                 .ctx = @ptrCast(&t.model),
                 .onDelta = &zygos.tui.model.Model.observerOnDelta,
+            });
+            ui_tap = zygos.stream_tap.register(.{
+                .ctx = @ptrCast(&t.model),
+                .onDelta = &tapToModel,
             });
             zygos.tui.logbridge.install(.{
                 .ctx = @ptrCast(&t.model),
@@ -334,13 +339,13 @@ pub fn run(gpa: std.mem.Allocator, args: *std.process.Args.Iterator) u8 {
     }) catch return oom();
 
     const res = caller.call("zygos::missions::start", request) catch {
-        if (ui) |t| tuiStop(t, ui_sink, turns, &real_term);
+        if (ui) |t| tuiStop(t, ui_sink, ui_tap, turns, &real_term);
         eprint("mission: bus call failed\n", .{});
         return 1;
     };
     // ALWAYS before touching stdout/stderr: the final JSON must print onto a
     // restored (cooked, cursor-visible) terminal, below the TUI's last frame.
-    if (ui) |t| tuiStop(t, ui_sink, turns, &real_term);
+    if (ui) |t| tuiStop(t, ui_sink, ui_tap, turns, &real_term);
     switch (res) {
         .err => |code| {
             eprint("mission: errored: {s}\n", .{code});
@@ -358,12 +363,24 @@ pub fn run(gpa: std.mem.Allocator, args: *std.process.Args.Iterator) u8 {
 /// frame), restore the terminal. Deliberately never destroys the Tui: the
 /// detached approval thread may still hold the model, and the process exits
 /// right after (run() leaks its workers the same way).
-fn tuiStop(ui: *zygos.tui.Tui, sink: ?usize, turns: *zygos.turn.TurnOrchestrator, real: *zygos.tui.term.RealTerm) void {
+fn tuiStop(ui: *zygos.tui.Tui, sink: ?usize, tap: ?usize, turns: *zygos.turn.TurnOrchestrator, real: *zygos.tui.term.RealTerm) void {
     turns.setDeltaObserver(null);
     if (sink) |token| zygos.trace.unregisterSink(token);
+    if (tap) |token| zygos.stream_tap.unregister(token);
     zygos.tui.logbridge.clear();
     ui.stop();
     real.restore();
+}
+
+/// stream_tap → model adapter: thinking/tool kinds map onto the model's
+/// live blocks (tui/ stays free of worker types; this switch is the glue).
+fn tapToModel(ctx: *anyopaque, kind: zygos.stream_tap.Kind, bytes: []const u8) void {
+    const model: *zygos.tui.model.Model = @ptrCast(@alignCast(ctx));
+    switch (kind) {
+        .thinking => model.onThinking(bytes),
+        .tool_name => model.onToolName(bytes),
+        .tool_args => model.onToolArgs(bytes),
+    }
 }
 
 fn usage() u8 {
