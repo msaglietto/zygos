@@ -49,6 +49,10 @@ pub const Ticker = struct {
     }
 
     fn loop(self: *Ticker) void {
+        // First tick fires immediately: the kernel's observed clock must be
+        // real before the first channel/invocation exists, or everything
+        // created in the first interval is stamped into the wrong epoch.
+        self.actor.post(.{ .tick = nowMs() });
         // timedWait doubles as the interval sleep: stop() wakes it promptly
         // instead of waiting out a nanosleep.
         while (!self.stop_event.timedWait(self.interval_ms)) {
@@ -66,6 +70,39 @@ const types = @import("../kernel/types.zig");
 const invocation_mod = @import("../kernel/invocation.zig");
 
 fn noopSend(_: *anyopaque, _: types.WorkerId, _: []const u8) actor_mod.SendError!void {}
+
+test "start posts an immediate tick; kernel time is known before the first interval" {
+    var dummy: u8 = 0;
+    var actor = try actor_mod.Actor.init(testing.allocator, .{}, .{
+        .ctx = @ptrCast(&dummy),
+        .sendFn = &noopSend,
+    });
+    defer actor.deinit();
+
+    // Already-expired pending: only a tick can sweep it. The interval is
+    // far beyond the assertion window, so only an immediate first tick
+    // (posted by start, not after one interval) can fire the waiter.
+    var w: invocation_mod.Waiter = .{};
+    defer w.deinit();
+    const uuid = try types.parseUuid("11111111-2222-3333-4444-555555555555");
+    const callee: types.WorkerId = [_]u8{7} ** 16;
+    try actor.invocations.add(uuid, callee, "f", .{ .waiter = &w }, nowMs() - 1);
+
+    const kernel = try std.Thread.spawn(.{}, actor_mod.Actor.run, .{&actor});
+
+    var ticker = Ticker.init(&actor, 60_000);
+    defer ticker.deinit();
+    try ticker.start();
+
+    try testing.expect(w.event.timedWait(5_000));
+    ticker.stop();
+    actor.post(.shutdown);
+    kernel.join();
+
+    const outcome = w.result orelse return error.NoOutcome;
+    try testing.expect(outcome == .err);
+    testing.allocator.free(outcome.err);
+}
 
 test "a running ticker sweeps expired invocations without any frame traffic" {
     var dummy: u8 = 0;
