@@ -594,11 +594,10 @@ fn runTurn(self: *TurnOrchestrator, arena: std.mem.Allocator, request_json: []co
 
         // Stream channel for this step: driver keeps the receiver, the
         // writer ref rides in the provider request (PROTOCOL.md sub-types).
-        const ch = self.actor.channelCreate(64, self.worker.id, 0) catch return error.Failed;
+        const ch = self.actor.channelCreate(64, self.worker.id) catch return error.Failed;
         var receiver = self.actor.channelTakeReceiver(
             ch.reader.channel_id,
             ch.reader.access_key,
-            0,
         ) catch return error.Failed;
 
         const provider_request = try std.fmt.allocPrint(arena,
@@ -1007,7 +1006,6 @@ const FakeProvider = struct {
         var sender = self.actor.channelTakeSender(
             chan.get("channel_id").?.string,
             chan.get("access_key").?.string,
-            0,
         ) catch return error.Failed;
         var d1 = "hello ".*;
         var d2 = "world".*;

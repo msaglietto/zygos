@@ -131,7 +131,7 @@ pub const AnthropicProvider = struct {
         if (obj.get("stream_channel")) |cv| if (cv == .object) {
             const id = strField(cv.object, "channel_id") orelse "";
             const key = strField(cv.object, "access_key") orelse "";
-            sender = self.actor.channelTakeSender(id, key, 0) catch null;
+            sender = self.actor.channelTakeSender(id, key) catch null;
         };
 
         const out = client.streamMessages(self.gpa, self.io, .{

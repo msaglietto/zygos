@@ -9,6 +9,9 @@
 //!   never drop). Only `run`/`step` pop, and only on the kernel thread.
 //! - The actor never reads a clock: frame commands carry poster-stamped
 //!   now_ms, `.tick` carries the timer thread's. Tests drive time via ticks.
+//!   The actor remembers the largest stamp it has seen (`now_ms`) and uses
+//!   it for the channel bridge ops, so every registry timestamp lives in
+//!   the one clock domain the sweeps run in.
 //! - A `.frame` command owns its `json.Parsed(Message)`; the actor deinits it
 //!   after handling (and on shutdown drain).
 //! - Outbound frames are serialized to bytes valid only during `send` —
@@ -72,7 +75,6 @@ pub const CreatedChannel = struct {
 pub const ChannelCreateOp = struct {
     capacity: usize,
     owner: WorkerId,
-    now_ms: i64,
     event: sync.ResetEvent = .{},
     /// null after event.set() means OOM (or kernel shutdown drain).
     /// Ref slices are owned by the channels registry — valid until reap.
@@ -84,7 +86,6 @@ pub const ChannelTakeError = error{ NotFound, BadKey, AlreadyTaken, Shutdown };
 pub const ChannelTakeSenderOp = struct {
     id: []const u8, // caller-owned; caller blocks, so stack slices are safe
     key: []const u8,
-    now_ms: i64,
     event: sync.ResetEvent = .{},
     result: union(enum) { pending, ok: channel_mod.Sender, err: ChannelTakeError } = .pending,
 };
@@ -92,7 +93,6 @@ pub const ChannelTakeSenderOp = struct {
 pub const ChannelTakeReceiverOp = struct {
     id: []const u8,
     key: []const u8,
-    now_ms: i64,
     event: sync.ResetEvent = .{},
     result: union(enum) { pending, ok: channel_mod.Receiver, err: ChannelTakeError } = .pending,
 };
@@ -173,6 +173,12 @@ pub const Actor = struct {
     invocations: invocation_mod.Invocations,
     triggers: trigger_mod.Triggers,
     channels: channel_mod.Channels,
+    /// The kernel's observed clock: the largest poster-stamped time seen on
+    /// any `.tick` or `.frame`. Never read from a syscall — time only enters
+    /// as message data. Channel bridge ops are stamped with this so callers
+    /// cannot put a channel into a different clock domain than the sweeps
+    /// (a caller-passed 0 once made every stream channel look decades idle).
+    now_ms: i64,
 
     pub fn init(gpa: std.mem.Allocator, config: Config, outbound: Outbound) error{OutOfMemory}!Actor {
         const buf = try gpa.alloc(Command, config.inbox_capacity);
@@ -186,6 +192,7 @@ pub const Actor = struct {
             .invocations = invocation_mod.Invocations.init(gpa),
             .triggers = trigger_mod.Triggers.init(gpa),
             .channels = channel_mod.Channels.init(gpa, config.channel_ttl_ms),
+            .now_ms = 0,
         };
     }
 
@@ -241,13 +248,14 @@ pub const Actor = struct {
 
     /// Create a channel through the kernel thread. Blocking; the returned
     /// Refs' slices are owned by the channels registry (valid until reap).
+    /// The kernel stamps the op with its own observed time — callers never
+    /// supply a clock here (in-proc callers have none the sweeps would trust).
     pub fn channelCreate(
         self: *Actor,
         capacity: usize,
         owner: WorkerId,
-        now_ms: i64,
     ) error{ OutOfMemory, Shutdown }!CreatedChannel {
-        var op: ChannelCreateOp = .{ .capacity = capacity, .owner = owner, .now_ms = now_ms };
+        var op: ChannelCreateOp = .{ .capacity = capacity, .owner = owner };
         defer op.event.deinit();
         self.post(.{ .channel_create = &op });
         op.event.wait();
@@ -259,9 +267,8 @@ pub const Actor = struct {
         self: *Actor,
         id: []const u8,
         key: []const u8,
-        now_ms: i64,
     ) ChannelTakeError!channel_mod.Sender {
-        var op: ChannelTakeSenderOp = .{ .id = id, .key = key, .now_ms = now_ms };
+        var op: ChannelTakeSenderOp = .{ .id = id, .key = key };
         defer op.event.deinit();
         self.post(.{ .channel_take_sender = &op });
         op.event.wait();
@@ -277,9 +284,8 @@ pub const Actor = struct {
         self: *Actor,
         id: []const u8,
         key: []const u8,
-        now_ms: i64,
     ) ChannelTakeError!channel_mod.Receiver {
-        var op: ChannelTakeReceiverOp = .{ .id = id, .key = key, .now_ms = now_ms };
+        var op: ChannelTakeReceiverOp = .{ .id = id, .key = key };
         defer op.event.deinit();
         self.post(.{ .channel_take_receiver = &op });
         op.event.wait();
@@ -297,26 +303,30 @@ pub const Actor = struct {
             .shutdown => return false,
             .worker_connected => |w| self.onConnected(w),
             .worker_disconnected => |w| self.onDisconnected(w),
-            .tick => |now_ms| self.onTick(now_ms),
+            .tick => |now_ms| {
+                self.now_ms = @max(self.now_ms, now_ms);
+                self.onTick(now_ms);
+            },
             .frame => |f| {
                 defer f.parsed.deinit();
+                self.now_ms = @max(self.now_ms, f.now_ms);
                 self.onFrame(f.from, f.parsed.value, f.now_ms);
             },
             .channel_create => |op| {
-                if (self.channels.create(op.capacity, op.owner, op.now_ms)) |refs| {
+                if (self.channels.create(op.capacity, op.owner, self.now_ms)) |refs| {
                     op.result = .{ .writer = refs.writer, .reader = refs.reader };
                 } else |_| {}
                 op.event.set();
             },
             .channel_take_sender => |op| {
-                op.result = if (self.channels.takeSender(op.id, op.key, op.now_ms)) |s|
+                op.result = if (self.channels.takeSender(op.id, op.key, self.now_ms)) |s|
                     .{ .ok = s }
                 else |err|
                     .{ .err = err };
                 op.event.set();
             },
             .channel_take_receiver => |op| {
-                op.result = if (self.channels.takeReceiver(op.id, op.key, op.now_ms)) |r|
+                op.result = if (self.channels.takeReceiver(op.id, op.key, self.now_ms)) |r|
                     .{ .ok = r }
                 else |err|
                     .{ .err = err };
@@ -1197,12 +1207,12 @@ test "channel bridge: create and take endpoints stream across threads" {
 
     const t = try std.Thread.spawn(.{}, Actor.run, .{&h.actor});
 
-    const refs = try h.actor.channelCreate(4, widOf(1), 0);
-    var sender = try h.actor.channelTakeSender(refs.writer.channel_id, refs.writer.access_key, 0);
-    var receiver = try h.actor.channelTakeReceiver(refs.reader.channel_id, refs.reader.access_key, 0);
+    const refs = try h.actor.channelCreate(4, widOf(1));
+    var sender = try h.actor.channelTakeSender(refs.writer.channel_id, refs.writer.access_key);
+    var receiver = try h.actor.channelTakeReceiver(refs.reader.channel_id, refs.reader.access_key);
     try testing.expectError(
         error.AlreadyTaken,
-        h.actor.channelTakeSender(refs.writer.channel_id, refs.writer.access_key, 0),
+        h.actor.channelTakeSender(refs.writer.channel_id, refs.writer.access_key),
     );
 
     var payload = "delta".*;
@@ -1213,6 +1223,40 @@ test "channel bridge: create and take endpoints stream across threads" {
 
     sender.deinit();
     try testing.expectError(error.EndOfStream, receiver.pop());
+    receiver.deinit();
+
+    h.actor.post(.shutdown);
+    t.join();
+}
+
+test "channel ops are stamped with the kernel's observed time, not caller time" {
+    var h = try Harness.init(testing.allocator);
+    defer h.deinit();
+
+    const t = try std.Thread.spawn(.{}, Actor.run, .{&h.actor});
+
+    // The kernel has already observed wall-clock-scale time (tick pump).
+    // Regression guard: callers used to stamp channel ops with now_ms=0,
+    // so the first real-time sweep saw every channel as decades idle and
+    // reaped it before the provider pushed a single delta (stream 0B).
+    const epoch: i64 = 1_700_000_000_000;
+    const ttl = h.actor.config.channel_ttl_ms;
+    h.actor.post(.{ .tick = epoch });
+
+    const refs = try h.actor.channelCreate(4, widOf(1));
+
+    // One tick short of the TTL: a channel stamped at kernel time survives.
+    h.actor.post(.{ .tick = epoch + ttl - 1 });
+    var receiver = try h.actor.channelTakeReceiver(refs.reader.channel_id, refs.reader.access_key);
+
+    // Two idle TTLs later the reap must still fire (the first sweep may
+    // absorb take-time pipe activity; the second sees true idleness).
+    h.actor.post(.{ .tick = epoch + 3 * ttl });
+    h.actor.post(.{ .tick = epoch + 5 * ttl });
+    try testing.expectError(
+        error.NotFound,
+        h.actor.channelTakeSender(refs.writer.channel_id, refs.writer.access_key),
+    );
     receiver.deinit();
 
     h.actor.post(.shutdown);

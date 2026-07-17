@@ -64,7 +64,7 @@ pub const FakeProvider = struct {
             const id = cv.object.get("channel_id");
             const key = cv.object.get("access_key");
             if (id != null and key != null and id.? == .string and key.? == .string) {
-                if (self.actor.channelTakeSender(id.?.string, key.?.string, 0)) |sender_const| {
+                if (self.actor.channelTakeSender(id.?.string, key.?.string)) |sender_const| {
                     var sender = sender_const;
                     var d1 = "hello ".*;
                     var d2 = "world".*;
