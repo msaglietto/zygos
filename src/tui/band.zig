@@ -56,7 +56,7 @@ pub fn build(
     now_ms: i64,
 ) error{OutOfMemory}![]const []const u8 {
     var bottom: std.ArrayList([]const u8) = .empty;
-    var color: [16]u8 = undefined;
+    var color: [24]u8 = undefined;
     var e_buf: [32]u8 = undefined;
 
     // Header: spinner + mission state + tasks + elapsed.
@@ -89,7 +89,7 @@ pub fn build(
 
     // Dispatched tool calls awaiting results.
     for (view.tools) |t| {
-        var tcolor: [16]u8 = undefined;
+        var tcolor: [24]u8 = undefined;
         try bottom.append(arena, try std.fmt.allocPrint(arena, "  {s} {s}{s}{s} {s}{s}{s}", .{
             theme.spinnerFrame(now_ms),
             theme.fg(&tcolor, theme.Color.tool),
@@ -158,7 +158,7 @@ fn renderLiveToolBox(
     const inner = @min(cols -| 6, 74); // box body cells between the │ rails
     if (inner < 8) return;
 
-    var tcolor: [16]u8 = undefined;
+    var tcolor: [24]u8 = undefined;
     const rail = try dashes(arena, inner -| (width.visibleWidth(name) + 3));
     try bottom.append(arena, try std.fmt.allocPrint(arena, "  ╭─ {s}{s}{s} {s}╮", .{
         theme.fg(&tcolor, theme.Color.tool), name, theme.reset, rail,

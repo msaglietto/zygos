@@ -270,6 +270,11 @@ pub fn run(gpa: std.mem.Allocator, args: *std.process.Args.Iterator) u8 {
     var ui_sink: ?usize = null;
     var ui_tap: ?usize = null;
     if (want_tui and real_term.enterRaw()) {
+        // Truecolor before the render thread exists (theme mode is write-once).
+        if (getEnv(env, "COLORTERM")) |ct| {
+            if (std.mem.eql(u8, ct, "truecolor") or std.mem.eql(u8, ct, "24bit"))
+                zygos.tui.theme.setMode(.truecolor);
+        }
         // fd 2 points into the planning root while the TUI owns the screen:
         // writers that bypass std.log (std.debug stack dumps on unexpected
         // errnos in Debug builds) would otherwise splice into the band.

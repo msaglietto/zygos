@@ -9,6 +9,7 @@ const std = @import("std");
 pub const width = @import("width.zig");
 pub const term = @import("term.zig");
 pub const theme = @import("theme.zig");
+pub const palette = @import("palette.zig");
 pub const fmt = @import("fmt.zig");
 pub const chatlog = @import("chatlog.zig");
 pub const band = @import("band.zig");

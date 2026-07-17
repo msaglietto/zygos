@@ -25,7 +25,7 @@ pub const Styler = struct {
             return try std.fmt.allocPrint(arena, "{s}│{s} {s}", .{ theme.dim, theme.reset, raw });
         }
 
-        var color: [16]u8 = undefined;
+        var color: [24]u8 = undefined;
         if (headerText(trimmed)) |title| {
             return try std.fmt.allocPrint(arena, "{s}{s}{s}{s}", .{
                 theme.bold, theme.fg(&color, theme.Color.accent), title, theme.reset,
@@ -55,7 +55,7 @@ fn headerText(s: []const u8) ?[]const u8 {
 /// `code` spans → amber, **bold** spans → bold. A marker without its mate
 /// is literal text; backtick spans win over asterisks (code may contain **).
 fn inlineSpans(arena: std.mem.Allocator, out: *std.ArrayList(u8), s: []const u8) error{OutOfMemory}!void {
-    var color: [16]u8 = undefined;
+    var color: [24]u8 = undefined;
     var i: usize = 0;
     while (i < s.len) {
         if (s[i] == '`') {

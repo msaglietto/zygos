@@ -4,24 +4,48 @@
 
 const std = @import("std");
 const width = @import("width.zig");
+const palette = @import("palette.zig");
 
 pub const dim = "\x1b[2m";
 pub const bold = "\x1b[1m";
 pub const italic = "\x1b[3m";
 pub const reset = "\x1b[0m";
 
-/// xterm-256 palette roles. Values chosen to read on dark and light schemes.
+/// Palette roles (truecolor + 256 fallback). Kept under the historical
+/// `Color` name so call sites read the same.
 pub const Color = struct {
-    pub const accent: u8 = 75; // steel blue — headers, active step
-    pub const ok: u8 = 71; // green — completed
-    pub const err: u8 = 167; // red — failures
-    pub const muted: u8 = 244; // gray — timestamps, footnotes
-    pub const tool: u8 = 179; // amber — tool names
+    pub const accent = palette.accent;
+    pub const ok = palette.ok;
+    pub const err = palette.err;
+    pub const muted = palette.muted;
+    pub const tool = palette.tool;
 };
 
-/// "\x1b[38;5;Nm" into caller's buffer.
-pub fn fg(buf: []u8, color256: u8) []const u8 {
-    return std.fmt.bufPrint(buf, "\x1b[38;5;{d}m", .{color256}) catch unreachable;
+pub const Mode = enum { indexed256, truecolor };
+
+/// Write-once at startup (COLORTERM detection in the CLI), strictly before
+/// the render thread exists — read unlocked on every fg/bg emit after that.
+var mode: Mode = .indexed256;
+
+pub fn setMode(m: Mode) void {
+    mode = m;
+}
+
+/// Foreground SGR for a palette role into caller's buffer (≥ 20 bytes):
+/// "\x1b[38;2;R;G;Bm" in truecolor mode, "\x1b[38;5;Nm" fallback otherwise.
+pub fn fg(buf: []u8, color: palette.Rgb) []const u8 {
+    return switch (mode) {
+        .indexed256 => std.fmt.bufPrint(buf, "\x1b[38;5;{d}m", .{color.fallback}) catch unreachable,
+        .truecolor => std.fmt.bufPrint(buf, "\x1b[38;2;{d};{d};{d}m", .{ color.r, color.g, color.b }) catch unreachable,
+    };
+}
+
+/// Background SGR for a palette role into caller's buffer (≥ 20 bytes).
+pub fn bg(buf: []u8, color: palette.Rgb) []const u8 {
+    return switch (mode) {
+        .indexed256 => std.fmt.bufPrint(buf, "\x1b[48;5;{d}m", .{color.fallback}) catch unreachable,
+        .truecolor => std.fmt.bufPrint(buf, "\x1b[48;2;{d};{d};{d}m", .{ color.r, color.g, color.b }) catch unreachable,
+    };
 }
 
 pub const spinner_frames = [_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" };
@@ -62,10 +86,23 @@ pub fn tokens(buf: []u8, n: i64) []const u8 {
 
 const testing = std.testing;
 
-test "fg emits the 256-color SGR" {
-    var buf: [16]u8 = undefined;
-    try testing.expectEqualStrings("\x1b[38;5;75m", fg(&buf, 75));
-    try testing.expectEqualStrings("\x1b[38;5;0m", fg(&buf, 0));
+test "fg emits the 256-color fallback SGR in indexed mode" {
+    var buf: [24]u8 = undefined;
+    try testing.expectEqualStrings("\x1b[38;5;75m", fg(&buf, Color.accent));
+    try testing.expectEqualStrings("\x1b[38;5;179m", fg(&buf, Color.tool));
+}
+
+test "fg and bg emit truecolor SGRs when the mode is set" {
+    setMode(.truecolor);
+    defer setMode(.indexed256);
+    var buf: [24]u8 = undefined;
+    try testing.expectEqualStrings("\x1b[38;2;122;162;247m", fg(&buf, Color.accent));
+    try testing.expectEqualStrings("\x1b[48;2;28;28;28m", bg(&buf, palette.panel));
+}
+
+test "bg emits the 256-color fallback SGR in indexed mode" {
+    var buf: [24]u8 = undefined;
+    try testing.expectEqualStrings("\x1b[48;5;234m", bg(&buf, palette.panel));
 }
 
 test "spinner frame derives from the clock" {

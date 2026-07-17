@@ -199,7 +199,7 @@ pub const Model = struct {
             try self.replaceOwned(&self.mission_state, to);
             self.tasks_done = int(obj, "tasks_done");
             self.tasks = int(obj, "tasks");
-            var color: [16]u8 = undefined;
+            var color: [24]u8 = undefined;
             try self.log.appendFmt("{s}◆ mission {s} → {s}{s}", .{
                 theme.fg(&color, theme.Color.accent), str(obj, "from") orelse "?", to, theme.reset,
             });
@@ -208,7 +208,7 @@ pub const Model = struct {
             try self.replaceOwned(&self.role, role);
             self.role_turn = int(obj, "role_turn");
             self.step = 0;
-            var color: [16]u8 = undefined;
+            var color: [24]u8 = undefined;
             try self.log.appendFmt("", .{}); // breathing room between roles
             try self.log.appendFmt("{s}▌ {s}{s} — turn {d}", .{
                 theme.fg(&color, theme.Color.accent), role, theme.reset, self.role_turn,
@@ -220,7 +220,7 @@ pub const Model = struct {
             try self.collapseOpenTools();
             const outcome = str(obj, "outcome") orelse "?";
             const failed = !std.mem.eql(u8, outcome, "ok");
-            var color: [16]u8 = undefined;
+            var color: [24]u8 = undefined;
             if (str(obj, "reason")) |reason| {
                 try self.log.appendFmt("{s}▌ {s}: {s} — {s}{s}", .{
                     theme.fg(&color, if (failed) theme.Color.err else theme.Color.ok),
@@ -262,7 +262,7 @@ pub const Model = struct {
         } else if (std.mem.eql(u8, ev, "tool_result")) {
             const name = str(obj, "tool") orelse "?";
             const is_err = boolOf(obj, "is_error");
-            var color: [16]u8 = undefined;
+            var color: [24]u8 = undefined;
             var count: [32]u8 = undefined;
             // Collapsed line keeps the call readable in scrollback: name,
             // the input it ran with, size, and a one-line output preview.
