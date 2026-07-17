@@ -7,6 +7,7 @@ const width = @import("width.zig");
 
 pub const dim = "\x1b[2m";
 pub const bold = "\x1b[1m";
+pub const italic = "\x1b[3m";
 pub const reset = "\x1b[0m";
 
 /// xterm-256 palette roles. Values chosen to read on dark and light schemes.
