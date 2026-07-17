@@ -159,6 +159,7 @@ pub const Assembler = struct {
     pub fn message(self: *Assembler) AssembleError!Message {
         if (!self.done) return error.Incomplete;
         if (self.materialized == null) {
+            for (self.tools.items) |*t| canonicalizeDuplicateKeys(self.gpa, &t.args);
             const has_text = self.text.items.len > 0;
             const out = try self.gpa.alloc(Block, self.tools.items.len + @intFromBool(has_text));
             var i: usize = 0;
@@ -185,6 +186,30 @@ pub const Assembler = struct {
         };
     }
 };
+
+/// Some providers stream tool-args fragments that concatenate into an
+/// object with a repeated key (observed on GLM's anthropic dialect; the
+/// chat dialect gets the same guard — the wire downstream is strict
+/// std.json and rejects DuplicateField). Rewrite exactly that case
+/// last-wins (JS JSON.parse semantics); anything else passes through
+/// untouched. Best-effort, never fails the stream.
+fn canonicalizeDuplicateKeys(gpa: std.mem.Allocator, input: *std.ArrayList(u8)) void {
+    if (std.json.parseFromSlice(std.json.Value, gpa, input.items, .{})) |ok| {
+        ok.deinit();
+        return;
+    } else |err| if (err != error.DuplicateField) return;
+
+    const parsed = std.json.parseFromSlice(std.json.Value, gpa, input.items, .{
+        .duplicate_field_behavior = .use_last,
+    }) catch return;
+    defer parsed.deinit();
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var ws: std.json.Stringify = .{ .writer = &out.writer, .options = .{ .whitespace = .minified } };
+    ws.write(parsed.value) catch return;
+    input.clearRetainingCapacity();
+    input.appendSlice(gpa, out.written()) catch {};
+}
 
 fn parseFinish(s: []const u8) StopReason {
     if (std.mem.eql(u8, s, "stop")) return .end_turn;
@@ -463,6 +488,21 @@ test "tool_calls stream taps the name and each arguments fragment live" {
     try testing.expectEqual(stream_tap.Kind.tool_args, cap.kinds.items[1]);
     try testing.expectEqualStrings("{\"comm", cap.chunks.items[1]);
     try testing.expectEqualStrings("and\":\"ls\"}", cap.chunks.items[2]);
+}
+
+test "duplicate keys in streamed tool arguments canonicalize last-wins" {
+    var a = Assembler.init(testing.allocator);
+    defer a.deinit();
+    _ = try a.onEvent(
+        \\{"id":"c","model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"bash","arguments":"{\"command\":\"long one\","}}]},"finish_reason":null}]}
+    );
+    _ = try a.onEvent(
+        \\{"id":"c","model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"command\":\"ls -la\"}"}}]},"finish_reason":"tool_calls"}]}
+    );
+    _ = try a.onEvent("[DONE]");
+
+    const msg = try a.message();
+    try testing.expectEqualStrings("{\"command\":\"ls -la\"}", msg.content[0].tool_use.input_json);
 }
 
 test "tool_calls stream: arguments fragments accumulate into input JSON" {

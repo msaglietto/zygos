@@ -216,6 +216,10 @@ pub const Assembler = struct {
     pub fn message(self: *Assembler) AssembleError!Message {
         if (!self.done) return error.Incomplete;
         if (self.materialized == null) {
+            for (self.blocks.items) |*b| switch (b.*) {
+                .tool_use => |*tu| canonicalizeDuplicateKeys(self.gpa, &tu.input),
+                else => {},
+            };
             const out = try self.gpa.alloc(Block, self.blocks.items.len);
             for (self.blocks.items, 0..) |b, i| {
                 out[i] = switch (b) {
@@ -238,6 +242,30 @@ pub const Assembler = struct {
         };
     }
 };
+
+/// Some providers (observed: GLM's anthropic dialect) stream tool-args
+/// fragments that concatenate into an object with a repeated key. Strict
+/// std.json downstream rejects the whole result frame (DuplicateField), so
+/// rewrite exactly that case last-wins (JS JSON.parse semantics). Anything
+/// else — valid JSON or garbage — passes through untouched; best-effort,
+/// never fails the stream.
+fn canonicalizeDuplicateKeys(gpa: std.mem.Allocator, input: *std.ArrayList(u8)) void {
+    if (std.json.parseFromSlice(std.json.Value, gpa, input.items, .{})) |ok| {
+        ok.deinit();
+        return;
+    } else |err| if (err != error.DuplicateField) return;
+
+    const parsed = std.json.parseFromSlice(std.json.Value, gpa, input.items, .{
+        .duplicate_field_behavior = .use_last,
+    }) catch return;
+    defer parsed.deinit();
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var ws: std.json.Stringify = .{ .writer = &out.writer, .options = .{ .whitespace = .minified } };
+    ws.write(parsed.value) catch return;
+    input.clearRetainingCapacity();
+    input.appendSlice(gpa, out.written()) catch {};
+}
 
 fn parseStopReason(s: []const u8) StopReason {
     if (std.mem.eql(u8, s, "end_turn")) return .end_turn;
@@ -351,6 +379,33 @@ test "tool_use stream accumulates partial_json fragments into input_json" {
     try testing.expectEqualStrings("toolu_1", msg.content[0].tool_use.id);
     try testing.expectEqualStrings("bash", msg.content[0].tool_use.name);
     try testing.expectEqualStrings("{\"command\":\"ls\"}", msg.content[0].tool_use.input_json);
+}
+
+test "duplicate keys in streamed tool input canonicalize last-wins" {
+    var a = Assembler.init(testing.allocator);
+    defer a.deinit();
+
+    // GLM's anthropic dialect has been observed streaming fragments that
+    // concatenate into {"command":"...","command":"..."} — strict std.json
+    // downstream rejects the whole result frame (DuplicateField).
+    _ = try a.onEvent("message_start", start_ev);
+    _ = try a.onEvent("content_block_start",
+        \\{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"bash","input":{}}}
+    );
+    _ = try a.onEvent("content_block_delta",
+        \\{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"command\":\"long one\","}}
+    );
+    _ = try a.onEvent("content_block_delta",
+        \\{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"\"command\":\"ls -la\"}"}}
+    );
+    _ = try a.onEvent("content_block_stop", "{\"type\":\"content_block_stop\",\"index\":0}");
+    _ = try a.onEvent("message_delta",
+        \\{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":5}}
+    );
+    _ = try a.onEvent("message_stop", "{\"type\":\"message_stop\"}");
+
+    const msg = try a.message();
+    try testing.expectEqualStrings("{\"command\":\"ls -la\"}", msg.content[0].tool_use.input_json);
 }
 
 test "mixed text and tool_use blocks preserve order and indexes" {
