@@ -403,7 +403,12 @@ pub const Worker = struct {
             self.postFrameFmt(
                 "{{\"type\":\"invocationresult\",\"invocation_id\":\"{s}\",\"function_id\":{f},\"result\":{s}}}",
                 .{ i, std.json.fmt(m.function_id, .{}), response },
-            ) catch {};
+            ) catch {
+                // Fail closed: a result the protocol rejects (handler emitted
+                // invalid JSON) must still answer the caller — a silent drop
+                // parks it until the invoke timeout and reads as a hang.
+                self.postErrorResult(i, m.function_id, "invalid_result");
+            };
         }
     }
 
@@ -448,7 +453,10 @@ pub const Worker = struct {
         const text = try std.fmt.allocPrint(self.gpa, fmt, args);
         defer self.gpa.free(text);
         const parsed = protocol.parseMessage(self.gpa, text) catch |err| {
-            log.err("{s}: built an invalid frame ({t}): {s}", .{ self.name, err, text });
+            // Callers recover (runHandler answers invalid_result), so this
+            // is evidence, not a fatality — and log.err would fail tests
+            // that exercise the recovery path.
+            log.warn("{s}: built an invalid frame ({t}): {s}", .{ self.name, err, text });
             return error.OutOfMemory;
         };
         self.actor.post(.{ .frame = .{ .from = self.id, .parsed = parsed, .now_ms = nowMs() } });
@@ -575,6 +583,29 @@ test "call to an unknown function surfaces the ErrorBody code" {
     defer result.deinit(testing.allocator);
     try testing.expect(result == .err);
     try testing.expectEqualStrings("function_not_found", result.err);
+}
+
+test "a handler result the protocol rejects errors the caller instead of hanging" {
+    var h = try Harness.init(testing.allocator);
+    defer h.deinit();
+
+    const a = try Worker.spawn(testing.allocator, &h.actor, &h.registry, "worker-a");
+    defer a.stop();
+    const b = try Worker.spawn(testing.allocator, &h.actor, &h.registry, "worker-b");
+    defer b.stop();
+
+    // Duplicate keys — the exact GLM tool-args shape that made the result
+    // frame unparseable: the caller must get an error result, never a
+    // silent drop that parks it until the invoke timeout.
+    try a.registerFunction("bad::json", null, &duplicateKeyHandler);
+    const result = try b.call("bad::json", "{}");
+    defer result.deinit(testing.allocator);
+    try testing.expect(result == .err);
+    try testing.expectEqualStrings("invalid_result", result.err);
+}
+
+fn duplicateKeyHandler(_: ?*anyopaque, _: std.mem.Allocator, _: []const u8) error{ Failed, OutOfMemory }![]const u8 {
+    return "{\"command\":\"long one\",\"command\":\"ls -la\"}";
 }
 
 test "fire-and-forget cast dispatches without a pending" {
