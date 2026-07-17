@@ -184,24 +184,12 @@ pub const Model = struct {
     }
 
     /// Captured std.log line — shown as a dim footnote so evidence is never
-    /// hidden while the TUI owns the terminal. Wrapped instead of clipped:
-    /// warnings routinely exceed the terminal width and losing the tail of
-    /// a provider error is worse than an extra row.
+    /// hidden while the TUI owns the terminal. Stored unwrapped: render()
+    /// word-wraps every chat line at the live terminal width.
     pub fn onLog(self: *Model, line: []const u8) void {
-        const wrap_cols: usize = 88;
         self.mutex.lock();
         defer self.mutex.unlock();
-        var rest = line;
-        var first = true;
-        while (rest.len > 0) {
-            var end = @min(rest.len, wrap_cols);
-            while (end > 0 and end < rest.len and (rest[end] & 0xC0) == 0x80) end -= 1;
-            self.appendChatFmt("{s}{s}{s}{s}", .{
-                theme.dim, if (first) "" else "  ", rest[0..end], theme.reset,
-            }) catch {};
-            rest = rest[end..];
-            first = false;
-        }
+        self.appendChatFmt("{s}{s}{s}", .{ theme.dim, line, theme.reset }) catch {};
         self.dirty.set();
     }
 
@@ -350,8 +338,14 @@ pub const Model = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        var chat = try arena.alloc([]const u8, self.chat.items.len);
-        for (self.chat.items, 0..) |line, i| chat[i] = try arena.dupe(u8, line);
+        // Chat wraps at the live width on word boundaries — the renderer
+        // clips rows defensively, so anything wider than `cols` here would
+        // lose its tail (mid-sentence cuts read as noise).
+        var chat_rows: std.ArrayList([]const u8) = .empty;
+        for (self.chat.items) |line| {
+            try chat_rows.appendSlice(arena, try width.wrapToWidth(arena, line, cols, "  "));
+        }
+        const chat = chat_rows.items;
 
         var bottom: std.ArrayList([]const u8) = .empty;
         var color: [16]u8 = undefined;
@@ -416,10 +410,13 @@ pub const Model = struct {
         // Live answer text: last N lines, full color — this is the payload.
         try appendTail(arena, &bottom, self.live.items, live_tail_lines, "");
 
-        // Approval ask.
+        // Approval ask — keys first: the summary can exceed the terminal
+        // width and rows clip right, so a trailing hint would be the part
+        // that vanishes (a gated mission then looks hung).
         if (self.approval) |ask| {
-            try bottom.append(arena, try std.fmt.allocPrint(arena, "{s}{s}  approve {s}? [y/N]{s}", .{
-                theme.bold, theme.fg(&color, theme.Color.err), ask, theme.reset,
+            try bottom.append(arena, try std.fmt.allocPrint(arena, "{s}{s}  [y/N] approve?{s} {s}{s}{s}", .{
+                theme.bold, theme.fg(&color, theme.Color.err), theme.reset,
+                theme.dim,  ask,                               theme.reset,
             }));
         }
 
@@ -827,10 +824,34 @@ test "pending approval renders the y/N band and clears" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     var view = try renderJoined(&m, arena_state.allocator());
-    try testing.expect(std.mem.indexOf(u8, view, "approve bash: rm -rf ./build? [y/N]") != null);
+    // Keys FIRST: the ask summary can exceed the terminal width and the
+    // renderer clips rows right — a trailing hint would be the part lost.
+    const keys_at = std.mem.indexOf(u8, view, "[y/N] approve?") orelse return error.NoKeyHint;
+    const ask_at = std.mem.indexOf(u8, view, "bash: rm -rf ./build") orelse return error.NoAsk;
+    try testing.expect(keys_at < ask_at);
     m.setPendingApproval(null);
     view = try renderJoined(&m, arena_state.allocator());
     try testing.expect(std.mem.indexOf(u8, view, "[y/N]") == null);
+}
+
+test "chat lines wrap at the render width on word boundaries" {
+    var m = Model.init(testing.allocator, 0);
+    defer m.deinit();
+    m.onLog("[provider] (warning): endpoint answered 429 and the ladder retried on another host");
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const f = try m.render(arena_state.allocator(), 40, 0);
+    try testing.expect(f.chat.len > 1); // wrapped, not one clipped row
+    var joined: std.ArrayList(u8) = .empty;
+    for (f.chat) |l| {
+        try testing.expect(width.visibleWidth(l) <= 40); // nothing for the renderer to clip
+        try joined.appendSlice(arena_state.allocator(), l);
+        try joined.append(arena_state.allocator(), '\n');
+    }
+    // Word boundary, and no tail lost (the closing words survive the wrap).
+    try testing.expect(std.mem.indexOf(u8, joined.items, "endpoint") != null);
+    try testing.expect(std.mem.indexOf(u8, joined.items, "host") != null);
+    try testing.expect(std.mem.indexOf(u8, joined.items, "endpoin\n") == null);
 }
 
 test "log lines land in chat as dim footnotes" {

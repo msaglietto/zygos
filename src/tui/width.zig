@@ -144,11 +144,137 @@ pub fn truncateToWidth(gpa: std.mem.Allocator, s: []const u8, cols: usize) std.m
     return out.toOwnedSlice(gpa);
 }
 
+/// Word-boundary wrap of one logical line into rows of at most `cols`
+/// visible cells. Escape sequences are zero-width and ride along; the
+/// line's LEADING escape run (its style prefix) is re-applied to every
+/// continuation row after `cont_prefix`, so a dim footnote stays dim
+/// across rows even though the renderer resets SGR per row. A single word
+/// wider than the budget is hard-split. Rows are arena-owned.
+pub fn wrapToWidth(
+    arena: std.mem.Allocator,
+    s: []const u8,
+    cols: usize,
+    cont_prefix: []const u8,
+) std.mem.Allocator.Error![]const []const u8 {
+    var rows: std.ArrayList([]const u8) = .empty;
+    if (cols == 0) {
+        try rows.append(arena, try arena.dupe(u8, s));
+        return rows.items;
+    }
+
+    // Leading escape run = the line's style prefix, re-applied on wrap.
+    var style_end: usize = 0;
+    while (style_end < s.len and s[style_end] == 0x1b) style_end += escapeLen(s, style_end);
+    const style = s[0..style_end];
+
+    var row: std.ArrayList(u8) = .empty;
+    var row_w: usize = 0;
+    var budget = cols;
+    // Byte/cell position of the last space in the current row, for the break.
+    var space_at: ?usize = null;
+    var space_w: usize = 0;
+
+    try row.appendSlice(arena, style);
+    var i: usize = style_end;
+    while (i < s.len) {
+        if (s[i] == 0x1b) {
+            const n = escapeLen(s, i);
+            try row.appendSlice(arena, s[i .. i + n]);
+            i += n;
+            continue;
+        }
+        var n = std.unicode.utf8ByteSequenceLength(s[i]) catch 1;
+        if (i + n > s.len) n = 1;
+        const cp: u21 = if (n == 1) s[i] else std.unicode.utf8Decode(s[i .. i + n]) catch blk: {
+            n = 1;
+            break :blk s[i];
+        };
+        const cw: usize = if (n == 1 and cp > 0x7F) 1 else runeWidth(@intCast(cp));
+
+        if (row_w + cw > budget) {
+            const cut = space_at orelse row.items.len;
+            const carry = try arena.dupe(u8, std.mem.trimStart(u8, row.items[cut..], " "));
+            row.shrinkRetainingCapacity(cut);
+            try rows.append(arena, try arena.dupe(u8, row.items));
+            row.clearRetainingCapacity();
+            try row.appendSlice(arena, cont_prefix);
+            try row.appendSlice(arena, style);
+            try row.appendSlice(arena, carry);
+            row_w = if (space_at != null) row_w - space_w else 0;
+            budget = cols -| visibleWidth(cont_prefix);
+            if (budget == 0) budget = 1;
+            space_at = null;
+        }
+
+        if (cp == ' ') {
+            space_at = row.items.len;
+            // Cells consumed up to and including this space — subtracted
+            // from the carried tail's width when the row breaks here.
+            space_w = row_w + 1;
+        }
+        try row.appendSlice(arena, s[i .. i + n]);
+        row_w += cw;
+        i += n;
+    }
+    const last = std.mem.trimEnd(u8, row.items, " ");
+    if (rows.items.len == 0 or visibleWidth(last) > 0) {
+        try rows.append(arena, try arena.dupe(u8, last));
+    }
+    return rows.items;
+}
+
 // ===========================================================================
 // Tests
 // ===========================================================================
 
 const testing = std.testing;
+
+test "wrap leaves a short line as one row" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const rows = try wrapToWidth(arena_state.allocator(), "hello world", 20, "  ");
+    try testing.expectEqual(@as(usize, 1), rows.len);
+    try testing.expectEqualStrings("hello world", rows[0]);
+}
+
+test "wrap breaks at a word boundary, never mid-word" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const rows = try wrapToWidth(arena_state.allocator(), "alpha beta gamma delta", 11, "");
+    try testing.expectEqual(@as(usize, 2), rows.len);
+    try testing.expectEqualStrings("alpha beta", rows[0]);
+    try testing.expectEqualStrings("gamma delta", rows[1]);
+}
+
+test "wrap prefixes continuation rows and re-applies the leading style" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const rows = try wrapToWidth(arena_state.allocator(), "\x1b[2malpha beta gamma\x1b[0m", 11, "  ");
+    try testing.expectEqual(@as(usize, 2), rows.len);
+    try testing.expectEqualStrings("\x1b[2malpha beta", rows[0]);
+    // Continuation: indent, then the line's own dim prefix, then the tail;
+    // the trailing reset stays on the last row.
+    try testing.expectEqualStrings("  \x1b[2mgamma\x1b[0m", rows[1]);
+}
+
+test "wrap hard-splits a single word wider than the budget" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const rows = try wrapToWidth(arena_state.allocator(), "abcdefghij", 4, "");
+    try testing.expectEqual(@as(usize, 3), rows.len);
+    try testing.expectEqualStrings("abcd", rows[0]);
+    try testing.expectEqualStrings("efgh", rows[1]);
+    try testing.expectEqualStrings("ij", rows[2]);
+}
+
+test "wrap counts double-width runes as two cells" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const rows = try wrapToWidth(arena_state.allocator(), "世界 世界", 5, "");
+    try testing.expectEqual(@as(usize, 2), rows.len);
+    try testing.expectEqualStrings("世界", rows[0]);
+    try testing.expectEqualStrings("世界", rows[1]);
+}
 
 test "ASCII is 1 cell" {
     try testing.expectEqual(@as(u2, 1), runeWidth('a'));

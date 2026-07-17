@@ -157,7 +157,8 @@ test "a pending approval is visible in the painted band" {
     try tui.start();
     tui.model.setPendingApproval("bash: rm -rf ./scratch");
     tui.stop();
-    try testing.expect(std.mem.indexOf(u8, fake.written(), "approve bash: rm -rf ./scratch? [y/N]") != null);
+    try testing.expect(std.mem.indexOf(u8, fake.written(), "[y/N] approve?") != null);
+    try testing.expect(std.mem.indexOf(u8, fake.written(), "bash: rm -rf ./scratch") != null);
 }
 
 test "a never-started tui can still be stopped and destroyed" {
