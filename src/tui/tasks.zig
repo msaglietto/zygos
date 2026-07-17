@@ -8,6 +8,7 @@ const std = @import("std");
 const theme = @import("theme.zig");
 const palette = @import("palette.zig");
 const entries = @import("entries.zig");
+const previewLen = @import("fmt.zig").previewLen;
 
 /// The task the executor is on right now. `desc` is owned by the model's
 /// gpa; the band borrows it under the model mutex.
@@ -35,15 +36,20 @@ pub fn bandLine(
 }
 
 /// "  ✓ task 2/6 implement the lexer · 1m20s" — scrollback collapse.
+/// Planner descs run long; the line clips at the tool-preview cap so the
+/// hand-off stays one row, not a wrapped dim paragraph.
 pub fn doneLine(
     arena: std.mem.Allocator,
     cur: Current,
     elapsed_txt: []const u8,
 ) error{OutOfMemory}![]u8 {
     var color: [24]u8 = undefined;
-    return std.fmt.allocPrint(arena, "  {s}✓{s} {s}task {d}/{d} {s} · {s}{s}", .{
-        theme.fg(&color, theme.Color.ok), theme.reset, theme.dim,
-        cur.index,                        cur.total,   cur.desc,
+    const cut = previewLen(cur.desc);
+    return std.fmt.allocPrint(arena, "  {s}✓{s} {s}task {d}/{d} {s}{s} · {s}{s}", .{
+        theme.fg(&color, theme.Color.ok), theme.reset,
+        theme.dim,                        cur.index,
+        cur.total,                        cur.desc[0..cut],
+        if (cut < cur.desc.len) "…" else "",
         elapsed_txt,                      theme.reset,
     });
 }
@@ -68,6 +74,22 @@ test "band line carries rail, spinner, index and desc" {
     try testing.expect(std.mem.indexOf(u8, line, "task 2/6") != null);
     try testing.expect(std.mem.indexOf(u8, line, "implement the lexer") != null);
     try testing.expect(std.mem.indexOf(u8, line, theme.spinnerFrame(0)) != null);
+}
+
+test "done line clips a long task desc to the preview cap" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var desc = ("Create `wordfreq` as a POSIX-compliant shell script that reads stdin, " ++
+        "lowercases via `tr A-Z a-z`, strips punctuation and counts frequencies").*;
+    const line = try doneLine(arena_state.allocator(), .{
+        .index = 1,
+        .total = 2,
+        .desc = &desc,
+        .started_ms = 0,
+    }, "23s");
+    try testing.expect(std.mem.indexOf(u8, line, "…") != null);
+    try testing.expect(std.mem.indexOf(u8, line, "counts frequencies") == null);
+    try testing.expect(std.mem.indexOf(u8, line, "· 23s") != null);
 }
 
 test "done line collapses dim with the ok marker and duration" {

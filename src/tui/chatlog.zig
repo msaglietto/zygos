@@ -10,6 +10,10 @@ const markdown = @import("markdown.zig");
 const entries = @import("entries.zig");
 const durFmt = @import("fmt.zig").durFmt;
 
+/// Narration collapses to ONE line; a first line longer than this clips
+/// with an ellipsis instead of wrapping into a paragraph of dim text.
+const narration_cap: usize = 96;
+
 /// A dispatched tool call awaiting its result. Slices are owned by the
 /// caller's gpa (the model frees them; the log only reads).
 pub const ToolView = struct {
@@ -70,18 +74,29 @@ pub const ChatLog = struct {
     }
 
     /// Move the streamed text into history and clear the live buffer.
+    /// Raw JSON payloads (role protocol output: PO objectives, planner task
+    /// lists, verifier verdicts) collapse like narration even at turn end —
+    /// the mission/task lines already tell that story in prose.
     pub fn flushLive(self: *ChatLog, live: *std.ArrayList(u8), mode: FlushMode) error{OutOfMemory}!void {
         if (live.items.len == 0) return;
         defer live.clearRetainingCapacity();
         const text = std.mem.trim(u8, live.items, " \t\r\n");
         if (text.len == 0) return;
-        switch (mode) {
+        const effective: FlushMode = if (mode == .answer and looksLikeJsonPayload(text)) .narration else mode;
+        switch (effective) {
             .narration => {
                 const nl = std.mem.indexOfScalar(u8, text, '\n');
-                const first = std.mem.trimEnd(u8, text[0 .. nl orelse text.len], " \t\r");
+                var first = std.mem.trimEnd(u8, text[0 .. nl orelse text.len], " \t\r");
+                var clipped = nl != null;
+                if (first.len > narration_cap) {
+                    var end = narration_cap;
+                    while (end > 0 and (first[end] & 0xC0) == 0x80) end -= 1;
+                    first = first[0..end];
+                    clipped = true;
+                }
                 try self.appendFmt("  {s}◆ {s}{s}{s}", .{
                     theme.dim,   first,
-                    if (nl != null) "…" else "",
+                    if (clipped) "…" else "",
                     theme.reset,
                 });
             },
@@ -97,6 +112,17 @@ pub const ChatLog = struct {
                 }
             },
         }
+    }
+
+    /// A bare protocol payload: the text (past an optional opening fence line)
+    /// starts with a JSON object or array.
+    fn looksLikeJsonPayload(text: []const u8) bool {
+        var t = text;
+        if (std.mem.startsWith(u8, t, "```")) {
+            const nl = std.mem.indexOfScalar(u8, t, '\n') orelse return false;
+            t = std.mem.trimStart(u8, t[nl + 1 ..], " \t\r\n");
+        }
+        return t.len > 0 and (t[0] == '{' or t[0] == '[');
     }
 
     /// A step/turn boundary with tools still open means their results never
@@ -183,6 +209,42 @@ test "flushLive answer promotes every line through markdown" {
     try testing.expectEqual(@as(usize, 2), log.lines.items.len);
     try testing.expect(std.mem.indexOf(u8, log.lines.items[0], "##") == null);
     try testing.expect(std.mem.indexOf(u8, log.lines.items[1], "second line survives") != null);
+}
+
+test "flushLive answer collapses raw JSON payloads like narration" {
+    var log = ChatLog.init(testing.allocator);
+    defer log.deinit();
+    var live: std.ArrayList(u8) = .empty;
+    defer live.deinit(testing.allocator);
+    try live.appendSlice(testing.allocator, "{\"objective\":\"build it\",\"acceptance\":\"it works\"}");
+    try log.flushLive(&live, .answer);
+    try testing.expectEqual(@as(usize, 1), log.lines.items.len);
+    try testing.expect(std.mem.indexOf(u8, log.lines.items[0], "◆ ") != null);
+    try testing.expect(std.mem.startsWith(u8, log.lines.items[0], "  " ++ theme.dim));
+}
+
+test "flushLive answer collapses fenced JSON payloads too" {
+    var log = ChatLog.init(testing.allocator);
+    defer log.deinit();
+    var live: std.ArrayList(u8) = .empty;
+    defer live.deinit(testing.allocator);
+    try live.appendSlice(testing.allocator, "```json\n{\"tasks\": [\"one\", \"two\"]}\n```");
+    try log.flushLive(&live, .answer);
+    try testing.expectEqual(@as(usize, 1), log.lines.items.len);
+    try testing.expect(std.mem.indexOf(u8, log.lines.items[0], "◆ ") != null);
+    try testing.expect(std.mem.indexOf(u8, log.lines.items[0], "│") == null); // no fence gutter
+}
+
+test "flushLive narration clips very long first lines" {
+    var log = ChatLog.init(testing.allocator);
+    defer log.deinit();
+    var live: std.ArrayList(u8) = .empty;
+    defer live.deinit(testing.allocator);
+    try live.appendSlice(testing.allocator, "word " ** 40); // 200 bytes, one line
+    try log.flushLive(&live, .narration);
+    try testing.expectEqual(@as(usize, 1), log.lines.items.len);
+    try testing.expect(log.lines.items[0].len < 120);
+    try testing.expect(std.mem.indexOf(u8, log.lines.items[0], "…") != null);
 }
 
 test "collapseOpenTools logs each entry as interrupted" {
