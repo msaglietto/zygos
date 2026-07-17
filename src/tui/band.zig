@@ -13,6 +13,7 @@ const entries = @import("entries.zig");
 const tasks_mod = @import("tasks.zig");
 const appendTail = @import("fmt.zig").appendTail;
 const tailLines = @import("fmt.zig").tailLines;
+const durFmt = @import("fmt.zig").durFmt;
 
 /// Streamed-text tail lines shown live in the bottom band.
 const live_tail_lines: usize = 8;
@@ -105,7 +106,7 @@ pub fn build(
     if (view.thinking.len > 0) {
         var t_buf: [32]u8 = undefined;
         const started = view.thinking_started_ms orelse now_ms;
-        try bottom.append(arena, try entries.thinkingHeader(arena, theme.elapsed(&t_buf, started, now_ms)));
+        try bottom.append(arena, try entries.thinkingHeader(arena, durFmt(&t_buf, now_ms - started)));
         var storage: [16][]const u8 = undefined;
         for (tailLines(view.thinking, &storage, thinking_tail_lines)) |line| {
             if (line.len == 0) continue;

@@ -4,6 +4,7 @@
 
 const std = @import("std");
 const theme = @import("theme.zig");
+const width = @import("width.zig");
 
 /// Cap for tool input previews in the step list.
 pub const input_preview_bytes: usize = 72;
@@ -48,6 +49,42 @@ pub fn spaces(arena: std.mem.Allocator, n: usize) error{OutOfMemory}![]const u8 
     const buf = try arena.alloc(u8, n);
     @memset(buf, ' ');
     return buf;
+}
+
+/// Duration into caller's buffer, grok rules: sub-10s keeps tenths
+/// ("0.3s", "5.2s"), then "32s", "1m20s", "1h02m". Negative clamps to 0.
+pub fn durFmt(buf: []u8, dur_ms: i64) []const u8 {
+    const ms = @max(dur_ms, 0);
+    if (ms < 10_000) {
+        return std.fmt.bufPrint(buf, "{d}.{d}s", .{
+            @divTrunc(ms, 1000), @mod(@divTrunc(ms, 100), 10),
+        }) catch unreachable;
+    }
+    const s = @divTrunc(ms, 1000);
+    if (s < 60) return std.fmt.bufPrint(buf, "{d}s", .{s}) catch unreachable;
+    if (s < 3600) {
+        return std.fmt.bufPrint(buf, "{d}m{d:0>2}s", .{ @divTrunc(s, 60), @mod(s, 60) }) catch unreachable;
+    }
+    return std.fmt.bufPrint(buf, "{d}h{d:0>2}m", .{
+        @divTrunc(s, 3600), @mod(@divTrunc(s, 60), 60),
+    }) catch unreachable;
+}
+
+/// One row with `left` flush-left and `right` flush-right at `cols` visible
+/// cells (SGR-aware). Too narrow: a single space separates them.
+pub fn padBetween(
+    arena: std.mem.Allocator,
+    left: []const u8,
+    right: []const u8,
+    cols: usize,
+) error{OutOfMemory}![]u8 {
+    const used = width.visibleWidth(left) + width.visibleWidth(right);
+    const gap = if (cols > used) cols - used else 1;
+    const out = try arena.alloc(u8, left.len + gap + right.len);
+    @memcpy(out[0..left.len], left);
+    @memset(out[left.len .. left.len + gap], ' ');
+    @memcpy(out[left.len + gap ..], right);
+    return out;
 }
 
 /// Cut an input preview on a UTF-8 boundary, first line only.
@@ -108,6 +145,32 @@ test "appendTail wraps lines in the sgr prefix and reset" {
     try appendTail(arena, &rows, "only", 4, theme.dim);
     try testing.expectEqual(@as(usize, 1), rows.items.len);
     try testing.expectEqualStrings("  " ++ theme.dim ++ "only" ++ theme.reset, rows.items[0]);
+}
+
+test "durFmt follows the grok duration rules" {
+    var buf: [32]u8 = undefined;
+    try testing.expectEqualStrings("0.3s", durFmt(&buf, 300));
+    try testing.expectEqualStrings("5.2s", durFmt(&buf, 5_250));
+    try testing.expectEqualStrings("32s", durFmt(&buf, 32_400));
+    try testing.expectEqualStrings("1m20s", durFmt(&buf, 80_000));
+    try testing.expectEqualStrings("1m05s", durFmt(&buf, 65_000));
+    try testing.expectEqualStrings("1h02m", durFmt(&buf, 3_720_000));
+    try testing.expectEqualStrings("0.0s", durFmt(&buf, -5));
+}
+
+test "padBetween right-aligns by visible width, SGR-aware" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const row = try padBetween(arena, "left", "right", 20);
+    try testing.expectEqualStrings("left           right", row);
+    try testing.expectEqual(@as(usize, 20), width.visibleWidth(row));
+    // SGR bytes cost no cells.
+    const styled = try padBetween(arena, theme.dim ++ "ab" ++ theme.reset, "cd", 8);
+    try testing.expectEqual(@as(usize, 8), width.visibleWidth(styled));
+    // Too narrow: one space, never a panic or truncation.
+    const tight = try padBetween(arena, "abcdef", "ghijkl", 4);
+    try testing.expectEqualStrings("abcdef ghijkl", tight);
 }
 
 test "tailLines returns the last N lines oldest first" {

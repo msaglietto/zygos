@@ -293,6 +293,7 @@ pub fn run(gpa: std.mem.Allocator, args: *std.process.Args.Iterator) u8 {
         const t = zygos.tui.Tui.create(gpa, real_term.terminal()) catch return oom();
         if (t.start()) {
             ui = t;
+            t.model.setObjective(extractObjective(brief_text));
             ui_sink = zygos.trace.registerSink(.{
                 .ctx = @ptrCast(&t.model),
                 .onEvent = &zygos.tui.model.Model.sinkOnEvent,

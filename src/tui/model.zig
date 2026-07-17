@@ -20,6 +20,7 @@ const band = @import("band.zig");
 const entries = @import("entries.zig");
 const tasks_mod = @import("tasks.zig");
 const previewLen = @import("fmt.zig").previewLen;
+const durFmt = @import("fmt.zig").durFmt;
 
 fn defaultNow() i64 {
     var ts: std.c.timespec = undefined;
@@ -46,6 +47,7 @@ pub const Model = struct {
     tasks: i64 = 0,
     role: ?[]u8 = null,
     role_turn: i64 = 0,
+    role_started_ms: ?i64 = null,
     step: i64 = 0,
     step_model: ?[]u8 = null,
     attempt: i64 = 0,
@@ -186,6 +188,15 @@ pub const Model = struct {
         self.dirty.set();
     }
 
+    /// The mission objective, echoed once at the top of the transcript —
+    /// grok's prompt-echo band, sans background (terminal-native scrollback).
+    pub fn setObjective(self: *Model, text: []const u8) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.log.appendFmt("{s}❯ {s}{s}", .{ theme.bold, text, theme.reset }) catch {};
+        self.dirty.set();
+    }
+
     /// Approval ask currently awaiting a keypress (null clears the band).
     pub fn setPendingApproval(self: *Model, summary: ?[]const u8) void {
         self.mutex.lock();
@@ -212,6 +223,7 @@ pub const Model = struct {
             const role = str(obj, "role") orelse "?";
             try self.replaceOwned(&self.role, role);
             self.role_turn = int(obj, "role_turn");
+            self.role_started_ms = self.now_fn();
             self.step = 0;
             var color: [24]u8 = undefined;
             try self.log.appendFmt("", .{}); // breathing room between roles
@@ -241,6 +253,13 @@ pub const Model = struct {
                     outcome,
                     theme.reset,
                 });
+            }
+            if (self.role_started_ms) |started| {
+                var e_buf: [32]u8 = undefined;
+                try self.log.appendFmt("{s}Worked for {s}.{s}", .{
+                    theme.dim, durFmt(&e_buf, self.now_fn() - started), theme.reset,
+                });
+                self.role_started_ms = null;
             }
             if (self.role) |r| {
                 self.gpa.free(r);
@@ -286,7 +305,7 @@ pub const Model = struct {
                 name,
                 input,
                 theme.tokens(&count, int(obj, "bytes")),
-                theme.elapsed(&e_buf, started, self.now_fn()),
+                durFmt(&e_buf, self.now_fn() - started),
                 is_err,
             )});
             if (out_preview.len > 0) {
@@ -315,7 +334,7 @@ pub const Model = struct {
                 try self.log.appendFmt("{s}", .{try tasks_mod.doneLine(
                     arena,
                     t,
-                    theme.elapsed(&e_buf, t.started_ms, self.now_fn()),
+                    durFmt(&e_buf, self.now_fn() - t.started_ms),
                 )});
                 self.gpa.free(t.desc);
                 self.current_task = null;
@@ -716,6 +735,34 @@ test "log lines land in chat as dim footnotes" {
     try testing.expect(found);
 }
 
+test "setObjective echoes the prompt once at the top of the transcript" {
+    var m = Model.init(testing.allocator, 0);
+    defer m.deinit();
+    m.setObjective("ship the gizmo");
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const view = try renderJoined(&m, arena_state.allocator());
+    try testing.expect(std.mem.indexOf(u8, view, "❯ ship the gizmo") != null);
+}
+
+test "role_end appends a dim worked-for duration line" {
+    var m = Model.init(testing.allocator, 0);
+    defer m.deinit();
+    m.now_fn = &fakeNow;
+    fake_now = 0;
+    m.onEvent(
+        \\{"ts":1,"event":"role_start","role":"executor","role_turn":1,"tools":true}
+    );
+    fake_now = 73_000;
+    m.onEvent(
+        \\{"ts":2,"event":"role_end","role":"executor","outcome":"ok"}
+    );
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const view = try renderJoined(&m, arena_state.allocator());
+    try testing.expect(std.mem.indexOf(u8, view, "Worked for 1m13s.") != null);
+}
+
 test "task_start highlights the band and task_done hands off to the next" {
     var m = Model.init(testing.allocator, 0);
     defer m.deinit();
@@ -839,7 +886,7 @@ test "thinking flushes when a tool call opens on the stream" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const view = try renderJoined(&m, arena_state.allocator());
-    try testing.expect(std.mem.indexOf(u8, view, "◆ Thought for 3s") != null);
+    try testing.expect(std.mem.indexOf(u8, view, "◆ Thought for 3.0s") != null);
     const marker = std.mem.indexOf(u8, view, "---").?;
     try testing.expect(std.mem.indexOf(u8, view[marker..], "should I list files") == null);
 }

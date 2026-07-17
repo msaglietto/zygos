@@ -8,6 +8,7 @@ const theme = @import("theme.zig");
 const width = @import("width.zig");
 const markdown = @import("markdown.zig");
 const entries = @import("entries.zig");
+const durFmt = @import("fmt.zig").durFmt;
 
 /// A dispatched tool call awaiting its result. Slices are owned by the
 /// caller's gpa (the model frees them; the log only reads).
@@ -61,7 +62,7 @@ pub const ChatLog = struct {
         }
         var e_buf: [32]u8 = undefined;
         const started = started_ms.* orelse now_ms;
-        const line = try entries.collapsedThought(self.gpa, theme.elapsed(&e_buf, started, now_ms));
+        const line = try entries.collapsedThought(self.gpa, durFmt(&e_buf, now_ms - started));
         errdefer self.gpa.free(line);
         try self.lines.append(self.gpa, line);
         thinking.clearRetainingCapacity();
