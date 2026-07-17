@@ -7,6 +7,7 @@
 const std = @import("std");
 const theme = @import("theme.zig");
 const palette = @import("palette.zig");
+const highlight = @import("highlight.zig");
 
 /// Per-flush state: fenced code spans multiple lines, so the caller keeps
 /// one Styler alive for the whole block of lines it is promoting.
@@ -35,12 +36,15 @@ pub const Styler = struct {
             return null;
         }
         if (self.in_fence) {
-            // Code is payload: gutter it, never reinterpret its bytes. The
-            // panel bg paints the text run only — committed lines re-wrap on
-            // resize, so full-width painting would tear.
+            // Code is payload: gutter it, keep its visible bytes intact
+            // (the highlighter only inserts SGRs). The panel bg paints the
+            // text run only — committed lines re-wrap on resize, so
+            // full-width painting would tear.
             var bg_buf: [24]u8 = undefined;
+            const bg = theme.bg(&bg_buf, palette.panel);
+            const body = try highlight.line(arena, highlight.langFromInfo(self.fenceInfo()), raw, bg);
             return try std.fmt.allocPrint(arena, "{s}│{s} {s}{s}{s}", .{
-                theme.dim, theme.reset, theme.bg(&bg_buf, palette.panel), raw, theme.reset,
+                theme.dim, theme.reset, bg, body, theme.reset,
             });
         }
 
