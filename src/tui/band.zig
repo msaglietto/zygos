@@ -9,9 +9,9 @@ const theme = @import("theme.zig");
 const width = @import("width.zig");
 const partialjson = @import("partialjson.zig");
 const chatlog = @import("chatlog.zig");
+const entries = @import("entries.zig");
 const appendTail = @import("fmt.zig").appendTail;
-const dashes = @import("fmt.zig").dashes;
-const spaces = @import("fmt.zig").spaces;
+const tailLines = @import("fmt.zig").tailLines;
 
 /// Streamed-text tail lines shown live in the bottom band.
 const live_tail_lines: usize = 8;
@@ -87,32 +87,24 @@ pub fn build(
         }
     }
 
-    // Dispatched tool calls awaiting results.
+    // Dispatched tool calls awaiting results: one heavy-rail line each.
     for (view.tools) |t| {
-        var tcolor: [24]u8 = undefined;
-        try bottom.append(arena, try std.fmt.allocPrint(arena, "  {s} {s}{s}{s} {s}{s}{s}", .{
-            theme.spinnerFrame(now_ms),
-            theme.fg(&tcolor, theme.Color.tool),
-            t.name,
-            theme.reset,
-            theme.dim,
-            t.input,
-            theme.reset,
-        }));
+        try bottom.append(arena, try entries.toolLine(arena, t.name, t.input));
     }
 
-    try renderLiveToolBox(view, arena, &bottom, cols);
+    try renderLiveToolEntry(view, arena, &bottom, cols);
 
-    // Thinking block: label + italic tail while the model reasons.
+    // Thinking entry: thin-rail header + italic tail while the model reasons.
     if (view.thinking.len > 0) {
         var t_buf: [32]u8 = undefined;
         const started = view.thinking_started_ms orelse now_ms;
-        try bottom.append(arena, try std.fmt.allocPrint(arena, "  {s}✳ thinking… {s}{s}", .{
-            theme.fg(&color, theme.Color.accent),
-            theme.elapsed(&t_buf, started, now_ms),
-            theme.reset,
-        }));
-        try appendTail(arena, &bottom, view.thinking, thinking_tail_lines, theme.dim ++ theme.italic);
+        try bottom.append(arena, try entries.thinkingHeader(arena, theme.elapsed(&t_buf, started, now_ms)));
+        var storage: [16][]const u8 = undefined;
+        for (tailLines(view.thinking, &storage, thinking_tail_lines)) |line| {
+            if (line.len == 0) continue;
+            const clipped = try width.truncateToWidth(arena, line, cols -| 4);
+            try bottom.append(arena, try entries.thinkingBody(arena, clipped));
+        }
     }
 
     // Live answer text: last N lines, full color — this is the payload.
@@ -144,25 +136,18 @@ pub fn build(
     return bottom.items;
 }
 
-/// Bordered live box for a tool call still composing its arguments —
-/// the headline field (command/path/content…) extracted from the
-/// partial JSON streams into the body. Body height is high-water padded
-/// so the box never shrinks mid-stream (zot's liveBodyHigh).
-fn renderLiveToolBox(
+/// Heavy-rail entry for a tool call still composing its arguments — the
+/// headline field (command/path/content…) extracted from the partial JSON
+/// streams into the body. Body height is high-water padded so the entry
+/// never shrinks mid-stream (zot's liveBodyHigh).
+fn renderLiveToolEntry(
     view: BandView,
     arena: std.mem.Allocator,
     bottom: *std.ArrayList([]const u8),
     cols: usize,
 ) error{OutOfMemory}!void {
     const name = view.live_tool_name orelse return;
-    const inner = @min(cols -| 6, 74); // box body cells between the │ rails
-    if (inner < 8) return;
-
-    var tcolor: [24]u8 = undefined;
-    const rail = try dashes(arena, inner -| (width.visibleWidth(name) + 3));
-    try bottom.append(arena, try std.fmt.allocPrint(arena, "  ╭─ {s}{s}{s} {s}╮", .{
-        theme.fg(&tcolor, theme.Color.tool), name, theme.reset, rail,
-    }));
+    try bottom.append(arena, try entries.toolHeader(arena, name));
 
     const body = try partialjson.extractDisplayField(arena, view.live_tool_args) orelse
         view.live_tool_args;
@@ -177,13 +162,9 @@ fn renderLiveToolBox(
     var row: usize = 0;
     while (row < view.live_tool_high.*) : (row += 1) {
         const text = if (row < shown.len) shown[row] else "";
-        const clipped = try width.truncateToWidth(arena, text, inner);
-        const pad = try spaces(arena, inner -| width.visibleWidth(clipped));
-        try bottom.append(arena, try std.fmt.allocPrint(arena, "  │{s}{s}{s}{s}│", .{
-            theme.dim, clipped, theme.reset, pad,
-        }));
+        const clipped = try width.truncateToWidth(arena, text, cols -| 4);
+        try bottom.append(arena, try entries.toolBody(arena, clipped));
     }
-    try bottom.append(arena, try std.fmt.allocPrint(arena, "  ╰{s}╯", .{try dashes(arena, inner)}));
 }
 
 // ===========================================================================
@@ -227,7 +208,7 @@ test "band always carries the header and status rows" {
     try testing.expect(std.mem.indexOf(u8, rows[rows.len - 1], "stream") != null);
 }
 
-test "live tool box high-water mark never shrinks mid-stream" {
+test "live tool entry high-water mark never shrinks mid-stream" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     var high: usize = 0;
@@ -236,13 +217,13 @@ test "live tool box high-water mark never shrinks mid-stream" {
     view.live_tool_args = "{\"command\":\"one\\ntwo\\nthree\"}";
     _ = try build(view, arena_state.allocator(), 80, 0);
     try testing.expectEqual(@as(usize, 3), high);
-    // A shorter body keeps the padded height.
+    // A shorter body keeps the padded height: header + 3 rail rows.
     view.live_tool_args = "{\"command\":\"one\"}";
     const rows = try build(view, arena_state.allocator(), 80, 0);
     try testing.expectEqual(@as(usize, 3), high);
-    var box_rows: usize = 0;
+    var rail_rows: usize = 0;
     for (rows) |r| {
-        if (std.mem.indexOf(u8, r, "│") != null) box_rows += 1;
+        if (std.mem.indexOf(u8, r, entries.heavy_rail) != null) rail_rows += 1;
     }
-    try testing.expectEqual(@as(usize, 3), box_rows);
+    try testing.expectEqual(@as(usize, 4), rail_rows);
 }

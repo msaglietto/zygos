@@ -17,6 +17,7 @@ const width = @import("width.zig");
 const partialjson = @import("partialjson.zig");
 const chatlog = @import("chatlog.zig");
 const band = @import("band.zig");
+const entries = @import("entries.zig");
 const previewLen = @import("fmt.zig").previewLen;
 
 fn defaultNow() i64 {
@@ -258,15 +259,17 @@ pub const Model = struct {
             const preview = raw_input[0..previewLen(raw_input)];
             const input = try self.gpa.dupe(u8, preview);
             errdefer self.gpa.free(input);
-            try self.tools.append(self.gpa, .{ .name = name, .input = input });
+            try self.tools.append(self.gpa, .{ .name = name, .input = input, .started_ms = self.now_fn() });
         } else if (std.mem.eql(u8, ev, "tool_result")) {
             const name = str(obj, "tool") orelse "?";
             const is_err = boolOf(obj, "is_error");
-            var color: [24]u8 = undefined;
             var count: [32]u8 = undefined;
+            var e_buf: [32]u8 = undefined;
             // Collapsed line keeps the call readable in scrollback: name,
-            // the input it ran with, size, and a one-line output preview.
-            const input: []const u8 = if (self.oldestTool(name)) |t| t.input else "";
+            // the input it ran with, size, duration, and an output preview.
+            const open = self.oldestTool(name);
+            const input: []const u8 = if (open) |t| t.input else "";
+            const started: i64 = if (open) |t| t.started_ms else self.now_fn();
             // Prefer the human payload inside the tool's JSON envelope
             // ({"output":...}, {"content":...}) over the envelope itself.
             const raw_out = str(obj, "output") orelse "";
@@ -274,16 +277,14 @@ pub const Model = struct {
                 (try partialjson.extractDisplayField(arena, raw_out)) orelse raw_out;
             const shown: []const u8 = if (unwrapped.len > 0) unwrapped else raw_out;
             const out_preview = shown[0..previewLen(shown)];
-            try self.log.appendFmt("  {s}{s} {s}{s} {s}{s}{s} · {s}B", .{
-                theme.fg(&color, if (is_err) theme.Color.err else theme.Color.ok),
-                if (is_err) "✗" else "✓",
+            try self.log.appendFmt("{s}", .{try entries.collapsedTool(
+                arena,
                 name,
-                theme.reset,
-                theme.dim,
                 input,
-                theme.reset,
                 theme.tokens(&count, int(obj, "bytes")),
-            });
+                theme.elapsed(&e_buf, started, self.now_fn()),
+                is_err,
+            )});
             if (out_preview.len > 0) {
                 try self.log.appendFmt("    {s}{s}{s}{s}", .{
                     theme.dim,
@@ -546,9 +547,9 @@ test "tool_call opens a running box and tool_result collapses it" {
         \\{"ts":2,"event":"tool_result","step":1,"tool":"bash","is_error":false,"bytes":5120,"output":"ok"}
     );
     view = try renderJoined(&m, arena_state.allocator());
-    // Collapsed into chat with the ok marker and size...
-    try testing.expect(std.mem.indexOf(u8, view, "✓ bash") != null);
-    try testing.expect(std.mem.indexOf(u8, view, "5.1k") != null);
+    // Collapsed into chat as one dim line with size and duration...
+    try testing.expect(std.mem.indexOf(u8, view, "◆ bash") != null);
+    try testing.expect(std.mem.indexOf(u8, view, "5.1kB") != null);
     // ...and no longer running in the band.
     const m2 = std.mem.indexOf(u8, view, "---").?;
     try testing.expect(std.mem.indexOf(u8, view[m2..], "bash") == null);
@@ -728,14 +729,15 @@ test "thinking streams live, then collapses to a thought-for line when text star
     defer arena_state.deinit();
     var view = try renderJoined(&m, arena_state.allocator());
     const marker = std.mem.indexOf(u8, view, "---").?;
-    try testing.expect(std.mem.indexOf(u8, view[marker..], "✳ thinking…") != null);
+    try testing.expect(std.mem.indexOf(u8, view[marker..], "Thinking…") != null);
+    try testing.expect(std.mem.indexOf(u8, view[marker..], entries.thin_rail) != null);
     try testing.expect(std.mem.indexOf(u8, view[marker..], "weighing allocator strategies") != null);
 
     fake_now = 13_000; // 12s of thinking
     m.onDelta("The answer is arenas.");
     view = try renderJoined(&m, arena_state.allocator());
     // Collapsed into history with the duration...
-    try testing.expect(std.mem.indexOf(u8, view, "✳ thought for 12s") != null);
+    try testing.expect(std.mem.indexOf(u8, view, "◆ Thought for 12s") != null);
     // ...content gone from the band, answer text present at full color.
     const m2 = std.mem.indexOf(u8, view, "---").?;
     try testing.expect(std.mem.indexOf(u8, view[m2..], "weighing allocator") == null);
@@ -743,7 +745,7 @@ test "thinking streams live, then collapses to a thought-for line when text star
     try testing.expect(std.mem.indexOf(u8, view[m2..], theme.dim ++ "The answer") == null);
 }
 
-test "a streaming tool call renders a live box with the extracted field" {
+test "a streaming tool call renders a rail entry with the extracted field" {
     var m = Model.init(testing.allocator, 0);
     defer m.deinit();
     m.onToolName("bash");
@@ -751,20 +753,21 @@ test "a streaming tool call renders a live box with the extracted field" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     var view = try renderJoined(&m, arena_state.allocator());
-    const marker = std.mem.indexOf(u8, view, "---").?;
-    try testing.expect(std.mem.indexOf(u8, view[marker..], "╭─ ") != null);
+    var marker = std.mem.indexOf(u8, view, "---").?;
+    // Heavy-rail header + rail-guttered body carrying the streamed field.
+    try testing.expect(std.mem.count(u8, view[marker..], entries.heavy_rail) >= 2);
     try testing.expect(std.mem.indexOf(u8, view[marker..], "bash") != null);
     try testing.expect(std.mem.indexOf(u8, view[marker..], "cat src/ker") != null);
-    try testing.expect(std.mem.indexOf(u8, view[marker..], "╰") != null);
 
-    // Dispatch (the tool_call trace event) hands over to the running list.
+    // Dispatch (the tool_call trace event) hands over to the running list:
+    // the streaming body collapses into one rail line.
     m.onEvent(
         \\{"ts":1,"event":"tool_call","turn_id":"t","step":1,"tool":"bash","input":"{\"command\":\"cat src/kernel/actor.zig\"}"}
     );
     view = try renderJoined(&m, arena_state.allocator());
-    const m2 = std.mem.indexOf(u8, view, "---").?;
-    try testing.expect(std.mem.indexOf(u8, view[m2..], "╭─ ") == null);
-    try testing.expect(std.mem.indexOf(u8, view[m2..], "bash") != null); // running entry
+    marker = std.mem.indexOf(u8, view, "---").?;
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, view[marker..], entries.heavy_rail));
+    try testing.expect(std.mem.indexOf(u8, view[marker..], "bash") != null); // running entry
 }
 
 test "thinking flushes when a tool call opens on the stream" {
@@ -778,12 +781,12 @@ test "thinking flushes when a tool call opens on the stream" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const view = try renderJoined(&m, arena_state.allocator());
-    try testing.expect(std.mem.indexOf(u8, view, "✳ thought for 3s") != null);
+    try testing.expect(std.mem.indexOf(u8, view, "◆ Thought for 3s") != null);
     const marker = std.mem.indexOf(u8, view, "---").?;
     try testing.expect(std.mem.indexOf(u8, view[marker..], "should I list files") == null);
 }
 
-test "tool box body falls back to raw args and pads its rails" {
+test "tool entry body falls back to raw args under the rail" {
     var m = Model.init(testing.allocator, 0);
     defer m.deinit();
     m.onToolName("mcp_thing");
@@ -791,13 +794,13 @@ test "tool box body falls back to raw args and pads its rails" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const f = try m.render(arena_state.allocator(), 80, 0);
-    // Every box row ends at the right rail (aligned padding).
-    var box_rows: usize = 0;
+    // No extractable display field: the raw args stream shows anyway.
+    var raw_row = false;
     for (f.bottom) |line| {
-        if (std.mem.indexOf(u8, line, "│") != null) {
-            box_rows += 1;
-            try testing.expect(std.mem.endsWith(u8, line, "│"));
+        if (std.mem.indexOf(u8, line, "{\"weird\":\"sha") != null) {
+            raw_row = true;
+            try testing.expect(std.mem.indexOf(u8, line, entries.heavy_rail) != null);
         }
     }
-    try testing.expect(box_rows >= 1);
+    try testing.expect(raw_row);
 }

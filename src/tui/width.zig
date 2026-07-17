@@ -358,3 +358,11 @@ test "truncate preserves escapes and clips only visible cells" {
     try testing.expectEqualStrings("ab\x1b[1mcd\x1b[0m", got);
     try testing.expectEqual(@as(usize, 4), visibleWidth(got));
 }
+
+test "TUI grammar glyphs are all one cell wide" {
+    // The entry-lifecycle grammar (entries.zig) aligns rails and bullets by
+    // column; a 2-cell glyph would shear every guttered row.
+    for ([_][]const u8{ "┃", "◆", "◈", "❙", "❯", "⇣", "◌", "✳" }) |g| {
+        try std.testing.expectEqual(@as(usize, 1), visibleWidth(g));
+    }
+}

@@ -7,12 +7,15 @@ const std = @import("std");
 const theme = @import("theme.zig");
 const width = @import("width.zig");
 const markdown = @import("markdown.zig");
+const entries = @import("entries.zig");
 
 /// A dispatched tool call awaiting its result. Slices are owned by the
 /// caller's gpa (the model frees them; the log only reads).
 pub const ToolView = struct {
     name: []u8,
     input: []u8,
+    /// Dispatch stamp — the collapsed line shows the run duration.
+    started_ms: i64 = 0,
 };
 
 pub const FlushMode = enum {
@@ -58,9 +61,9 @@ pub const ChatLog = struct {
         }
         var e_buf: [32]u8 = undefined;
         const started = started_ms.* orelse now_ms;
-        try self.appendFmt("  {s}{s}✳ thought for {s}{s}", .{
-            theme.dim, theme.italic, theme.elapsed(&e_buf, started, now_ms), theme.reset,
-        });
+        const line = try entries.collapsedThought(self.gpa, theme.elapsed(&e_buf, started, now_ms));
+        errdefer self.gpa.free(line);
+        try self.lines.append(self.gpa, line);
         thinking.clearRetainingCapacity();
         started_ms.* = null;
     }
@@ -142,7 +145,7 @@ test "flushThinking collapses to a duration line and clears the buffer" {
     var started: ?i64 = 1000;
     try log.flushThinking(&thinking, &started, 13_000);
     try testing.expectEqual(@as(usize, 1), log.lines.items.len);
-    try testing.expect(std.mem.indexOf(u8, log.lines.items[0], "✳ thought for 12s") != null);
+    try testing.expect(std.mem.indexOf(u8, log.lines.items[0], "◆ Thought for 12s") != null);
     try testing.expectEqual(@as(usize, 0), thinking.items.len);
     try testing.expectEqual(@as(?i64, null), started);
 }

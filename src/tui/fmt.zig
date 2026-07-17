@@ -8,6 +8,18 @@ const theme = @import("theme.zig");
 /// Cap for tool input previews in the step list.
 pub const input_preview_bytes: usize = 72;
 
+/// Last `max` lines of `text` (ignoring a trailing newline), oldest first,
+/// into `storage`. Returned slices borrow `text`.
+pub fn tailLines(text: []const u8, storage: *[16][]const u8, max: usize) []const []const u8 {
+    if (text.len == 0) return storage[0..0];
+    var tail = std.mem.splitBackwardsScalar(u8, std.mem.trimEnd(u8, text, "\n"), '\n');
+    var n: usize = 0;
+    while (n < @min(max, storage.len)) : (n += 1) {
+        storage[storage.len - 1 - n] = tail.next() orelse break;
+    }
+    return storage[storage.len - n ..];
+}
+
 /// Last `max` non-empty-tail lines of `text` into the band, prefixed and
 /// wrapped in `sgr` (empty = terminal default).
 pub fn appendTail(
@@ -17,18 +29,11 @@ pub fn appendTail(
     max: usize,
     comptime sgr: []const u8,
 ) error{OutOfMemory}!void {
-    if (text.len == 0) return;
-    var tail = std.mem.splitBackwardsScalar(u8, std.mem.trimEnd(u8, text, "\n"), '\n');
-    var collected: [16][]const u8 = undefined;
-    var n: usize = 0;
-    while (n < @min(max, collected.len)) : (n += 1) {
-        collected[n] = tail.next() orelse break;
-    }
-    while (n > 0) {
-        n -= 1;
-        if (collected[n].len == 0) continue;
+    var storage: [16][]const u8 = undefined;
+    for (tailLines(text, &storage, max)) |line| {
+        if (line.len == 0) continue;
         try bottom.append(arena, try std.fmt.allocPrint(arena, "  " ++ sgr ++ "{s}" ++
-            (if (sgr.len > 0) theme.reset else ""), .{collected[n]}));
+            (if (sgr.len > 0) theme.reset else ""), .{line}));
     }
 }
 
@@ -103,6 +108,15 @@ test "appendTail wraps lines in the sgr prefix and reset" {
     try appendTail(arena, &rows, "only", 4, theme.dim);
     try testing.expectEqual(@as(usize, 1), rows.items.len);
     try testing.expectEqualStrings("  " ++ theme.dim ++ "only" ++ theme.reset, rows.items[0]);
+}
+
+test "tailLines returns the last N lines oldest first" {
+    var storage: [16][]const u8 = undefined;
+    const lines = tailLines("one\ntwo\nthree\n", &storage, 2);
+    try testing.expectEqual(@as(usize, 2), lines.len);
+    try testing.expectEqualStrings("two", lines[0]);
+    try testing.expectEqualStrings("three", lines[1]);
+    try testing.expectEqual(@as(usize, 0), tailLines("", &storage, 4).len);
 }
 
 test "appendTail on empty text appends nothing" {
