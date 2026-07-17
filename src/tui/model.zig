@@ -164,10 +164,12 @@ pub const Model = struct {
     }
 
     /// A tool call opened on the stream (`.tool_name`): start a live box.
+    /// Thinking and narration both close here — they precede the call.
     pub fn onToolName(self: *Model, name: []const u8) void {
         self.mutex.lock();
         defer self.mutex.unlock();
         self.flushThinking() catch {};
+        self.flushLive(.narration) catch {};
         const copy = self.gpa.dupe(u8, name) catch return;
         if (self.live_tool_name) |old| self.gpa.free(old);
         self.live_tool_name = copy;
@@ -282,7 +284,10 @@ pub const Model = struct {
             try self.replaceOwned(&self.step_model, str(obj, "model") orelse "?");
         } else if (std.mem.eql(u8, ev, "tool_call")) {
             // Dispatch: the streaming box (if any) hands over to the running
-            // tool list fed by this event.
+            // tool list fed by this event. Narration streamed before this
+            // call commits first — otherwise the "I'll do X" line lands
+            // after the tool it introduced (reads backwards in scrollback).
+            try self.flushLive(.narration);
             self.clearLiveTool();
             const name = try self.gpa.dupe(u8, str(obj, "tool") orelse "?");
             errdefer self.gpa.free(name);
@@ -629,6 +634,24 @@ test "tool_call opens a running box and tool_result collapses it" {
     // ...and no longer running in the band.
     const m2 = std.mem.indexOf(u8, view, "---").?;
     try testing.expect(std.mem.indexOf(u8, view[m2..], "bash") == null);
+}
+
+test "narration commits before the tool call it introduced" {
+    var m = Model.init(testing.allocator, 0);
+    defer m.deinit();
+    m.onDelta("I'll create the script now.");
+    m.onEvent(
+        \\{"ts":1,"event":"tool_call","turn_id":"t","step":1,"tool":"bash","input":"{}"}
+    );
+    m.onEvent(
+        \\{"ts":2,"event":"tool_result","step":1,"tool":"bash","is_error":false,"bytes":5,"output":"ok"}
+    );
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const view = try renderJoined(&m, arena_state.allocator());
+    const say = std.mem.indexOf(u8, view, "I'll create the script now.") orelse return error.NoNarration;
+    const did = std.mem.indexOf(u8, view, "◆ bash") orelse return error.NoTool;
+    try testing.expect(say < did);
 }
 
 test "tool_result with is_error renders the error marker" {
