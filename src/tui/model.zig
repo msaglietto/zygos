@@ -14,6 +14,7 @@ const json = std.json;
 const sync = @import("../kernel/sync.zig");
 const theme = @import("theme.zig");
 const width = @import("width.zig");
+const markdown = @import("markdown.zig");
 const partialjson = @import("partialjson.zig");
 
 /// Streamed-text tail lines shown live in the bottom band.
@@ -227,7 +228,7 @@ pub const Model = struct {
             });
         } else if (std.mem.eql(u8, ev, "role_end")) {
             try self.flushThinking();
-            try self.flushLive();
+            try self.flushLive(.answer);
             self.clearLiveTool();
             try self.collapseOpenTools();
             const outcome = str(obj, "outcome") orelse "?";
@@ -255,7 +256,7 @@ pub const Model = struct {
             }
         } else if (std.mem.eql(u8, ev, "step")) {
             try self.flushThinking();
-            try self.flushLive();
+            try self.flushLive(.narration);
             self.clearLiveTool();
             self.step = int(obj, "step");
             self.attempt = int(obj, "attempt");
@@ -310,7 +311,7 @@ pub const Model = struct {
             self.tokens_out += int(obj, "output_tokens");
         } else if (std.mem.eql(u8, ev, "turn_end")) {
             try self.flushThinking();
-            try self.flushLive();
+            try self.flushLive(.answer);
             self.clearLiveTool();
             try self.collapseOpenTools();
             self.step = 0;
@@ -511,15 +512,42 @@ pub const Model = struct {
         self.live_tool_high = 0;
     }
 
-    /// Move the streamed text into chat history, one dim line per text line.
-    fn flushLive(self: *Model) error{OutOfMemory}!void {
+    const FlushMode = enum {
+        /// Step boundary: the text was the model talking to itself between
+        /// tool calls — activity, not payload. One dim ◆ line.
+        narration,
+        /// Turn end: this is the answer. Full promote, markdown-lite styled.
+        answer,
+    };
+
+    /// Move the streamed text into chat history.
+    fn flushLive(self: *Model, mode: FlushMode) error{OutOfMemory}!void {
         if (self.live.items.len == 0) return;
-        var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, self.live.items, "\n"), '\n');
-        while (lines.next()) |line| {
-            if (line.len == 0) continue;
-            try self.appendChatFmt("  {s}", .{line});
+        defer self.live.clearRetainingCapacity();
+        const text = std.mem.trim(u8, self.live.items, " \t\r\n");
+        if (text.len == 0) return;
+        switch (mode) {
+            .narration => {
+                const nl = std.mem.indexOfScalar(u8, text, '\n');
+                const first = std.mem.trimEnd(u8, text[0 .. nl orelse text.len], " \t\r");
+                try self.appendChatFmt("  {s}◆ {s}{s}{s}", .{
+                    theme.dim,   first,
+                    if (nl != null) "…" else "",
+                    theme.reset,
+                });
+            },
+            .answer => {
+                var arena_state = std.heap.ArenaAllocator.init(self.gpa);
+                defer arena_state.deinit();
+                var styler = markdown.Styler{};
+                var lines = std.mem.splitScalar(u8, text, '\n');
+                while (lines.next()) |line| {
+                    if (line.len == 0) continue;
+                    const styled = (styler.line(arena_state.allocator(), line) catch line) orelse continue;
+                    try self.appendChatFmt("  {s}", .{styled});
+                }
+            },
         }
-        self.live.clearRetainingCapacity();
     }
 
     /// A step/turn boundary with tools still open means their results never
@@ -697,12 +725,16 @@ test "step event flushes streamed text into chat" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const f = try m.render(arena_state.allocator(), 80, 0);
-    // Flushed into chat...
+    // Interim narration collapses to ONE dim ◆ line (the model talking to
+    // itself between tool calls is activity, not the answer).
     var found = false;
+    var second = false;
     for (f.chat) |l| {
-        if (std.mem.indexOf(u8, l, "thinking about allocators") != null) found = true;
+        if (std.mem.indexOf(u8, l, "◆ thinking about allocators…") != null) found = true;
+        if (std.mem.indexOf(u8, l, "second line") != null) second = true;
     }
     try testing.expect(found);
+    try testing.expect(!second);
     // ...and no longer in the live tail.
     for (f.bottom) |l| {
         try testing.expect(std.mem.indexOf(u8, l, "thinking about") == null);
@@ -799,6 +831,25 @@ test "turn_end flushes live text and collapses interrupted tools" {
     try testing.expect(std.mem.indexOf(u8, view, "tail text") != null);
     try testing.expect(std.mem.indexOf(u8, view, "bash interrupted") != null);
     try testing.expect(std.mem.indexOf(u8, view, "turn: aborted (3 steps)") != null);
+}
+
+test "turn_end promotes the answer in full with markdown styling" {
+    var m = Model.init(testing.allocator, 0);
+    defer m.deinit();
+    m.onDelta("## Result\nkept `HEAD` intact\nsecond line survives");
+    m.onEvent(
+        \\{"ts":1,"event":"turn_end","turn_id":"t","stop":"end_turn","steps":1}
+    );
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const view = try renderJoined(&m, arena_state.allocator());
+    // Full promote — nothing collapsed away.
+    try testing.expect(std.mem.indexOf(u8, view, "second line survives") != null);
+    // Header styled, hashes gone; inline code amber, backticks gone.
+    try testing.expect(std.mem.indexOf(u8, view, "##") == null);
+    try testing.expect(std.mem.indexOf(u8, view, "\x1b[38;5;75mResult") != null);
+    try testing.expect(std.mem.indexOf(u8, view, "\x1b[38;5;179mHEAD\x1b[0m") != null);
+    try testing.expect(std.mem.indexOf(u8, view, "`HEAD`") == null);
 }
 
 test "malformed event JSON is ignored and never wedges the model" {
