@@ -113,6 +113,10 @@ pub const StopReason = enum {
 pub const Task = struct {
     desc: []const u8,
     done: bool = false,
+    /// Excerpt of the executor's answer for this task — carried into later
+    /// executor turns so they stop re-discovering finished work. In-memory
+    /// only (not persisted); a resumed mission sees [done] without it.
+    result: []const u8 = "",
 };
 
 /// All slices are owned by whoever built the Mission: the driver builds one
@@ -182,7 +186,9 @@ pub const Role = enum {
                 "you are given. Reply with ONLY a JSON object: " ++
                 "{\"objective\": <one precise sentence>, \"acceptance\": <how completion is judged>}.",
             .planner => "You are the planner of a mission. Break the objective into ordered, " ++
-                "independently executable tasks. Reply with ONLY a JSON object: " ++
+                "independently executable tasks. Prefer few substantive tasks; each task " ++
+                "validates its own work, so never emit separate verify-only or " ++
+                "run-the-tests-again tasks. Reply with ONLY a JSON object: " ++
                 "{\"tasks\": [<task description>, ...]}.",
             .executor => "You are the executor of a mission. Complete the single task you are " ++
                 "given, using the available tools when they help. The bash tool already runs " ++
@@ -815,21 +821,49 @@ fn rolePlan(self: *MissionOrchestrator, arena: std.mem.Allocator, cfg: RunConfig
     }
 }
 
+/// First `max` bytes of a role answer, cut back to a space (and never inside
+/// a UTF-8 sequence) — enough context for the next turn, not a transcript.
+fn outcomeExcerpt(arena: std.mem.Allocator, text: []const u8, max: usize) error{OutOfMemory}![]const u8 {
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    if (trimmed.len <= max) return arena.dupe(u8, trimmed);
+    var end = max;
+    while (end > 0 and (trimmed[end] & 0xC0) == 0x80) end -= 1;
+    if (std.mem.lastIndexOfScalar(u8, trimmed[0..end], ' ')) |sp| {
+        if (sp > max / 2) end = sp;
+    }
+    return std.fmt.allocPrint(arena, "{s}…", .{std.mem.trimEnd(u8, trimmed[0..end], " \t\r\n")});
+}
+
 fn roleExecute(self: *MissionOrchestrator, arena: std.mem.Allocator, cfg: RunConfig, m: *Mission) MissionError!void {
     std.debug.assert(m.task_index < m.tasks.len);
-    const content = if (m.feedback.len > 0)
-        try std.fmt.allocPrint(
-            arena,
-            "Objective:\n{s}\n\nYour task:\n{s}\n\nFeedback on the previous attempt:\n{s}\n",
-            .{ m.objective, m.tasks[m.task_index].desc, m.feedback },
-        )
-    else
-        try std.fmt.allocPrint(
-            arena,
-            "Objective:\n{s}\n\nYour task:\n{s}\n",
-            .{ m.objective, m.tasks[m.task_index].desc },
-        );
-    switch (try runRole(self, arena, cfg, m, .executor, content, true)) {
+    // The executor is stateless across turns; the prompt is its only memory.
+    // Without the progress block every turn re-discovers (and re-verifies)
+    // the workspace from scratch — the dogfood runs burned most of their
+    // steps re-testing finished tasks.
+    var content: std.Io.Writer.Allocating = .init(arena);
+    const w = &content.writer;
+    w.print("Objective:\n{s}\n", .{m.objective}) catch return error.OutOfMemory;
+    if (m.tasks.len > 1) {
+        w.writeAll(if (m.task_index > 0)
+            "\nPlan progress — earlier tasks are already complete and verified; " ++
+                "do NOT redo, re-check, or re-test them:\n"
+        else
+            "\nPlan:\n") catch return error.OutOfMemory;
+        for (m.tasks, 0..) |t, i| {
+            const mark = if (t.done) "done" else if (i == m.task_index) "current" else "pending";
+            w.print("{d}. [{s}] {s}\n", .{ i + 1, mark, t.desc }) catch return error.OutOfMemory;
+            if (t.done and t.result.len > 0)
+                w.print("   outcome: {s}\n", .{t.result}) catch return error.OutOfMemory;
+        }
+    }
+    w.print(
+        "\nYour task (do ONLY this, then stop):\n{s}\n",
+        .{m.tasks[m.task_index].desc},
+    ) catch return error.OutOfMemory;
+    if (m.feedback.len > 0)
+        w.print("\nFeedback on the previous attempt:\n{s}\n", .{m.feedback}) catch return error.OutOfMemory;
+
+    switch (try runRole(self, arena, cfg, m, .executor, content.written(), true)) {
         .failed => |reason| try failRole(m, reason),
         // A step-budget stop is exhaustion, not malfunction: retry the same
         // task with feedback, counted against the same escalation threshold
@@ -850,10 +884,11 @@ fn roleExecute(self: *MissionOrchestrator, arena: std.mem.Allocator, cfg: RunCon
                 // state stays .executing — the loop re-runs this task.
             }
         },
-        .ok => {
+        .ok => |text| {
             m.feedback = "";
             m.exec_fail_count = 0;
             m.tasks[m.task_index].done = true;
+            m.tasks[m.task_index].result = try outcomeExcerpt(arena, text, 600);
             m.task_index += 1;
             m.state = try Fsm.apply(m.state, if (m.task_index == m.tasks.len) .tasks_done else .task_done);
         },
@@ -1397,6 +1432,34 @@ test "happy path: define, plan, execute x2, verify, gate approve; artifacts + te
 const exec_toolspin =
     \\{"stop_reason":"tool_use","content":[{"type":"tool_use","id":"t1","name":"noop","input":{}}]}
 ;
+
+test "executor turns carry completed-task outcomes forward" {
+    const exec_one = roleText("built the gizmo at ./gizmo");
+    var h = try Harness.init(testing.allocator, &.{ po_ok, plan2, exec_one, exec_ok, verify_pass });
+    defer h.deinit();
+    const approvals = try approval_mod.ApprovalWorker.start(testing.allocator, &h.actor, &h.registry, .auto_approve);
+    defer approvals.stop();
+
+    const req = try h.startReq(testing.allocator, seed_and_gate);
+    defer testing.allocator.free(req);
+    const res = try h.caller.call("zygos::missions::start", req);
+    defer res.deinit(testing.allocator);
+    try expectTerminal(res.ok, "done", "completed");
+
+    // Call order: po, planner, executor(task 1), executor(task 2), verifier.
+    const first_exec = h.provider.requests.items[2];
+    const second_exec = h.provider.requests.items[3];
+
+    // Task 1 starts with nothing done — no completed outcomes to carry.
+    try testing.expect(std.mem.indexOf(u8, first_exec, "[done]") == null);
+    try testing.expect(std.mem.indexOf(u8, first_exec, "build the gizmo") != null);
+
+    // Task 2 must see task 1 marked done WITH its outcome, so it stops
+    // re-discovering and re-verifying finished work every turn.
+    try testing.expect(std.mem.indexOf(u8, second_exec, "[done] build the gizmo") != null);
+    try testing.expect(std.mem.indexOf(u8, second_exec, "built the gizmo at ./gizmo") != null);
+    try testing.expect(std.mem.indexOf(u8, second_exec, "[current] test the gizmo") != null);
+}
 
 test "executor max_steps retries the task with feedback instead of failing the mission" {
     var h = try Harness.init(testing.allocator, &.{
