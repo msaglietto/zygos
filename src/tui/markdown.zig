@@ -6,11 +6,19 @@
 
 const std = @import("std");
 const theme = @import("theme.zig");
+const palette = @import("palette.zig");
 
 /// Per-flush state: fenced code spans multiple lines, so the caller keeps
 /// one Styler alive for the whole block of lines it is promoting.
 pub const Styler = struct {
     in_fence: bool = false,
+    /// Fence info string ("```zig" → "zig") for syntax highlighting.
+    fence_info: [16]u8 = undefined,
+    fence_info_len: usize = 0,
+
+    pub fn fenceInfo(self: *const Styler) []const u8 {
+        return self.fence_info[0..self.fence_info_len];
+    }
 
     /// Style one line for the terminal (arena-owned result), or null when
     /// the line is markup that should not render (``` fence markers).
@@ -18,11 +26,22 @@ pub const Styler = struct {
         const trimmed = std.mem.trimStart(u8, raw, " ");
         if (std.mem.startsWith(u8, trimmed, "```")) {
             self.in_fence = !self.in_fence;
+            self.fence_info_len = 0;
+            if (self.in_fence) {
+                const info = std.mem.trim(u8, trimmed[3..], " \t");
+                self.fence_info_len = @min(info.len, self.fence_info.len);
+                @memcpy(self.fence_info[0..self.fence_info_len], info[0..self.fence_info_len]);
+            }
             return null;
         }
         if (self.in_fence) {
-            // Code is payload: gutter it, never reinterpret its bytes.
-            return try std.fmt.allocPrint(arena, "{s}│{s} {s}", .{ theme.dim, theme.reset, raw });
+            // Code is payload: gutter it, never reinterpret its bytes. The
+            // panel bg paints the text run only — committed lines re-wrap on
+            // resize, so full-width painting would tear.
+            var bg_buf: [24]u8 = undefined;
+            return try std.fmt.allocPrint(arena, "{s}│{s} {s}{s}{s}", .{
+                theme.dim, theme.reset, theme.bg(&bg_buf, palette.panel), raw, theme.reset,
+            });
         }
 
         var color: [24]u8 = undefined;
@@ -39,11 +58,27 @@ pub const Styler = struct {
         if (std.mem.startsWith(u8, rest, "- ") or std.mem.startsWith(u8, rest, "* ")) {
             try out.appendSlice(arena, "• ");
             rest = rest[2..];
+        } else if (ordinalLen(rest)) |n| {
+            // Numbered list: keep the ordinal, dim it, style the rest.
+            try out.appendSlice(arena, theme.dim);
+            try out.appendSlice(arena, rest[0..n]);
+            try out.appendSlice(arena, theme.reset);
+            rest = rest[n..];
         }
         try inlineSpans(arena, &out, rest);
         return out.items;
     }
 };
+
+/// Byte length of a leading list ordinal ("12. ") incl. the dot, excl. the
+/// space — or null. Capped at 3 digits: "1024. " is prose, not a list.
+fn ordinalLen(s: []const u8) ?usize {
+    var digits: usize = 0;
+    while (digits < s.len and std.ascii.isDigit(s[digits])) digits += 1;
+    if (digits == 0 or digits > 3) return null;
+    if (digits + 1 >= s.len or s[digits] != '.' or s[digits + 1] != ' ') return null;
+    return digits + 1;
+}
 
 fn headerText(s: []const u8) ?[]const u8 {
     var hashes: usize = 0;
@@ -149,6 +184,39 @@ test "fence markers vanish; fenced lines get a gutter and stay literal" {
     try testing.expectEqual(@as(?[]const u8, null), try styleOne(&s, arena_state.allocator(), "```"));
     const after = (try styleOne(&s, arena_state.allocator(), "back to prose")).?;
     try testing.expectEqualStrings("back to prose", after);
+}
+
+test "numbered lists keep the ordinal dim and style the rest" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var s = Styler{};
+    const got = (try styleOne(&s, arena_state.allocator(), "2. run `zig build`")).?;
+    try testing.expect(std.mem.indexOf(u8, got, theme.dim ++ "2." ++ theme.reset) != null);
+    try testing.expect(std.mem.indexOf(u8, got, "`") == null); // rest still styled
+    // Prose that merely starts with a number is not a list.
+    const prose = (try styleOne(&s, arena_state.allocator(), "1024. That is a lot.")).?;
+    try testing.expect(std.mem.indexOf(u8, prose, theme.dim) == null);
+}
+
+test "fenced lines carry the code panel background" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var s = Styler{};
+    _ = try styleOne(&s, arena_state.allocator(), "```");
+    const body = (try styleOne(&s, arena_state.allocator(), "const x = 1;")).?;
+    try testing.expect(std.mem.indexOf(u8, body, "\x1b[48;5;234m") != null); // panel bg
+    try testing.expect(std.mem.endsWith(u8, body, theme.reset)); // bg never leaks
+}
+
+test "fence info string is captured while the fence is open" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var s = Styler{};
+    try testing.expectEqualStrings("", s.fenceInfo());
+    _ = try styleOne(&s, arena_state.allocator(), "```zig");
+    try testing.expectEqualStrings("zig", s.fenceInfo());
+    _ = try styleOne(&s, arena_state.allocator(), "```");
+    try testing.expectEqualStrings("", s.fenceInfo());
 }
 
 test "list markers render as bullets" {
