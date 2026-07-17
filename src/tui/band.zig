@@ -10,6 +10,7 @@ const width = @import("width.zig");
 const partialjson = @import("partialjson.zig");
 const chatlog = @import("chatlog.zig");
 const entries = @import("entries.zig");
+const tasks_mod = @import("tasks.zig");
 const appendTail = @import("fmt.zig").appendTail;
 const tailLines = @import("fmt.zig").tailLines;
 
@@ -37,6 +38,7 @@ pub const BandView = struct {
     tokens_in: i64,
     tokens_out: i64,
     approval: ?[]const u8,
+    current_task: ?tasks_mod.Current,
     tools: []const chatlog.ToolView,
     thinking: []const u8,
     thinking_started_ms: ?i64,
@@ -69,6 +71,11 @@ pub fn build(
         view.tasks,
         theme.elapsed(&e_buf, view.started_ms, now_ms),
     }));
+
+    // The executor's live task — the one bright long-lived band line.
+    if (view.current_task) |cur| {
+        try bottom.append(arena, try tasks_mod.bandLine(arena, cur, now_ms));
+    }
 
     // Current role/step.
     if (view.role) |role| {
@@ -187,6 +194,7 @@ fn emptyView(high: *usize) BandView {
         .tokens_in = 0,
         .tokens_out = 0,
         .approval = null,
+        .current_task = null,
         .tools = &.{},
         .thinking = "",
         .thinking_started_ms = null,

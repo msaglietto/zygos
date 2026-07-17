@@ -14,6 +14,7 @@ pub const fmt = @import("fmt.zig");
 pub const chatlog = @import("chatlog.zig");
 pub const band = @import("band.zig");
 pub const entries = @import("entries.zig");
+pub const tasks = @import("tasks.zig");
 pub const frame = @import("frame.zig");
 pub const markdown = @import("markdown.zig");
 pub const model = @import("model.zig");

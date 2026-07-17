@@ -18,6 +18,7 @@ const partialjson = @import("partialjson.zig");
 const chatlog = @import("chatlog.zig");
 const band = @import("band.zig");
 const entries = @import("entries.zig");
+const tasks_mod = @import("tasks.zig");
 const previewLen = @import("fmt.zig").previewLen;
 
 fn defaultNow() i64 {
@@ -51,6 +52,8 @@ pub const Model = struct {
     tokens_in: i64 = 0,
     tokens_out: i64 = 0,
     approval: ?[]u8 = null,
+    /// The executor's live task (task_start .. task_done window).
+    current_task: ?tasks_mod.Current = null,
 
     /// Completed history — flows into terminal scrollback, only grows.
     log: chatlog.ChatLog,
@@ -89,6 +92,7 @@ pub const Model = struct {
         if (self.role) |r| self.gpa.free(r);
         if (self.step_model) |m| self.gpa.free(m);
         if (self.approval) |a| self.gpa.free(a);
+        if (self.current_task) |t| self.gpa.free(t.desc);
         self.dirty.deinit();
         self.mutex.deinit();
         self.* = undefined;
@@ -294,6 +298,28 @@ pub const Model = struct {
                 });
             }
             self.removeOldestTool(name);
+        } else if (std.mem.eql(u8, ev, "task_start")) {
+            const desc = try self.gpa.dupe(u8, str(obj, "desc") orelse "?");
+            if (self.current_task) |t| self.gpa.free(t.desc);
+            self.current_task = .{
+                .index = int(obj, "index"),
+                .total = int(obj, "total"),
+                .desc = desc,
+                .started_ms = self.now_fn(),
+            };
+        } else if (std.mem.eql(u8, ev, "task_done")) {
+            // The hand-off: this task collapses into scrollback; the next
+            // task_start repopulates the band with a fresh timer.
+            if (self.current_task) |t| {
+                var e_buf: [32]u8 = undefined;
+                try self.log.appendFmt("{s}", .{try tasks_mod.doneLine(
+                    arena,
+                    t,
+                    theme.elapsed(&e_buf, t.started_ms, self.now_fn()),
+                )});
+                self.gpa.free(t.desc);
+                self.current_task = null;
+            }
         } else if (std.mem.eql(u8, ev, "usage")) {
             self.tokens_in += int(obj, "input_tokens");
             self.tokens_out += int(obj, "output_tokens");
@@ -338,6 +364,7 @@ pub const Model = struct {
             .tokens_in = self.tokens_in,
             .tokens_out = self.tokens_out,
             .approval = self.approval,
+            .current_task = self.current_task,
             .tools = self.tools.items,
             .thinking = self.thinking.items,
             .thinking_started_ms = self.thinking_started_ms,
@@ -687,6 +714,37 @@ test "log lines land in chat as dim footnotes" {
         if (std.mem.indexOf(u8, l, "something odd") != null) found = true;
     }
     try testing.expect(found);
+}
+
+test "task_start highlights the band and task_done hands off to the next" {
+    var m = Model.init(testing.allocator, 0);
+    defer m.deinit();
+    m.now_fn = &fakeNow;
+    fake_now = 0;
+    m.onEvent(
+        \\{"ts":1,"event":"task_start","index":1,"total":2,"desc":"build the gizmo"}
+    );
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var view = try renderJoined(&m, arena_state.allocator());
+    var marker = std.mem.indexOf(u8, view, "---").?;
+    try testing.expect(std.mem.indexOf(u8, view[marker..], "task 1/2") != null);
+    try testing.expect(std.mem.indexOf(u8, view[marker..], "build the gizmo") != null);
+
+    fake_now = 80_000; // 1m20s on the first task
+    m.onEvent(
+        \\{"ts":2,"event":"task_done","index":1,"total":2,"desc":"build the gizmo"}
+    );
+    m.onEvent(
+        \\{"ts":3,"event":"task_start","index":2,"total":2,"desc":"test the gizmo"}
+    );
+    view = try renderJoined(&m, arena_state.allocator());
+    marker = std.mem.indexOf(u8, view, "---").?;
+    // The finished task collapsed into scrollback with its duration...
+    try testing.expect(std.mem.indexOf(u8, view[0..marker], "task 1/2 build the gizmo · 1m20s") != null);
+    // ...and the band now highlights the next task, not the old one.
+    try testing.expect(std.mem.indexOf(u8, view[marker..], "task 2/2") != null);
+    try testing.expect(std.mem.indexOf(u8, view[marker..], "build the gizmo") == null);
 }
 
 test "every mutation sets the dirty event" {
