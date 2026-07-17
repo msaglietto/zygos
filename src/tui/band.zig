@@ -14,6 +14,7 @@ const tasks_mod = @import("tasks.zig");
 const appendTail = @import("fmt.zig").appendTail;
 const tailLines = @import("fmt.zig").tailLines;
 const durFmt = @import("fmt.zig").durFmt;
+const padBetween = @import("fmt.zig").padBetween;
 
 /// Streamed-text tail lines shown live in the bottom band.
 const live_tail_lines: usize = 8;
@@ -22,12 +23,20 @@ const thinking_tail_lines: usize = 4;
 /// Live tool box body rows (high-water padded up to this cap).
 const tool_box_max_rows: usize = 5;
 
+/// What the mission is doing right now, in display-priority order. The
+/// model derives this on every mutation (touchPhase) so the phase timer
+/// resets exactly when the label class changes.
+pub const Activity = enum { approval, tool, thinking, streaming, idle };
+
 /// Read-only snapshot of the model state the band renders from. Slices
 /// borrow the model's storage — valid only while the model mutex is held.
 /// `live_tool_high` points back into the model: the box's high-water body
 /// height is the one piece of state that advances during a render.
 pub const BandView = struct {
     started_ms: i64,
+    activity: Activity,
+    phase_started_ms: i64,
+    role_started_ms: ?i64,
     mission_state: ?[]const u8,
     tasks_done: i64,
     tasks: i64,
@@ -62,10 +71,10 @@ pub fn build(
     var color: [24]u8 = undefined;
     var e_buf: [32]u8 = undefined;
 
-    // Header: spinner + mission state + tasks + elapsed.
-    try bottom.append(arena, try std.fmt.allocPrint(arena, "{s}{s} zygos{s} · {s} · tasks {d}/{d} · {s}", .{
+    // Header: identity + mission state + tasks + total elapsed. The spinner
+    // lives on the status line, where the activity is.
+    try bottom.append(arena, try std.fmt.allocPrint(arena, "{s}zygos{s} · {s} · tasks {d}/{d} · {s}", .{
         theme.fg(&color, theme.Color.accent),
-        theme.spinnerFrame(now_ms),
         theme.reset,
         if (view.mission_state) |s| s else "starting",
         view.tasks_done,
@@ -128,20 +137,70 @@ pub fn build(
         }));
     }
 
-    // Status line. `stream` counts observed delta bytes — 0B while
-    // tokens climb means the delta path is broken, not the providers.
+    try bottom.append(arena, try statusLine(view, arena, cols, now_ms));
+
+    return bottom.items;
+}
+
+/// "⠹ Responding… · 4.2s        1m13s · 12.4k↑ 3.1k↓ · ⇣NB" — spinner +
+/// activity label + phase timer left; turn timer + token flow right. ⇣N
+/// counts observed delta bytes: 0 while tokens climb means the delta path
+/// is broken, not the providers. Only the left label truncates.
+fn statusLine(
+    view: BandView,
+    arena: std.mem.Allocator,
+    cols: usize,
+    now_ms: i64,
+) error{OutOfMemory}![]const u8 {
+    var color: [24]u8 = undefined;
+    var p_buf: [32]u8 = undefined;
+    const label: []const u8 = switch (view.activity) {
+        .approval => "Waiting for approval",
+        .tool => blk: {
+            const name = view.live_tool_name orelse
+                (if (view.tools.len > 0) view.tools[view.tools.len - 1].name else "tool");
+            break :blk try std.fmt.allocPrint(arena, "Run {s}", .{name});
+        },
+        .thinking => "Thinking…",
+        .streaming => "Responding…",
+        .idle => view.mission_state orelse "starting",
+    };
+    const label_sgr: []const u8 = switch (view.activity) {
+        .approval => theme.fg(&color, theme.Color.err),
+        .tool => theme.fg(&color, theme.Color.ok),
+        .thinking, .streaming => theme.fg(&color, theme.Color.accent),
+        .idle => theme.fg(&color, theme.Color.muted),
+    };
+    var left: []const u8 = try std.fmt.allocPrint(arena, "{s} {s}{s}{s} {s}· {s}{s}", .{
+        theme.spinnerFrame(now_ms), label_sgr,
+        label,                      theme.reset,
+        theme.dim,                  durFmt(&p_buf, now_ms - view.phase_started_ms),
+        theme.reset,
+    });
+
+    var t_buf: [32]u8 = undefined;
     var in_buf: [32]u8 = undefined;
     var out_buf: [32]u8 = undefined;
     var s_buf: [32]u8 = undefined;
-    try bottom.append(arena, try std.fmt.allocPrint(arena, "  {s}{s}↑ {s}↓ · stream {s}B{s}", .{
+    const turn: []const u8 = if (view.role_started_ms) |started|
+        try std.fmt.allocPrint(arena, "{s} · ", .{durFmt(&t_buf, now_ms - started)})
+    else
+        "";
+    const right = try std.fmt.allocPrint(arena, "{s}{s}{s}↑ {s}↓ · ⇣{s}B{s}", .{
         theme.dim,
+        turn,
         theme.tokens(&in_buf, view.tokens_in),
         theme.tokens(&out_buf, view.tokens_out),
         theme.tokens(&s_buf, @intCast(view.stream_bytes)),
         theme.reset,
-    }));
+    });
 
-    return bottom.items;
+    // Only the left label gives way when the row is tight.
+    const rw = width.visibleWidth(right);
+    if (width.visibleWidth(left) + rw + 1 > cols) {
+        left = try width.truncateToWidth(arena, left, cols -| (rw + 1));
+    }
+    return padBetween(arena, left, right, cols);
 }
 
 /// Heavy-rail entry for a tool call still composing its arguments — the
@@ -184,6 +243,9 @@ const testing = std.testing;
 fn emptyView(high: *usize) BandView {
     return .{
         .started_ms = 0,
+        .activity = .idle,
+        .phase_started_ms = 0,
+        .role_started_ms = null,
         .mission_state = null,
         .tasks_done = 0,
         .tasks = 0,
@@ -214,7 +276,63 @@ test "band always carries the header and status rows" {
     const rows = try build(emptyView(&high), arena_state.allocator(), 80, 0);
     try testing.expect(rows.len >= 2);
     try testing.expect(std.mem.indexOf(u8, rows[0], "zygos") != null);
-    try testing.expect(std.mem.indexOf(u8, rows[rows.len - 1], "stream") != null);
+    try testing.expect(std.mem.indexOf(u8, rows[rows.len - 1], "⇣") != null);
+}
+
+test "status line labels follow the activity class with its color" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var high: usize = 0;
+    var view = emptyView(&high);
+
+    view.activity = .streaming;
+    var row = try statusLine(view, arena, 80, 0);
+    try testing.expect(std.mem.indexOf(u8, row, "Responding…") != null);
+
+    view.activity = .approval;
+    row = try statusLine(view, arena, 80, 0);
+    try testing.expect(std.mem.indexOf(u8, row, "Waiting for approval") != null);
+
+    var name = "bash".*;
+    var input = "{}".*;
+    view.activity = .tool;
+    view.tools = &.{.{ .name = &name, .input = &input }};
+    row = try statusLine(view, arena, 80, 0);
+    try testing.expect(std.mem.indexOf(u8, row, "Run bash") != null);
+
+    view.activity = .idle;
+    view.mission_state = "verifying";
+    row = try statusLine(view, arena, 80, 0);
+    try testing.expect(std.mem.indexOf(u8, row, "verifying") != null);
+}
+
+test "status line pads to the full width with the turn timer right" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var high: usize = 0;
+    var view = emptyView(&high);
+    view.activity = .streaming;
+    view.phase_started_ms = 0;
+    view.role_started_ms = 0;
+    const row = try statusLine(view, arena_state.allocator(), 60, 73_000);
+    try testing.expectEqual(@as(usize, 60), width.visibleWidth(row));
+    try testing.expect(std.mem.indexOf(u8, row, "1m13s") != null);
+}
+
+test "only the left label truncates when the row is tight" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var high: usize = 0;
+    var view = emptyView(&high);
+    var name = "a_very_long_mcp_tool_name_that_never_ends".*;
+    var input = "{}".*;
+    view.activity = .tool;
+    view.tools = &.{.{ .name = &name, .input = &input }};
+    const row = try statusLine(view, arena_state.allocator(), 40, 0);
+    try testing.expect(width.visibleWidth(row) <= 40);
+    // The right side survives intact.
+    try testing.expect(std.mem.indexOf(u8, row, "⇣") != null);
 }
 
 test "live tool entry high-water mark never shrinks mid-stream" {

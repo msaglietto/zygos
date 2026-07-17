@@ -75,6 +75,10 @@ pub const Model = struct {
     /// Total streamed bytes seen (text + thinking) — surfaced in the status
     /// line as a live health check of the delta path.
     stream_bytes: usize = 0,
+    /// Current activity class + when it last changed: the status-line phase
+    /// timer resets exactly on class transitions (touchPhase).
+    phase_class: band.Activity = .idle,
+    phase_started_ms: i64 = 0,
     /// Injectable clock (tests); render timestamps still come from callers.
     now_fn: *const fn () i64 = &defaultNow,
 
@@ -134,7 +138,7 @@ pub const Model = struct {
         defer self.mutex.unlock();
         defer self.dirty.set();
         self.applyEvent(arena, ev, obj) catch {}; // OOM: drop the line, keep the view alive
-
+        self.touchPhase();
     }
 
     pub fn onDelta(self: *Model, bytes: []const u8) void {
@@ -144,6 +148,7 @@ pub const Model = struct {
         self.flushThinking() catch {};
         self.live.appendSlice(self.gpa, bytes) catch {};
         self.stream_bytes += bytes.len;
+        self.touchPhase();
         self.dirty.set();
     }
 
@@ -154,6 +159,7 @@ pub const Model = struct {
         if (self.thinking_started_ms == null) self.thinking_started_ms = self.now_fn();
         self.thinking.appendSlice(self.gpa, bytes) catch {};
         self.stream_bytes += bytes.len;
+        self.touchPhase();
         self.dirty.set();
     }
 
@@ -167,6 +173,7 @@ pub const Model = struct {
         self.live_tool_name = copy;
         self.live_tool_args.clearRetainingCapacity();
         self.live_tool_high = 0;
+        self.touchPhase();
         self.dirty.set();
     }
 
@@ -206,6 +213,7 @@ pub const Model = struct {
             self.approval = null;
         }
         if (summary) |s| self.approval = self.gpa.dupe(u8, s) catch null;
+        self.touchPhase();
         self.dirty.set();
     }
 
@@ -372,6 +380,9 @@ pub const Model = struct {
         const chat = try self.log.wrapForRender(arena, cols);
         const bottom = try band.build(.{
             .started_ms = self.started_ms,
+            .activity = self.phase_class,
+            .phase_started_ms = self.phase_started_ms,
+            .role_started_ms = self.role_started_ms,
             .mission_state = self.mission_state,
             .tasks_done = self.tasks_done,
             .tasks = self.tasks,
@@ -398,6 +409,25 @@ pub const Model = struct {
     }
 
     // -- internals (mutex held) ----------------------------------------------
+
+    /// Re-derive the activity class after a mutation; a class change resets
+    /// the status-line phase timer. Priority mirrors band.Activity order.
+    fn touchPhase(self: *Model) void {
+        const class: band.Activity = if (self.approval != null)
+            .approval
+        else if (self.tools.items.len > 0 or self.live_tool_name != null)
+            .tool
+        else if (self.thinking.items.len > 0)
+            .thinking
+        else if (self.live.items.len > 0)
+            .streaming
+        else
+            .idle;
+        if (class != self.phase_class) {
+            self.phase_class = class;
+            self.phase_started_ms = self.now_fn();
+        }
+    }
 
     fn flushThinking(self: *Model) error{OutOfMemory}!void {
         try self.log.flushThinking(&self.thinking, &self.thinking_started_ms, self.now_fn());
@@ -792,6 +822,28 @@ test "task_start highlights the band and task_done hands off to the next" {
     // ...and the band now highlights the next task, not the old one.
     try testing.expect(std.mem.indexOf(u8, view[marker..], "task 2/2") != null);
     try testing.expect(std.mem.indexOf(u8, view[marker..], "build the gizmo") == null);
+}
+
+test "phase timer resets when the activity class changes" {
+    var m = Model.init(testing.allocator, 0);
+    defer m.deinit();
+    m.now_fn = &fakeNow;
+    fake_now = 1_000;
+    m.onThinking("hmm");
+    try testing.expectEqual(band.Activity.thinking, m.phase_class);
+    try testing.expectEqual(@as(i64, 1_000), m.phase_started_ms);
+
+    fake_now = 5_000;
+    m.onThinking("more"); // same class: timer unchanged
+    try testing.expectEqual(@as(i64, 1_000), m.phase_started_ms);
+
+    m.onDelta("answer"); // thinking flushed → streaming: timer resets
+    try testing.expectEqual(band.Activity.streaming, m.phase_class);
+    try testing.expectEqual(@as(i64, 5_000), m.phase_started_ms);
+
+    // Approval outranks everything.
+    m.setPendingApproval("bash: rm -rf ./build");
+    try testing.expectEqual(band.Activity.approval, m.phase_class);
 }
 
 test "every mutation sets the dirty event" {
