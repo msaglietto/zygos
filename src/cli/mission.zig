@@ -324,6 +324,14 @@ pub fn run(gpa: std.mem.Allocator, args: *std.process.Args.Iterator) u8 {
     // ---- the mission ---------------------------------------------------------
     // Scripted-test defaults (8 steps/turn, 16 turns) are too tight for real
     // executors iterating with tools — a real mission gets room by default.
+    // The workspace path rides in the bash description: a model that does
+    // not know its cwd wastes steps probing $HOME or inventing /home paths.
+    const bash_desc = std.fmt.allocPrint(
+        gpa,
+        "Run a shell command and get its output. The shell runs in the mission workspace: {s}. " ++
+            "Do all work inside this directory (relative paths work); never write to $HOME or system paths.",
+        .{cwd},
+    ) catch return oom();
     const request = std.fmt.allocPrint(gpa,
         \\{{"mission_id":{f},"planning_root":{f},"objective":{f},"brief":{f},
         \\ "router_function":"zygos::models::resolve",
@@ -334,7 +342,7 @@ pub fn run(gpa: std.mem.Allocator, args: *std.process.Args.Iterator) u8 {
         \\ "role_max_steps":{d},"max_role_turns":{d}{s},
         \\ "tools":[
         \\  {{"name":"bash","function_id":"zygos::tools::bash",
-        \\   "description":"Run a shell command in the mission workspace and get its output.",
+        \\   "description":{f},
         \\   "input_schema":{{"type":"object","properties":{{"command":{{"type":"string",
         \\    "description":"the shell command to run"}}}},"required":["command"]}}}},
         \\  {{"name":"web_search","function_id":"zygos::tools::web_search",
@@ -346,11 +354,12 @@ pub fn run(gpa: std.mem.Allocator, args: *std.process.Args.Iterator) u8 {
         \\   "input_schema":{{"type":"object","properties":{{"url":{{"type":"string",
         \\    "description":"the absolute http(s) URL to fetch"}}}},"required":["url"]}}}}{s}]}}
     , .{
-        json.fmt(mission_id, .{}),                   json.fmt(planning, .{}),
-        json.fmt(extractObjective(brief_text), .{}), json.fmt(brief_text, .{}),
-        json.fmt(mission_id, .{}),                   json.fmt(trace_path, .{}),
-        envInt(env, "ZYGOS_ROLE_MAX_STEPS", 24),     envInt(env, "ZYGOS_MAX_ROLE_TURNS", 48),
-        if (resume_flag) ",\"resume\":true" else "", if (mcp) |m| m.toolEntriesJson(gpa) catch return oom() else "",
+        json.fmt(mission_id, .{}),                                      json.fmt(planning, .{}),
+        json.fmt(extractObjective(brief_text), .{}),                    json.fmt(brief_text, .{}),
+        json.fmt(mission_id, .{}),                                      json.fmt(trace_path, .{}),
+        envInt(env, "ZYGOS_ROLE_MAX_STEPS", 24),                        envInt(env, "ZYGOS_MAX_ROLE_TURNS", 48),
+        if (resume_flag) ",\"resume\":true" else "",                    json.fmt(bash_desc, .{}),
+        if (mcp) |m| m.toolEntriesJson(gpa) catch return oom() else "",
     }) catch return oom();
 
     const res = caller.call("zygos::missions::start", request) catch {

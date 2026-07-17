@@ -185,7 +185,9 @@ pub const Role = enum {
                 "independently executable tasks. Reply with ONLY a JSON object: " ++
                 "{\"tasks\": [<task description>, ...]}.",
             .executor => "You are the executor of a mission. Complete the single task you are " ++
-                "given, using the available tools when they help.",
+                "given, using the available tools when they help. The bash tool already runs " ++
+                "in the mission workspace — work there with relative paths; do not create " ++
+                "directories elsewhere or probe $HOME.",
             .verifier => "You are the verifier of a mission. Judge whether the executed plan " ++
                 "meets the objective and its acceptance criteria. Reply with ONLY a JSON " ++
                 "object: {\"passed\": true|false, \"reason\": <one sentence>}.",
