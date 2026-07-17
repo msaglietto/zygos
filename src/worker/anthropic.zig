@@ -133,10 +133,7 @@ pub const Assembler = struct {
                 if (self.model.len > 0) self.gpa.free(self.model);
                 self.id = try self.gpa.dupe(u8, id);
                 self.model = try self.gpa.dupe(u8, model);
-                if (objField(msg, "usage")) |u| {
-                    if (intField(u, "input_tokens")) |n| self.usage.input_tokens = n;
-                    if (intField(u, "output_tokens")) |n| self.usage.output_tokens = n;
-                }
+                if (objField(msg, "usage")) |u| self.captureUsage(u);
                 return null;
             },
             .content_block_start => {
@@ -199,13 +196,22 @@ pub const Assembler = struct {
                 if (objField(obj, "delta")) |d| {
                     if (strField(d, "stop_reason")) |sr| self.stop_reason = parseStopReason(sr);
                 }
-                if (objField(obj, "usage")) |u| {
-                    if (intField(u, "output_tokens")) |n| self.usage.output_tokens = n;
-                }
+                if (objField(obj, "usage")) |u| self.captureUsage(u);
                 return null;
             },
             else => unreachable,
         }
+    }
+
+    /// Take whatever token counts an event carries. Compat endpoints drift
+    /// from the Anthropic contract: GLM's anthropic dialect reports input
+    /// tokens in message_delta (not message_start) and has used the openai
+    /// prompt_/completion_ spellings — missing either read as 0↑ live.
+    fn captureUsage(self: *Assembler, u: json.ObjectMap) void {
+        if (intField(u, "input_tokens") orelse intField(u, "prompt_tokens")) |n|
+            self.usage.input_tokens = n;
+        if (intField(u, "output_tokens") orelse intField(u, "completion_tokens")) |n|
+            self.usage.output_tokens = n;
     }
 
     pub fn isDone(self: *const Assembler) bool {
@@ -440,6 +446,30 @@ test "usage captured from message_start and message_delta" {
     try feedTextStream(&a);
     const msg = try a.message();
     try testing.expectEqual(@as(u64, 11), msg.usage.input_tokens);
+    try testing.expectEqual(@as(u64, 9), msg.usage.output_tokens);
+}
+
+test "usage arriving late or under openai-style keys still counts (GLM anthropic dialect)" {
+    // GLM's anthropic-compat endpoint reports input tokens in message_delta
+    // (not message_start) and has been seen using prompt_tokens spelling —
+    // a mission showed 0↑ while output climbed.
+    var a = Assembler.init(testing.allocator);
+    defer a.deinit();
+    _ = try a.onEvent("message_start",
+        \\{"type":"message_start","message":{"id":"m","model":"glm-5.2","content":[],"usage":{"output_tokens":0}}}
+    );
+    _ = try a.onEvent("content_block_start",
+        \\{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+    );
+    _ = try a.onEvent("content_block_stop",
+        \\{"type":"content_block_stop","index":0}
+    );
+    _ = try a.onEvent("message_delta",
+        \\{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"prompt_tokens":42,"output_tokens":9}}
+    );
+    _ = try a.onEvent("message_stop", "{\"type\":\"message_stop\"}");
+    const msg = try a.message();
+    try testing.expectEqual(@as(u64, 42), msg.usage.input_tokens);
     try testing.expectEqual(@as(u64, 9), msg.usage.output_tokens);
 }
 

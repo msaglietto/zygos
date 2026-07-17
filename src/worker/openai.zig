@@ -95,9 +95,13 @@ pub const Assembler = struct {
         if (self.model.len == 0) if (strField(obj, "model")) |m| {
             self.model = try self.gpa.dupe(u8, m);
         };
+        // Accept the anthropic spellings too: compat endpoints mix dialects
+        // (see anthropic.zig captureUsage for the observed GLM drift).
         if (objField(obj, "usage")) |u| {
-            if (intField(u, "prompt_tokens")) |n| self.usage.input_tokens = n;
-            if (intField(u, "completion_tokens")) |n| self.usage.output_tokens = n;
+            if (intField(u, "prompt_tokens") orelse intField(u, "input_tokens")) |n|
+                self.usage.input_tokens = n;
+            if (intField(u, "completion_tokens") orelse intField(u, "output_tokens")) |n|
+                self.usage.output_tokens = n;
         }
 
         const choices = obj.get("choices") orelse return null;
