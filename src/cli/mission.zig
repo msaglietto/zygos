@@ -278,6 +278,13 @@ pub fn run(gpa: std.mem.Allocator, args: *std.process.Args.Iterator) u8 {
             real_term.redirectStderr(errlog.ptr);
             gpa.free(errlog);
         } else |_| {}
+        // ZYGOS_TUI_CAPTURE=<path>: tee raw frames for terminal debugging.
+        if (getEnv(env, "ZYGOS_TUI_CAPTURE")) |cap| {
+            if (std.fmt.allocPrintSentinel(gpa, "{s}", .{cap}, 0)) |cap_z| {
+                real_term.setCapture(cap_z.ptr);
+                gpa.free(cap_z);
+            } else |_| {}
+        }
         const t = zygos.tui.Tui.create(gpa, real_term.terminal()) catch return oom();
         if (t.start()) {
             ui = t;

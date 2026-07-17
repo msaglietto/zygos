@@ -91,6 +91,8 @@ pub const RealTerm = struct {
     out_fd: c_int = 2,
     /// Dup of the original fd 2, kept to undo redirectStderr.
     saved_stderr: ?c_int = null,
+    /// Optional raw-frame tee (ZYGOS_TUI_CAPTURE) for terminal debugging.
+    capture_fd: ?c_int = null,
 
     pub fn isTty() bool {
         return std.c.isatty(2) != 0 and std.c.isatty(0) != 0;
@@ -175,9 +177,17 @@ pub const RealTerm = struct {
         };
     }
 
+    /// Tee every rendered byte to `log_path` (truncating). Best-effort.
+    pub fn setCapture(self: *RealTerm, log_path: [*:0]const u8) void {
+        if (self.capture_fd != null) return;
+        const fd = std.c.open(log_path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+        if (fd >= 0) self.capture_fd = fd;
+    }
+
     fn realWrite(ctx: *anyopaque, bytes: []const u8) void {
         const self: *RealTerm = @ptrCast(@alignCast(ctx));
         writeFd(self.out_fd, bytes);
+        if (self.capture_fd) |fd| writeFd(fd, bytes);
     }
 
     fn realSize(ctx: *anyopaque) Size {

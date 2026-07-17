@@ -77,6 +77,9 @@ pub const Model = struct {
     live_tool_name: ?[]u8 = null,
     live_tool_args: std.ArrayList(u8) = .empty,
     live_tool_high: usize = 0,
+    /// Total streamed bytes seen (text + thinking) — surfaced in the status
+    /// line as a live health check of the delta path.
+    stream_bytes: usize = 0,
     /// Injectable clock (tests); render timestamps still come from callers.
     now_fn: *const fn () i64 = &defaultNow,
 
@@ -145,6 +148,7 @@ pub const Model = struct {
         // The answer starting is the end of the thinking phase.
         self.flushThinking() catch {};
         self.live.appendSlice(self.gpa, bytes) catch {};
+        self.stream_bytes += bytes.len;
         self.dirty.set();
     }
 
@@ -154,6 +158,7 @@ pub const Model = struct {
         defer self.mutex.unlock();
         if (self.thinking_started_ms == null) self.thinking_started_ms = self.now_fn();
         self.thinking.appendSlice(self.gpa, bytes) catch {};
+        self.stream_bytes += bytes.len;
         self.dirty.set();
     }
 
@@ -179,11 +184,24 @@ pub const Model = struct {
     }
 
     /// Captured std.log line — shown as a dim footnote so evidence is never
-    /// hidden while the TUI owns the terminal.
+    /// hidden while the TUI owns the terminal. Wrapped instead of clipped:
+    /// warnings routinely exceed the terminal width and losing the tail of
+    /// a provider error is worse than an extra row.
     pub fn onLog(self: *Model, line: []const u8) void {
+        const wrap_cols: usize = 88;
         self.mutex.lock();
         defer self.mutex.unlock();
-        self.appendChatFmt("{s}{s}{s}", .{ theme.dim, line, theme.reset }) catch {};
+        var rest = line;
+        var first = true;
+        while (rest.len > 0) {
+            var end = @min(rest.len, wrap_cols);
+            while (end > 0 and end < rest.len and (rest[end] & 0xC0) == 0x80) end -= 1;
+            self.appendChatFmt("{s}{s}{s}{s}", .{
+                theme.dim, if (first) "" else "  ", rest[0..end], theme.reset,
+            }) catch {};
+            rest = rest[end..];
+            first = false;
+        }
         self.dirty.set();
     }
 
@@ -200,7 +218,6 @@ pub const Model = struct {
     }
 
     fn applyEvent(self: *Model, arena: std.mem.Allocator, ev: []const u8, obj: json.ObjectMap) error{OutOfMemory}!void {
-        _ = arena;
         if (std.mem.eql(u8, ev, "mission")) {
             const to = str(obj, "to") orelse "?";
             try self.replaceOwned(&self.mission_state, to);
@@ -216,6 +233,7 @@ pub const Model = struct {
             self.role_turn = int(obj, "role_turn");
             self.step = 0;
             var color: [16]u8 = undefined;
+            try self.appendChatFmt("", .{}); // breathing room between roles
             try self.appendChatFmt("{s}▌ {s}{s} — turn {d}", .{
                 theme.fg(&color, theme.Color.accent), role, theme.reset, self.role_turn,
             });
@@ -270,13 +288,34 @@ pub const Model = struct {
             const is_err = boolOf(obj, "is_error");
             var color: [16]u8 = undefined;
             var count: [32]u8 = undefined;
-            try self.appendChatFmt("  {s}{s} {s}{s} · {s}B", .{
+            // Collapsed line keeps the call readable in scrollback: name,
+            // the input it ran with, size, and a one-line output preview.
+            const input: []const u8 = if (self.oldestTool(name)) |t| t.input else "";
+            // Prefer the human payload inside the tool's JSON envelope
+            // ({"output":...}, {"content":...}) over the envelope itself.
+            const raw_out = str(obj, "output") orelse "";
+            const unwrapped = (try partialjson.extractStringField(arena, raw_out, "output")) orelse
+                (try partialjson.extractDisplayField(arena, raw_out)) orelse raw_out;
+            const shown: []const u8 = if (unwrapped.len > 0) unwrapped else raw_out;
+            const out_preview = shown[0..previewLen(shown)];
+            try self.appendChatFmt("  {s}{s} {s}{s} {s}{s}{s} · {s}B", .{
                 theme.fg(&color, if (is_err) theme.Color.err else theme.Color.ok),
                 if (is_err) "✗" else "✓",
                 name,
                 theme.reset,
+                theme.dim,
+                input,
+                theme.reset,
                 theme.tokens(&count, int(obj, "bytes")),
             });
+            if (out_preview.len > 0) {
+                try self.appendChatFmt("    {s}{s}{s}{s}", .{
+                    theme.dim,
+                    if (is_err) "✗ " else "→ ",
+                    out_preview,
+                    theme.reset,
+                });
+            }
             self.removeOldestTool(name);
         } else if (std.mem.eql(u8, ev, "usage")) {
             self.tokens_in += int(obj, "input_tokens");
@@ -384,13 +423,16 @@ pub const Model = struct {
             }));
         }
 
-        // Status line.
+        // Status line. `stream` counts observed delta bytes — 0B while
+        // tokens climb means the delta path is broken, not the providers.
         var in_buf: [32]u8 = undefined;
         var out_buf: [32]u8 = undefined;
-        try bottom.append(arena, try std.fmt.allocPrint(arena, "  {s}{s}↑ {s}↓{s}", .{
+        var s_buf: [32]u8 = undefined;
+        try bottom.append(arena, try std.fmt.allocPrint(arena, "  {s}{s}↑ {s}↓ · stream {s}B{s}", .{
             theme.dim,
             theme.tokens(&in_buf, self.tokens_in),
             theme.tokens(&out_buf, self.tokens_out),
+            theme.tokens(&s_buf, @intCast(self.stream_bytes)),
             theme.reset,
         }));
 
@@ -498,6 +540,13 @@ pub const Model = struct {
             self.gpa.free(t.input);
         }
         self.tools.clearRetainingCapacity();
+    }
+
+    fn oldestTool(self: *Model, name: []const u8) ?*const ToolView {
+        for (self.tools.items) |*t| {
+            if (std.mem.eql(u8, t.name, name)) return t;
+        }
+        return null;
     }
 
     fn removeOldestTool(self: *Model, name: []const u8) void {
