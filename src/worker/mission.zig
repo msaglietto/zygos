@@ -863,6 +863,15 @@ fn roleExecute(self: *MissionOrchestrator, arena: std.mem.Allocator, cfg: RunCon
     if (m.feedback.len > 0)
         w.print("\nFeedback on the previous attempt:\n{s}\n", .{m.feedback}) catch return error.OutOfMemory;
 
+    // Task edges are trace-only (fail-open, not protocol frames): the TUI
+    // keys its live current-task line off start/done pairs.
+    try trace_mod.event(
+        arena,
+        cfg.trace_path,
+        "\"event\":\"task_start\",\"index\":{d},\"total\":{d},\"desc\":{f}",
+        .{ m.task_index + 1, m.tasks.len, json.fmt(try trace_mod.clip(arena, m.tasks[m.task_index].desc), .{}) },
+    );
+
     switch (try runRole(self, arena, cfg, m, .executor, content.written(), true)) {
         .failed => |reason| try failRole(m, reason),
         // A step-budget stop is exhaustion, not malfunction: retry the same
@@ -889,6 +898,12 @@ fn roleExecute(self: *MissionOrchestrator, arena: std.mem.Allocator, cfg: RunCon
             m.exec_fail_count = 0;
             m.tasks[m.task_index].done = true;
             m.tasks[m.task_index].result = try outcomeExcerpt(arena, text, 600);
+            try trace_mod.event(
+                arena,
+                cfg.trace_path,
+                "\"event\":\"task_done\",\"index\":{d},\"total\":{d},\"desc\":{f}",
+                .{ m.task_index + 1, m.tasks.len, json.fmt(try trace_mod.clip(arena, m.tasks[m.task_index].desc), .{}) },
+            );
             m.task_index += 1;
             m.state = try Fsm.apply(m.state, if (m.task_index == m.tasks.len) .tasks_done else .task_done);
         },
@@ -1369,6 +1384,45 @@ test "trace_path threads through role turns: role, mission and turn events land 
         defer p.deinit();
         try testing.expect(p.value == .object);
     }
+}
+
+test "executor emits task_start and task_done with index, total and desc" {
+    var h = try Harness.init(testing.allocator, &.{ po_ok, plan2, exec_ok, exec_ok, verify_pass });
+    defer h.deinit();
+    const approvals = try approval_mod.ApprovalWorker.start(testing.allocator, &h.actor, &h.registry, .auto_approve);
+    defer approvals.stop();
+
+    const tpath = try std.fmt.allocPrint(testing.allocator, "{s}/events.jsonl", .{h.root});
+    defer testing.allocator.free(tpath);
+    const extra = try std.fmt.allocPrint(
+        testing.allocator,
+        seed_and_gate ++ ",\"trace_path\":{f}",
+        .{json.fmt(tpath, .{})},
+    );
+    defer testing.allocator.free(extra);
+    const req = try h.startReq(testing.allocator, extra);
+    defer testing.allocator.free(req);
+    const res = try h.caller.call("zygos::missions::start", req);
+    defer res.deinit(testing.allocator);
+    try testing.expect(res == .ok);
+    try expectTerminal(res.ok, "done", "completed");
+
+    const text = trace_mod.readFile(testing.allocator, tpath) orelse return error.ReadFailed;
+    defer testing.allocator.free(text);
+
+    // Both edges for both tasks: 1-based index, total, and the task desc.
+    for ([_][]const u8{
+        "\"event\":\"task_start\",\"index\":1,\"total\":2,\"desc\":\"build the gizmo\"",
+        "\"event\":\"task_done\",\"index\":1,\"total\":2,\"desc\":\"build the gizmo\"",
+        "\"event\":\"task_start\",\"index\":2,\"total\":2,\"desc\":\"test the gizmo\"",
+        "\"event\":\"task_done\",\"index\":2,\"total\":2,\"desc\":\"test the gizmo\"",
+    }) |needle| {
+        try testing.expect(std.mem.indexOf(u8, text, needle) != null);
+    }
+    // The first task closes before the second opens: the TUI hand-off moment.
+    const done1 = std.mem.indexOf(u8, text, "\"event\":\"task_done\",\"index\":1").?;
+    const start2 = std.mem.indexOf(u8, text, "\"event\":\"task_start\",\"index\":2").?;
+    try testing.expect(done1 < start2);
 }
 
 test "happy path: define, plan, execute x2, verify, gate approve; artifacts + terminal state on disk" {

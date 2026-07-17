@@ -178,6 +178,12 @@ fn renderLine(
     } else if (std.mem.eql(u8, ev, "role_end")) {
         try appendFmt(gpa, &w, "── role {s}: {s}", .{ str(obj, "role") orelse "?", str(obj, "outcome") orelse "?" });
         if (str(obj, "reason")) |r| try appendFmt(gpa, &w, " — {s}", .{r});
+    } else if (std.mem.eql(u8, ev, "task_start")) {
+        try appendFmt(gpa, &w, "  ▸ task {d}/{d}: {s}", .{
+            int(obj, "index"), int(obj, "total"), str(obj, "desc") orelse "?",
+        });
+    } else if (std.mem.eql(u8, ev, "task_done")) {
+        try appendFmt(gpa, &w, "  ✓ task {d}/{d} done", .{ int(obj, "index"), int(obj, "total") });
     } else if (std.mem.eql(u8, ev, "step")) {
         try appendFmt(gpa, &w, "  step {d}: {s} via {s}", .{
             int(obj, "step"), str(obj, "model") orelse "?", str(obj, "provider") orelse "?",
@@ -289,6 +295,8 @@ test "render pretty-prints every event kind and passes unknown lines through raw
     const jsonl =
         \\{"ts":1752200000000,"event":"mission","from":"defining","to":"planning","role_turns":1,"tasks_done":0,"tasks":6}
         \\{"ts":1752200001000,"event":"role_start","role":"executor","role_turn":3,"tools":true,"content":"Objective: ship"}
+        \\{"ts":1752200001500,"event":"task_start","index":2,"total":6,"desc":"implement the lexer"}
+        \\{"ts":1752200001700,"event":"task_done","index":2,"total":6,"desc":"implement the lexer"}
         \\{"ts":1752200002000,"event":"step","turn_id":"","step":1,"provider":"zygos::providers::glm-5-2","model":"glm-5.2","attempt":0}
         \\{"ts":1752200003000,"event":"tool_call","turn_id":"","step":1,"tool":"web_search","input":"{\"query\":\"zig allocators\"}"}
         \\{"ts":1752200004000,"event":"tool_result","step":1,"tool":"web_search","is_error":false,"bytes":5120,"output":"[{\"title\":\"Zig\"}]"}
@@ -312,6 +320,8 @@ test "render pretty-prints every event kind and passes unknown lines through raw
     try testing.expect(std.mem.indexOf(u8, out, "max_steps") != null);
     try testing.expect(std.mem.indexOf(u8, out, "failed") != null);
     try testing.expect(std.mem.indexOf(u8, out, "not-json garbage line") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "▸ task 2/6: implement the lexer") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "✓ task 2/6 done") != null);
     // Timestamps render as wall clock, one per line.
     try testing.expect(std.mem.indexOf(u8, out, "02:13:20") != null); // 1752200000 UTC
 }
