@@ -29,6 +29,7 @@ pub const context = @import("worker/context.zig");
 pub const context_substrate = @import("worker/context_substrate.zig");
 pub const context_conformance = @import("worker/context_conformance.zig");
 pub const context_recall = @import("worker/context_recall.zig");
+pub const context_thread = @import("worker/context_thread.zig");
 pub const tessera_vault = @import("worker/tessera/vault.zig");
 pub const tessera_session_writer = @import("worker/tessera/session_writer.zig");
 pub const tessera_orient = @import("worker/tessera_orient.zig");

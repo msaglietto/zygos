@@ -24,6 +24,7 @@ const brief_mod = @import("brief.zig");
 const context_mod = @import("context.zig");
 const context_substrate = @import("context_substrate.zig");
 const context_recall = @import("context_recall.zig");
+const context_thread = @import("context_thread.zig");
 
 const log = std.log.scoped(.mission);
 
@@ -445,6 +446,8 @@ fn runMission(self: *MissionOrchestrator, arena: std.mem.Allocator, request_json
     };
     var recall_owned: ?*context_recall.RecallStrategy = null;
     defer if (recall_owned) |r| r.destroy();
+    var thread_owned: ?*context_thread.ThreadStrategy = null;
+    defer if (thread_owned) |t| t.destroy();
     const strategy: context_mod.ContextStrategy = switch (ctx_cfg.kind) {
         .substrate => context_substrate.strategy(),
         .recall => blk: {
@@ -453,8 +456,19 @@ fn runMission(self: *MissionOrchestrator, arena: std.mem.Allocator, request_json
                 return error.OutOfMemory;
             break :blk recall_owned.?.strategy();
         },
-        // Configuring a strategy before it lands refuses the start.
-        .thread => return error.MalformedRequest,
+        .thread => blk: {
+            // Threads + DECISIONS.md live in the planning root beside the
+            // artifacts; the git digest reads the process cwd (the mission
+            // workspace), fail-open when it is not a repo.
+            thread_owned = context_thread.ThreadStrategy.create(
+                self.gpa,
+                planning_root,
+                ".",
+                context_thread.PopenRunner.runner(),
+                .{},
+            ) catch return error.OutOfMemory;
+            break :blk thread_owned.?.strategy();
+        },
     };
     var store_substrate = StoreSubstrate{
         .gpa = self.gpa,
@@ -1459,10 +1473,33 @@ test "context_strategy: kind recall runs the pipeline and persists a source inde
     try testing.expect(std.mem.indexOf(u8, text, "\"id\":\"outcome:verifier:") != null);
 }
 
-test "context_strategy: an unimplemented or unknown kind refuses the start (fail closed)" {
+test "context_strategy: kind thread runs the pipeline and persists per-task threads" {
+    var h = try Harness.init(testing.allocator, &.{ po_ok, plan1, exec_ok, verify_pass });
+    defer h.deinit();
+    const approvals = try approval_mod.ApprovalWorker.start(testing.allocator, &h.actor, &h.registry, .auto_approve);
+    defer approvals.stop();
+
+    const req = try h.startReq(
+        testing.allocator,
+        seed_and_gate ++ ",\"context_strategy\":{\"kind\":\"thread\"}",
+    );
+    defer testing.allocator.free(req);
+    const res = try h.caller.call("zygos::missions::start", req);
+    defer res.deinit(testing.allocator);
+    try testing.expect(res == .ok);
+    try expectTerminal(res.ok, "done", "completed");
+
+    const tpath = try std.fmt.allocPrint(testing.allocator, "{s}/threads/task-0.jsonl", .{h.root});
+    defer testing.allocator.free(tpath);
+    const text = trace_mod.readFile(testing.allocator, tpath) orelse return error.ReadFailed;
+    defer testing.allocator.free(text);
+    try testing.expect(std.mem.indexOf(u8, text, "\"role\":\"executor\"") != null);
+}
+
+test "context_strategy: an unknown kind refuses the start (fail closed)" {
     var h = try Harness.init(testing.allocator, &.{po_ok});
     defer h.deinit();
-    for ([_][]const u8{ "thread", "transcript-dump" }) |kind| {
+    for ([_][]const u8{"transcript-dump"}) |kind| {
         const extra = try std.fmt.allocPrint(
             testing.allocator,
             ",\"objective\":\"seed: gizmo\",\"context_strategy\":{{\"kind\":\"{s}\"}}",

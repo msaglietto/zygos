@@ -77,6 +77,10 @@ pub fn run(gpa: std.mem.Allocator, args: *std.process.Args.Iterator) u8 {
         eprint("mission: cannot parse .mcp_servers in {s}\n", .{zon_path});
         return 2;
     };
+    const ctx_cfg = zygos.context.Config.parse(gpa, zon_text) catch {
+        eprint("mission: invalid .context_strategy in {s}\n", .{zon_path});
+        return 2;
+    };
 
     // ---- kernel + roster (the e2e/m3 wiring, catalog + manual approvals) ----
     var registry = zygos.inproc.Registry.init(gpa, null);
@@ -306,6 +310,7 @@ pub fn run(gpa: std.mem.Allocator, args: *std.process.Args.Iterator) u8 {
         \\ "policy_function":"zygos::policy::check",
         \\ "approval_function":"zygos::approvals::request",
         \\ "budget_scope":{f},"trace_path":{f},
+        \\ "context_strategy":{{"kind":"{t}","max_tokens":{d}}},
         \\ "role_max_steps":{d},"max_role_turns":{d}{s},
         \\ "tools":[
         \\  {{"name":"bash","function_id":"zygos::tools::bash",
@@ -324,6 +329,7 @@ pub fn run(gpa: std.mem.Allocator, args: *std.process.Args.Iterator) u8 {
         json.fmt(mission_id, .{}),                                      json.fmt(planning, .{}),
         json.fmt(extractObjective(brief_text), .{}),                    json.fmt(brief_text, .{}),
         json.fmt(mission_id, .{}),                                      json.fmt(trace_path, .{}),
+        ctx_cfg.kind,                                                   ctx_cfg.max_tokens,
         tm.role_max_steps,                                              tm.max_role_turns,
         if (resume_flag) ",\"resume\":true" else "",                    json.fmt(bash_desc, .{}),
         if (mcp) |m| m.toolEntriesJson(gpa) catch return oom() else "",
