@@ -198,6 +198,7 @@ fn renderLine(
             tr.bytes, if (tr.is_error) " ERROR" else "", tr.output,
         }),
         .usage => |u| try appendFmt(gpa, &w, "    usage: {d}↑ {d}↓", .{ u.input_tokens, u.output_tokens }),
+        .steer => |s| try appendFmt(gpa, &w, "  ⚑ steer: {s}", .{s.text}),
         .turn_end => |te| {
             try appendFmt(gpa, &w, "  turn end: {s} ({d} steps)", .{ te.stop, te.steps });
             if (te.err) |e| try appendFmt(gpa, &w, " — {s}", .{e});

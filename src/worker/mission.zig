@@ -134,6 +134,9 @@ pub const Mission = struct {
     objective: []const u8 = "",
     acceptance: []const u8 = "",
     feedback: []const u8 = "",
+    /// M6 operator steer riding the next role turn. In-memory only (a
+    /// parked mission does not carry a pending steer across resume).
+    steer: []const u8 = "",
     tasks: []Task = &.{},
     task_index: usize = 0,
     fail_count: usize = 0,
@@ -210,6 +213,10 @@ pub const Role = enum {
 /// after every persisted transition, status/abort read it.
 const MissionControl = struct {
     aborted: bool = false,
+    /// M6: pause parks the run durably at the next role boundary.
+    paused: bool = false,
+    /// M6: pending operator steer, gpa-owned, consumed at the next boundary.
+    steer: ?[]u8 = null,
     state: State = .defining,
     stop: StopReason = .none,
     task_index: usize = 0,
@@ -288,6 +295,9 @@ pub const MissionOrchestrator = struct {
         try self.worker.registerFunction("zygos::missions::start", self, &startHandler);
         try self.worker.registerFunction("zygos::missions::status", self, &statusHandler);
         try self.worker.registerFunction("zygos::missions::abort", self, &abortHandler);
+        try self.worker.registerFunction("zygos::missions::steer", self, &steerHandler);
+        try self.worker.registerFunction("zygos::missions::pause", self, &pauseHandler);
+        try self.worker.registerFunction("zygos::missions::resume", self, &resumeHandler);
         return self;
     }
 
@@ -321,6 +331,7 @@ pub const MissionOrchestrator = struct {
         self.ctl_mutex.lock();
         defer self.ctl_mutex.unlock();
         if (self.live.fetchRemove(mission_id)) |kv| {
+            if (kv.value.steer) |s| self.gpa.free(s);
             self.gpa.destroy(kv.value);
             self.gpa.free(kv.key);
         }
@@ -330,6 +341,21 @@ pub const MissionOrchestrator = struct {
         self.ctl_mutex.lock();
         defer self.ctl_mutex.unlock();
         return ctl.aborted;
+    }
+
+    fn pollPaused(self: *MissionOrchestrator, ctl: *MissionControl) bool {
+        self.ctl_mutex.lock();
+        defer self.ctl_mutex.unlock();
+        return ctl.paused;
+    }
+
+    /// The pending steer text (gpa-owned, caller frees), clearing the slot.
+    fn takeSteer(self: *MissionOrchestrator, ctl: *MissionControl) ?[]u8 {
+        self.ctl_mutex.lock();
+        defer self.ctl_mutex.unlock();
+        const s = ctl.steer;
+        ctl.steer = null;
+        return s;
     }
 
     /// Persist first, then publish the snapshot — status never reports a
@@ -396,6 +422,68 @@ fn abortHandler(
         defer self.ctl_mutex.unlock();
         const ctl = self.live.get(mid) orelse break :blk false;
         ctl.aborted = true;
+        break :blk true;
+    };
+    return std.fmt.allocPrint(arena, "{{\"ok\":{}}}", .{ok});
+}
+
+/// M6 turn-steer one level up: text lands at the next role boundary and
+/// rides exactly one role turn. Last write wins while one is pending.
+fn steerHandler(
+    ctx: ?*anyopaque,
+    arena: std.mem.Allocator,
+    request_json: []const u8,
+) error{ Failed, OutOfMemory }![]const u8 {
+    const self: *MissionOrchestrator = @ptrCast(@alignCast(ctx.?));
+    const ok = blk: {
+        const root = json.parseFromSliceLeaky(json.Value, arena, request_json, .{}) catch break :blk false;
+        if (root != .object) break :blk false;
+        const mid = strField(root.object, "mission_id") orelse break :blk false;
+        const text = strField(root.object, "text") orelse break :blk false;
+        if (text.len == 0) break :blk false;
+        const copy = try self.gpa.dupe(u8, text);
+        self.ctl_mutex.lock();
+        defer self.ctl_mutex.unlock();
+        const ctl = self.live.get(mid) orelse {
+            self.gpa.free(copy);
+            break :blk false;
+        };
+        if (ctl.steer) |old| self.gpa.free(old);
+        ctl.steer = copy;
+        break :blk true;
+    };
+    return std.fmt.allocPrint(arena, "{{\"ok\":{}}}", .{ok});
+}
+
+fn pauseHandler(
+    ctx: ?*anyopaque,
+    arena: std.mem.Allocator,
+    request_json: []const u8,
+) error{ Failed, OutOfMemory }![]const u8 {
+    return setPaused(ctx, arena, request_json, true);
+}
+
+fn resumeHandler(
+    ctx: ?*anyopaque,
+    arena: std.mem.Allocator,
+    request_json: []const u8,
+) error{ Failed, OutOfMemory }![]const u8 {
+    return setPaused(ctx, arena, request_json, false);
+}
+
+fn setPaused(
+    ctx: ?*anyopaque,
+    arena: std.mem.Allocator,
+    request_json: []const u8,
+    paused: bool,
+) error{ Failed, OutOfMemory }![]const u8 {
+    const self: *MissionOrchestrator = @ptrCast(@alignCast(ctx.?));
+    const ok = blk: {
+        const mid = controlTarget(arena, request_json) orelse break :blk false;
+        self.ctl_mutex.lock();
+        defer self.ctl_mutex.unlock();
+        const ctl = self.live.get(mid) orelse break :blk false;
+        ctl.paused = paused;
         break :blk true;
     };
     return std.fmt.allocPrint(arena, "{{\"ok\":{}}}", .{ok});
@@ -535,17 +623,34 @@ fn runMission(self: *MissionOrchestrator, arena: std.mem.Allocator, request_json
             m.stop = .aborted;
             m.detail = "aborted over the bus";
             m.state = try Fsm.apply(m.state, .abort);
+        } else if (self.pollPaused(ctl)) {
+            // Pause parks durably at the boundary; the substrate already
+            // resumes (mission start with resume:true).
+            try self.persist(cfg.store, ctl, &m);
+            return replyParked(arena, &m);
         } else if (m.state != .gating and m.role_turns_used >= cfg.max_role_turns) {
             m.stop = .role_turns_exhausted;
             m.detail = "max_role_turns reached";
             m.state = try Fsm.apply(m.state, .role_turns_exhausted);
-        } else switch (m.state) {
-            .defining => try roleDefine(self, arena, cfg, &m),
-            .planning => try rolePlan(self, arena, cfg, &m),
-            .executing => try roleExecute(self, arena, cfg, &m),
-            .verifying => try roleVerify(self, arena, cfg, &m),
-            .gating => try gate(self, arena, cfg, &m),
-            .done, .failed => unreachable,
+        } else {
+            // Steer is consumed at the boundary and rides exactly the next
+            // role turn's content (turn-steer semantics one level up).
+            if (self.takeSteer(ctl)) |text| {
+                defer self.gpa.free(text);
+                m.steer = try arena.dupe(u8, text);
+                try trace_mod.emit(arena, cfg.trace_path, .{ .steer = .{
+                    .text = try trace_mod.clip(arena, m.steer),
+                } });
+            }
+            switch (m.state) {
+                .defining => try roleDefine(self, arena, cfg, &m),
+                .planning => try rolePlan(self, arena, cfg, &m),
+                .executing => try roleExecute(self, arena, cfg, &m),
+                .verifying => try roleVerify(self, arena, cfg, &m),
+                .gating => try gate(self, arena, cfg, &m),
+                .done, .failed => unreachable,
+            }
+            m.steer = "";
         }
         try self.persist(cfg.store, ctl, &m);
         if (m.state != prev) {
@@ -645,6 +750,15 @@ fn replyTerminal(arena: std.mem.Allocator, m: *const Mission) error{OutOfMemory}
         arena,
         "{{\"state\":\"{t}\",\"stop\":\"{t}\",\"detail\":{f},\"role_turns\":{d},\"tasks_done\":{d}}}",
         .{ m.state, m.stop, json.fmt(m.detail, .{}), m.role_turns_used, m.tasksDone() },
+    );
+}
+
+/// Parked, not terminal: state is on disk, resume completes it.
+fn replyParked(arena: std.mem.Allocator, m: *const Mission) error{OutOfMemory}![]const u8 {
+    return std.fmt.allocPrint(
+        arena,
+        "{{\"state\":\"{t}\",\"stop\":\"{t}\",\"paused\":true,\"role_turns\":{d},\"tasks_done\":{d}}}",
+        .{ m.state, m.stop, m.role_turns_used, m.tasksDone() },
     );
 }
 
@@ -860,6 +974,11 @@ fn assembleContent(
             return null;
         },
     };
+    // Operator steer appends after strategy assembly — operator text is
+    // sovereign and never dropped by a strategy's packing.
+    if (m.steer.len > 0) {
+        return try std.fmt.allocPrint(arena, "{s}\n\nOperator steer:\n{s}\n", .{ out.content, m.steer });
+    }
     return out.content;
 }
 
@@ -2021,6 +2140,89 @@ test "abort mid-mission stops durably with aborted" {
     var m = try h.store().load(testing.allocator);
     defer m.deinit(testing.allocator);
     try testing.expectEqual(StopReason.aborted, m.stop);
+}
+
+test "steer text is consumed at the next role boundary and rides exactly one role turn" {
+    var h = try Harness.init(testing.allocator, &.{ po_ok, plan2, exec_ok, exec_ok, verify_pass });
+    defer h.deinit();
+    const approvals = try approval_mod.ApprovalWorker.start(testing.allocator, &h.actor, &h.registry, .auto_approve);
+    defer approvals.stop();
+    h.provider.park_at = 2; // park the first executor turn
+    const ctl_worker = try inproc.Worker.spawn(testing.allocator, &h.actor, &h.registry, "test-control");
+    defer ctl_worker.stop();
+
+    const req = try h.startReq(testing.allocator, seed_and_gate);
+    defer testing.allocator.free(req);
+    var ctx: StartCtx = .{ .h = h, .req = req };
+    const t = try std.Thread.spawn(.{}, StartCtx.run, .{&ctx});
+
+    h.provider.entered.wait();
+    const sres = try ctl_worker.call(
+        "zygos::missions::steer",
+        "{\"mission_id\":\"m-1\",\"text\":\"focus on the gizmo docs\"}",
+    );
+    defer sres.deinit(testing.allocator);
+    try testing.expect(std.mem.indexOf(u8, sres.ok, "true") != null);
+    h.provider.release.set();
+    t.join();
+    defer ctx.res.deinit(testing.allocator);
+    try expectTerminal(ctx.res.ok, "done", "completed");
+
+    h.provider.mutex.lock();
+    defer h.provider.mutex.unlock();
+    // The role turn after the boundary (second executor, call 3) carries it…
+    try testing.expect(std.mem.indexOf(u8, h.provider.requests.items[3], "Operator steer:") != null);
+    try testing.expect(std.mem.indexOf(u8, h.provider.requests.items[3], "focus on the gizmo docs") != null);
+    // …and exactly once: the verifier turn after it does not.
+    try testing.expect(std.mem.indexOf(u8, h.provider.requests.items[4], "Operator steer:") == null);
+}
+
+test "steer for an unknown mission replies ok:false" {
+    var h = try Harness.init(testing.allocator, &.{});
+    defer h.deinit();
+    const res = try h.caller.call("zygos::missions::steer", "{\"mission_id\":\"ghost\",\"text\":\"x\"}");
+    defer res.deinit(testing.allocator);
+    try testing.expect(std.mem.indexOf(u8, res.ok, "false") != null);
+}
+
+test "pause parks durably at a role boundary; the substrate resumes to done" {
+    var h = try Harness.init(testing.allocator, &.{ po_ok, plan2, exec_ok, exec_ok, verify_pass });
+    defer h.deinit();
+    const approvals = try approval_mod.ApprovalWorker.start(testing.allocator, &h.actor, &h.registry, .auto_approve);
+    defer approvals.stop();
+    h.provider.park_at = 2;
+    const ctl_worker = try inproc.Worker.spawn(testing.allocator, &h.actor, &h.registry, "test-control");
+    defer ctl_worker.stop();
+
+    const req = try h.startReq(testing.allocator, seed_and_gate);
+    defer testing.allocator.free(req);
+    var ctx: StartCtx = .{ .h = h, .req = req };
+    const t = try std.Thread.spawn(.{}, StartCtx.run, .{&ctx});
+
+    h.provider.entered.wait();
+    const pres = try ctl_worker.call("zygos::missions::pause", "{\"mission_id\":\"m-1\"}");
+    defer pres.deinit(testing.allocator);
+    try testing.expect(std.mem.indexOf(u8, pres.ok, "true") != null);
+    h.provider.release.set();
+    t.join();
+    defer ctx.res.deinit(testing.allocator);
+
+    // Parked, not terminal: the in-flight executor turn finished, then the
+    // boundary parked the run with the state persisted.
+    try testing.expect(ctx.res == .ok);
+    try testing.expect(std.mem.indexOf(u8, ctx.res.ok, "\"paused\":true") != null);
+    try testing.expect(std.mem.indexOf(u8, ctx.res.ok, "\"state\":\"executing\"") != null);
+    var parked = try h.store().load(testing.allocator);
+    defer parked.deinit(testing.allocator);
+    try testing.expectEqual(State.executing, parked.state);
+
+    // The substrate already resumes: a resume start completes the mission.
+    const rreq = try h.startReq(testing.allocator, seed_and_gate ++ ",\"resume\":true");
+    defer testing.allocator.free(rreq);
+    const rres = try h.caller.call("zygos::missions::start", rreq);
+    defer rres.deinit(testing.allocator);
+    try testing.expect(rres == .ok);
+    try expectTerminal(rres.ok, "done", "completed");
 }
 
 test "max_role_turns exhausts at a role boundary" {

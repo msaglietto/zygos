@@ -358,6 +358,12 @@ pub const Model = struct {
                 self.tokens_in += u.input_tokens;
                 self.tokens_out += u.output_tokens;
             },
+            .steer => |s| {
+                var color: [24]u8 = undefined;
+                try self.log.appendFmt("{s}⚑ steer: {s}{s}", .{
+                    theme.fg(&color, theme.Color.accent), s.text, theme.reset,
+                });
+            },
             .turn_end => |te| {
                 try self.flushThinking();
                 try self.flushLive(.answer);

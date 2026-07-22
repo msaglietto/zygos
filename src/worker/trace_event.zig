@@ -21,6 +21,11 @@ pub const TraceEvent = union(enum) {
     tool_result: ToolResult,
     usage: Usage,
     turn_end: TurnEnd,
+    steer: Steer,
+
+    pub const Steer = struct {
+        text: []const u8 = "",
+    };
 
     pub const Mission = struct {
         from: []const u8 = "?",
@@ -125,6 +130,11 @@ pub fn body(arena: std.mem.Allocator, ev: TraceEvent) error{OutOfMemory}![]const
             "\"event\":\"usage\",\"turn_id\":{f},\"step\":{d},\"input_tokens\":{d},\"output_tokens\":{d}",
             .{ json.fmt(u.turn_id, .{}), u.step, u.input_tokens, u.output_tokens },
         ),
+        .steer => |s| std.fmt.allocPrint(
+            arena,
+            "\"event\":\"steer\",\"text\":{f}",
+            .{json.fmt(s.text, .{})},
+        ),
         .turn_end => |te| if (te.err) |e| std.fmt.allocPrint(
             arena,
             "\"event\":\"turn_end\",\"turn_id\":{f},\"stop\":{f},\"steps\":{d},\"error\":{f}",
@@ -198,6 +208,8 @@ pub fn parse(arena: std.mem.Allocator, line: []const u8) ?Parsed {
         .step = int(obj, "step"),
         .input_tokens = int(obj, "input_tokens"),
         .output_tokens = int(obj, "output_tokens"),
+    } } else if (std.mem.eql(u8, name, "steer")) .{ .steer = .{
+        .text = str(obj, "text") orelse "",
     } } else if (std.mem.eql(u8, name, "turn_end")) .{ .turn_end = .{
         .turn_id = str(obj, "turn_id") orelse "",
         .stop = str(obj, "stop") orelse "?",
@@ -302,6 +314,7 @@ test "parse: body round-trips through a full line for every variant" {
         .{ .tool_result = .{ .step = 3, .tool = "bash", .is_error = true, .bytes = 9, .output = "no" } },
         .{ .usage = .{ .turn_id = "t", .step = 3, .input_tokens = 10, .output_tokens = 2 } },
         .{ .turn_end = .{ .turn_id = "t", .stop = "aborted", .steps = 3, .err = "boom" } },
+        .{ .steer = .{ .text = "focus on the docs" } },
     };
     for (cases) |ev| {
         const line = try std.fmt.allocPrint(arena, "{{\"ts\":42,{s}}}", .{try body(arena, ev)});
