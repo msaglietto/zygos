@@ -1,8 +1,13 @@
 ---
 title: Resolve brave search key at mission-CLI boot (Y5 unblock)
-status: open
+status: closed
 labels: [ready-for-agent]
 created: 2026-07-19
+closed: 2026-07-21
+resolution: >
+  Fixed in 1ebe1aa (feat(worker/mission_boot)): searchConfigFromEnv now
+  resolves key_env into SearchConfig.key at boot, with a named regression
+  test ("brave resolves key_env into key at boot (Y5 regression)").
 origin: docs/RECONCILIATION-2026-07-18.md (latent defect #1); ROADMAP.md M4.7
 ---
 
