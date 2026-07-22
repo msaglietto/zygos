@@ -289,7 +289,7 @@ pub fn run(gpa: std.mem.Allocator, args: *std.process.Args.Iterator) u8 {
                 gpa.free(note);
             } else |_| {}
             if (std.Thread.spawn(.{}, tuiApprovalLoop, .{
-                gpa, console_worker, t, real_term.terminal(),
+                gpa, console_worker, t, real_term.terminal(), mission_id,
             })) |thr| thr.detach() else |_| {}
         } else |_| {
             real_term.restore();
@@ -671,16 +671,19 @@ fn consoleLoop(gpa: std.mem.Allocator, worker: *zygos.inproc.Worker) void {
     }
 }
 
-/// TUI twin of consoleLoop: the pending ask renders as the model's approval
-/// band and resolves on a single keypress (raw mode). Ctrl-C arrives as byte
-/// 0x03 (ISIG is off) — repair the terminal and re-raise SIGINT. If the
-/// approval worker's manual timeout denies the ask first, the band clears on
-/// the next poll — fail closed, same as the console path.
+/// TUI twin of consoleLoop, plus the M6 intervention keys: the pending ask
+/// resolves on y/n; `s` opens the steer input line (Enter sends over the
+/// bus, Esc discards), `p`/`r` pause/resume the mission. Ctrl-C arrives as
+/// byte 0x03 (ISIG is off) — repair the terminal and re-raise SIGINT (the
+/// M7 handler turns it into a clean abort). If the approval worker's manual
+/// timeout denies the ask first, the band clears on the next poll — fail
+/// closed, same as the console path.
 fn tuiApprovalLoop(
     gpa: std.mem.Allocator,
     worker: *zygos.inproc.Worker,
     ui: *zygos.tui.Tui,
     keys: zygos.tui.term.Terminal,
+    mission_id: []const u8,
 ) void {
     var handled = std.StringHashMap(void).init(gpa);
     var current_id: ?[]u8 = null;
@@ -692,6 +695,41 @@ fn tuiApprovalLoop(
                 _ = std.c.raise(.INT);
                 return;
             }
+            if (ui.model.steerInputOpen()) {
+                switch (k) {
+                    '\r', '\n' => if (ui.model.steerTake()) |text| {
+                        defer gpa.free(text);
+                        const req = std.fmt.allocPrint(gpa, "{{\"mission_id\":{f},\"text\":{f}}}", .{
+                            json.fmt(mission_id, .{}), json.fmt(text, .{}),
+                        }) catch continue;
+                        defer gpa.free(req);
+                        const res = worker.call("zygos::missions::steer", req) catch return;
+                        res.deinit(gpa);
+                        ui.model.onLog("⚑ steer queued for the next role boundary");
+                    },
+                    0x1b => ui.model.steerCancel(),
+                    else => ui.model.steerKey(k),
+                }
+                continue;
+            }
+            if (current_id == null) switch (k) {
+                's' => {
+                    ui.model.steerOpen();
+                    continue;
+                },
+                'p', 'r' => {
+                    const fun = if (k == 'p') "zygos::missions::pause" else "zygos::missions::resume";
+                    const req = std.fmt.allocPrint(gpa, "{{\"mission_id\":{f}}}", .{
+                        json.fmt(mission_id, .{}),
+                    }) catch continue;
+                    defer gpa.free(req);
+                    const res = worker.call(fun, req) catch return;
+                    res.deinit(gpa);
+                    ui.model.setPaused(k == 'p');
+                    continue;
+                },
+                else => {},
+            };
             const id = current_id orelse continue;
             const approved = switch (k) {
                 'y', 'Y' => true,

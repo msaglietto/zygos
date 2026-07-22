@@ -55,6 +55,9 @@ pub const Model = struct {
     tokens_in: i64 = 0,
     tokens_out: i64 = 0,
     approval: ?[]u8 = null,
+    /// M6 intervention: open steer input line (null = closed) + pause state.
+    steer_input: ?std.ArrayList(u8) = null,
+    paused: bool = false,
     /// The executor's live task (task_start .. task_done window).
     current_task: ?tasks_mod.Current = null,
 
@@ -99,6 +102,7 @@ pub const Model = struct {
         if (self.role) |r| self.gpa.free(r);
         if (self.step_model) |m| self.gpa.free(m);
         if (self.approval) |a| self.gpa.free(a);
+        if (self.steer_input) |*b| b.deinit(self.gpa);
         if (self.current_task) |t| self.gpa.free(t.desc);
         self.dirty.deinit();
         self.mutex.deinit();
@@ -203,6 +207,68 @@ pub const Model = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         self.log.appendFmt("{s}❯ {s}{s}", .{ theme.bold, text, theme.reset }) catch {};
+        self.dirty.set();
+    }
+
+    // -- intervention (M6): steer input line + pause state --------------------
+
+    pub fn steerInputOpen(self: *Model) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.steer_input != null;
+    }
+
+    pub fn steerOpen(self: *Model) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.steer_input == null) self.steer_input = .empty;
+        self.dirty.set();
+    }
+
+    /// One raw key into the open input; 0x7f/0x08 backspace. No-op when
+    /// closed or non-printable.
+    pub fn steerKey(self: *Model, key: u8) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const buf = if (self.steer_input) |*b| b else return;
+        if (key == 0x7f or key == 0x08) {
+            if (buf.items.len > 0) buf.items.len -= 1;
+        } else if (key >= 0x20 and key < 0x7f) {
+            buf.append(self.gpa, key) catch {};
+        } else return;
+        self.dirty.set();
+    }
+
+    pub fn steerCancel(self: *Model) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.steer_input) |*b| b.deinit(self.gpa);
+        self.steer_input = null;
+        self.dirty.set();
+    }
+
+    /// Close the input and hand the text over (gpa-owned, caller frees);
+    /// an empty input yields null — nothing to send.
+    pub fn steerTake(self: *Model) ?[]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var buf = self.steer_input orelse return null;
+        self.steer_input = null;
+        self.dirty.set();
+        if (buf.items.len == 0) {
+            buf.deinit(self.gpa);
+            return null;
+        }
+        return buf.toOwnedSlice(self.gpa) catch {
+            buf.deinit(self.gpa);
+            return null;
+        };
+    }
+
+    pub fn setPaused(self: *Model, paused: bool) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.paused = paused;
         self.dirty.set();
     }
 
@@ -407,6 +473,8 @@ pub const Model = struct {
             .tokens_in = self.tokens_in,
             .tokens_out = self.tokens_out,
             .approval = self.approval,
+            .steer_input = if (self.steer_input) |b| b.items else null,
+            .paused = self.paused,
             .current_task = self.current_task,
             .tools = self.tools.items,
             .thinking = self.thinking.items,
@@ -745,6 +813,53 @@ test "pending approval renders the y/N band and clears" {
     m.setPendingApproval(null);
     view = try renderJoined(&m, arena_state.allocator());
     try testing.expect(std.mem.indexOf(u8, view, "[y/N]") == null);
+}
+
+test "steer input: open, type, backspace, render, take — the intervention line" {
+    var m = Model.init(testing.allocator, 0);
+    defer m.deinit();
+    try testing.expect(!m.steerInputOpen());
+    m.steerOpen();
+    try testing.expect(m.steerInputOpen());
+    for ("focx") |ch| m.steerKey(ch);
+    m.steerKey(0x7f); // backspace
+    for ("us on docs") |ch| m.steerKey(ch);
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const view = try renderJoined(&m, arena_state.allocator());
+    try testing.expect(std.mem.indexOf(u8, view, "steer: focus on docs") != null);
+    try testing.expect(std.mem.indexOf(u8, view, "Enter send") != null);
+
+    const text = m.steerTake() orelse return error.NoText;
+    defer testing.allocator.free(text);
+    try testing.expectEqualStrings("focus on docs", text);
+    try testing.expect(!m.steerInputOpen());
+}
+
+test "steer input: cancel discards; taking an empty input yields null" {
+    var m = Model.init(testing.allocator, 0);
+    defer m.deinit();
+    m.steerOpen();
+    m.steerKey('x');
+    m.steerCancel();
+    try testing.expect(!m.steerInputOpen());
+    m.steerOpen();
+    try testing.expect(m.steerTake() == null); // empty input: nothing to send
+    try testing.expect(!m.steerInputOpen());
+}
+
+test "paused missions say so in the status line until resumed" {
+    var m = Model.init(testing.allocator, 0);
+    defer m.deinit();
+    m.setPaused(true);
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var view = try renderJoined(&m, arena_state.allocator());
+    try testing.expect(std.mem.indexOf(u8, view, "Paused") != null);
+    m.setPaused(false);
+    view = try renderJoined(&m, arena_state.allocator());
+    try testing.expect(std.mem.indexOf(u8, view, "Paused") == null);
 }
 
 test "chat lines wrap at the render width on word boundaries" {

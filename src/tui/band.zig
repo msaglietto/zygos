@@ -48,6 +48,9 @@ pub const BandView = struct {
     tokens_in: i64,
     tokens_out: i64,
     approval: ?[]const u8,
+    /// M6 intervention: open steer input text (null = closed) + pause state.
+    steer_input: ?[]const u8 = null,
+    paused: bool = false,
     current_task: ?tasks_mod.Current,
     tools: []const chatlog.ToolView,
     thinking: []const u8,
@@ -137,6 +140,15 @@ pub fn build(
         }));
     }
 
+    // Steer input line (M6 intervention): the operator's message composing
+    // live; sent on Enter, discarded on Esc.
+    if (view.steer_input) |text| {
+        try bottom.append(arena, try std.fmt.allocPrint(arena, "{s}⚑ steer: {s}▏{s} {s}[Enter send · Esc cancel]{s}", .{
+            theme.fg(&color, theme.Color.accent), text,        theme.reset,
+            theme.dim,                            theme.reset,
+        }));
+    }
+
     try bottom.append(arena, try statusLine(view, arena, cols, now_ms));
 
     return bottom.items;
@@ -154,7 +166,7 @@ fn statusLine(
 ) error{OutOfMemory}![]const u8 {
     var color: [24]u8 = undefined;
     var p_buf: [32]u8 = undefined;
-    const label: []const u8 = switch (view.activity) {
+    const label: []const u8 = if (view.paused) "Paused (r resumes)" else switch (view.activity) {
         .approval => "Waiting for approval",
         .tool => blk: {
             const name = view.live_tool_name orelse
