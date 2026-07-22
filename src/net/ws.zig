@@ -20,6 +20,7 @@ const protocol = @import("../kernel/protocol.zig");
 const types = @import("../kernel/types.zig");
 const sync = @import("../kernel/sync.zig");
 const ticker_mod = @import("ticker.zig");
+const writer_queue = @import("writer_queue.zig");
 
 const log = std.log.scoped(.ws);
 
@@ -76,7 +77,7 @@ pub const Gateway = struct {
             .gpa = gpa,
             .config = config,
             .actor = undefined, // set by bind()
-            .conns = .{ .map = std.AutoHashMap(WorkerId, *websocket.Conn).init(gpa) },
+            .conns = .{ .map = std.AutoHashMap(WorkerId, *ConnEntry).init(gpa) },
             .io_backing = std.Io.Threaded.init(gpa, .{}),
         };
         return self;
@@ -89,6 +90,11 @@ pub const Gateway = struct {
     pub fn destroy(self: *Gateway) void {
         if (self.server) |*s| s.deinit();
         self.io_backing.deinit();
+        var it = self.conns.map.valueIterator();
+        while (it.next()) |entry| {
+            entry.*.queue.deinit();
+            self.gpa.destroy(entry.*);
+        }
         self.conns.map.deinit();
         self.conns.mutex.deinit();
         if (self.tick_timer) |*t| t.deinit();
@@ -130,36 +136,66 @@ pub const Gateway = struct {
 
     // -- conn table -----------------------------------------------------------
 
-    const ConnTable = struct {
-        mutex: sync.Mutex = .{},
-        map: std.AutoHashMap(WorkerId, *websocket.Conn),
+    /// One live connection: the socket plus its bounded writer queue (M7
+    /// net hardening) — a stalled consumer fills its own queue and gets
+    /// QueueFull; it never parks the kernel thread in a socket write.
+    const ConnEntry = struct {
+        conn: *websocket.Conn,
+        queue: writer_queue.WriterQueue,
+
+        fn sinkWrite(ctx: *anyopaque, frame: []const u8) error{Disconnected}!void {
+            const self: *ConnEntry = @ptrCast(@alignCast(ctx));
+            self.conn.writeText(frame) catch return error.Disconnected;
+        }
     };
 
-    fn addConn(self: *Gateway, id: WorkerId, conn: *websocket.Conn) error{OutOfMemory}!void {
+    const ConnTable = struct {
+        mutex: sync.Mutex = .{},
+        map: std.AutoHashMap(WorkerId, *ConnEntry),
+    };
+
+    fn addConn(self: *Gateway, id: WorkerId, conn: *websocket.Conn) !void {
+        const entry = try self.gpa.create(ConnEntry);
+        errdefer self.gpa.destroy(entry);
+        entry.* = .{ .conn = conn, .queue = undefined };
+        entry.queue = writer_queue.WriterQueue.init(self.gpa, .{
+            .ctx = @ptrCast(entry),
+            .writeFn = &ConnEntry.sinkWrite,
+        });
+        try entry.queue.start();
         self.conns.mutex.lock();
         defer self.conns.mutex.unlock();
-        try self.conns.map.put(id, conn);
+        try self.conns.map.put(id, entry);
     }
 
     /// Returns false if already removed — the exactly-once disconnect guard.
+    /// The removed entry's queue joins its writer before freeing, so no
+    /// in-flight write outlives the connection.
     fn removeConn(self: *Gateway, id: WorkerId) bool {
         self.conns.mutex.lock();
-        defer self.conns.mutex.unlock();
-        return self.conns.map.remove(id);
+        const removed = self.conns.map.fetchRemove(id);
+        self.conns.mutex.unlock();
+        const kv = removed orelse return false;
+        kv.value.queue.deinit();
+        self.gpa.destroy(kv.value);
+        return true;
     }
 
-    /// Outbound implementation. The write happens under the table mutex:
-    /// this serializes sends and guarantees a closing connection cannot be
-    /// freed mid-write (Handler.close's removeConn blocks until the write
-    /// completes; after removal no new send can reach the conn). M0
-    /// simplicity — per-connection writer queues (cap 64) are the M1
-    /// hardening called out in docs/specs/net.md.
+    /// Outbound implementation: enqueue, never block. A full queue is
+    /// QueueFull back to the kernel (spec cap 64, mirrors iii); a closed
+    /// queue reads as Disconnected.
     fn sendFn(ctx: *anyopaque, to: WorkerId, frame: []const u8) actor_mod.SendError!void {
         const self: *Gateway = @ptrCast(@alignCast(ctx));
         self.conns.mutex.lock();
-        defer self.conns.mutex.unlock();
-        const conn = self.conns.map.get(to) orelse return error.Disconnected;
-        conn.writeText(frame) catch return error.Disconnected;
+        const entry = self.conns.map.get(to) orelse {
+            self.conns.mutex.unlock();
+            return error.Disconnected;
+        };
+        self.conns.mutex.unlock();
+        entry.queue.push(frame) catch |err| switch (err) {
+            error.QueueFull => return error.QueueFull,
+            error.Closed, error.OutOfMemory => return error.Disconnected,
+        };
     }
 };
 

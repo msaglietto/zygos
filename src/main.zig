@@ -52,6 +52,29 @@ fn filteredLog(
     std.log.defaultLog(level, scope, format, args);
 }
 
+// M7 net hardening: SIGINT lands as a graceful stop, not process death.
+// The handler only flips an atomic (async-signal-safe); the main thread
+// polls it and runs the ordered teardown. A second SIGINT hard-exits.
+var sigint_hits = std.atomic.Value(u8).init(0);
+
+fn onSigint(_: c_int) callconv(.c) void {
+    const hits = sigint_hits.fetchAdd(1, .acq_rel);
+    if (hits >= 1) {
+        zygos.tui.emergencyRestore();
+        std.c._exit(130);
+    }
+}
+
+extern "c" fn signal(sig: c_int, handler: ?*const fn (c_int) callconv(.c) void) ?*const fn (c_int) callconv(.c) void;
+
+pub fn installSigint() void {
+    _ = signal(2, &onSigint); // SIGINT
+}
+
+pub fn sigintRequested() bool {
+    return sigint_hits.load(.acquire) > 0;
+}
+
 fn initLogFilter() void {
     const raw = std.c.getenv("ZYGOS_LOG") orelse return;
     const s = std.mem.span(raw);
@@ -86,7 +109,16 @@ pub fn main(proc: std.process.Init) !void {
     const kernel_thread = try std.Thread.spawn(.{}, zygos.actor.Actor.run, .{&actor});
 
     try gateway.start();
-    gateway.wait(); // parks until the listener exits
+    installSigint();
+    // Park until SIGINT: the ordered teardown (stop listener, shut the
+    // kernel down, join) runs on the main thread — never in the handler.
+    while (!sigintRequested()) {
+        var interval: std.c.timespec = .{ .sec = 0, .nsec = 200 * std.time.ns_per_ms };
+        var rem: std.c.timespec = undefined;
+        _ = std.c.nanosleep(&interval, &rem);
+    }
+    std.log.info("SIGINT: stopping gateway and kernel", .{});
+    gateway.stop();
 
     actor.post(.shutdown);
     kernel_thread.join();

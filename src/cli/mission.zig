@@ -344,6 +344,16 @@ pub fn run(gpa: std.mem.Allocator, args: *std.process.Args.Iterator) u8 {
         if (mcp) |m| m.toolEntriesJson(gpa) catch return oom() else "",
     }) catch return oom();
 
+    // M7 net hardening: SIGINT (cron kill, Ctrl-C) lands as a clean abort —
+    // the watcher posts missions::abort and the blocking start returns a
+    // terminal "aborted" state through the normal exit path. A second
+    // SIGINT hard-exits.
+    installSigint();
+    {
+        const sig_worker = zygos.inproc.Worker.spawn(gpa, &actor, &registry, "mission-sigint") catch return boot_fail();
+        if (std.Thread.spawn(.{}, sigintWatch, .{ gpa, sig_worker, mission_id })) |t| t.detach() else |_| {}
+    }
+
     const res = caller.call("zygos::missions::start", request) catch {
         if (ui) |t| tuiStop(t, ui_sink, ui_tap, turns, &real_term);
         eprint("mission: bus call failed\n", .{});
@@ -387,6 +397,37 @@ fn tapToModel(ctx: *anyopaque, kind: zygos.stream_tap.Kind, bytes: []const u8) v
         .tool_name => model.onToolName(bytes),
         .tool_args => model.onToolArgs(bytes),
     }
+}
+
+// ---- SIGINT → clean abort (M7) ----------------------------------------------
+
+var sigint_hits = std.atomic.Value(u8).init(0);
+
+fn onSigint(_: c_int) callconv(.c) void {
+    // Async-signal-safe only: flip the atomic; the watcher does the work.
+    if (sigint_hits.fetchAdd(1, .acq_rel) >= 1) {
+        zygos.tui.emergencyRestore();
+        std.c._exit(130);
+    }
+}
+
+extern "c" fn signal(sig: c_int, handler: ?*const fn (c_int) callconv(.c) void) ?*const fn (c_int) callconv(.c) void;
+
+fn installSigint() void {
+    _ = signal(2, &onSigint); // SIGINT
+}
+
+/// Detached: waits for the flag, aborts the mission over the bus once.
+fn sigintWatch(gpa: std.mem.Allocator, worker: *zygos.inproc.Worker, mission_id: []const u8) void {
+    while (sigint_hits.load(.acquire) == 0) {
+        var interval: std.c.timespec = .{ .sec = 0, .nsec = 200 * std.time.ns_per_ms };
+        var rem: std.c.timespec = undefined;
+        _ = std.c.nanosleep(&interval, &rem);
+    }
+    const req = std.fmt.allocPrint(gpa, "{{\"mission_id\":{f}}}", .{json.fmt(mission_id, .{})}) catch return;
+    defer gpa.free(req);
+    const res = worker.call("zygos::missions::abort", req) catch return;
+    res.deinit(gpa);
 }
 
 fn usage() u8 {
