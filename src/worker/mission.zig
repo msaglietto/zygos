@@ -21,6 +21,8 @@ const sync = @import("../kernel/sync.zig");
 const store_mod = @import("mission_store.zig");
 const trace_mod = @import("trace.zig");
 const brief_mod = @import("brief.zig");
+const context_mod = @import("context.zig");
+const context_substrate = @import("context_substrate.zig");
 
 const log = std.log.scoped(.mission);
 
@@ -234,6 +236,28 @@ const RunConfig = struct {
     role_max_steps: usize,
     /// events.jsonl in the planning root (fail-open — see worker/trace.zig).
     trace_path: ?[]const u8,
+    /// M5 seam: every role's content is strategy-assembled under a hard
+    /// token budget; the driver never hand-builds prompts.
+    strategy: context_mod.ContextStrategy,
+    context_budget: context_mod.TokenBudget,
+    substrate: context_mod.Substrate,
+};
+
+/// context.Substrate over the planning store (artifact reads for strategies).
+const StoreSubstrate = struct {
+    gpa: std.mem.Allocator,
+    store: store_mod.Store,
+
+    fn read(ctx: *anyopaque, arena: std.mem.Allocator, name: []const u8) ?[]const u8 {
+        const self: *StoreSubstrate = @ptrCast(@alignCast(ctx));
+        const bytes = self.store.readArtifact(self.gpa, name) catch return null;
+        defer self.gpa.free(bytes);
+        return arena.dupe(u8, bytes) catch null;
+    }
+
+    fn substrate(self: *StoreSubstrate) context_mod.Substrate {
+        return .{ .ctx = @ptrCast(self), .readFn = &read };
+    }
 };
 
 const mission_artifact = "MISSION.md";
@@ -403,9 +427,37 @@ fn runMission(self: *MissionOrchestrator, arena: std.mem.Allocator, request_json
         }
     }
 
+    // .context_strategy on the start request (from zygos.zon at boot):
+    // {"kind":"substrate"|"recall"|"thread","max_tokens":N}. Absent ⇒
+    // substrate with the default budget; an unknown kind refuses the start.
+    const ctx_cfg: context_mod.Config = blk: {
+        const v = obj.get("context_strategy") orelse
+            break :blk .{ .kind = .substrate, .max_tokens = context_mod.default_max_tokens };
+        if (v != .object) return error.MalformedRequest;
+        const kind_s = strField(v.object, "kind") orelse "substrate";
+        const kind = std.meta.stringToEnum(context_mod.Kind, kind_s) orelse
+            return error.MalformedRequest;
+        break :blk .{
+            .kind = kind,
+            .max_tokens = uintFieldOr(v.object, "max_tokens", context_mod.default_max_tokens),
+        };
+    };
+    const strategy: context_mod.ContextStrategy = switch (ctx_cfg.kind) {
+        .substrate => context_substrate.strategy(),
+        // Configuring a strategy before it lands refuses the start.
+        .recall, .thread => return error.MalformedRequest,
+    };
+    var store_substrate = StoreSubstrate{
+        .gpa = self.gpa,
+        .store = store_mod.Store.init(planning_root),
+    };
+
     const cfg: RunConfig = .{
         .mission_id = mission_id,
         .store = store_mod.Store.init(planning_root),
+        .strategy = strategy,
+        .context_budget = .{ .max_tokens = ctx_cfg.max_tokens },
+        .substrate = store_substrate.substrate(),
         .provider_function = strField(obj, "provider_function"),
         .router_function = strField(obj, "router_function"),
         .gate_function = strField(obj, "gate_function"),
@@ -613,6 +665,18 @@ fn runRole(
             .outcome = "exhausted",
         } }),
     }
+    // Strategies absorb every outcome (the view is pre-completion — the
+    // driver updates task state after this returns). Absorb failures degrade
+    // context, never the mission (fail-open, like the trace).
+    const outcome: context_mod.Outcome = switch (out) {
+        .ok => |t| .{ .role = role.stepId(), .ok = true, .text = t },
+        .failed => |r| .{ .role = role.stepId(), .ok = false, .text = r },
+        .exhausted => .{ .role = role.stepId(), .ok = false, .text = "max_steps" },
+    };
+    cfg.strategy.absorb(try stepRefFor(arena, cfg, m, role), outcome) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => log.warn("context absorb failed (mission unaffected): {t}", .{err}),
+    };
     return out;
 }
 
@@ -722,6 +786,60 @@ fn unwrapFence(text: []const u8) []const u8 {
     return std.mem.trim(u8, trimmed[open_end + 1 .. trimmed.len - 3], " \t\r\n");
 }
 
+/// Neutral strategy view of the mission (TaskView slice arena-built).
+fn stepRefFor(
+    arena: std.mem.Allocator,
+    cfg: RunConfig,
+    m: *const Mission,
+    role: Role,
+) error{OutOfMemory}!context_mod.StepRef {
+    const tasks = try arena.alloc(context_mod.TaskView, m.tasks.len);
+    for (m.tasks, 0..) |t, i| tasks[i] = .{ .desc = t.desc, .done = t.done, .result = t.result };
+    return .{
+        .role = role.stepId(),
+        .mission = .{
+            .mission_id = m.mission_id,
+            .objective = m.objective,
+            .acceptance = m.acceptance,
+            .feedback = m.feedback,
+            .tasks = tasks,
+            .task_index = m.task_index,
+        },
+        .substrate = cfg.substrate,
+    };
+}
+
+/// Strategy-assembled role content. Null means the mission already moved to
+/// failed (with the strategy's exact diagnostic as detail) — callers return.
+fn assembleContent(
+    arena: std.mem.Allocator,
+    cfg: RunConfig,
+    m: *Mission,
+    role: Role,
+) MissionError!?[]const u8 {
+    var diag: context_mod.Diag = .{};
+    const step = try stepRefFor(arena, cfg, m, role);
+    const out = cfg.strategy.assemble(arena, step, cfg.context_budget, &diag) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.BudgetExceeded => {
+            try failRole(m, try std.fmt.allocPrint(
+                arena,
+                "context budget exceeded assembling {s} content ({d} tokens max)",
+                .{ role.stepId(), cfg.context_budget.max_tokens },
+            ));
+            return null;
+        },
+        error.Failed => {
+            try failRole(m, if (diag.message.len > 0)
+                try arena.dupe(u8, diag.message)
+            else
+                "context assembly failed");
+            return null;
+        },
+    };
+    return out.content;
+}
+
 fn failRole(m: *Mission, reason: []const u8) error{IllegalTransition}!void {
     m.stop = .role_failed;
     m.detail = reason;
@@ -746,7 +864,8 @@ fn rejectRole(
 }
 
 fn roleDefine(self: *MissionOrchestrator, arena: std.mem.Allocator, cfg: RunConfig, m: *Mission) MissionError!void {
-    switch (try runRole(self, arena, cfg, m, .product_owner, m.objective, false)) {
+    const content = (try assembleContent(arena, cfg, m, .product_owner)) orelse return;
+    switch (try runRole(self, arena, cfg, m, .product_owner, content, false)) {
         .failed => |reason| try failRole(m, reason),
         .exhausted => try failRole(m, "product-owner turn stopped: max_steps"),
         .ok => |text| {
@@ -772,15 +891,7 @@ fn roleDefine(self: *MissionOrchestrator, arena: std.mem.Allocator, cfg: RunConf
 }
 
 fn rolePlan(self: *MissionOrchestrator, arena: std.mem.Allocator, cfg: RunConfig, m: *Mission) MissionError!void {
-    // The substrate is the context: the planner reads the persisted mission
-    // brief, not driver state.
-    const brief = getArtifact(self, arena, cfg, mission_artifact) orelse
-        return failRole(m, "MISSION.md missing from the planning root");
-    const content = if (m.feedback.len > 0)
-        try std.fmt.allocPrint(arena, "{s}\n\nFeedback on the previous attempt:\n{s}\n", .{ brief, m.feedback })
-    else
-        brief;
-
+    const content = (try assembleContent(arena, cfg, m, .planner)) orelse return;
     switch (try runRole(self, arena, cfg, m, .planner, content, false)) {
         .failed => |reason| try failRole(m, reason),
         .exhausted => try failRole(m, "planner turn stopped: max_steps"),
@@ -829,32 +940,7 @@ fn outcomeExcerpt(arena: std.mem.Allocator, text: []const u8, max: usize) error{
 
 fn roleExecute(self: *MissionOrchestrator, arena: std.mem.Allocator, cfg: RunConfig, m: *Mission) MissionError!void {
     std.debug.assert(m.task_index < m.tasks.len);
-    // The executor is stateless across turns; the prompt is its only memory.
-    // Without the progress block every turn re-discovers (and re-verifies)
-    // the workspace from scratch — the dogfood runs burned most of their
-    // steps re-testing finished tasks.
-    var content: std.Io.Writer.Allocating = .init(arena);
-    const w = &content.writer;
-    w.print("Objective:\n{s}\n", .{m.objective}) catch return error.OutOfMemory;
-    if (m.tasks.len > 1) {
-        w.writeAll(if (m.task_index > 0)
-            "\nPlan progress — earlier tasks are already complete and verified; " ++
-                "do NOT redo, re-check, or re-test them:\n"
-        else
-            "\nPlan:\n") catch return error.OutOfMemory;
-        for (m.tasks, 0..) |t, i| {
-            const mark = if (t.done) "done" else if (i == m.task_index) "current" else "pending";
-            w.print("{d}. [{s}] {s}\n", .{ i + 1, mark, t.desc }) catch return error.OutOfMemory;
-            if (t.done and t.result.len > 0)
-                w.print("   outcome: {s}\n", .{t.result}) catch return error.OutOfMemory;
-        }
-    }
-    w.print(
-        "\nYour task (do ONLY this, then stop):\n{s}\n",
-        .{m.tasks[m.task_index].desc},
-    ) catch return error.OutOfMemory;
-    if (m.feedback.len > 0)
-        w.print("\nFeedback on the previous attempt:\n{s}\n", .{m.feedback}) catch return error.OutOfMemory;
+    const content = (try assembleContent(arena, cfg, m, .executor)) orelse return;
 
     // Task edges are trace-only (fail-open, not protocol frames): the TUI
     // keys its live current-task line off start/done pairs.
@@ -864,7 +950,7 @@ fn roleExecute(self: *MissionOrchestrator, arena: std.mem.Allocator, cfg: RunCon
         .desc = try trace_mod.clip(arena, m.tasks[m.task_index].desc),
     } });
 
-    switch (try runRole(self, arena, cfg, m, .executor, content.written(), true)) {
+    switch (try runRole(self, arena, cfg, m, .executor, content, true)) {
         .failed => |reason| try failRole(m, reason),
         // A step-budget stop is exhaustion, not malfunction: retry the same
         // task with feedback, counted against the same escalation threshold
@@ -902,15 +988,7 @@ fn roleExecute(self: *MissionOrchestrator, arena: std.mem.Allocator, cfg: RunCon
 }
 
 fn roleVerify(self: *MissionOrchestrator, arena: std.mem.Allocator, cfg: RunConfig, m: *Mission) MissionError!void {
-    const brief = getArtifact(self, arena, cfg, mission_artifact) orelse
-        return failRole(m, "MISSION.md missing from the planning root");
-    const plan = getArtifact(self, arena, cfg, plan_artifact) orelse
-        return failRole(m, "PLAN.md missing from the planning root");
-    const content = try std.fmt.allocPrint(
-        arena,
-        "{s}\n{s}\nEvery task above has been executed. Verify the objective is met.\n",
-        .{ brief, plan },
-    );
+    const content = (try assembleContent(arena, cfg, m, .verifier)) orelse return;
     switch (try runRole(self, arena, cfg, m, .verifier, content, false)) {
         .failed => |reason| try failRole(m, reason),
         .exhausted => try failRole(m, "verifier turn stopped: max_steps"),
@@ -1327,6 +1405,42 @@ fn expectTerminal(payload: []const u8, state: []const u8, stop: []const u8) !voi
     defer p.deinit();
     try testing.expectEqualStrings(state, p.value.object.get("state").?.string);
     try testing.expectEqualStrings(stop, p.value.object.get("stop").?.string);
+}
+
+test "context_strategy: a tiny max_tokens budget fails the mission with a budget detail" {
+    var h = try Harness.init(testing.allocator, &.{po_ok});
+    defer h.deinit();
+
+    // "seed: gizmo" is 3 tokens; a 1-token budget must refuse the assembly
+    // before any provider turn runs.
+    const req = try h.startReq(
+        testing.allocator,
+        ",\"objective\":\"seed: gizmo\",\"context_strategy\":{\"kind\":\"substrate\",\"max_tokens\":1}",
+    );
+    defer testing.allocator.free(req);
+    const res = try h.caller.call("zygos::missions::start", req);
+    defer res.deinit(testing.allocator);
+    try testing.expect(res == .ok);
+    try expectTerminal(res.ok, "failed", "role_failed");
+    try testing.expect(std.mem.indexOf(u8, res.ok, "context budget exceeded") != null);
+}
+
+test "context_strategy: an unimplemented or unknown kind refuses the start (fail closed)" {
+    var h = try Harness.init(testing.allocator, &.{po_ok});
+    defer h.deinit();
+    for ([_][]const u8{ "recall", "thread", "transcript-dump" }) |kind| {
+        const extra = try std.fmt.allocPrint(
+            testing.allocator,
+            ",\"objective\":\"seed: gizmo\",\"context_strategy\":{{\"kind\":\"{s}\"}}",
+            .{kind},
+        );
+        defer testing.allocator.free(extra);
+        const req = try h.startReq(testing.allocator, extra);
+        defer testing.allocator.free(req);
+        const res = try h.caller.call("zygos::missions::start", req);
+        defer res.deinit(testing.allocator);
+        try testing.expect(res == .err);
+    }
 }
 
 test "trace_path threads through role turns: role, mission and turn events land in one events.jsonl" {
