@@ -272,6 +272,17 @@ const StoreSubstrate = struct {
 const mission_artifact = "MISSION.md";
 const plan_artifact = "PLAN.md";
 const verify_artifact = "VERIFY.md";
+const decisions_artifact = "DECISIONS.md";
+
+/// PO decision journal (M6): every accept/redo/replan appends one audit
+/// line. Fail-open — a journal write never changes a mission outcome — and
+/// append-only. ThreadStrategy pins DECISIONS.md into every role's context,
+/// so journaled decisions survive every step of long factory missions.
+fn journal(self: *MissionOrchestrator, cfg: RunConfig, kind: []const u8, reason: []const u8) void {
+    const line = std.fmt.allocPrint(self.gpa, "- {s} [{s}] {s}\n", .{ nowStamp(), kind, reason }) catch return;
+    defer self.gpa.free(line);
+    cfg.store.appendArtifact(self.gpa, decisions_artifact, line) catch {};
+}
 
 pub const MissionOrchestrator = struct {
     gpa: std.mem.Allocator,
@@ -1153,6 +1164,7 @@ fn roleVerify(self: *MissionOrchestrator, arena: std.mem.Allocator, cfg: RunConf
                 m.fail_count = 0;
                 m.state = try Fsm.apply(m.state, .verify_passed);
             } else {
+                journal(self, cfg, "replan", reason);
                 m.fail_count += 1;
                 if (m.fail_count >= cfg.fail_threshold) {
                     m.stop = .escalated;
@@ -1202,12 +1214,14 @@ fn gate(self: *MissionOrchestrator, arena: std.mem.Allocator, cfg: RunConfig, m:
             if (approved_val != .bool) return gateFail(m, "malformed gate reply");
 
             if (approved_val.bool) {
+                journal(self, cfg, "accept", m.objective);
                 m.stop = .completed;
                 m.detail = "";
                 m.state = try Fsm.apply(m.state, .gate_approved);
                 return;
             }
             const reason = try arena.dupe(u8, strField(parsed.object, "reason") orelse "gate denied");
+            journal(self, cfg, "redo", reason);
             m.gate_denials += 1;
             if (m.gate_denials >= cfg.gate_threshold) {
                 return gateFail(m, reason);
@@ -2223,6 +2237,39 @@ test "pause parks durably at a role boundary; the substrate resumes to done" {
     defer rres.deinit(testing.allocator);
     try testing.expect(rres == .ok);
     try expectTerminal(rres.ok, "done", "completed");
+}
+
+test "PO decision journal: gate denial, verify failure, and acceptance land in DECISIONS.md" {
+    // verify fails once (replan), gate denies once (redo), then both pass.
+    var h = try Harness.init(testing.allocator, &.{
+        po_ok, plan1, exec_ok, verify_fail, // → replanning
+        plan1, exec_ok, verify_pass, // → gating (denied)
+        plan1, exec_ok, verify_pass, // → gating (approved)
+    });
+    defer h.deinit();
+    const gate_worker = try FakeGate.start(testing.allocator, &h.actor, &h.registry, &.{
+        "{\"approved\":false,\"reason\":\"brief contradiction: scope creep\"}",
+        "{\"approved\":true}",
+    });
+    defer gate_worker.stop();
+
+    const req = try h.startReq(
+        testing.allocator,
+        ",\"objective\":\"seed: gizmo\",\"gate_function\":\"test::gate::request\"",
+    );
+    defer testing.allocator.free(req);
+    const res = try h.caller.call("zygos::missions::start", req);
+    defer res.deinit(testing.allocator);
+    try testing.expect(res == .ok);
+    try expectTerminal(res.ok, "done", "completed");
+
+    const text = try h.store().readArtifact(testing.allocator, "DECISIONS.md");
+    defer testing.allocator.free(text);
+    // Append-only audit trail, in order: replan → redo → accept.
+    const replan = std.mem.indexOf(u8, text, "[replan] missing tests") orelse return error.Missing;
+    const redo = std.mem.indexOf(u8, text, "[redo] brief contradiction: scope creep") orelse return error.Missing;
+    const accept = std.mem.indexOf(u8, text, "[accept]") orelse return error.Missing;
+    try testing.expect(replan < redo and redo < accept);
 }
 
 test "max_role_turns exhausts at a role boundary" {

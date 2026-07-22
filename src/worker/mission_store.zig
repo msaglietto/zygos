@@ -46,6 +46,26 @@ pub const Store = struct {
         try self.writeAtomic(gpa, name, bytes);
     }
 
+    /// Append-only artifacts (the DECISIONS.md journal): O_APPEND, no tmp
+    /// dance — appends of one write are atomic enough for a journal, and
+    /// the file must never be clobbered.
+    pub fn appendArtifact(self: Store, gpa: std.mem.Allocator, name: []const u8, bytes: []const u8) StoreError!void {
+        try checkName(name);
+        try mkdirP(gpa, self.root);
+        const path_z = std.fmt.allocPrintSentinel(gpa, "{s}/{s}", .{ self.root, name }, 0) catch
+            return error.OutOfMemory;
+        defer gpa.free(path_z);
+        const fd = c.open(path_z, .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true }, @as(c.mode_t, 0o644));
+        if (fd < 0) return error.Io;
+        defer _ = c.close(fd);
+        var off: usize = 0;
+        while (off < bytes.len) {
+            const n = c.write(fd, bytes.ptr + off, bytes.len - off);
+            if (n <= 0) return error.Io;
+            off += @intCast(n);
+        }
+    }
+
     /// Returns owned bytes; missing artifact is NotFound.
     pub fn readArtifact(self: Store, gpa: std.mem.Allocator, name: []const u8) StoreError![]u8 {
         try checkName(name);
@@ -371,6 +391,20 @@ test "artifacts land under the planning root; root auto-created; separators reje
     try testing.expectError(error.BadName, store.writeArtifact(testing.allocator, "..", "x"));
     try testing.expectError(error.BadName, store.writeArtifact(testing.allocator, "", "x"));
     try testing.expectError(error.NotFound, store.readArtifact(testing.allocator, "PLAN.md"));
+}
+
+test "appendArtifact grows a file append-only; name rules apply" {
+    var t = TestRoot.init();
+    defer t.deinit();
+    const store = Store.init(try t.path());
+
+    try store.appendArtifact(testing.allocator, "DECISIONS.md", "- one\n");
+    try store.appendArtifact(testing.allocator, "DECISIONS.md", "- two\n");
+    const got = try store.readArtifact(testing.allocator, "DECISIONS.md");
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings("- one\n- two\n", got);
+
+    try testing.expectError(error.BadName, store.appendArtifact(testing.allocator, "a/b.md", "x"));
 }
 
 test "load without a state file is NotFound; garbage is Corrupt" {
