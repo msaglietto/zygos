@@ -25,6 +25,7 @@ const context_mod = @import("context.zig");
 const context_substrate = @import("context_substrate.zig");
 const context_recall = @import("context_recall.zig");
 const context_thread = @import("context_thread.zig");
+const playbook_mod = @import("playbook.zig");
 
 const log = std.log.scoped(.mission);
 
@@ -184,26 +185,6 @@ pub const Role = enum {
             .planner => "planner",
             .executor => "executor",
             .verifier => "verifier",
-        };
-    }
-
-    fn system(self: Role) []const u8 {
-        return switch (self) {
-            .product_owner => "You are the product-owner of a mission. Refine the raw objective " ++
-                "you are given. Reply with ONLY a JSON object: " ++
-                "{\"objective\": <one precise sentence>, \"acceptance\": <how completion is judged>}.",
-            .planner => "You are the planner of a mission. Break the objective into ordered, " ++
-                "independently executable tasks. Prefer few substantive tasks; each task " ++
-                "validates its own work, so never emit separate verify-only or " ++
-                "run-the-tests-again tasks. Reply with ONLY a JSON object: " ++
-                "{\"tasks\": [<task description>, ...]}.",
-            .executor => "You are the executor of a mission. Complete the single task you are " ++
-                "given, using the available tools when they help. The bash tool already runs " ++
-                "in the mission workspace — work there with relative paths; do not create " ++
-                "directories elsewhere or probe $HOME.",
-            .verifier => "You are the verifier of a mission. Judge whether the executed plan " ++
-                "meets the objective and its acceptance criteria. Reply with ONLY a JSON " ++
-                "object: {\"passed\": true|false, \"reason\": <one sentence>}.",
         };
     }
 };
@@ -868,12 +849,17 @@ fn runRoleTurn(
         m.mission_id, m.role_turns_used, role.stepId(), with_tools,
     });
 
+    // Playbook (M7): a role-<id>.md artifact overrides the built-in prompt;
+    // reply-shape parsing stays fail-closed regardless of the prompt source.
+    const system = (try playbook_mod.resolve(arena, cfg.substrate, role.stepId())) orelse
+        playbook_mod.defaultSystem(role.stepId()).?;
+
     var req: std.Io.Writer.Allocating = .init(arena);
     errdefer req.deinit();
     const w = &req.writer;
     w.print("{{\"system\":{f},\"step_id\":{f},\"max_steps\":{d}," ++
         "\"messages\":[{{\"role\":\"user\",\"content\":{f}}}]", .{
-        json.fmt(role.system(), .{}),
+        json.fmt(system, .{}),
         json.fmt(role.stepId(), .{}),
         cfg.role_max_steps,
         json.fmt(content, .{}),
@@ -2263,6 +2249,27 @@ test "pause parks durably at a role boundary; the substrate resumes to done" {
     defer rres.deinit(testing.allocator);
     try testing.expect(rres == .ok);
     try expectTerminal(rres.ok, "done", "completed");
+}
+
+test "role playbook: a role-executor.md artifact overrides the executor system prompt" {
+    var h = try Harness.init(testing.allocator, &.{ po_ok, plan1, exec_ok, verify_pass });
+    defer h.deinit();
+    const approvals = try approval_mod.ApprovalWorker.start(testing.allocator, &h.actor, &h.registry, .auto_approve);
+    defer approvals.stop();
+    try h.store().writeArtifact(testing.allocator, "role-executor.md", "You are orchy's integrator; merge, never rewrite.\n");
+
+    const req = try h.startReq(testing.allocator, seed_and_gate);
+    defer testing.allocator.free(req);
+    const res = try h.caller.call("zygos::missions::start", req);
+    defer res.deinit(testing.allocator);
+    try expectTerminal(res.ok, "done", "completed");
+
+    h.provider.mutex.lock();
+    defer h.provider.mutex.unlock();
+    // Executor turn (call 2) prompted with the override…
+    try testing.expect(std.mem.indexOf(u8, h.provider.requests.items[2], "orchy's integrator") != null);
+    // …while the planner (call 1) kept its built-in reply-shape prompt.
+    try testing.expect(std.mem.indexOf(u8, h.provider.requests.items[1], "planner of a mission") != null);
 }
 
 test "budget ledger: terminal mission writes LEDGER.md with the scope rollup" {
