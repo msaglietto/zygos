@@ -11,6 +11,7 @@
 
 const std = @import("std");
 const json = std.json;
+const trace_event = @import("../worker/trace_event.zig");
 const sync = @import("../kernel/sync.zig");
 const theme = @import("theme.zig");
 const width = @import("width.zig");
@@ -129,15 +130,14 @@ pub const Model = struct {
         var arena_state = std.heap.ArenaAllocator.init(self.gpa);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
-        const v = json.parseFromSliceLeaky(json.Value, arena, line_json, .{}) catch return;
-        if (v != .object) return;
-        const obj = v.object;
-        const ev = str(obj, "event") orelse return;
+        // Unknown kinds parse as null and are ignored: the view must survive
+        // a newer emitter. Known kinds hit the exhaustive switch below.
+        const parsed = trace_event.parse(arena, line_json) orelse return;
 
         self.mutex.lock();
         defer self.mutex.unlock();
         defer self.dirty.set();
-        self.applyEvent(arena, ev, obj) catch {}; // OOM: drop the line, keep the view alive
+        self.applyEvent(arena, parsed.event) catch {}; // OOM: drop the line, keep the view alive
         self.touchPhase();
     }
 
@@ -219,159 +219,161 @@ pub const Model = struct {
         self.dirty.set();
     }
 
-    fn applyEvent(self: *Model, arena: std.mem.Allocator, ev: []const u8, obj: json.ObjectMap) error{OutOfMemory}!void {
-        if (std.mem.eql(u8, ev, "mission")) {
-            const to = str(obj, "to") orelse "?";
-            try self.replaceOwned(&self.mission_state, to);
-            self.tasks_done = int(obj, "tasks_done");
-            self.tasks = int(obj, "tasks");
-            var color: [24]u8 = undefined;
-            try self.log.appendFmt("{s}◆ mission {s} → {s}{s}", .{
-                theme.fg(&color, theme.Color.accent), str(obj, "from") orelse "?", to, theme.reset,
-            });
-        } else if (std.mem.eql(u8, ev, "role_start")) {
-            const role = str(obj, "role") orelse "?";
-            try self.replaceOwned(&self.role, role);
-            self.role_turn = int(obj, "role_turn");
-            self.role_started_ms = self.now_fn();
-            self.step = 0;
-            var color: [24]u8 = undefined;
-            try self.log.appendFmt("", .{}); // breathing room between roles
-            try self.log.appendFmt("{s}▌ {s}{s} — turn {d}", .{
-                theme.fg(&color, theme.Color.accent), role, theme.reset, self.role_turn,
-            });
-        } else if (std.mem.eql(u8, ev, "role_end")) {
-            try self.flushThinking();
-            try self.flushLive(.answer);
-            self.clearLiveTool();
-            try self.collapseOpenTools();
-            const outcome = str(obj, "outcome") orelse "?";
-            const failed = !std.mem.eql(u8, outcome, "ok");
-            var color: [24]u8 = undefined;
-            if (str(obj, "reason")) |reason| {
-                try self.log.appendFmt("{s}▌ {s}: {s} — {s}{s}", .{
-                    theme.fg(&color, if (failed) theme.Color.err else theme.Color.ok),
-                    str(obj, "role") orelse "?",
-                    outcome,
-                    reason,
-                    theme.reset,
+    fn applyEvent(self: *Model, arena: std.mem.Allocator, ev: trace_event.TraceEvent) error{OutOfMemory}!void {
+        switch (ev) {
+            .mission => |m| {
+                try self.replaceOwned(&self.mission_state, m.to);
+                self.tasks_done = m.tasks_done;
+                self.tasks = m.tasks;
+                var color: [24]u8 = undefined;
+                try self.log.appendFmt("{s}◆ mission {s} → {s}{s}", .{
+                    theme.fg(&color, theme.Color.accent), m.from, m.to, theme.reset,
                 });
-            } else {
-                try self.log.appendFmt("{s}▌ {s}: {s}{s}", .{
-                    theme.fg(&color, if (failed) theme.Color.err else theme.Color.ok),
-                    str(obj, "role") orelse "?",
-                    outcome,
-                    theme.reset,
+            },
+            .role_start => |r| {
+                try self.replaceOwned(&self.role, r.role);
+                self.role_turn = r.role_turn;
+                self.role_started_ms = self.now_fn();
+                self.step = 0;
+                var color: [24]u8 = undefined;
+                try self.log.appendFmt("", .{}); // breathing room between roles
+                try self.log.appendFmt("{s}▌ {s}{s} — turn {d}", .{
+                    theme.fg(&color, theme.Color.accent), r.role, theme.reset, self.role_turn,
                 });
-            }
-            if (self.role_started_ms) |started| {
+            },
+            .role_end => |r| {
+                try self.flushThinking();
+                try self.flushLive(.answer);
+                self.clearLiveTool();
+                try self.collapseOpenTools();
+                const failed = !std.mem.eql(u8, r.outcome, "ok");
+                var color: [24]u8 = undefined;
+                if (r.reason) |reason| {
+                    try self.log.appendFmt("{s}▌ {s}: {s} — {s}{s}", .{
+                        theme.fg(&color, if (failed) theme.Color.err else theme.Color.ok),
+                        r.role,
+                        r.outcome,
+                        reason,
+                        theme.reset,
+                    });
+                } else {
+                    try self.log.appendFmt("{s}▌ {s}: {s}{s}", .{
+                        theme.fg(&color, if (failed) theme.Color.err else theme.Color.ok),
+                        r.role,
+                        r.outcome,
+                        theme.reset,
+                    });
+                }
+                if (self.role_started_ms) |started| {
+                    var e_buf: [32]u8 = undefined;
+                    try self.log.appendFmt("{s}Worked for {s}.{s}", .{
+                        theme.dim, durFmt(&e_buf, self.now_fn() - started), theme.reset,
+                    });
+                    self.role_started_ms = null;
+                }
+                if (self.role) |r_owned| {
+                    self.gpa.free(r_owned);
+                    self.role = null;
+                }
+            },
+            .step => |s| {
+                try self.flushThinking();
+                try self.flushLive(.narration);
+                self.clearLiveTool();
+                self.step = s.step;
+                self.attempt = s.attempt;
+                try self.replaceOwned(&self.step_model, s.model);
+            },
+            .tool_call => |tc| {
+                // Dispatch: the streaming box (if any) hands over to the running
+                // tool list fed by this event. Narration streamed before this
+                // call commits first — otherwise the "I'll do X" line lands
+                // after the tool it introduced (reads backwards in scrollback).
+                try self.flushLive(.narration);
+                self.clearLiveTool();
+                const name = try self.gpa.dupe(u8, tc.tool);
+                errdefer self.gpa.free(name);
+                const preview = tc.input[0..previewLen(tc.input)];
+                const input = try self.gpa.dupe(u8, preview);
+                errdefer self.gpa.free(input);
+                try self.tools.append(self.gpa, .{ .name = name, .input = input, .started_ms = self.now_fn() });
+            },
+            .tool_result => |tr| {
+                var count: [32]u8 = undefined;
                 var e_buf: [32]u8 = undefined;
-                try self.log.appendFmt("{s}Worked for {s}.{s}", .{
-                    theme.dim, durFmt(&e_buf, self.now_fn() - started), theme.reset,
-                });
-                self.role_started_ms = null;
-            }
-            if (self.role) |r| {
-                self.gpa.free(r);
-                self.role = null;
-            }
-        } else if (std.mem.eql(u8, ev, "step")) {
-            try self.flushThinking();
-            try self.flushLive(.narration);
-            self.clearLiveTool();
-            self.step = int(obj, "step");
-            self.attempt = int(obj, "attempt");
-            try self.replaceOwned(&self.step_model, str(obj, "model") orelse "?");
-        } else if (std.mem.eql(u8, ev, "tool_call")) {
-            // Dispatch: the streaming box (if any) hands over to the running
-            // tool list fed by this event. Narration streamed before this
-            // call commits first — otherwise the "I'll do X" line lands
-            // after the tool it introduced (reads backwards in scrollback).
-            try self.flushLive(.narration);
-            self.clearLiveTool();
-            const name = try self.gpa.dupe(u8, str(obj, "tool") orelse "?");
-            errdefer self.gpa.free(name);
-            const raw_input = str(obj, "input") orelse "";
-            const preview = raw_input[0..previewLen(raw_input)];
-            const input = try self.gpa.dupe(u8, preview);
-            errdefer self.gpa.free(input);
-            try self.tools.append(self.gpa, .{ .name = name, .input = input, .started_ms = self.now_fn() });
-        } else if (std.mem.eql(u8, ev, "tool_result")) {
-            const name = str(obj, "tool") orelse "?";
-            const is_err = boolOf(obj, "is_error");
-            var count: [32]u8 = undefined;
-            var e_buf: [32]u8 = undefined;
-            // Collapsed line keeps the call readable in scrollback: name,
-            // the input it ran with, size, duration, and an output preview.
-            const open = self.oldestTool(name);
-            const input: []const u8 = if (open) |t| t.input else "";
-            const started: i64 = if (open) |t| t.started_ms else self.now_fn();
-            // Prefer the human payload inside the tool's JSON envelope
-            // ({"output":...}, {"content":...}) over the envelope itself.
-            const raw_out = str(obj, "output") orelse "";
-            const unwrapped = (try partialjson.extractStringField(arena, raw_out, "output")) orelse
-                (try partialjson.extractDisplayField(arena, raw_out)) orelse raw_out;
-            const shown: []const u8 = if (unwrapped.len > 0) unwrapped else raw_out;
-            const out_preview = shown[0..previewLen(shown)];
-            try self.log.appendFmt("{s}", .{try entries.collapsedTool(
-                arena,
-                name,
-                input,
-                theme.tokens(&count, int(obj, "bytes")),
-                durFmt(&e_buf, self.now_fn() - started),
-                is_err,
-            )});
-            if (out_preview.len > 0) {
-                try self.log.appendFmt("    {s}{s}{s}{s}", .{
-                    theme.dim,
-                    if (is_err) "✗ " else "→ ",
-                    out_preview,
-                    theme.reset,
-                });
-            }
-            self.removeOldestTool(name);
-        } else if (std.mem.eql(u8, ev, "task_start")) {
-            const desc = try self.gpa.dupe(u8, str(obj, "desc") orelse "?");
-            if (self.current_task) |t| self.gpa.free(t.desc);
-            self.current_task = .{
-                .index = int(obj, "index"),
-                .total = int(obj, "total"),
-                .desc = desc,
-                .started_ms = self.now_fn(),
-            };
-        } else if (std.mem.eql(u8, ev, "task_done")) {
-            // The hand-off: this task collapses into scrollback; the next
-            // task_start repopulates the band with a fresh timer.
-            if (self.current_task) |t| {
-                var e_buf: [32]u8 = undefined;
-                try self.log.appendFmt("{s}", .{try tasks_mod.doneLine(
+                // Collapsed line keeps the call readable in scrollback: name,
+                // the input it ran with, size, duration, and an output preview.
+                const open = self.oldestTool(tr.tool);
+                const input: []const u8 = if (open) |t| t.input else "";
+                const started: i64 = if (open) |t| t.started_ms else self.now_fn();
+                // Prefer the human payload inside the tool's JSON envelope
+                // ({"output":...}, {"content":...}) over the envelope itself.
+                const unwrapped = (try partialjson.extractStringField(arena, tr.output, "output")) orelse
+                    (try partialjson.extractDisplayField(arena, tr.output)) orelse tr.output;
+                const shown: []const u8 = if (unwrapped.len > 0) unwrapped else tr.output;
+                const out_preview = shown[0..previewLen(shown)];
+                try self.log.appendFmt("{s}", .{try entries.collapsedTool(
                     arena,
-                    t,
-                    durFmt(&e_buf, self.now_fn() - t.started_ms),
+                    tr.tool,
+                    input,
+                    theme.tokens(&count, tr.bytes),
+                    durFmt(&e_buf, self.now_fn() - started),
+                    tr.is_error,
                 )});
-                self.gpa.free(t.desc);
-                self.current_task = null;
-            }
-        } else if (std.mem.eql(u8, ev, "usage")) {
-            self.tokens_in += int(obj, "input_tokens");
-            self.tokens_out += int(obj, "output_tokens");
-        } else if (std.mem.eql(u8, ev, "turn_end")) {
-            try self.flushThinking();
-            try self.flushLive(.answer);
-            self.clearLiveTool();
-            try self.collapseOpenTools();
-            self.step = 0;
-            var buf: [64]u8 = undefined;
-            const stop = str(obj, "stop") orelse "?";
-            const suffix = if (str(obj, "error")) |e|
-                std.fmt.bufPrint(&buf, " — {s}", .{e[0..@min(e.len, 40)]}) catch ""
-            else
-                "";
-            try self.log.appendFmt("{s}  turn: {s} ({d} steps){s}{s}", .{
-                theme.dim, stop, int(obj, "steps"), suffix, theme.reset,
-            });
+                if (out_preview.len > 0) {
+                    try self.log.appendFmt("    {s}{s}{s}{s}", .{
+                        theme.dim,
+                        if (tr.is_error) "✗ " else "→ ",
+                        out_preview,
+                        theme.reset,
+                    });
+                }
+                self.removeOldestTool(tr.tool);
+            },
+            .task_start => |t| {
+                const desc = try self.gpa.dupe(u8, t.desc);
+                if (self.current_task) |ct| self.gpa.free(ct.desc);
+                self.current_task = .{
+                    .index = t.index,
+                    .total = t.total,
+                    .desc = desc,
+                    .started_ms = self.now_fn(),
+                };
+            },
+            .task_done => {
+                // The hand-off: this task collapses into scrollback; the next
+                // task_start repopulates the band with a fresh timer.
+                if (self.current_task) |t| {
+                    var e_buf: [32]u8 = undefined;
+                    try self.log.appendFmt("{s}", .{try tasks_mod.doneLine(
+                        arena,
+                        t,
+                        durFmt(&e_buf, self.now_fn() - t.started_ms),
+                    )});
+                    self.gpa.free(t.desc);
+                    self.current_task = null;
+                }
+            },
+            .usage => |u| {
+                self.tokens_in += u.input_tokens;
+                self.tokens_out += u.output_tokens;
+            },
+            .turn_end => |te| {
+                try self.flushThinking();
+                try self.flushLive(.answer);
+                self.clearLiveTool();
+                try self.collapseOpenTools();
+                self.step = 0;
+                var buf: [64]u8 = undefined;
+                const suffix = if (te.err) |e|
+                    std.fmt.bufPrint(&buf, " — {s}", .{e[0..@min(e.len, 40)]}) catch ""
+                else
+                    "";
+                try self.log.appendFmt("{s}  turn: {s} ({d} steps){s}{s}", .{
+                    theme.dim, te.stop, te.steps, suffix, theme.reset,
+                });
+            },
         }
-        // Unknown kinds are ignored: the view must survive a newer emitter.
     }
 
     // -- rendering (render thread) -------------------------------------------
@@ -490,21 +492,6 @@ pub const Model = struct {
         slot.* = copy;
     }
 };
-
-fn str(obj: json.ObjectMap, key: []const u8) ?[]const u8 {
-    const v = obj.get(key) orelse return null;
-    return if (v == .string) v.string else null;
-}
-
-fn int(obj: json.ObjectMap, key: []const u8) i64 {
-    const v = obj.get(key) orelse return 0;
-    return if (v == .integer) v.integer else 0;
-}
-
-fn boolOf(obj: json.ObjectMap, key: []const u8) bool {
-    const v = obj.get(key) orelse return false;
-    return v == .bool and v.bool;
-}
 
 // ===========================================================================
 // Tests

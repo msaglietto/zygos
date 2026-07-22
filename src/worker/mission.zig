@@ -477,12 +477,13 @@ fn runMission(self: *MissionOrchestrator, arena: std.mem.Allocator, request_json
             log.info("mission {s}: {t} → {t} (role_turns {d}, tasks {d}/{d})", .{
                 m.mission_id, prev, m.state, m.role_turns_used, m.tasksDone(), m.tasks.len,
             });
-            try trace_mod.event(
-                arena,
-                cfg.trace_path,
-                "\"event\":\"mission\",\"from\":\"{t}\",\"to\":\"{t}\",\"role_turns\":{d},\"tasks_done\":{d},\"tasks\":{d}",
-                .{ prev, m.state, m.role_turns_used, m.tasksDone(), m.tasks.len },
-            );
+            try trace_mod.emit(arena, cfg.trace_path, .{ .mission = .{
+                .from = @tagName(prev),
+                .to = @tagName(m.state),
+                .role_turns = @intCast(m.role_turns_used),
+                .tasks_done = @intCast(m.tasksDone()),
+                .tasks = @intCast(m.tasks.len),
+            } });
             try phase_log.append(arena, try std.fmt.allocPrint(arena, "{t} → {t}", .{ prev, m.state }));
         }
     }
@@ -590,35 +591,27 @@ fn runRole(
     content: []const u8,
     with_tools: bool,
 ) MissionError!RoleOut {
-    try trace_mod.event(
-        arena,
-        cfg.trace_path,
-        "\"event\":\"role_start\",\"role\":{f},\"role_turn\":{d},\"tools\":{},\"content\":{f}",
-        .{
-            json.fmt(role.stepId(), .{}),                      m.role_turns_used + 1, with_tools,
-            json.fmt(try trace_mod.clip(arena, content), .{}),
-        },
-    );
+    try trace_mod.emit(arena, cfg.trace_path, .{ .role_start = .{
+        .role = role.stepId(),
+        .role_turn = @intCast(m.role_turns_used + 1),
+        .tools = with_tools,
+        .content = try trace_mod.clip(arena, content),
+    } });
     const out = try runRoleTurn(self, arena, cfg, m, role, content, with_tools);
     switch (out) {
-        .ok => try trace_mod.event(
-            arena,
-            cfg.trace_path,
-            "\"event\":\"role_end\",\"role\":{f},\"outcome\":\"ok\"",
-            .{json.fmt(role.stepId(), .{})},
-        ),
-        .failed => |reason| try trace_mod.event(
-            arena,
-            cfg.trace_path,
-            "\"event\":\"role_end\",\"role\":{f},\"outcome\":\"failed\",\"reason\":{f}",
-            .{ json.fmt(role.stepId(), .{}), json.fmt(reason, .{}) },
-        ),
-        .exhausted => try trace_mod.event(
-            arena,
-            cfg.trace_path,
-            "\"event\":\"role_end\",\"role\":{f},\"outcome\":\"exhausted\"",
-            .{json.fmt(role.stepId(), .{})},
-        ),
+        .ok => try trace_mod.emit(arena, cfg.trace_path, .{ .role_end = .{
+            .role = role.stepId(),
+            .outcome = "ok",
+        } }),
+        .failed => |reason| try trace_mod.emit(arena, cfg.trace_path, .{ .role_end = .{
+            .role = role.stepId(),
+            .outcome = "failed",
+            .reason = reason,
+        } }),
+        .exhausted => try trace_mod.emit(arena, cfg.trace_path, .{ .role_end = .{
+            .role = role.stepId(),
+            .outcome = "exhausted",
+        } }),
     }
     return out;
 }
@@ -865,12 +858,11 @@ fn roleExecute(self: *MissionOrchestrator, arena: std.mem.Allocator, cfg: RunCon
 
     // Task edges are trace-only (fail-open, not protocol frames): the TUI
     // keys its live current-task line off start/done pairs.
-    try trace_mod.event(
-        arena,
-        cfg.trace_path,
-        "\"event\":\"task_start\",\"index\":{d},\"total\":{d},\"desc\":{f}",
-        .{ m.task_index + 1, m.tasks.len, json.fmt(try trace_mod.clip(arena, m.tasks[m.task_index].desc), .{}) },
-    );
+    try trace_mod.emit(arena, cfg.trace_path, .{ .task_start = .{
+        .index = @intCast(m.task_index + 1),
+        .total = @intCast(m.tasks.len),
+        .desc = try trace_mod.clip(arena, m.tasks[m.task_index].desc),
+    } });
 
     switch (try runRole(self, arena, cfg, m, .executor, content.written(), true)) {
         .failed => |reason| try failRole(m, reason),
@@ -898,12 +890,11 @@ fn roleExecute(self: *MissionOrchestrator, arena: std.mem.Allocator, cfg: RunCon
             m.exec_fail_count = 0;
             m.tasks[m.task_index].done = true;
             m.tasks[m.task_index].result = try outcomeExcerpt(arena, text, 600);
-            try trace_mod.event(
-                arena,
-                cfg.trace_path,
-                "\"event\":\"task_done\",\"index\":{d},\"total\":{d},\"desc\":{f}",
-                .{ m.task_index + 1, m.tasks.len, json.fmt(try trace_mod.clip(arena, m.tasks[m.task_index].desc), .{}) },
-            );
+            try trace_mod.emit(arena, cfg.trace_path, .{ .task_done = .{
+                .index = @intCast(m.task_index + 1),
+                .total = @intCast(m.tasks.len),
+                .desc = try trace_mod.clip(arena, m.tasks[m.task_index].desc),
+            } });
             m.task_index += 1;
             m.state = try Fsm.apply(m.state, if (m.task_index == m.tasks.len) .tasks_done else .task_done);
         },

@@ -12,6 +12,9 @@ const std = @import("std");
 const c = std.c;
 const json = std.json;
 const sync = @import("../kernel/sync.zig");
+const trace_event = @import("trace_event.zig");
+
+pub const TraceEvent = trace_event.TraceEvent;
 
 pub const file_name = "events.jsonl";
 
@@ -85,6 +88,19 @@ pub fn event(
     }
 }
 
+/// Typed twin of `event` — the only emission path the drivers use. The
+/// tagged union keeps emitters and consumers on one schema: adding a
+/// variant breaks every exhaustive switch at compile time instead of
+/// silently dropping on the floor.
+pub fn emit(
+    arena: std.mem.Allocator,
+    path: ?[]const u8,
+    ev: TraceEvent,
+) error{OutOfMemory}!void {
+    if (path == null and sink_count.load(.acquire) == 0) return;
+    try event(arena, path, "{s}", .{try trace_event.body(arena, ev)});
+}
+
 /// Truncate a payload for embedding, cutting on a UTF-8 sequence boundary so
 /// the JSON encoder never sees a split code point. Short inputs pass through
 /// unchanged (no copy).
@@ -154,56 +170,39 @@ fn renderLine(
     gpa: std.mem.Allocator,
     line: []const u8,
 ) error{ OutOfMemory, Unrenderable }!void {
-    const v = json.parseFromSliceLeaky(json.Value, arena, line, .{}) catch return error.Unrenderable;
-    if (v != .object) return error.Unrenderable;
-    const obj = v.object;
-    const ev = str(obj, "event") orelse return error.Unrenderable;
+    const parsed = trace_event.parse(arena, line) orelse return error.Unrenderable;
 
     var w: std.ArrayList(u8) = .empty;
     defer w.deinit(gpa);
-    const ts = if (obj.get("ts")) |t| (if (t == .integer) t.integer else 0) else 0;
-    try appendClock(gpa, &w, ts);
+    try appendClock(gpa, &w, parsed.ts);
 
-    if (std.mem.eql(u8, ev, "mission")) {
-        try appendFmt(gpa, &w, "mission {s} → {s} (role_turns {d}, tasks {d}/{d})", .{
-            str(obj, "from") orelse "?", str(obj, "to") orelse "?", int(obj, "role_turns"),
-            int(obj, "tasks_done"),      int(obj, "tasks"),
-        });
-    } else if (std.mem.eql(u8, ev, "role_start")) {
-        try appendFmt(gpa, &w, "── role {s} (turn {d}, tools {s})", .{
-            str(obj, "role") orelse "?",
-            int(obj, "role_turn"),
-            if (boolOf(obj, "tools")) "on" else "off",
-        });
-    } else if (std.mem.eql(u8, ev, "role_end")) {
-        try appendFmt(gpa, &w, "── role {s}: {s}", .{ str(obj, "role") orelse "?", str(obj, "outcome") orelse "?" });
-        if (str(obj, "reason")) |r| try appendFmt(gpa, &w, " — {s}", .{r});
-    } else if (std.mem.eql(u8, ev, "task_start")) {
-        try appendFmt(gpa, &w, "  ▸ task {d}/{d}: {s}", .{
-            int(obj, "index"), int(obj, "total"), str(obj, "desc") orelse "?",
-        });
-    } else if (std.mem.eql(u8, ev, "task_done")) {
-        try appendFmt(gpa, &w, "  ✓ task {d}/{d} done", .{ int(obj, "index"), int(obj, "total") });
-    } else if (std.mem.eql(u8, ev, "step")) {
-        try appendFmt(gpa, &w, "  step {d}: {s} via {s}", .{
-            int(obj, "step"), str(obj, "model") orelse "?", str(obj, "provider") orelse "?",
-        });
-        const attempt = int(obj, "attempt");
-        if (attempt > 0) try appendFmt(gpa, &w, " (attempt {d})", .{attempt});
-    } else if (std.mem.eql(u8, ev, "tool_call")) {
-        try appendFmt(gpa, &w, "    tool {s} {s}", .{ str(obj, "tool") orelse "?", str(obj, "input") orelse "" });
-    } else if (std.mem.eql(u8, ev, "tool_result")) {
-        try appendFmt(gpa, &w, "      → {d}B{s}: {s}", .{
-            int(obj, "bytes"),
-            if (boolOf(obj, "is_error")) " ERROR" else "",
-            str(obj, "output") orelse "",
-        });
-    } else if (std.mem.eql(u8, ev, "usage")) {
-        try appendFmt(gpa, &w, "    usage: {d}↑ {d}↓", .{ int(obj, "input_tokens"), int(obj, "output_tokens") });
-    } else if (std.mem.eql(u8, ev, "turn_end")) {
-        try appendFmt(gpa, &w, "  turn end: {s} ({d} steps)", .{ str(obj, "stop") orelse "?", int(obj, "steps") });
-        if (str(obj, "error")) |e| try appendFmt(gpa, &w, " — {s}", .{e});
-    } else return error.Unrenderable;
+    switch (parsed.event) {
+        .mission => |m| try appendFmt(gpa, &w, "mission {s} → {s} (role_turns {d}, tasks {d}/{d})", .{
+            m.from, m.to, m.role_turns, m.tasks_done, m.tasks,
+        }),
+        .role_start => |r| try appendFmt(gpa, &w, "── role {s} (turn {d}, tools {s})", .{
+            r.role, r.role_turn, if (r.tools) "on" else "off",
+        }),
+        .role_end => |r| {
+            try appendFmt(gpa, &w, "── role {s}: {s}", .{ r.role, r.outcome });
+            if (r.reason) |reason| try appendFmt(gpa, &w, " — {s}", .{reason});
+        },
+        .task_start => |t| try appendFmt(gpa, &w, "  ▸ task {d}/{d}: {s}", .{ t.index, t.total, t.desc }),
+        .task_done => |t| try appendFmt(gpa, &w, "  ✓ task {d}/{d} done", .{ t.index, t.total }),
+        .step => |s| {
+            try appendFmt(gpa, &w, "  step {d}: {s} via {s}", .{ s.step, s.model, s.provider });
+            if (s.attempt > 0) try appendFmt(gpa, &w, " (attempt {d})", .{s.attempt});
+        },
+        .tool_call => |tc| try appendFmt(gpa, &w, "    tool {s} {s}", .{ tc.tool, tc.input }),
+        .tool_result => |tr| try appendFmt(gpa, &w, "      → {d}B{s}: {s}", .{
+            tr.bytes, if (tr.is_error) " ERROR" else "", tr.output,
+        }),
+        .usage => |u| try appendFmt(gpa, &w, "    usage: {d}↑ {d}↓", .{ u.input_tokens, u.output_tokens }),
+        .turn_end => |te| {
+            try appendFmt(gpa, &w, "  turn end: {s} ({d} steps)", .{ te.stop, te.steps });
+            if (te.err) |e| try appendFmt(gpa, &w, " — {s}", .{e});
+        },
+    }
 
     try w.append(gpa, '\n');
     try out.appendSlice(gpa, w.items);
@@ -222,21 +221,6 @@ fn appendClock(gpa: std.mem.Allocator, w: *std.ArrayList(u8), ts_ms: i64) error{
     try appendFmt(gpa, w, "{d:0>2}:{d:0>2}:{d:0>2} ", .{
         ds.getHoursIntoDay(), ds.getMinutesIntoHour(), ds.getSecondsIntoMinute(),
     });
-}
-
-fn str(obj: json.ObjectMap, key: []const u8) ?[]const u8 {
-    const v = obj.get(key) orelse return null;
-    return if (v == .string) v.string else null;
-}
-
-fn int(obj: json.ObjectMap, key: []const u8) i64 {
-    const v = obj.get(key) orelse return 0;
-    return if (v == .integer) v.integer else 0;
-}
-
-fn boolOf(obj: json.ObjectMap, key: []const u8) bool {
-    const v = obj.get(key) orelse return false;
-    return v == .bool and v.bool;
 }
 
 fn nowMs() i64 {
@@ -395,6 +379,26 @@ test "sink and file both receive when a path is set" {
     try testing.expectEqual(@as(usize, 1), cap.lines.items.len);
     const text = readFile(arena, path) orelse return error.ReadFailed;
     try testing.expect(std.mem.indexOf(u8, text, "\"step\":1") != null);
+}
+
+test "emit delivers the typed event through the same line path" {
+    var cap = SinkCapture{ .gpa = testing.allocator };
+    defer cap.deinit();
+    const token = registerSink(cap.sink()) orelse return error.NoSlot;
+    defer unregisterSink(token);
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    try emit(arena_state.allocator(), null, .{ .step = .{
+        .turn_id = "t",
+        .step = 1,
+        .provider = "p",
+        .model = "m",
+    } });
+
+    try testing.expectEqual(@as(usize, 1), cap.lines.items.len);
+    try testing.expect(std.mem.indexOf(u8, cap.lines.items[0], "\"event\":\"step\"") != null);
+    try testing.expect(std.mem.indexOf(u8, cap.lines.items[0], "\"model\":\"m\"") != null);
 }
 
 test "unregister stops delivery and slots are reusable" {

@@ -578,12 +578,12 @@ fn runTurn(self: *TurnOrchestrator, arena: std.mem.Allocator, request_json: []co
                 step_model = r.model;
             } else {
                 state = try Fsm.apply(state, .provider_error); // → failed
-                try trace_mod.event(
-                    arena,
-                    trace_path,
-                    "\"event\":\"turn_end\",\"turn_id\":{f},\"stop\":\"failed\",\"steps\":{d},\"error\":\"route_exhausted\"",
-                    .{ json.fmt(turn_id orelse "", .{}), steps },
-                );
+                try trace_mod.emit(arena, trace_path, .{ .turn_end = .{
+                    .turn_id = turn_id orelse "",
+                    .stop = "failed",
+                    .steps = @intCast(steps),
+                    .err = "route_exhausted",
+                } });
                 return try std.fmt.allocPrint(
                     arena,
                     "{{\"stop\":\"failed\",\"steps\":{d},\"error\":\"route_exhausted\"}}",
@@ -615,12 +615,13 @@ fn runTurn(self: *TurnOrchestrator, arena: std.mem.Allocator, request_json: []co
         log.info("turn {s} step {d}: {s} model {s} (attempt {d})", .{
             turn_id orelse "?", steps + 1, step_provider, step_model, attempt,
         });
-        try trace_mod.event(
-            arena,
-            trace_path,
-            "\"event\":\"step\",\"turn_id\":{f},\"step\":{d},\"provider\":{f},\"model\":{f},\"attempt\":{d}",
-            .{ json.fmt(turn_id orelse "", .{}), steps + 1, json.fmt(step_provider, .{}), json.fmt(step_model, .{}), attempt },
-        );
+        try trace_mod.emit(arena, trace_path, .{ .step = .{
+            .turn_id = turn_id orelse "",
+            .step = @intCast(steps + 1),
+            .provider = step_provider,
+            .model = step_model,
+            .attempt = @intCast(attempt),
+        } });
         state = try Fsm.apply(state, .provider_started); // → streaming
         const drain_thread = std.Thread.spawn(.{}, DeltaLog.drain, .{ &deltas, self.gpa, &receiver }) catch
             return error.Failed;
@@ -649,12 +650,12 @@ fn runTurn(self: *TurnOrchestrator, arena: std.mem.Allocator, request_json: []co
                 }
                 defer self.gpa.free(code);
                 state = try Fsm.apply(state, .provider_error); // → failed
-                try trace_mod.event(
-                    arena,
-                    trace_path,
-                    "\"event\":\"turn_end\",\"turn_id\":{f},\"stop\":\"failed\",\"steps\":{d},\"error\":{f}",
-                    .{ json.fmt(turn_id orelse "", .{}), steps, json.fmt(code, .{}) },
-                );
+                try trace_mod.emit(arena, trace_path, .{ .turn_end = .{
+                    .turn_id = turn_id orelse "",
+                    .stop = "failed",
+                    .steps = @intCast(steps),
+                    .err = code,
+                } });
                 return try std.fmt.allocPrint(
                     arena,
                     "{{\"stop\":\"failed\",\"steps\":{d},\"error\":{f}}}",
@@ -674,15 +675,12 @@ fn runTurn(self: *TurnOrchestrator, arena: std.mem.Allocator, request_json: []co
                 // independent of budgeting: token totals are observability.
                 if (msg.object.get("usage")) |u| if (u == .object) {
                     if (budget_scope) |scope| try self.recordUsage(arena, scope, u.object);
-                    try trace_mod.event(
-                        arena,
-                        trace_path,
-                        "\"event\":\"usage\",\"turn_id\":{f},\"step\":{d},\"input_tokens\":{d},\"output_tokens\":{d}",
-                        .{
-                            json.fmt(turn_id orelse "", .{}),   steps,
-                            intField(u.object, "input_tokens"), intField(u.object, "output_tokens"),
-                        },
-                    );
+                    try trace_mod.emit(arena, trace_path, .{ .usage = .{
+                        .turn_id = turn_id orelse "",
+                        .step = @intCast(steps),
+                        .input_tokens = @intCast(intField(u.object, "input_tokens")),
+                        .output_tokens = @intCast(intField(u.object, "output_tokens")),
+                    } });
                 };
                 const content = msg.object.get("content") orelse json.Value{ .array = .init(arena) };
 
@@ -711,15 +709,12 @@ fn runTurn(self: *TurnOrchestrator, arena: std.mem.Allocator, request_json: []co
                     const tool_name = strField(block.object, "name") orelse "";
                     const input = block.object.get("input") orelse json.Value.null;
                     log.info("turn {s} step {d}: tool {s}", .{ turn_id orelse "?", steps, tool_name });
-                    try trace_mod.event(
-                        arena,
-                        trace_path,
-                        "\"event\":\"tool_call\",\"turn_id\":{f},\"step\":{d},\"tool\":{f},\"input\":{f}",
-                        .{
-                            json.fmt(turn_id orelse "", .{}),                                    steps, json.fmt(tool_name, .{}),
-                            json.fmt(try trace_mod.clip(arena, try rawJson(arena, input)), .{}),
-                        },
-                    );
+                    try trace_mod.emit(arena, trace_path, .{ .tool_call = .{
+                        .turn_id = turn_id orelse "",
+                        .step = @intCast(steps),
+                        .tool = tool_name,
+                        .input = try trace_mod.clip(arena, try rawJson(arena, input)),
+                    } });
 
                     if (self.pollAborted(ctl)) {
                         state = try Fsm.apply(state, .abort); // dispatching → stopped
@@ -800,12 +795,11 @@ fn runTurn(self: *TurnOrchestrator, arena: std.mem.Allocator, request_json: []co
     }
 
     std.debug.assert(state == .stopped);
-    try trace_mod.event(
-        arena,
-        trace_path,
-        "\"event\":\"turn_end\",\"turn_id\":{f},\"stop\":{f},\"steps\":{d}",
-        .{ json.fmt(turn_id orelse "", .{}), json.fmt(stop, .{}), steps },
-    );
+    try trace_mod.emit(arena, trace_path, .{ .turn_end = .{
+        .turn_id = turn_id orelse "",
+        .stop = stop,
+        .steps = @intCast(steps),
+    } });
     deltas.mutex.lock();
     const delta_text = deltas.buf.items;
     deltas.mutex.unlock();
@@ -826,15 +820,13 @@ fn traceToolResult(
     content: []const u8,
     is_error: bool,
 ) error{OutOfMemory}!void {
-    try trace_mod.event(
-        arena,
-        trace_path,
-        "\"event\":\"tool_result\",\"step\":{d},\"tool\":{f},\"is_error\":{},\"bytes\":{d},\"output\":{f}",
-        .{
-            step,                                              json.fmt(tool_name, .{}), is_error, content.len,
-            json.fmt(try trace_mod.clip(arena, content), .{}),
-        },
-    );
+    try trace_mod.emit(arena, trace_path, .{ .tool_result = .{
+        .step = @intCast(step),
+        .tool = tool_name,
+        .is_error = is_error,
+        .bytes = @intCast(content.len),
+        .output = try trace_mod.clip(arena, content),
+    } });
 }
 
 fn toolResult(arena: std.mem.Allocator, tool_use_id: []const u8, content: []const u8, is_error: bool) error{OutOfMemory}![]const u8 {
