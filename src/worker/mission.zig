@@ -290,6 +290,7 @@ pub const MissionOrchestrator = struct {
         try self.worker.registerFunction("zygos::missions::steer", self, &steerHandler);
         try self.worker.registerFunction("zygos::missions::pause", self, &pauseHandler);
         try self.worker.registerFunction("zygos::missions::resume", self, &resumeHandler);
+        try self.worker.registerFunction("zygos::missions::list", self, &listHandler);
         return self;
     }
 
@@ -417,6 +418,41 @@ fn abortHandler(
         break :blk true;
     };
     return std.fmt.allocPrint(arena, "{{\"ok\":{}}}", .{ok});
+}
+
+/// M6 multi-mission dashboard data: snapshot of every live mission's
+/// control block. Terminal missions untrack on exit, so the list is
+/// exactly what is running (or parked at a boundary) right now.
+fn listHandler(
+    ctx: ?*anyopaque,
+    arena: std.mem.Allocator,
+    request_json: []const u8,
+) error{ Failed, OutOfMemory }![]const u8 {
+    _ = request_json;
+    const self: *MissionOrchestrator = @ptrCast(@alignCast(ctx.?));
+    var out: std.Io.Writer.Allocating = .init(arena);
+    const w = &out.writer;
+    w.writeAll("{\"missions\":[") catch return error.OutOfMemory;
+
+    self.ctl_mutex.lock();
+    defer self.ctl_mutex.unlock();
+    var it = self.live.iterator();
+    var first = true;
+    while (it.next()) |kv| {
+        if (!first) w.writeAll(",") catch return error.OutOfMemory;
+        first = false;
+        const ctl = kv.value_ptr.*;
+        w.print(
+            "{{\"mission_id\":{f},\"state\":\"{t}\",\"stop\":\"{t}\"," ++
+                "\"role_turns\":{d},\"task_index\":{d},\"paused\":{}}}",
+            .{
+                json.fmt(kv.key_ptr.*, .{}), ctl.state,      ctl.stop,
+                ctl.role_turns_used,         ctl.task_index, ctl.paused,
+            },
+        ) catch return error.OutOfMemory;
+    }
+    w.writeAll("]}") catch return error.OutOfMemory;
+    return out.toOwnedSlice() catch return error.OutOfMemory;
 }
 
 /// M6 turn-steer one level up: text lands at the next role boundary and
@@ -2344,6 +2380,34 @@ test "max_role_turns exhausts at a role boundary" {
     var p = try json.parseFromSlice(json.Value, testing.allocator, res.ok, .{});
     defer p.deinit();
     try testing.expectEqual(@as(i64, 2), p.value.object.get("role_turns").?.integer);
+}
+
+test "missions::list snapshots every live mission and empties at terminal state" {
+    var h = try Harness.init(testing.allocator, &.{ po_ok, plan2, exec_ok, exec_ok, verify_pass });
+    defer h.deinit();
+    const approvals = try approval_mod.ApprovalWorker.start(testing.allocator, &h.actor, &h.registry, .auto_approve);
+    defer approvals.stop();
+    h.provider.park_at = 2;
+    const ctl_worker = try inproc.Worker.spawn(testing.allocator, &h.actor, &h.registry, "test-control");
+    defer ctl_worker.stop();
+
+    const req = try h.startReq(testing.allocator, seed_and_gate);
+    defer testing.allocator.free(req);
+    var ctx: StartCtx = .{ .h = h, .req = req };
+    const t = try std.Thread.spawn(.{}, StartCtx.run, .{&ctx});
+
+    h.provider.entered.wait();
+    const lres = try ctl_worker.call("zygos::missions::list", "{}");
+    defer lres.deinit(testing.allocator);
+    try testing.expect(std.mem.indexOf(u8, lres.ok, "\"mission_id\":\"m-1\"") != null);
+    try testing.expect(std.mem.indexOf(u8, lres.ok, "\"state\":\"executing\"") != null);
+    h.provider.release.set();
+    t.join();
+    ctx.res.deinit(testing.allocator);
+
+    const after = try ctl_worker.call("zygos::missions::list", "{}");
+    defer after.deinit(testing.allocator);
+    try testing.expect(std.mem.indexOf(u8, after.ok, "\"missions\":[]") != null);
 }
 
 test "status reflects a live mission; unknown mission_id errors" {

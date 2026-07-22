@@ -20,23 +20,33 @@ pub fn run(gpa: std.mem.Allocator, args: *std.process.Args.Iterator) u8 {
     const parsed = zygos.mission_boot.parseArgs(argv.items) catch return usage();
     if (parsed.verb == .trace) return runTrace(gpa, parsed.brief_path);
     if (parsed.verb == .attach) return runAttach(gpa, parsed.brief_path);
+    if (parsed.verb == .dashboard) return runDashboard(gpa, parsed.brief_path);
+    const queue_mode = parsed.verb == .queue;
     const resume_flag = parsed.resume_flag;
     const run_stamp = parsed.run_stamp;
-    const no_tui = parsed.no_tui;
+    const no_tui = parsed.no_tui or queue_mode;
     const bp = parsed.brief_path;
 
-    // ---- brief (lint before anything boots) --------------------------------
-    const brief_text = readWholeFile(gpa, bp) orelse {
-        eprint("mission: cannot read brief {s}\n", .{bp});
-        return 2;
-    };
-    switch (zygos.brief.lint(brief_text)) {
-        .ok => {},
-        .invalid => |e| {
-            eprint("mission: brief rejected: {s}\n", .{zygos.brief.tag(e)});
+    // ---- briefs (lint everything before anything boots) --------------------
+    var brief_paths: std.ArrayList([]const u8) = .empty;
+    brief_paths.append(gpa, bp) catch return oom();
+    if (queue_mode) brief_paths.appendSlice(gpa, parsed.rest) catch return oom();
+    var brief_texts: std.ArrayList([]const u8) = .empty;
+    for (brief_paths.items) |path| {
+        const text = readWholeFile(gpa, path) orelse {
+            eprint("mission: cannot read brief {s}\n", .{path});
             return 2;
-        },
+        };
+        switch (zygos.brief.lint(text)) {
+            .ok => {},
+            .invalid => |e| {
+                eprint("mission: brief {s} rejected: {s}\n", .{ path, zygos.brief.tag(e) });
+                return 2;
+            },
+        }
+        brief_texts.append(gpa, text) catch return oom();
     }
+    const brief_text = brief_texts.items[0];
 
     // ---- provider catalog ---------------------------------------------------
     const env = envPairs(gpa) catch return oom();
@@ -131,7 +141,7 @@ pub fn run(gpa: std.mem.Allocator, args: *std.process.Args.Iterator) u8 {
     // invocation its own planning root; without it, starting over an
     // existing mission substrate refuses instead of clobbering it.
     const planning = zygos.mission_boot.planningRoot(gpa, planning_base, run_stamp, runStamp()) catch return oom();
-    if (zygos.mission_boot.refuseStart(resume_flag, run_stamp, fileExists(gpa, planning, "mission.json"))) {
+    if (!queue_mode and zygos.mission_boot.refuseStart(resume_flag, run_stamp, fileExists(gpa, planning, "mission.json"))) {
         eprint(
             "mission: {s} already holds a mission; resume it, pick a fresh --planning, or pass --run-stamp\n",
             .{planning},
@@ -196,11 +206,13 @@ pub fn run(gpa: std.mem.Allocator, args: *std.process.Args.Iterator) u8 {
     _ = orch;
     const caller = zygos.inproc.Worker.spawn(gpa, &actor, &registry, "mission-cli") catch return boot_fail();
 
-    const budget_req = std.fmt.allocPrint(gpa, "{{\"scope\":{f},\"max_tokens\":{d}}}", .{
-        json.fmt(mission_id, .{}), tm.budget_max_tokens,
-    }) catch return oom();
-    const conf = caller.call("zygos::budget::configure", budget_req) catch return boot_fail();
-    conf.deinit(gpa);
+    if (!queue_mode) {
+        const budget_req = std.fmt.allocPrint(gpa, "{{\"scope\":{f},\"max_tokens\":{d}}}", .{
+            json.fmt(mission_id, .{}), tm.budget_max_tokens,
+        }) catch return oom();
+        const conf = caller.call("zygos::budget::configure", budget_req) catch return boot_fail();
+        conf.deinit(gpa);
+    }
 
     // ZYGOS_VAULT_ROOT (Y5): mission artifacts land behind a tessera-undo
     // checkpoint — an unusable vault refuses the run instead of writing
@@ -210,15 +222,20 @@ pub fn run(gpa: std.mem.Allocator, args: *std.process.Args.Iterator) u8 {
             .root = vault_root,
         }) catch return boot_fail();
         _ = undo;
-        const cp_req = zygos.mission_boot.checkpointRequest(gpa, mission_id) catch return oom();
-        const cp = caller.call("zygos::tessera::checkpoint", cp_req) catch {
-            eprint("mission: vault checkpoint failed for {s}\n", .{vault_root});
-            return 2;
-        };
-        defer cp.deinit(gpa);
-        if (zygos.mission_boot.checkpointVerdict(cp) == .refuse) {
-            eprint("mission: vault checkpoint failed for {s}\n", .{vault_root});
-            return 2;
+    }
+    if (!queue_mode) {
+        single_checkpoint: {
+            const vault_root = getEnv(env, "ZYGOS_VAULT_ROOT") orelse break :single_checkpoint;
+            const cp_req = zygos.mission_boot.checkpointRequest(gpa, mission_id) catch return oom();
+            const cp = caller.call("zygos::tessera::checkpoint", cp_req) catch {
+                eprint("mission: vault checkpoint failed for {s}\n", .{vault_root});
+                return 2;
+            };
+            defer cp.deinit(gpa);
+            if (zygos.mission_boot.checkpointVerdict(cp) == .refuse) {
+                eprint("mission: vault checkpoint failed for {s}\n", .{vault_root});
+                return 2;
+            }
         }
     }
 
@@ -233,7 +250,7 @@ pub fn run(gpa: std.mem.Allocator, args: *std.process.Args.Iterator) u8 {
     // Control channel (M6): a detached poller tails <planning>/control.jsonl
     // and dispatches steer/pause/resume/approve commands appended by
     // `zygos mission attach` onto the bus.
-    {
+    if (!queue_mode) {
         const ctl_worker = zygos.inproc.Worker.spawn(gpa, &actor, &registry, "mission-control-tail") catch return boot_fail();
         if (std.Thread.spawn(.{}, controlLoop, .{ gpa, ctl_worker, planning, mission_id })) |t| t.detach() else |_| {}
     }
@@ -312,36 +329,98 @@ pub fn run(gpa: std.mem.Allocator, args: *std.process.Args.Iterator) u8 {
             "Do all work inside this directory (relative paths work); never write to $HOME or system paths.",
         .{cwd},
     ) catch return oom();
-    const request = std.fmt.allocPrint(gpa,
-        \\{{"mission_id":{f},"planning_root":{f},"objective":{f},"brief":{f},
-        \\ "router_function":"zygos::models::resolve",
-        \\ "gate_function":"zygos::approvals::request",
-        \\ "policy_function":"zygos::policy::check",
-        \\ "approval_function":"zygos::approvals::request",
-        \\ "budget_scope":{f},"trace_path":{f},
-        \\ "context_strategy":{{"kind":"{t}","max_tokens":{d}}},
-        \\ "role_max_steps":{d},"max_role_turns":{d}{s},
-        \\ "tools":[
-        \\  {{"name":"bash","function_id":"zygos::tools::bash",
-        \\   "description":{f},
-        \\   "input_schema":{{"type":"object","properties":{{"command":{{"type":"string",
-        \\    "description":"the shell command to run"}}}},"required":["command"]}}}},
-        \\  {{"name":"web_search","function_id":"zygos::tools::web_search",
-        \\   "description":"Search the web; returns a list of {{title,url,snippet}} results.",
-        \\   "input_schema":{{"type":"object","properties":{{"query":{{"type":"string",
-        \\    "description":"the search query"}}}},"required":["query"]}}}},
-        \\  {{"name":"web_fetch","function_id":"zygos::tools::web_fetch",
-        \\   "description":"Fetch a URL and return its readable text content.",
-        \\   "input_schema":{{"type":"object","properties":{{"url":{{"type":"string",
-        \\    "description":"the absolute http(s) URL to fetch"}}}},"required":["url"]}}}}{s}]}}
-    , .{
-        json.fmt(mission_id, .{}),                                      json.fmt(planning, .{}),
-        json.fmt(extractObjective(brief_text), .{}),                    json.fmt(brief_text, .{}),
-        json.fmt(mission_id, .{}),                                      json.fmt(trace_path, .{}),
-        ctx_cfg.kind,                                                   ctx_cfg.max_tokens,
-        tm.role_max_steps,                                              tm.max_role_turns,
-        if (resume_flag) ",\"resume\":true" else "",                    json.fmt(bash_desc, .{}),
-        if (mcp) |m| m.toolEntriesJson(gpa) catch return oom() else "",
+
+    // ---- queue (M6): N missions sequentially under this one kernel ---------
+    // Per-mission planning roots (<base>-<stem>) and budget scopes; an
+    // existing substrate resumes instead of refusing (idempotent, cron-safe);
+    // terminal substrates report and move on. SIGINT stops the queue between
+    // missions and aborts the one in flight. Trim's saved_bytes scope stays
+    // pinned to the first mission id (v1 shared-roster limit).
+    if (queue_mode) {
+        installSigint();
+        var worst: u8 = 0;
+        for (brief_paths.items, brief_texts.items) |qpath, qtext| {
+            if (sigint_hits.load(.acquire) > 0) break;
+            const mid = stem(qpath);
+            var root = std.fmt.allocPrint(gpa, "{s}-{s}", .{ planning_base, mid }) catch return oom();
+            if (run_stamp)
+                root = std.fmt.allocPrint(gpa, "{s}-{s}", .{ root, runStamp() }) catch return oom();
+            const resume_q = fileExists(gpa, root, "mission.json");
+
+            const bconf = std.fmt.allocPrint(gpa, "{{\"scope\":{f},\"max_tokens\":{d}}}", .{
+                json.fmt(mid, .{}), tm.budget_max_tokens,
+            }) catch return oom();
+            const conf = caller.call("zygos::budget::configure", bconf) catch return boot_fail();
+            conf.deinit(gpa);
+
+            if (getEnv(env, "ZYGOS_VAULT_ROOT")) |vault_root| {
+                const cp_req = zygos.mission_boot.checkpointRequest(gpa, mid) catch return oom();
+                const cp = caller.call("zygos::tessera::checkpoint", cp_req) catch {
+                    eprint("mission: vault checkpoint failed for {s}\n", .{vault_root});
+                    return 2;
+                };
+                defer cp.deinit(gpa);
+                if (zygos.mission_boot.checkpointVerdict(cp) == .refuse) {
+                    eprint("mission: vault checkpoint failed for {s}\n", .{vault_root});
+                    return 2;
+                }
+            }
+
+            {
+                const ctl_worker = zygos.inproc.Worker.spawn(gpa, &actor, &registry, "mission-control-tail") catch return boot_fail();
+                if (std.Thread.spawn(.{}, controlLoop, .{ gpa, ctl_worker, root, mid })) |t| t.detach() else |_| {}
+                const sig_worker = zygos.inproc.Worker.spawn(gpa, &actor, &registry, "mission-sigint") catch return boot_fail();
+                if (std.Thread.spawn(.{}, sigintWatch, .{ gpa, sig_worker, mid })) |t| t.detach() else |_| {}
+            }
+
+            const qtrace = std.fmt.allocPrint(gpa, "{s}/{s}", .{ root, zygos.trace.file_name }) catch return oom();
+            eprint("mission queue: {s} → {s}{s}\n", .{ mid, root, if (resume_q) " (resume)" else "" });
+            const qreq = buildStartRequest(gpa, .{
+                .mission_id = mid,
+                .planning = root,
+                .brief_text = qtext,
+                .trace_path = qtrace,
+                .resume_flag = resume_q,
+                .bash_desc = bash_desc,
+                .mcp_entries = if (mcp) |mm| mm.toolEntriesJson(gpa) catch return oom() else "",
+                .ctx_kind = ctx_cfg.kind,
+                .ctx_max_tokens = ctx_cfg.max_tokens,
+                .role_max_steps = tm.role_max_steps,
+                .max_role_turns = tm.max_role_turns,
+            }) catch return oom();
+            const qres = caller.call("zygos::missions::start", qreq) catch {
+                eprint("mission {s}: bus call failed\n", .{mid});
+                worst = @max(worst, 1);
+                continue;
+            };
+            defer qres.deinit(gpa);
+            switch (qres) {
+                .err => |code| {
+                    eprint("mission {s}: errored: {s}\n", .{ mid, code });
+                    worst = @max(worst, 1);
+                },
+                .ok => |payload| {
+                    writeStdout(payload);
+                    writeStdout("\n");
+                    worst = @max(worst, terminalExitCode(gpa, payload));
+                },
+            }
+        }
+        return worst;
+    }
+
+    const request = buildStartRequest(gpa, .{
+        .mission_id = mission_id,
+        .planning = planning,
+        .brief_text = brief_text,
+        .trace_path = trace_path,
+        .resume_flag = resume_flag,
+        .bash_desc = bash_desc,
+        .mcp_entries = if (mcp) |m| m.toolEntriesJson(gpa) catch return oom() else "",
+        .ctx_kind = ctx_cfg.kind,
+        .ctx_max_tokens = ctx_cfg.max_tokens,
+        .role_max_steps = tm.role_max_steps,
+        .max_role_turns = tm.max_role_turns,
     }) catch return oom();
 
     // M7 net hardening: SIGINT (cron kill, Ctrl-C) lands as a clean abort —
@@ -433,11 +512,63 @@ fn sigintWatch(gpa: std.mem.Allocator, worker: *zygos.inproc.Worker, mission_id:
 fn usage() u8 {
     eprint(
         "usage: zygos mission start|resume <brief.md> [--planning <dir>] [--resume] [--run-stamp] [--no-tui]\n" ++
+            "       zygos mission queue [--planning <base>] [--run-stamp] <brief.md>...\n" ++
             "       zygos mission trace <planning-dir|events.jsonl>\n" ++
-            "       zygos mission attach <planning-dir>\n",
+            "       zygos mission attach <planning-dir>\n" ++
+            "       zygos mission dashboard <dir>\n",
         .{},
     );
     return 2;
+}
+
+const StartParams = struct {
+    mission_id: []const u8,
+    planning: []const u8,
+    brief_text: []const u8,
+    trace_path: []const u8,
+    resume_flag: bool,
+    bash_desc: []const u8,
+    mcp_entries: []const u8,
+    ctx_kind: zygos.context.Kind,
+    ctx_max_tokens: usize,
+    role_max_steps: i64,
+    max_role_turns: i64,
+};
+
+/// The missions::start request body — shared by the single-mission path and
+/// the queue loop so the wire shape can never drift between them.
+fn buildStartRequest(gpa: std.mem.Allocator, p: StartParams) error{OutOfMemory}![]u8 {
+    return std.fmt.allocPrint(gpa,
+        \\{{"mission_id":{f},"planning_root":{f},"objective":{f},"brief":{f},
+        \\ "router_function":"zygos::models::resolve",
+        \\ "gate_function":"zygos::approvals::request",
+        \\ "policy_function":"zygos::policy::check",
+        \\ "approval_function":"zygos::approvals::request",
+        \\ "budget_scope":{f},"trace_path":{f},
+        \\ "context_strategy":{{"kind":"{t}","max_tokens":{d}}},
+        \\ "role_max_steps":{d},"max_role_turns":{d}{s},
+        \\ "tools":[
+        \\  {{"name":"bash","function_id":"zygos::tools::bash",
+        \\   "description":{f},
+        \\   "input_schema":{{"type":"object","properties":{{"command":{{"type":"string",
+        \\    "description":"the shell command to run"}}}},"required":["command"]}}}},
+        \\  {{"name":"web_search","function_id":"zygos::tools::web_search",
+        \\   "description":"Search the web; returns a list of {{title,url,snippet}} results.",
+        \\   "input_schema":{{"type":"object","properties":{{"query":{{"type":"string",
+        \\    "description":"the search query"}}}},"required":["query"]}}}},
+        \\  {{"name":"web_fetch","function_id":"zygos::tools::web_fetch",
+        \\   "description":"Fetch a URL and return its readable text content.",
+        \\   "input_schema":{{"type":"object","properties":{{"url":{{"type":"string",
+        \\    "description":"the absolute http(s) URL to fetch"}}}},"required":["url"]}}}}{s}]}}
+    , .{
+        json.fmt(p.mission_id, .{}),                   json.fmt(p.planning, .{}),
+        json.fmt(extractObjective(p.brief_text), .{}), json.fmt(p.brief_text, .{}),
+        json.fmt(p.mission_id, .{}),                   json.fmt(p.trace_path, .{}),
+        p.ctx_kind,                                    p.ctx_max_tokens,
+        p.role_max_steps,                              p.max_role_turns,
+        if (p.resume_flag) ",\"resume\":true" else "", json.fmt(p.bash_desc, .{}),
+        p.mcp_entries,
+    });
 }
 
 /// Detached control-channel poller inside the RUNNING mission: tail
@@ -462,6 +593,61 @@ fn controlLoop(gpa: std.mem.Allocator, worker: *zygos.inproc.Worker, planning: [
             res.deinit(gpa);
         }
     }
+}
+
+/// `zygos mission dashboard <dir>` — one status line per mission substrate
+/// under <dir> (the dir itself and its immediate children). File-based, so
+/// live, parked, and crashed runs all list from any process; pair with
+/// `zygos mission attach <root>` to intervene.
+fn runDashboard(gpa: std.mem.Allocator, dir: []const u8) u8 {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const trimmed = std.mem.trimEnd(u8, dir, "/");
+    const runner = zygos.context_thread.PopenRunner.runner();
+    var shown: usize = 0;
+    for ([_][]const u8{ "/mission.json", "/*/mission.json" }) |suffix| {
+        const glob = std.mem.concat(arena, u8, &.{ trimmed, suffix }) catch return oom();
+        const listing = runner.run(arena, &.{ "ls", "-1d", glob }) orelse continue;
+        var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, listing, "\n"), '\n');
+        while (lines.next()) |path| {
+            if (path.len == 0) continue;
+            const line = dashboardLine(arena, path) orelse continue;
+            writeStdout(line);
+            shown += 1;
+        }
+    }
+    if (shown == 0) {
+        eprint("dashboard: no mission substrates under {s}\n", .{trimmed});
+        return 2;
+    }
+    return 0;
+}
+
+fn dashboardLine(arena: std.mem.Allocator, state_path: []const u8) ?[]const u8 {
+    const text = readWholeFile(arena, state_path) orelse return null;
+    const v = json.parseFromSliceLeaky(json.Value, arena, text, .{}) catch return null;
+    if (v != .object) return null;
+    const state = strOf(v.object.get("state")) orelse "?";
+    const stop = strOf(v.object.get("stop")) orelse "?";
+    const mid = strOf(v.object.get("mission_id")) orelse "?";
+    var tasks: usize = 0;
+    var done: usize = 0;
+    if (v.object.get("tasks")) |tv| if (tv == .array) {
+        tasks = tv.array.items.len;
+        for (tv.array.items) |t| {
+            if (t == .object) if (t.object.get("done")) |d| {
+                if (d == .bool and d.bool) done += 1;
+            };
+        }
+    };
+    const turns = if (v.object.get("role_turns_used")) |n| (if (n == .integer) n.integer else 0) else 0;
+    const root = if (std.mem.lastIndexOfScalar(u8, state_path, '/')) |i| state_path[0..i] else state_path;
+    return std.fmt.allocPrint(
+        arena,
+        "{s}  {s} ({s})  tasks {d}/{d}  role_turns {d}  {s}\n",
+        .{ mid, state, stop, done, tasks, turns, root },
+    ) catch null;
 }
 
 /// `zygos mission attach <planning-dir>` — tail the run's events.jsonl as a

@@ -32,13 +32,16 @@ pub fn envInt(env: []const EnvPair, name: []const u8, default: i64) i64 {
 // argv → Args
 // ---------------------------------------------------------------------------
 
-pub const Verb = enum { start, trace, attach };
+pub const Verb = enum { start, trace, attach, queue, dashboard };
 
-/// `resume` normalizes to `.start` + `resume_flag`; for `.trace`/`.attach`,
-/// `brief_path` holds the target (planning dir, or events.jsonl for trace).
+/// `resume` normalizes to `.start` + `resume_flag`; for `.trace`/`.attach`/
+/// `.dashboard`, `brief_path` holds the target. `.queue` takes flags first,
+/// then one-or-more briefs: `brief_path` is the first, `rest` the remainder
+/// (aliases into argv).
 pub const Args = struct {
     verb: Verb,
     brief_path: []const u8,
+    rest: []const []const u8 = &.{},
     planning: ?[]const u8 = null,
     resume_flag: bool = false,
     run_stamp: bool = false,
@@ -58,6 +61,10 @@ pub fn parseArgs(argv: []const []const u8) ArgsError!Args {
         out.verb = .trace;
     } else if (std.mem.eql(u8, verb, "attach")) {
         out.verb = .attach;
+    } else if (std.mem.eql(u8, verb, "queue")) {
+        out.verb = .queue;
+    } else if (std.mem.eql(u8, verb, "dashboard")) {
+        out.verb = .dashboard;
     } else if (!std.mem.eql(u8, verb, "start")) {
         return error.Usage;
     }
@@ -77,6 +84,11 @@ pub fn parseArgs(argv: []const []const u8) ArgsError!Args {
             out.no_tui = true;
         } else if (positional == null) {
             positional = a;
+            if (out.verb == .queue) {
+                // Queue: everything after the first brief is more briefs.
+                out.rest = argv[i + 1 ..];
+                break;
+            }
         } else {
             return error.Usage;
         }
@@ -241,6 +253,26 @@ test "parseArgs: trace requires a target" {
     const a = try parseArgs(&.{ "trace", ".planning" });
     try t.expectEqual(Verb.trace, a.verb);
     try t.expectEqualStrings(".planning", a.brief_path);
+}
+
+test "parseArgs: queue takes flags then one-or-more briefs" {
+    try t.expectError(error.Usage, parseArgs(&.{"queue"}));
+    const a = try parseArgs(&.{ "queue", "--planning", "base", "a.md", "b.md", "c.md" });
+    try t.expectEqual(Verb.queue, a.verb);
+    try t.expectEqualStrings("base", a.planning.?);
+    try t.expectEqualStrings("a.md", a.brief_path);
+    try t.expectEqual(@as(usize, 2), a.rest.len);
+    try t.expectEqualStrings("b.md", a.rest[0]);
+    try t.expectEqualStrings("c.md", a.rest[1]);
+    const one = try parseArgs(&.{ "queue", "solo.md" });
+    try t.expectEqual(@as(usize, 0), one.rest.len);
+}
+
+test "parseArgs: dashboard takes a directory target" {
+    try t.expectError(error.Usage, parseArgs(&.{"dashboard"}));
+    const a = try parseArgs(&.{ "dashboard", "runs" });
+    try t.expectEqual(Verb.dashboard, a.verb);
+    try t.expectEqualStrings("runs", a.brief_path);
 }
 
 test "parseArgs: attach takes a planning-dir target" {
