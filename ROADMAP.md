@@ -65,7 +65,27 @@ real-provider smokes.
 
 ---
 
-## PROPOSED
+## PROPOSED — ALL IMPLEMENTED (2026-07-21..22, commits 1ebe1aa..43ef187)
+
+Every item below landed TDD-first (579 → 670 tests green; all five
+network-free e2e legs + the Node SDK leg pass). Section headers below keep
+the original planning text; per-item status:
+
+- **M4.7** — brave key_env fix (1ebe1aa, closes issues/0001), mission_boot
+  extraction (1ebe1aa), shared assembler core (d8e66e9), typed TraceEvent
+  (e942078), missing specs (3c42159). Y5's harness blocker is gone; the
+  real-vault unattended rerun remains at the human gate.
+- **M5** — ContextStrategy seam + zygos.zon config (55eeea7), conformance
+  harness (8106c56), SubstrateStrategy (55eeea7), RecallStrategy (cb6748f),
+  ThreadStrategy + compaction-inside-strategies (b54a981, cb6748f);
+  spec: docs/specs/context.md.
+- **M6** — missions::steer/pause/resume (afa3a49), control channel +
+  `mission attach` (f4df8e2, docs/specs/mission-attach.md), PO decision
+  journal (ca91f41), intervention TUI keys (f070b0a), missions::list +
+  `mission queue`/`mission dashboard` (503533a).
+- **M7** — role playbook as data (4e3c149), budget ledger (4c6f98e), net
+  hardening: writer queue + SIGINT graceful shutdown (40b2c51), executor
+  worktree isolation (43ef187).
 
 Sizes: S ≈ a session, M ≈ a few sessions, L ≈ a milestone-dominating build.
 Tags: which consumer the item is load-bearing for.
