@@ -24,71 +24,7 @@ pub const SubstrateStrategy = struct {
     ) context.Error!context.Assembled {
         _ = ctx;
         _ = budget; // enforced by the seam wrapper
-        const m = step.mission;
-
-        if (std.mem.eql(u8, step.role, "product-owner")) {
-            return .{ .content = m.objective };
-        }
-        if (std.mem.eql(u8, step.role, "planner")) {
-            // The substrate is the context: the planner reads the persisted
-            // mission brief, not driver state.
-            const brief = step.substrate.read(arena, mission_artifact) orelse {
-                diag.message = mission_artifact ++ " missing from the planning root";
-                return error.Failed;
-            };
-            if (m.feedback.len == 0) return .{ .content = brief };
-            return .{ .content = try std.fmt.allocPrint(
-                arena,
-                "{s}\n\nFeedback on the previous attempt:\n{s}\n",
-                .{ brief, m.feedback },
-            ) };
-        }
-        if (std.mem.eql(u8, step.role, "executor")) {
-            // The executor is stateless across turns; the prompt is its only
-            // memory. Without the progress block every turn re-discovers the
-            // workspace from scratch.
-            std.debug.assert(m.task_index < m.tasks.len);
-            var content: std.Io.Writer.Allocating = .init(arena);
-            const w = &content.writer;
-            w.print("Objective:\n{s}\n", .{m.objective}) catch return error.OutOfMemory;
-            if (m.tasks.len > 1) {
-                w.writeAll(if (m.task_index > 0)
-                    "\nPlan progress — earlier tasks are already complete and verified; " ++
-                        "do NOT redo, re-check, or re-test them:\n"
-                else
-                    "\nPlan:\n") catch return error.OutOfMemory;
-                for (m.tasks, 0..) |t, i| {
-                    const mark = if (t.done) "done" else if (i == m.task_index) "current" else "pending";
-                    w.print("{d}. [{s}] {s}\n", .{ i + 1, mark, t.desc }) catch return error.OutOfMemory;
-                    if (t.done and t.result.len > 0)
-                        w.print("   outcome: {s}\n", .{t.result}) catch return error.OutOfMemory;
-                }
-            }
-            w.print(
-                "\nYour task (do ONLY this, then stop):\n{s}\n",
-                .{m.tasks[m.task_index].desc},
-            ) catch return error.OutOfMemory;
-            if (m.feedback.len > 0)
-                w.print("\nFeedback on the previous attempt:\n{s}\n", .{m.feedback}) catch return error.OutOfMemory;
-            return .{ .content = content.written() };
-        }
-        if (std.mem.eql(u8, step.role, "verifier")) {
-            const brief = step.substrate.read(arena, mission_artifact) orelse {
-                diag.message = mission_artifact ++ " missing from the planning root";
-                return error.Failed;
-            };
-            const plan = step.substrate.read(arena, plan_artifact) orelse {
-                diag.message = plan_artifact ++ " missing from the planning root";
-                return error.Failed;
-            };
-            return .{ .content = try std.fmt.allocPrint(
-                arena,
-                "{s}\n{s}\nEvery task above has been executed. Verify the objective is met.\n",
-                .{ brief, plan },
-            ) };
-        }
-        diag.message = "unknown role";
-        return error.Failed;
+        return assembleContent(arena, step, diag);
     }
 
     fn absorbImpl(ctx: *anyopaque, step: context.StepRef, outcome: context.Outcome) context.Error!void {
@@ -97,6 +33,81 @@ pub const SubstrateStrategy = struct {
         _ = outcome;
     }
 };
+
+/// The artifacts-as-context assembly itself, budget-free — composable by
+/// richer strategies (recall/thread) that append to this base under their
+/// own budget math.
+pub fn assembleContent(
+    arena: std.mem.Allocator,
+    step: context.StepRef,
+    diag: *context.Diag,
+) context.Error!context.Assembled {
+    const m = step.mission;
+
+    if (std.mem.eql(u8, step.role, "product-owner")) {
+        return .{ .content = m.objective };
+    }
+    if (std.mem.eql(u8, step.role, "planner")) {
+        // The substrate is the context: the planner reads the persisted
+        // mission brief, not driver state.
+        const brief = step.substrate.read(arena, mission_artifact) orelse {
+            diag.message = mission_artifact ++ " missing from the planning root";
+            return error.Failed;
+        };
+        if (m.feedback.len == 0) return .{ .content = brief };
+        return .{ .content = try std.fmt.allocPrint(
+            arena,
+            "{s}\n\nFeedback on the previous attempt:\n{s}\n",
+            .{ brief, m.feedback },
+        ) };
+    }
+    if (std.mem.eql(u8, step.role, "executor")) {
+        // The executor is stateless across turns; the prompt is its only
+        // memory. Without the progress block every turn re-discovers the
+        // workspace from scratch.
+        std.debug.assert(m.task_index < m.tasks.len);
+        var content: std.Io.Writer.Allocating = .init(arena);
+        const w = &content.writer;
+        w.print("Objective:\n{s}\n", .{m.objective}) catch return error.OutOfMemory;
+        if (m.tasks.len > 1) {
+            w.writeAll(if (m.task_index > 0)
+                "\nPlan progress — earlier tasks are already complete and verified; " ++
+                    "do NOT redo, re-check, or re-test them:\n"
+            else
+                "\nPlan:\n") catch return error.OutOfMemory;
+            for (m.tasks, 0..) |t, i| {
+                const mark = if (t.done) "done" else if (i == m.task_index) "current" else "pending";
+                w.print("{d}. [{s}] {s}\n", .{ i + 1, mark, t.desc }) catch return error.OutOfMemory;
+                if (t.done and t.result.len > 0)
+                    w.print("   outcome: {s}\n", .{t.result}) catch return error.OutOfMemory;
+            }
+        }
+        w.print(
+            "\nYour task (do ONLY this, then stop):\n{s}\n",
+            .{m.tasks[m.task_index].desc},
+        ) catch return error.OutOfMemory;
+        if (m.feedback.len > 0)
+            w.print("\nFeedback on the previous attempt:\n{s}\n", .{m.feedback}) catch return error.OutOfMemory;
+        return .{ .content = content.written() };
+    }
+    if (std.mem.eql(u8, step.role, "verifier")) {
+        const brief = step.substrate.read(arena, mission_artifact) orelse {
+            diag.message = mission_artifact ++ " missing from the planning root";
+            return error.Failed;
+        };
+        const plan = step.substrate.read(arena, plan_artifact) orelse {
+            diag.message = plan_artifact ++ " missing from the planning root";
+            return error.Failed;
+        };
+        return .{ .content = try std.fmt.allocPrint(
+            arena,
+            "{s}\n{s}\nEvery task above has been executed. Verify the objective is met.\n",
+            .{ brief, plan },
+        ) };
+    }
+    diag.message = "unknown role";
+    return error.Failed;
+}
 
 /// Stateless: one shared instance serves every mission.
 var shared: SubstrateStrategy = .{};

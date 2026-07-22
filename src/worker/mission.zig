@@ -23,6 +23,7 @@ const trace_mod = @import("trace.zig");
 const brief_mod = @import("brief.zig");
 const context_mod = @import("context.zig");
 const context_substrate = @import("context_substrate.zig");
+const context_recall = @import("context_recall.zig");
 
 const log = std.log.scoped(.mission);
 
@@ -442,10 +443,18 @@ fn runMission(self: *MissionOrchestrator, arena: std.mem.Allocator, request_json
             .max_tokens = uintFieldOr(v.object, "max_tokens", context_mod.default_max_tokens),
         };
     };
+    var recall_owned: ?*context_recall.RecallStrategy = null;
+    defer if (recall_owned) |r| r.destroy();
     const strategy: context_mod.ContextStrategy = switch (ctx_cfg.kind) {
         .substrate => context_substrate.strategy(),
+        .recall => blk: {
+            const dir = try std.fmt.allocPrint(arena, "{s}/memory", .{planning_root});
+            recall_owned = context_recall.RecallStrategy.create(self.gpa, dir, .{}) catch
+                return error.OutOfMemory;
+            break :blk recall_owned.?.strategy();
+        },
         // Configuring a strategy before it lands refuses the start.
-        .recall, .thread => return error.MalformedRequest,
+        .thread => return error.MalformedRequest,
     };
     var store_substrate = StoreSubstrate{
         .gpa = self.gpa,
@@ -1425,10 +1434,35 @@ test "context_strategy: a tiny max_tokens budget fails the mission with a budget
     try testing.expect(std.mem.indexOf(u8, res.ok, "context budget exceeded") != null);
 }
 
+test "context_strategy: kind recall runs the pipeline and persists a source index" {
+    var h = try Harness.init(testing.allocator, &.{ po_ok, plan1, exec_ok, verify_pass });
+    defer h.deinit();
+    const approvals = try approval_mod.ApprovalWorker.start(testing.allocator, &h.actor, &h.registry, .auto_approve);
+    defer approvals.stop();
+
+    const req = try h.startReq(
+        testing.allocator,
+        seed_and_gate ++ ",\"context_strategy\":{\"kind\":\"recall\"}",
+    );
+    defer testing.allocator.free(req);
+    const res = try h.caller.call("zygos::missions::start", req);
+    defer res.deinit(testing.allocator);
+    try testing.expect(res == .ok);
+    try expectTerminal(res.ok, "done", "completed");
+
+    // Absorbed role outcomes landed in the rolling index on disk.
+    const spath = try std.fmt.allocPrint(testing.allocator, "{s}/memory/sources.jsonl", .{h.root});
+    defer testing.allocator.free(spath);
+    const text = trace_mod.readFile(testing.allocator, spath) orelse return error.ReadFailed;
+    defer testing.allocator.free(text);
+    try testing.expect(std.mem.indexOf(u8, text, "\"id\":\"outcome:executor:0\"") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "\"id\":\"outcome:verifier:") != null);
+}
+
 test "context_strategy: an unimplemented or unknown kind refuses the start (fail closed)" {
     var h = try Harness.init(testing.allocator, &.{po_ok});
     defer h.deinit();
-    for ([_][]const u8{ "recall", "thread", "transcript-dump" }) |kind| {
+    for ([_][]const u8{ "thread", "transcript-dump" }) |kind| {
         const extra = try std.fmt.allocPrint(
             testing.allocator,
             ",\"objective\":\"seed: gizmo\",\"context_strategy\":{{\"kind\":\"{s}\"}}",
