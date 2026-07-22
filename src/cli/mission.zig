@@ -14,36 +14,15 @@ const zygos = @import("zygos");
 const eprint = std.debug.print; // stderr
 
 pub fn run(gpa: std.mem.Allocator, args: *std.process.Args.Iterator) u8 {
-    // ---- args --------------------------------------------------------------
-    const verb = args.next() orelse return usage();
-    var resume_flag = false;
-    if (std.mem.eql(u8, verb, "resume")) {
-        resume_flag = true;
-    } else if (std.mem.eql(u8, verb, "trace")) {
-        return runTrace(gpa, args);
-    } else if (!std.mem.eql(u8, verb, "start")) {
-        return usage();
-    }
-    var brief_path: ?[]const u8 = null;
-    var planning_opt: ?[]const u8 = null;
-    var run_stamp = false;
-    var no_tui = false;
-    while (args.next()) |a| {
-        if (std.mem.eql(u8, a, "--planning")) {
-            planning_opt = args.next() orelse return usage();
-        } else if (std.mem.eql(u8, a, "--resume")) {
-            resume_flag = true;
-        } else if (std.mem.eql(u8, a, "--run-stamp")) {
-            run_stamp = true;
-        } else if (std.mem.eql(u8, a, "--no-tui")) {
-            no_tui = true;
-        } else if (brief_path == null) {
-            brief_path = a;
-        } else {
-            return usage();
-        }
-    }
-    const bp = brief_path orelse return usage();
+    // ---- args (rules live in worker/mission_boot.zig) ----------------------
+    var argv: std.ArrayList([]const u8) = .empty;
+    while (args.next()) |a| argv.append(gpa, a) catch return oom();
+    const parsed = zygos.mission_boot.parseArgs(argv.items) catch return usage();
+    if (parsed.verb == .trace) return runTrace(gpa, parsed.brief_path);
+    const resume_flag = parsed.resume_flag;
+    const run_stamp = parsed.run_stamp;
+    const no_tui = parsed.no_tui;
+    const bp = parsed.brief_path;
 
     // ---- brief (lint before anything boots) --------------------------------
     const brief_text = readWholeFile(gpa, bp) orelse {
@@ -101,18 +80,15 @@ pub fn run(gpa: std.mem.Allocator, args: *std.process.Args.Iterator) u8 {
 
     // ---- kernel + roster (the e2e/m3 wiring, catalog + manual approvals) ----
     var registry = zygos.inproc.Registry.init(gpa, null);
-    // The blocking missions::start call spans the WHOLE mission — under the
-    // flat invoke timeout it doubled as a mission duration cap (a 1h default
-    // killed hour-long research runs mid-flight). It gets its own ceiling;
-    // everything else (role turns, providers, gates) keeps
-    // ZYGOS_INVOKE_TIMEOUT_MS. Must outlive the actor: function-local.
+    const tm = zygos.mission_boot.timeouts(env);
+    // The blocking missions::start call spans the WHOLE mission, so it gets
+    // its own ceiling; everything else keeps the invoke timeout. Must
+    // outlive the actor: function-local.
     const timeout_overrides = [_]zygos.actor.TimeoutOverride{
-        .{ .prefix = "zygos::missions::", .timeout_ms = envInt(env, "ZYGOS_MISSION_TIMEOUT_MS", 86_400_000) },
+        .{ .prefix = "zygos::missions::", .timeout_ms = tm.mission_ms },
     };
     var actor = zygos.actor.Actor.init(gpa, .{
-        // Role turns ride bus invocations; real providers and console gates
-        // outlive the 30s default.
-        .invoke_timeout_ms = envInt(env, "ZYGOS_INVOKE_TIMEOUT_MS", 3_600_000),
+        .invoke_timeout_ms = tm.invoke_ms,
         .invoke_timeout_overrides = &timeout_overrides,
     }, registry.outbound()) catch return oom();
     const kernel = std.Thread.spawn(.{}, zygos.actor.Actor.run, .{&actor}) catch {
@@ -145,15 +121,12 @@ pub fn run(gpa: std.mem.Allocator, args: *std.process.Args.Iterator) u8 {
     const cwd = std.mem.sliceTo(&cwd_buf, 0);
 
     const mission_id = stem(bp);
-    const planning_base = absPath(gpa, cwd, planning_opt orelse "./.planning") catch return oom();
+    const planning_base = absPath(gpa, cwd, parsed.planning orelse "./.planning") catch return oom();
     // Unattended-rerun semantics (Y3): --run-stamp gives every scheduled
     // invocation its own planning root; without it, starting over an
     // existing mission substrate refuses instead of clobbering it.
-    const planning = if (run_stamp)
-        std.fmt.allocPrint(gpa, "{s}-{s}", .{ planning_base, runStamp() }) catch return oom()
-    else
-        planning_base;
-    if (!resume_flag and !run_stamp and fileExists(gpa, planning, "mission.json")) {
+    const planning = zygos.mission_boot.planningRoot(gpa, planning_base, run_stamp, runStamp()) catch return oom();
+    if (zygos.mission_boot.refuseStart(resume_flag, run_stamp, fileExists(gpa, planning, "mission.json"))) {
         eprint(
             "mission: {s} already holds a mission; resume it, pick a fresh --planning, or pass --run-stamp\n",
             .{planning},
@@ -191,28 +164,16 @@ pub fn run(gpa: std.mem.Allocator, args: *std.process.Args.Iterator) u8 {
     // per-tool asks return with X5's tightening pass. Web tools (Y1) ride
     // the same policy gate with the URL in the policy request (Y2). MCP
     // tools are operator-configured, so they boot as allow too.
-    var policy_rules: std.ArrayList(zygos.policy.Rule) = .empty;
-    policy_rules.appendSlice(gpa, &.{
-        .{ .tool = "bash", .verdict = .allow },
-        .{ .tool = "web_fetch", .verdict = .allow },
-        .{ .tool = "web_search", .verdict = .allow },
-    }) catch return oom();
-    if (mcp) |m| {
-        const names = m.toolNames(gpa) catch return oom();
-        for (names) |n| policy_rules.append(gpa, .{ .tool = n, .verdict = .allow }) catch return oom();
-    }
-    const policy = zygos.policy.PolicyWorker.start(gpa, &actor, &registry, policy_rules.items) catch return boot_fail();
+    const mcp_names: []const []const u8 = if (mcp) |m| m.toolNames(gpa) catch return oom() else &.{};
+    const policy_rules = zygos.mission_boot.policySeed(gpa, mcp_names) catch return oom();
+    const policy = zygos.policy.PolicyWorker.start(gpa, &actor, &registry, policy_rules) catch return boot_fail();
     _ = policy;
-    // Search backend is operator env config: ZYGOS_SEARCH_ENGINE
-    // (brave|searxng) + ZYGOS_SEARCH_ENDPOINT (+ ZYGOS_SEARCH_KEY_ENV,
-    // default BRAVE_API_KEY for brave). Unset ⇒ web_search replies a
-    // structured error per call; web_fetch always works.
     const web = zygos.web_tools.WebToolsWorker.start(gpa, &actor, &registry, io_boot.io(), .{
-        .search = searchConfigFromEnv(env),
+        .search = zygos.mission_boot.searchConfigFromEnv(env),
     }) catch return boot_fail();
     _ = web;
     const approvals = zygos.approval.ApprovalWorker.start(gpa, &actor, &registry, .{
-        .manual = .{ .timeout_ms = @intCast(envInt(env, "ZYGOS_APPROVAL_TIMEOUT_MS", 300_000)) },
+        .manual = .{ .timeout_ms = @intCast(tm.approval_ms) },
     }) catch return boot_fail();
     _ = approvals;
     const router = zygos.router.RouterWorker.start(gpa, &actor, &registry, route_cfg) catch return boot_fail();
@@ -231,7 +192,7 @@ pub fn run(gpa: std.mem.Allocator, args: *std.process.Args.Iterator) u8 {
     const caller = zygos.inproc.Worker.spawn(gpa, &actor, &registry, "mission-cli") catch return boot_fail();
 
     const budget_req = std.fmt.allocPrint(gpa, "{{\"scope\":{f},\"max_tokens\":{d}}}", .{
-        json.fmt(mission_id, .{}), envInt(env, "ZYGOS_BUDGET_MAX_TOKENS", 1_000_000),
+        json.fmt(mission_id, .{}), tm.budget_max_tokens,
     }) catch return oom();
     const conf = caller.call("zygos::budget::configure", budget_req) catch return boot_fail();
     conf.deinit(gpa);
@@ -244,13 +205,13 @@ pub fn run(gpa: std.mem.Allocator, args: *std.process.Args.Iterator) u8 {
             .root = vault_root,
         }) catch return boot_fail();
         _ = undo;
-        const cp_req = std.fmt.allocPrint(gpa, "{{\"label\":\"pre-mission {s}\"}}", .{mission_id}) catch return oom();
+        const cp_req = zygos.mission_boot.checkpointRequest(gpa, mission_id) catch return oom();
         const cp = caller.call("zygos::tessera::checkpoint", cp_req) catch {
             eprint("mission: vault checkpoint failed for {s}\n", .{vault_root});
             return 2;
         };
         defer cp.deinit(gpa);
-        if (cp == .err) {
+        if (zygos.mission_boot.checkpointVerdict(cp) == .refuse) {
             eprint("mission: vault checkpoint failed for {s}\n", .{vault_root});
             return 2;
         }
@@ -363,7 +324,7 @@ pub fn run(gpa: std.mem.Allocator, args: *std.process.Args.Iterator) u8 {
         json.fmt(mission_id, .{}),                                      json.fmt(planning, .{}),
         json.fmt(extractObjective(brief_text), .{}),                    json.fmt(brief_text, .{}),
         json.fmt(mission_id, .{}),                                      json.fmt(trace_path, .{}),
-        envInt(env, "ZYGOS_ROLE_MAX_STEPS", 24),                        envInt(env, "ZYGOS_MAX_ROLE_TURNS", 48),
+        tm.role_max_steps,                                              tm.max_role_turns,
         if (resume_flag) ",\"resume\":true" else "",                    json.fmt(bash_desc, .{}),
         if (mcp) |m| m.toolEntriesJson(gpa) catch return oom() else "",
     }) catch return oom();
@@ -424,8 +385,7 @@ fn usage() u8 {
 
 /// `zygos mission trace <planning-dir|events.jsonl>` — render the run's
 /// event log as a human view. Read-only; exits 2 when there is no trace.
-fn runTrace(gpa: std.mem.Allocator, args: *std.process.Args.Iterator) u8 {
-    const target = args.next() orelse return usage();
+fn runTrace(gpa: std.mem.Allocator, target: []const u8) u8 {
     // Planning root first: fopen("r") on a directory succeeds with an empty
     // read on macOS, so trying the bare target first would render nothing.
     const joined = std.fmt.allocPrint(gpa, "{s}/{s}", .{
@@ -689,28 +649,4 @@ fn envPairs(gpa: std.mem.Allocator) error{OutOfMemory}![]zygos.providers_catalog
     return list.toOwnedSlice(gpa);
 }
 
-fn getEnv(env: []const zygos.providers_catalog.EnvPair, name: []const u8) ?[]const u8 {
-    for (env) |p| if (std.mem.eql(u8, p.name, name)) return p.value;
-    return null;
-}
-
-fn searchConfigFromEnv(env: []const zygos.providers_catalog.EnvPair) ?zygos.web_tools.SearchConfig {
-    const engine_raw = getEnv(env, "ZYGOS_SEARCH_ENGINE") orelse return null;
-    if (std.mem.eql(u8, engine_raw, "brave")) return .{
-        .endpoint = getEnv(env, "ZYGOS_SEARCH_ENDPOINT") orelse "https://api.search.brave.com",
-        .key_env = getEnv(env, "ZYGOS_SEARCH_KEY_ENV") orelse "BRAVE_API_KEY",
-        .engine = .brave,
-    };
-    if (std.mem.eql(u8, engine_raw, "searxng")) {
-        return .{
-            .endpoint = getEnv(env, "ZYGOS_SEARCH_ENDPOINT") orelse return null,
-            .engine = .searxng,
-        };
-    }
-    return null;
-}
-
-fn envInt(env: []const zygos.providers_catalog.EnvPair, name: []const u8, default: i64) i64 {
-    const raw = getEnv(env, name) orelse return default;
-    return std.fmt.parseInt(i64, raw, 10) catch default;
-}
+const getEnv = zygos.mission_boot.getEnv;
