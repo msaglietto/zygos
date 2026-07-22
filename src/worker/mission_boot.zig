@@ -32,10 +32,10 @@ pub fn envInt(env: []const EnvPair, name: []const u8, default: i64) i64 {
 // argv → Args
 // ---------------------------------------------------------------------------
 
-pub const Verb = enum { start, trace };
+pub const Verb = enum { start, trace, attach };
 
-/// `resume` normalizes to `.start` + `resume_flag`; for `.trace`, `brief_path`
-/// holds the trace target (planning dir or events.jsonl).
+/// `resume` normalizes to `.start` + `resume_flag`; for `.trace`/`.attach`,
+/// `brief_path` holds the target (planning dir, or events.jsonl for trace).
 pub const Args = struct {
     verb: Verb,
     brief_path: []const u8,
@@ -56,6 +56,8 @@ pub fn parseArgs(argv: []const []const u8) ArgsError!Args {
         out.resume_flag = true;
     } else if (std.mem.eql(u8, verb, "trace")) {
         out.verb = .trace;
+    } else if (std.mem.eql(u8, verb, "attach")) {
+        out.verb = .attach;
     } else if (!std.mem.eql(u8, verb, "start")) {
         return error.Usage;
     }
@@ -238,6 +240,13 @@ test "parseArgs: trace requires a target" {
     try t.expectError(error.Usage, parseArgs(&.{"trace"}));
     const a = try parseArgs(&.{ "trace", ".planning" });
     try t.expectEqual(Verb.trace, a.verb);
+    try t.expectEqualStrings(".planning", a.brief_path);
+}
+
+test "parseArgs: attach takes a planning-dir target" {
+    try t.expectError(error.Usage, parseArgs(&.{"attach"}));
+    const a = try parseArgs(&.{ "attach", ".planning" });
+    try t.expectEqual(Verb.attach, a.verb);
     try t.expectEqualStrings(".planning", a.brief_path);
 }
 

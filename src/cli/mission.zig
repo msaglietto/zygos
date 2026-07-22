@@ -19,6 +19,7 @@ pub fn run(gpa: std.mem.Allocator, args: *std.process.Args.Iterator) u8 {
     while (args.next()) |a| argv.append(gpa, a) catch return oom();
     const parsed = zygos.mission_boot.parseArgs(argv.items) catch return usage();
     if (parsed.verb == .trace) return runTrace(gpa, parsed.brief_path);
+    if (parsed.verb == .attach) return runAttach(gpa, parsed.brief_path);
     const resume_flag = parsed.resume_flag;
     const run_stamp = parsed.run_stamp;
     const no_tui = parsed.no_tui;
@@ -229,6 +230,14 @@ pub fn run(gpa: std.mem.Allocator, args: *std.process.Args.Iterator) u8 {
     const console_worker = zygos.inproc.Worker.spawn(gpa, &actor, &registry, "mission-console") catch return boot_fail();
     const trace_path = std.fmt.allocPrint(gpa, "{s}/{s}", .{ planning, zygos.trace.file_name }) catch return oom();
 
+    // Control channel (M6): a detached poller tails <planning>/control.jsonl
+    // and dispatches steer/pause/resume/approve commands appended by
+    // `zygos mission attach` onto the bus.
+    {
+        const ctl_worker = zygos.inproc.Worker.spawn(gpa, &actor, &registry, "mission-control-tail") catch return boot_fail();
+        if (std.Thread.spawn(.{}, controlLoop, .{ gpa, ctl_worker, planning, mission_id })) |t| t.detach() else |_| {}
+    }
+
     const want_tui = !no_tui and getEnv(env, "ZYGOS_NO_TUI") == null and zygos.tui.term.RealTerm.isTty();
     var real_term: zygos.tui.term.RealTerm = .{};
     var ui: ?*zygos.tui.Tui = null;
@@ -383,10 +392,108 @@ fn tapToModel(ctx: *anyopaque, kind: zygos.stream_tap.Kind, bytes: []const u8) v
 fn usage() u8 {
     eprint(
         "usage: zygos mission start|resume <brief.md> [--planning <dir>] [--resume] [--run-stamp] [--no-tui]\n" ++
-            "       zygos mission trace <planning-dir|events.jsonl>\n",
+            "       zygos mission trace <planning-dir|events.jsonl>\n" ++
+            "       zygos mission attach <planning-dir>\n",
         .{},
     );
     return 2;
+}
+
+/// Detached control-channel poller inside the RUNNING mission: tail
+/// control.jsonl, translate each command onto the bus. Malformed lines are
+/// skipped; a dead bus ends the loop (the process is exiting).
+fn controlLoop(gpa: std.mem.Allocator, worker: *zygos.inproc.Worker, planning: []const u8, mission_id: []const u8) void {
+    var tail: zygos.control.Tail = .{};
+    while (true) {
+        var interval: std.c.timespec = .{ .sec = 0, .nsec = 300 * std.time.ns_per_ms };
+        var rem: std.c.timespec = undefined;
+        _ = std.c.nanosleep(&interval, &rem);
+
+        var arena_state = std.heap.ArenaAllocator.init(gpa);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const path = std.fmt.allocPrint(arena, "{s}/{s}", .{ planning, zygos.control.file_name }) catch continue;
+        const lines = tail.poll(arena, path) catch continue;
+        for (lines) |line| {
+            const cmd = zygos.control.parseCommandLine(arena, line) orelse continue;
+            const req = zygos.control.requestFor(arena, mission_id, cmd) catch continue;
+            const res = worker.call(req.function, req.body) catch return;
+            res.deinit(gpa);
+        }
+    }
+}
+
+/// `zygos mission attach <planning-dir>` — tail the run's events.jsonl as a
+/// live rendered stream while stdin lines drive the control channel:
+/// `steer <text>` | `pause` | `resume` | `approve <id> y|n`. Works against a
+/// crashed mission too: the view shows what happened, commands park in
+/// control.jsonl until a resume picks them up. Ctrl-D detaches.
+fn runAttach(gpa: std.mem.Allocator, target: []const u8) u8 {
+    const dir = std.mem.trimEnd(u8, target, "/");
+    const events_path = std.fmt.allocPrint(gpa, "{s}/{s}", .{ dir, zygos.trace.file_name }) catch return oom();
+    eprint(
+        "attach: {s}\ncommands: steer <text> | pause | resume | approve <id> y|n | Ctrl-D detaches\n",
+        .{dir},
+    );
+
+    const Tailer = struct {
+        fn run(alloc: std.mem.Allocator, path: []const u8) void {
+            var tail: zygos.control.Tail = .{};
+            while (true) {
+                var interval: std.c.timespec = .{ .sec = 0, .nsec = 300 * std.time.ns_per_ms };
+                var rem: std.c.timespec = undefined;
+                _ = std.c.nanosleep(&interval, &rem);
+                var arena_state = std.heap.ArenaAllocator.init(alloc);
+                defer arena_state.deinit();
+                const arena = arena_state.allocator();
+                const lines = tail.poll(arena, path) catch continue;
+                for (lines) |line| {
+                    const with_nl = std.fmt.allocPrint(arena, "{s}\n", .{line}) catch continue;
+                    const rendered = zygos.trace.render(arena, with_nl) catch continue;
+                    writeStdout(rendered);
+                }
+            }
+        }
+    };
+    if (std.Thread.spawn(.{}, Tailer.run, .{ gpa, events_path })) |t| t.detach() else |_| {
+        eprint("attach: cannot spawn tailer\n", .{});
+        return 2;
+    }
+
+    var line_buf: [4096]u8 = undefined;
+    while (readStdinLine(&line_buf)) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t");
+        if (trimmed.len == 0) continue;
+        const cmd: zygos.control.Command = blk: {
+            if (std.mem.eql(u8, trimmed, "pause")) break :blk .pause;
+            if (std.mem.eql(u8, trimmed, "resume")) break :blk .@"resume";
+            if (std.mem.startsWith(u8, trimmed, "steer ")) {
+                const text = std.mem.trim(u8, trimmed["steer ".len..], " \t");
+                if (text.len == 0) {
+                    eprint("attach: steer needs text\n", .{});
+                    continue;
+                }
+                break :blk .{ .steer = .{ .text = text } };
+            }
+            if (std.mem.startsWith(u8, trimmed, "approve ")) {
+                var it = std.mem.tokenizeScalar(u8, trimmed["approve ".len..], ' ');
+                const id = it.next() orelse {
+                    eprint("attach: approve needs an id\n", .{});
+                    continue;
+                };
+                const verdict = it.next() orelse "n";
+                break :blk .{ .approve = .{
+                    .id = id,
+                    .approved = verdict.len > 0 and (verdict[0] == 'y' or verdict[0] == 'Y'),
+                } };
+            }
+            eprint("attach: unknown command: {s}\n", .{trimmed});
+            continue;
+        };
+        zygos.control.appendCommand(gpa, dir, cmd) catch return oom();
+        eprint("attach: queued\n", .{});
+    }
+    return 0;
 }
 
 /// `zygos mission trace <planning-dir|events.jsonl>` — render the run's
