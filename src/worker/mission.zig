@@ -685,7 +685,33 @@ fn runMission(self: *MissionOrchestrator, arena: std.mem.Allocator, request_json
         error.OutOfMemory => return error.OutOfMemory,
         else => log.warn("continuity close failed (mission outcome unaffected): {t}", .{err}),
     };
+    writeLedger(self, arena, cfg, &m);
     return replyTerminal(arena, &m);
+}
+
+/// M7 mission-level budget ledger: the scope's spend rollup (tokens +
+/// saved_bytes from the budget worker's data) written into the substrate at
+/// terminal state. Fail-open — an unreachable budget worker skips the
+/// ledger, never the outcome.
+fn writeLedger(self: *MissionOrchestrator, arena: std.mem.Allocator, cfg: RunConfig, m: *const Mission) void {
+    const scope = cfg.budget_scope orelse return;
+    const req = std.fmt.allocPrint(arena, "{{\"scope\":{f}}}", .{json.fmt(scope, .{})}) catch return;
+    const res = self.worker.call("zygos::budget::check", req) catch return;
+    defer res.deinit(self.gpa);
+    if (res != .ok) return;
+    const parsed = json.parseFromSliceLeaky(json.Value, arena, res.ok, .{}) catch return;
+    if (parsed != .object) return;
+    const used = if (parsed.object.get("used_tokens")) |v| (if (v == .integer) v.integer else 0) else 0;
+    const saved = if (parsed.object.get("saved_bytes")) |v| (if (v == .integer) v.integer else 0) else 0;
+    const md = std.fmt.allocPrint(
+        arena,
+        "# Ledger — {s}\n\nused_tokens: {d}\nsaved_bytes: {d}\nrole_turns: {d}\nstate: {t} ({t})\n",
+        .{ m.mission_id, used, saved, m.role_turns_used, m.state, m.stop },
+    ) catch return;
+    cfg.store.writeArtifact(self.gpa, "LEDGER.md", md) catch {};
+    log.info("mission {s}: ledger — {d} tokens, {d} bytes saved, {d} role turns", .{
+        m.mission_id, used, saved, m.role_turns_used,
+    });
 }
 
 /// W3 seam: when a continuity function + project ride the start request, the
@@ -2237,6 +2263,32 @@ test "pause parks durably at a role boundary; the substrate resumes to done" {
     defer rres.deinit(testing.allocator);
     try testing.expect(rres == .ok);
     try expectTerminal(rres.ok, "done", "completed");
+}
+
+test "budget ledger: terminal mission writes LEDGER.md with the scope rollup" {
+    const exec_usage = "{\"stop_reason\":\"end_turn\",\"content\":[{\"type\":\"text\",\"text\":\"done\"}]," ++
+        "\"usage\":{\"input_tokens\":100,\"output_tokens\":20}}";
+    var h = try Harness.init(testing.allocator, &.{ po_ok, plan1, exec_usage, verify_pass });
+    defer h.deinit();
+    const approvals = try approval_mod.ApprovalWorker.start(testing.allocator, &h.actor, &h.registry, .auto_approve);
+    defer approvals.stop();
+    const budget_mod = @import("budget.zig");
+    const budget = try budget_mod.BudgetWorker.start(testing.allocator, &h.actor, &h.registry);
+    defer budget.stop();
+    const conf = try h.caller.call("zygos::budget::configure", "{\"scope\":\"m-1\",\"max_tokens\":1000000}");
+    conf.deinit(testing.allocator);
+
+    const req = try h.startReq(testing.allocator, seed_and_gate ++ ",\"budget_scope\":\"m-1\"");
+    defer testing.allocator.free(req);
+    const res = try h.caller.call("zygos::missions::start", req);
+    defer res.deinit(testing.allocator);
+    try expectTerminal(res.ok, "done", "completed");
+
+    const text = try h.store().readArtifact(testing.allocator, "LEDGER.md");
+    defer testing.allocator.free(text);
+    try testing.expect(std.mem.indexOf(u8, text, "used_tokens: 120") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "saved_bytes:") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "state: done (completed)") != null);
 }
 
 test "PO decision journal: gate denial, verify failure, and acceptance land in DECISIONS.md" {
