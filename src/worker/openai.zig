@@ -13,25 +13,16 @@
 const std = @import("std");
 const stream_tap = @import("stream_tap.zig");
 const json = std.json;
+const core = @import("assembler.zig");
 
-pub const AssembleError = error{ OutOfMemory, MalformedEvent, ApiError, Incomplete };
-
-pub const StopReason = enum { end_turn, tool_use, max_tokens, unknown };
-
-pub const Block = union(enum) {
-    text: []const u8,
-    tool_use: struct { id: []const u8, name: []const u8, input_json: []const u8 },
-};
-
-pub const Usage = struct { input_tokens: u64 = 0, output_tokens: u64 = 0 };
-
-pub const Message = struct {
-    id: []const u8,
-    model: []const u8,
-    stop_reason: StopReason,
-    usage: Usage,
-    content: []const Block,
-};
+// Both SSE dialects share one terminal shape and the drift-prone helpers
+// (worker/assembler.zig) — a compat-endpoint quirk gets fixed once. The
+// chat dialect never produces `.stop_sequence`.
+pub const AssembleError = core.AssembleError;
+pub const StopReason = core.StopReason;
+pub const Block = core.Block;
+pub const Usage = core.Usage;
+pub const Message = core.Message;
 
 const ToolAcc = struct {
     id: std.ArrayList(u8) = .empty,
@@ -95,14 +86,7 @@ pub const Assembler = struct {
         if (self.model.len == 0) if (strField(obj, "model")) |m| {
             self.model = try self.gpa.dupe(u8, m);
         };
-        // Accept the anthropic spellings too: compat endpoints mix dialects
-        // (see anthropic.zig captureUsage for the observed GLM drift).
-        if (objField(obj, "usage")) |u| {
-            if (intField(u, "prompt_tokens") orelse intField(u, "input_tokens")) |n|
-                self.usage.input_tokens = n;
-            if (intField(u, "completion_tokens") orelse intField(u, "output_tokens")) |n|
-                self.usage.output_tokens = n;
-        }
+        if (objField(obj, "usage")) |u| core.captureUsage(&self.usage, u);
 
         const choices = obj.get("choices") orelse return null;
         if (choices != .array or choices.array.items.len == 0) return null;
@@ -191,62 +175,12 @@ pub const Assembler = struct {
     }
 };
 
-/// Some providers stream tool-args fragments that concatenate into an
-/// object with a repeated key (observed on GLM's anthropic dialect; the
-/// chat dialect gets the same guard — the wire downstream is strict
-/// std.json and rejects DuplicateField). Rewrite exactly that case
-/// last-wins (JS JSON.parse semantics); anything else passes through
-/// untouched. Best-effort, never fails the stream.
-fn canonicalizeDuplicateKeys(gpa: std.mem.Allocator, input: *std.ArrayList(u8)) void {
-    if (std.json.parseFromSlice(std.json.Value, gpa, input.items, .{})) |ok| {
-        ok.deinit();
-        return;
-    } else |err| if (err != error.DuplicateField) return;
-
-    const parsed = std.json.parseFromSlice(std.json.Value, gpa, input.items, .{
-        .duplicate_field_behavior = .use_last,
-    }) catch return;
-    defer parsed.deinit();
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    var ws: std.json.Stringify = .{ .writer = &out.writer, .options = .{ .whitespace = .minified } };
-    ws.write(parsed.value) catch return;
-    input.clearRetainingCapacity();
-    input.appendSlice(gpa, out.written()) catch {};
-}
-
-fn parseFinish(s: []const u8) StopReason {
-    if (std.mem.eql(u8, s, "stop")) return .end_turn;
-    if (std.mem.eql(u8, s, "tool_calls")) return .tool_use;
-    if (std.mem.eql(u8, s, "length")) return .max_tokens;
-    return .unknown;
-}
-
-fn objField(obj: json.ObjectMap, key: []const u8) ?json.ObjectMap {
-    const v = obj.get(key) orelse return null;
-    return if (v == .object) v.object else null;
-}
-
-fn strField(obj: json.ObjectMap, key: []const u8) ?[]const u8 {
-    const v = obj.get(key) orelse return null;
-    return if (v == .string) v.string else null;
-}
-
-fn intField(obj: json.ObjectMap, key: []const u8) ?u64 {
-    const v = obj.get(key) orelse return null;
-    return switch (v) {
-        .integer => |n| if (n >= 0) @intCast(n) else null,
-        else => null,
-    };
-}
-
-fn rawJson(arena: std.mem.Allocator, value: json.Value) error{OutOfMemory}![]const u8 {
-    var out: std.Io.Writer.Allocating = .init(arena);
-    errdefer out.deinit();
-    var ws: json.Stringify = .{ .writer = &out.writer, .options = .{ .whitespace = .minified } };
-    ws.write(value) catch return error.OutOfMemory;
-    return out.toOwnedSlice() catch return error.OutOfMemory;
-}
+const canonicalizeDuplicateKeys = core.canonicalizeDuplicateKeys;
+const parseFinish = core.parseFinish;
+const objField = core.objField;
+const strField = core.strField;
+const intField = core.intField;
+const rawJson = core.rawJson;
 
 // ---------------------------------------------------------------------------
 // Neutral → chat-completions request translation (pure)

@@ -11,25 +11,15 @@
 const std = @import("std");
 const json = std.json;
 const stream_tap = @import("stream_tap.zig");
+const core = @import("assembler.zig");
 
-pub const AssembleError = error{ OutOfMemory, MalformedEvent, ApiError, Incomplete };
-
-pub const StopReason = enum { end_turn, tool_use, max_tokens, stop_sequence, unknown };
-
-pub const Block = union(enum) {
-    text: []const u8,
-    tool_use: struct { id: []const u8, name: []const u8, input_json: []const u8 },
-};
-
-pub const Usage = struct { input_tokens: u64 = 0, output_tokens: u64 = 0 };
-
-pub const Message = struct {
-    id: []const u8,
-    model: []const u8,
-    stop_reason: StopReason,
-    usage: Usage,
-    content: []const Block,
-};
+// Both SSE dialects share one terminal shape and the drift-prone helpers
+// (worker/assembler.zig) — a compat-endpoint quirk gets fixed once.
+pub const AssembleError = core.AssembleError;
+pub const StopReason = core.StopReason;
+pub const Block = core.Block;
+pub const Usage = core.Usage;
+pub const Message = core.Message;
 
 const BlockAcc = union(enum) {
     text: std.ArrayList(u8),
@@ -203,15 +193,8 @@ pub const Assembler = struct {
         }
     }
 
-    /// Take whatever token counts an event carries. Compat endpoints drift
-    /// from the Anthropic contract: GLM's anthropic dialect reports input
-    /// tokens in message_delta (not message_start) and has used the openai
-    /// prompt_/completion_ spellings — missing either read as 0↑ live.
     fn captureUsage(self: *Assembler, u: json.ObjectMap) void {
-        if (intField(u, "input_tokens") orelse intField(u, "prompt_tokens")) |n|
-            self.usage.input_tokens = n;
-        if (intField(u, "output_tokens") orelse intField(u, "completion_tokens")) |n|
-            self.usage.output_tokens = n;
+        core.captureUsage(&self.usage, u);
     }
 
     pub fn isDone(self: *const Assembler) bool {
@@ -249,55 +232,11 @@ pub const Assembler = struct {
     }
 };
 
-/// Some providers (observed: GLM's anthropic dialect) stream tool-args
-/// fragments that concatenate into an object with a repeated key. Strict
-/// std.json downstream rejects the whole result frame (DuplicateField), so
-/// rewrite exactly that case last-wins (JS JSON.parse semantics). Anything
-/// else — valid JSON or garbage — passes through untouched; best-effort,
-/// never fails the stream.
-fn canonicalizeDuplicateKeys(gpa: std.mem.Allocator, input: *std.ArrayList(u8)) void {
-    if (std.json.parseFromSlice(std.json.Value, gpa, input.items, .{})) |ok| {
-        ok.deinit();
-        return;
-    } else |err| if (err != error.DuplicateField) return;
-
-    const parsed = std.json.parseFromSlice(std.json.Value, gpa, input.items, .{
-        .duplicate_field_behavior = .use_last,
-    }) catch return;
-    defer parsed.deinit();
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    var ws: std.json.Stringify = .{ .writer = &out.writer, .options = .{ .whitespace = .minified } };
-    ws.write(parsed.value) catch return;
-    input.clearRetainingCapacity();
-    input.appendSlice(gpa, out.written()) catch {};
-}
-
-fn parseStopReason(s: []const u8) StopReason {
-    if (std.mem.eql(u8, s, "end_turn")) return .end_turn;
-    if (std.mem.eql(u8, s, "tool_use")) return .tool_use;
-    if (std.mem.eql(u8, s, "max_tokens")) return .max_tokens;
-    if (std.mem.eql(u8, s, "stop_sequence")) return .stop_sequence;
-    return .unknown;
-}
-
-fn objField(obj: json.ObjectMap, key: []const u8) ?json.ObjectMap {
-    const v = obj.get(key) orelse return null;
-    return if (v == .object) v.object else null;
-}
-
-fn strField(obj: json.ObjectMap, key: []const u8) ?[]const u8 {
-    const v = obj.get(key) orelse return null;
-    return if (v == .string) v.string else null;
-}
-
-fn intField(obj: json.ObjectMap, key: []const u8) ?u64 {
-    const v = obj.get(key) orelse return null;
-    return switch (v) {
-        .integer => |n| if (n >= 0) @intCast(n) else null,
-        else => null,
-    };
-}
+const canonicalizeDuplicateKeys = core.canonicalizeDuplicateKeys;
+const parseStopReason = core.parseStopReason;
+const objField = core.objField;
+const strField = core.strField;
+const intField = core.intField;
 
 // ===========================================================================
 // Tests
