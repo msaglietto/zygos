@@ -25,16 +25,30 @@ terminal message **in the provider-neutral shape the turn driver consumes**
 - `choices[0].finish_reason`: `"stop"→end_turn`, `"tool_calls"→tool_use`,
   `"length"→max_tokens`, anything else → `unknown`.
 - `usage` rides a final chunk (when `stream_options.include_usage`):
-  `prompt_tokens`→input, `completion_tokens`→output.
+  `prompt_tokens`→input, `completion_tokens`→output — **with an
+  anthropic-spelling fallback** (`input_tokens`/`output_tokens`), because
+  some openai-compatible endpoints (observed: GLM) drift; the mirror
+  fallback lives in anthropic.zig's `captureUsage`.
 - Robustness contract identical to anthropic.zig: unknown fields ignored;
   malformed JSON on a chunk ⇒ `MalformedEvent`, assembler stays usable;
   an `{"error":{...}}` body ⇒ `ApiError`; never crash on input bytes.
+- **Duplicate keys in accumulated tool arguments are canonicalized
+  last-wins** (`canonicalizeDuplicateKeys`, mirrored in anthropic.zig) —
+  models occasionally emit the same key twice in streamed JSON.
+- **Stream tap**: tool_name / tool_args / `reasoning_content` fragments are
+  mirrored to `worker/stream_tap.zig` (fail-open, TUI live view); thinking
+  rides `reasoning_content` on this dialect.
 
 ## API (mirrors anthropic.Assembler)
 
 `Assembler.init/deinit`, `onEvent(data_json) !?[]const u8` (no event name —
 the dialect has none; `[DONE]` marks done), `isDone()`, `message()` →
 `error.Incomplete` before `[DONE]`.
+
+The module also owns the pure **neutral→chat translation** used by the net
+glue: `translateMessages` / `translateTools` map the provider-neutral
+request shape onto chat-completions messages/functions (tested here, not in
+`net/`).
 
 ## Test contract (RED first)
 

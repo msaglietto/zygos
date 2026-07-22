@@ -10,9 +10,19 @@ X2 `CatalogBoot` and auto-approve replaced by a console approval path.
 ## Invocation
 
 ```
-zygos mission start <brief.md> [--planning <dir>] [--resume]
+zygos mission start <brief.md> [--planning <dir>] [--resume] [--run-stamp] [--no-tui]
 zygos mission resume <brief.md> [--planning <dir>]   # sugar for --resume
+zygos mission trace <planning-dir>                   # render events.jsonl
 ```
+
+- `--run-stamp` (Y3, unattended reruns): the planning root becomes
+  `<root>-YYYYMMDD-HHMMSS` so every scheduled invocation gets its own
+  substrate. Without it, a non-resume start over an existing substrate
+  **refuses** (exit 2) instead of clobbering — no double-start races.
+- `--no-tui` (or `ZYGOS_NO_TUI=1`): keep the plain stderr banner even on a
+  tty. Piped/CI runs fall back automatically.
+- `trace` renders the structured `events.jsonl` the mission writes (see
+  README "Mission trace").
 
 - Brief: the file's text rides the `missions::start` request as `brief`
   (the W1 lint refuses malformed briefs server-side); the CLI also runs
@@ -32,10 +42,17 @@ zygos mission resume <brief.md> [--planning <dir>]   # sugar for --resume
 
 ## Worker roster (the "default" slider position, per e2e/m3 + catalog)
 
-turn orchestrator, `CatalogBoot` provider instances, agent-tools, policy
-(fail-closed; `ask` on bash), approval worker in `.manual` mode, router,
-budget, trim, mission orchestrator. Missing pieces at boot are exit-2
-errors, never silent omissions.
+turn orchestrator, `CatalogBoot` provider instances, agent-tools, web-tools,
+policy (fail-closed; as built **bash boots as `allow`**, not `ask` — the
+per-tool ask deferral is noted in `cli/mission.zig`; web_fetch/web_search
+and configured MCP tools also boot `allow`), approval worker in `.manual`
+mode, router, budget, trim, mission orchestrator, MCP clients for any
+`.mcp_servers` entries in `zygos.zon` (a broken server refuses the run at
+boot). Missing pieces at boot are exit-2 errors, never silent omissions.
+
+When `ZYGOS_VAULT_ROOT` is set, the CLI takes a **tessera-undo checkpoint of
+the vault before the mission runs** (Y5): checkpoint failure refuses the run
+(fail closed) — artifacts never land in an un-undoable vault.
 
 ## Console approvals (fail closed)
 
@@ -49,9 +66,35 @@ not-a-tty ⇒ stop prompting entirely and let the manual timeout deny
 ## Progress
 
 The mission/turn workers' existing `std.log` lines are the progress feed
-(stderr, default log level info for the binary); the terminal reply JSON
+(stderr, default log level info for the binary); on a tty the live TUI
+replaces the banner (see README "Mission TUI"). The terminal reply JSON
 (state/stop/role_turns/tasks_done) goes to stdout. Exit 0 on `state=done`,
 1 on `failed`/`aborted`, 2 on config/boot errors.
+
+## Environment knobs (as built)
+
+Tiered timeouts (one flat deadline cannot serve a mission and its calls):
+
+- `ZYGOS_MISSION_TIMEOUT_MS` (default 24h) — per-function override on
+  `zygos::missions::` via the actor's `invoke_timeout_overrides`; the only
+  bound on total mission duration.
+- `ZYGOS_INVOKE_TIMEOUT_MS` (default 1h) — every other bus invocation.
+- `ZYGOS_STREAM_IDLE_MS` (default 120s, `0` disables) — provider-stream idle
+  watchdog (see `net/stream_guard.zig`), wired through `provider_boot`.
+- `ZYGOS_APPROVAL_TIMEOUT_MS` (default 300s) — manual-approval deny timer.
+
+Others: `ZYGOS_BUDGET_MAX_TOKENS` (default 1M), `ZYGOS_ROLE_MAX_STEPS`
+(default 24), `ZYGOS_MAX_ROLE_TURNS` (default 48),
+`ZYGOS_SEARCH_ENGINE`/`ZYGOS_SEARCH_ENDPOINT`/`ZYGOS_SEARCH_KEY_ENV`
+(web-search backend config), `ZYGOS_VAULT_ROOT` (pre-mission checkpoint,
+above), `ZYGOS_NO_TUI`, `ZYGOS_TUI_CAPTURE` (raw-frame debug tee),
+`ZYGOS_LOG` (log filter), `COLORTERM` (truecolor detection).
+
+> ⚠️ **Known defect (flagged 2026-07-18, unfixed):** the brave search branch
+> of `searchConfigFromEnv` sets `key_env` but nothing ever resolves it into
+> `key`, and `web_tools` reads only `key`. Net effect: brave `web_search`
+> through the mission CLI always returns `MissingSearchKey` even with
+> `BRAVE_API_KEY` set. searxng (keyless) works.
 
 ## Resume
 

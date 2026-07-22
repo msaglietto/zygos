@@ -27,7 +27,8 @@ thread and never touched via the registry again.
 ```zig
 pub const Ref = struct {              // wire shape: StreamChannelRef
     channel_id: []const u8,
-    access_key: []const u8,           // random 32 bytes, hex — from std.crypto.random
+    access_key: []const u8,           // random 32 bytes, hex — from arc4random_buf
+                                      // (Zig 0.16 removed std.crypto.random)
     direction: enum { read, write },
 };
 

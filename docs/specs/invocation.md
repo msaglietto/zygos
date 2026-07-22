@@ -56,15 +56,16 @@ pub const Invocations = struct {
     pub fn complete(self: *Invocations, id: Uuid) ?ReplyTarget;
 
     /// Fire timeouts. For every entry with deadline <= now_ms: remove it and
-    /// invoke on_timeout(id, reply_target) so the actor can synthesize an
-    /// invocationresult with ErrorBody{code="timeout"}. Lazy-deletion safe.
-    pub fn sweepExpired(self: *Invocations, now_ms: i64,
-                        ctx: anytype, on_timeout: fn (@TypeOf(ctx), Uuid, ReplyTarget) void) usize;
+    /// invoke on_timeout(id, reply_target, function_id) so the actor can
+    /// synthesize an invocationresult with ErrorBody{code="timeout"}.
+    /// Lazy-deletion safe.
+    pub fn sweepExpired(self: *Invocations, now_ms: i64, ctx: anytype,
+                        comptime on_timeout: fn (@TypeOf(ctx), Uuid, ReplyTarget, []const u8) void) usize;
 
     /// Callee died: complete each of its pendings via on_fail (actor sends
     /// worker_disconnected error to the reply target). Returns count.
-    pub fn failAllForCallee(self: *Invocations, callee: WorkerId,
-                            ctx: anytype, on_fail: fn (@TypeOf(ctx), Uuid, ReplyTarget) void) usize;
+    pub fn failAllForCallee(self: *Invocations, callee: WorkerId, ctx: anytype,
+                            comptime on_fail: fn (@TypeOf(ctx), Uuid, ReplyTarget, []const u8) void) usize;
 
     /// Caller died: silently drop all pendings whose reply target is that
     /// connection. Returns count.

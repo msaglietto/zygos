@@ -23,9 +23,14 @@ command ordering instead of concurrent maps.
 pub const WorkerId = [16]u8;                    // UUID bytes
 pub const KERNEL_WORKER: WorkerId = [_]u8{0} ** 16;  // owner of built-in functions
 
+pub const Builtin = struct {
+    ctx: ?*anyopaque,               // opaque state passed back to `f` (see inproc.md)
+    f: *const BuiltinFn,
+};
+
 pub const Handler = union(enum) {
     worker: WorkerId,               // dispatch: send invokefunction to this connection
-    builtin: *const BuiltinFn,      // dispatch: call in-process on the kernel side
+    builtin: Builtin,               // dispatch: call in-process on the kernel side
     external_http: HttpRef,         // dispatch: HTTP call (M0: store only, no dispatch)
 };
 

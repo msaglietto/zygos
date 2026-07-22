@@ -32,13 +32,19 @@ Each tool's `inputSchema` is a permissive `{"type":"object"}` in W6 — the
 workers validate their own requests fail-closed; duplicating their schemas
 here would drift.
 
+> Note: the **inverse direction** — consuming *external* MCP servers' tools
+> onto the bus as `zygos::mcp::<server>::<tool>` — lives in
+> `src/worker/mcp/client.zig` and currently has **no spec doc** (README
+> "MCP servers as tool providers" is its only prose). Flagged 2026-07-18.
+
 ## Pure layer API
 
 ```zig
 pub const Caller = struct {
     ctx: *anyopaque,
     /// Mirrors inproc.Worker.call's result shape: ok payload or error code.
-    callFn: *const fn (ctx: *anyopaque, function: []const u8, request_json: []const u8) CallError!Result,
+    /// The arena owns the reply bytes for the duration of `handle`.
+    callFn: *const fn (ctx: *anyopaque, function: []const u8, request_json: []const u8, arena: std.mem.Allocator) CallError!Result,
 };
 
 /// One JSON-RPC message in (a single line, LSP-style framing NOT used — MCP

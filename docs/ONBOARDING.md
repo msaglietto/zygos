@@ -2,6 +2,8 @@
 
 > Generated from the Understand-Anything knowledge graph (`.ua/knowledge-graph.json`),
 > commit `9b4be8d`, 2026-07-17. 118 files, 274 graph nodes, 609 edges.
+> ⚠️ Counts spot-corrected 2026-07-18 (tests, TUI file count); the graph
+> itself predates the TUI split — regenerate for accurate node/edge figures.
 
 ## Project Overview
 
@@ -14,7 +16,7 @@ on that same bus.
 
 - **Languages:** Zig (kernel + workers), Markdown (specs), shell/JS (e2e harnesses), ZON (configs)
 - **Dependencies:** `websocket.zig` only — external deps are human-gated (`GOAL.md`)
-- **Status:** M4.6 (M0–M4.5 closed); `zig build test` runs 385 leak-checked tests, no network
+- **Status:** M4.6 (M0–M4.5 closed); `zig build test` runs 579 leak-checked tests, no network
 - **Process:** TDD is law (`AGENTS.md`); wire format is human-gated (`docs/PROTOCOL.md`)
 
 ## Architecture Layers
@@ -55,7 +57,7 @@ the tessera worker family (`tessera_orient/continuity/capture/undo` over pure pa
 in `tessera/`). `mcp/gateway.zig` exposes tessera over MCP stdio; `mcp/client.zig`
 plugs external MCP servers onto the bus.
 
-### 5. TUI Layer (10 files, `src/tui/`)
+### 5. TUI Layer (17 files, `src/tui/`)
 Live mission progress: hand-rolled ANSI, zero external deps, Elm-style model/view
 split (`model.zig` state under a mutex, `frame.zig` scrollback-flow renderer,
 `loop.zig` render thread). libc terminal control is confined here, mirroring the
@@ -139,11 +141,11 @@ and example missions (`examples/x5-dogfood/`, `examples/zahir-radar/`) with thei
 
 Approach these with the spec open and run `zig build test` often:
 
-1. **`src/worker/mission.zig`** (2039 lines) — mission FSM + driver + continuity/trace seams; the most tightly coupled cluster in the graph (with `mission_store.zig` and its spec).
+1. **`src/worker/mission.zig`** (2093 lines) — mission FSM + driver + continuity/trace seams; the most tightly coupled cluster in the graph (with `mission_store.zig` and its spec).
 2. **`src/worker/turn.zig`** (1805 lines) — turn FSM + orchestrator; policy/approval/router/budget/trim seams all converge here.
 3. **`src/kernel/protocol.zig`** (1390 lines) — every wire frame; changes are human-gated via `docs/PROTOCOL.md`.
 4. **`src/kernel/actor.zig`** (1371 lines) — highest fan-in (25); check callers before touching shared behavior.
-5. **`src/tui/model.zig`** (1046 lines) — mutates under a mutex from multiple foreign threads.
+5. **`src/tui/model.zig`** (986 lines) — mutates under a mutex from multiple foreign threads.
 6. **`src/worker/mcp/client.zig`** (859 lines) and **`src/net/web_tools.zig`** (886 lines) — protocol bridges with fail-closed parsing.
 7. **`src/config/providers.zig`** / **`src/net/provider_boot.zig`** — fail-closed config parsing and boot refusal; errors here stop the binary by design.
 

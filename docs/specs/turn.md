@@ -58,8 +58,10 @@ pub const Event = enum {
 | stopped / failed | *anything* | IllegalTransition (terminal) |
 
 `Fsm.apply(state, event) error{IllegalTransition}!State` — pure function over
-the table. A `Turn` struct tracks `state`, `steps_used`, `stop: enum { none,
-end_turn, aborted, max_steps }`, and the message transcript.
+the table. The driver tracks `state`, `steps_used`, the message transcript,
+and `stop` as a **string**, not an enum: live values include `"end_turn"`,
+`"aborted"`, `"max_steps"`, `"budget_exhausted"`, `"failed"`,
+`"route_exhausted"`, plus any provider stop_reason passed through.
 
 ## Driver (inproc worker `turn-orchestrator`)
 
@@ -87,9 +89,15 @@ Loop per step (each arrow = an FSM event; state asserted after each):
    dispatch. `worker.call(tool_fn, input_json)` → tool_result (errors become
    `{"is_error":true,...}` results). All collected → `tools_done` → append
    assistant msg + tool_results user msg to transcript, next step.
+3b. Every ok tool result passes through the **`zygos::output::compress`
+   seam** (Z-09) before entering the transcript — fail-open, savings
+   reported to budget when a scope rides the request.
 4. **stopped**: reply to the original invocation with
    `{"stop":"end_turn|aborted|max_steps","steps":N,"transcript":[...],"deltas":"..."}`.
-   **failed**: ErrorBody `turn_failed` with the provider error.
+   **failed**: replies `.ok` with `{"stop":"failed","steps":N,"error":<code>}`
+   — **not** an ErrorBody. (As built and header-flagged in `turn.zig`: a
+   structured stop payload keeps mission-driver handling uniform; the
+   originally specified `turn_failed` ErrorBody was never implemented.)
 
 ## M2 driver extensions (U1–U3, U5; specs: policy.md, approval.md, router.md, budget.md)
 
@@ -158,12 +166,21 @@ Driver (fake provider + fake tool, both inproc):
 6. `tool-use turn: tool dispatched over the bus, tool_result in next request, ends end_turn on step 2` — the T4 core
 7. `unknown tool name yields is_error tool_result and the turn continues`
 8. `tool marked requires_approval routes through awaiting_approval (auto-approved) and still dispatches`
-9. `provider error fails the turn with turn_failed`
+9. `provider error fails the turn` (asserts `stop=="failed"` + error code in
+   the ok payload — see step 4 note above)
 10. `max_steps exhausts cleanly`
 11. `deltas streamed over the kernel channel are captured in order`
 12. `no leaks under a multi-step turn` (testing.allocator)
 
+## Post-M2 additions (present in code, TUI-era)
+
+- **Delta observer seam**: `DeltaObserver` + `setDeltaObserver` — an in-proc
+  callback receiving live assistant deltas alongside the channel drain (the
+  TUI's live token feed). Fail-open.
+- **Per-step `usage` trace event**: emitted through `worker/trace.zig` even
+  when no budget scope rides the request (the TUI token counter's source).
+- Default `max_steps` is **8** when the request omits it.
+
 ## Out of scope
 
-- Real approval worker, steering surface, budgets, model routing — M2.
-- Context compaction, session persistence — M2/M3.
+- Context compaction, session persistence — M5.

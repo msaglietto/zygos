@@ -24,9 +24,9 @@ dependency: a minimal in-repo TOML-subset parser, `std` only.
 Per the JSON schema's semantics:
 
 - provider: `name`, `type`, `model` required; `type` ∈
-  `{openai_compatible, google, ollama}`; `endpoint` required when `type`
-  is `openai_compatible` or `ollama`; `max_tokens >= 1`;
-  `0 <= temperature <= 2`.
+  `{openai_compatible, anthropic_compatible, google, ollama}`; `endpoint`
+  required when `type` is `openai_compatible`, `anthropic_compatible`, or
+  `ollama`; `max_tokens >= 1`; `0 <= temperature <= 2`.
 - cli: `name`, `command` required; `args` optional string array.
 - Duplicate provider `name`s are an error, and so are duplicate derived
   slugs (bus registration would silently last-win otherwise).
@@ -57,13 +57,13 @@ Diagnostics: `parse(gpa, toml_text, *?Diag)` — on error, `Diag` carries
 
 ## Test contract (RED first)
 
-1. `parse: real-shaped fixture (8 providers incl. google + local, 2 clis) round-trips every field`
+1. `parse: real-shaped fixture (9 providers incl. anthropic_compatible + google + local, 2 clis) round-trips every field`
 2. `parse: comments, trailing comments, blank lines ignored`
 3. `parse: unknown keys and unknown array-of-table sections skipped`
 4. `parse: string escapes decoded; unsupported escape ⇒ ParseToml with line`
 5. `parse: malformed input (unclosed string, [table] header, bare junk) ⇒ ParseToml, no leaks`
 6. `validate: missing name/type/model ⇒ InvalidCatalog, diag names the field`
-7. `validate: openai_compatible or ollama without endpoint ⇒ InvalidCatalog`
+7. `validate: openai_compatible, anthropic_compatible, or ollama without endpoint ⇒ InvalidCatalog`
 8. `validate: unknown type enum ⇒ InvalidCatalog`
 9. `validate: temperature out of [0,2] or max_tokens < 1 ⇒ InvalidCatalog`
 10. `validate: duplicate provider name (and distinct names colliding to one slug) ⇒ InvalidCatalog`

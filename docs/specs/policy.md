@@ -30,9 +30,11 @@ pub const Rule = struct {
 };
 ```
 
-First matching rule wins — match `tool` exactly, or `function_id` when the
-pattern contains "::", with a trailing `*` doing prefix match. **No rule
-matches ⇒ `deny`** (the fail-closed default), reason "no rule matched".
+First matching rule wins. As built, each pattern is tried against **both**
+the `tool` name and the `function_id` unconditionally (exact match, or
+trailing-`*` prefix match) — the worker never inspects the pattern for `::`.
+**No rule matches ⇒ `deny`** (the fail-closed default), reason "no rule
+matched".
 
 ## Test contract (RED first)
 

@@ -48,8 +48,17 @@ pub const Command = union(enum) {
     frame: struct { from: WorkerId, parsed: std.json.Parsed(protocol.Message), now_ms: i64 },
     tick: i64,                       // now_ms
     shutdown,
+    // Channel bridge (in-process endpoint handoff for native workers/providers):
+    channel_create: ChannelCreate,
+    channel_take_sender: ChannelTake,
+    channel_take_receiver: ChannelTake,
 };
 ```
+
+The three `channel_*` variants back the public `channelCreate` /
+`channelTakeSender` / `channelTakeReceiver` helpers (see inproc.md "Kernel
+extensions"). Channel ops are stamped with the **kernel's observed clock**
+(`now_ms` = max stamp seen), so a bridge op can never rewind channel TTL time.
 
 `shutdown` stops the loop after the current command; remaining queued commands
 are drained-and-deinitialized without processing (frames own memory — never
@@ -79,7 +88,7 @@ leak them on shutdown).
      ErrorBody `function_not_found`; else log-drop.
    - **`.worker(callee)`** → if `invocation_id` present: parse to Uuid (invalid
      UUID text → log-drop the frame, mirroring iii's deserialization rejection),
-     `invocations.add(uuid, callee, .{ .connection = W }, now + invoke_timeout_ms)`,
+     `invocations.add(uuid, callee, m.function_id, .{ .connection = W }, now + invokeTimeoutFor(function_id))`,
      then forward the frame to `callee`. `DuplicateId` → log-drop. If absent:
      fire-and-forget — forward only, no pending (S3 spec boundary).
    - **`.builtin(f)`** → call in-process on the kernel thread (M0 built-ins are
@@ -123,9 +132,15 @@ No RFC-variant validation beyond shape (8-4-4-4-12 hex) — iii accepts any UUID
 ```zig
 pub const Config = struct {
     invoke_timeout_ms: i64 = 30_000,
-    ack_timeout_ms: i64 = 10_000,
+    ack_timeout_ms: i64 = 10_000,      // NOTE: dead in M0 — wire-path bindings
+                                       // register with no ack deadline; no code
+                                       // path derives a deadline from this yet
     channel_ttl_ms: i64 = 300_000,
     inbox_capacity: usize = 1024,
+    /// Per-function timeout policy: longest-matching id prefix wins
+    /// (e.g. `zygos::missions::` → 24h while everything else keeps 1h).
+    /// Wired by the mission CLI; the WS binary boots with none.
+    invoke_timeout_overrides: []const TimeoutOverride = &.{},
 };
 
 pub const Actor = struct {
@@ -141,6 +156,14 @@ pub const Actor = struct {
     /// Test seam: process exactly one queued command (kernel thread only).
     /// Returns false when it processed `shutdown` or the inbox was empty.
     pub fn step(self: *Actor) bool;
+
+    /// Register a kernel-side builtin handler (ctx + fn; see catalog.md).
+    pub fn registerBuiltin(self: *Actor, id: []const u8, ctx: ?*anyopaque, f: *const BuiltinFn) !void;
+
+    /// Channel bridge for in-process callers (providers, inproc workers).
+    pub fn channelCreate(self: *Actor, ...) ...;
+    pub fn channelTakeSender(self: *Actor, ...) ...;
+    pub fn channelTakeReceiver(self: *Actor, ...) ...;
 };
 ```
 
@@ -170,6 +193,14 @@ the net layer, not here.
 18. `shutdown drains and frees queued frames (no leaks)`
 19. `run loop smoke: spawn thread, post, shutdown, join` — bounded, no sleeps
 20. `no leaks under register/invoke/complete loops` (≥100, std.testing.allocator)
+
+Post-M0 additions (present in code):
+
+21. `invoke timeout overrides: longest prefix match picks the deadline`
+22. `builtin ctx reaches the call and persists`
+23. `waiter completion carries a real duped payload`
+24. `channel bridge: create and take endpoints stream`
+25. `channel ops are stamped with the kernel's observed time`
 
 ## Out of scope
 

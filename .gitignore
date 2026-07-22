@@ -8,3 +8,6 @@ test/e2e/node-sdk/package-lock.json
 zig-pkg/
 .tokensave/
 .claude
+.ua
+wm
+CLAUDE.md

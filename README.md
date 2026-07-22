@@ -57,7 +57,7 @@ SDKs. See `GOAL.md` for the mission, `docs/ARCHITECTURE.md` and
 Requires Zig 0.16.0 (and libc — pthread + CSPRNG; macOS or Linux).
 
 ```bash
-zig build test   # full suite (385 tests, leak-checked, no network)
+zig build test   # full suite (579 tests, leak-checked, no network)
 zig build        # produces zig-out/bin/zygos
 ```
 
@@ -196,7 +196,11 @@ The CLI reads the provider catalog from `AI_PROVIDERS_CONFIG` (else
 `~/.agents/providers.toml`) and the route table from `ZYGOS_CONFIG` (else
 `./zygos.zon`); approvals prompt on stderr and fail closed (manual timeout
 denies) when stdin closes. Knobs: `ZYGOS_APPROVAL_TIMEOUT_MS`,
-`ZYGOS_INVOKE_TIMEOUT_MS`, `ZYGOS_BUDGET_MAX_TOKENS`. Debugging: `ZYGOS_LOG=info`
+`ZYGOS_INVOKE_TIMEOUT_MS`, `ZYGOS_BUDGET_MAX_TOKENS`, `ZYGOS_ROLE_MAX_STEPS`
+(default 24), `ZYGOS_MAX_ROLE_TURNS` (default 48); web-search backend via
+`ZYGOS_SEARCH_ENGINE`/`ZYGOS_SEARCH_ENDPOINT`/`ZYGOS_SEARCH_KEY_ENV`
+(brave/searxng — see the known brave key_env defect flagged in
+`docs/specs/mission-cli.md`). Debugging: `ZYGOS_LOG=info`
 streams the harness's progress feed (mission transitions, role turns,
 per-step provider/model, tool dispatches) to stderr; `debug` for more.
 
@@ -222,25 +226,32 @@ mission ceiling.
 
 When `zygos mission start` runs on a real terminal (tty on stdin and
 stderr), it takes over the screen with a live progress view instead of the
-plain banner: a spinner header with mission state, tasks, and elapsed time;
-role/step lines with the routed model; a **live `✳ thinking…` block**
-streaming the model's reasoning (anthropic `thinking_delta`,
-openai-compatible `reasoning_content` — DeepSeek/GLM/Minimax) that
-collapses to `✳ thought for Ns` in history; **bordered live tool boxes**
-showing the command/file being composed as the arguments stream (extracted
-from the partial JSON); running tool calls that collapse into ✓/✗ summary
-lines as results land; assistant tokens streaming at full color; captured
-warn/err log lines as dim footnotes; and a token counter fed by per-step
-`usage` trace events. History scrolls into the terminal's own
-scrollback (no alternate screen) — only the bottom band repaints, wrapped
-in synchronized output (`?2026`).
+plain banner: a header with mission state, tasks, and elapsed time (the
+spinner rides the status line); an objective echo; a live current-task line
+that collapses to a dim `✓` line when the task lands; role/step lines with
+the routed model; a **live `❙ Thinking…` block** streaming the model's
+reasoning (anthropic `thinking_delta`, openai-compatible `reasoning_content`
+— DeepSeek/GLM/Minimax) that collapses to `◆ Thought for Ns` in history;
+**rail-guttered live tool entries** (`┃`) showing the command/file being
+composed as the arguments stream (extracted from the partial JSON); running
+tool calls that collapse into `◆`/`✗` summary lines as results land;
+assistant tokens streaming at full color, promoted answers rendered
+markdown-lite (headers, bold, bullets, numbered lists, fenced code with
+keyword syntax highlighting on a panel background); captured warn/err log
+lines as dim footnotes; and a token counter fed by per-step `usage` trace
+events. Truecolor when `COLORTERM` says so, indexed-256 fallback otherwise.
+History scrolls into the terminal's own scrollback (no alternate screen) —
+only the bottom band repaints, wrapped in synchronized output (`?2026`).
 
 Approvals resolve on a single keypress: the pending ask renders as a
-highlighted `approve <tool>: <reason>? [y/N]` band (`y` approves; `n`,
+highlighted keys-first `[y/N] approve? <summary>` band (`y` approves; `n`,
 Enter, or the server-side `ZYGOS_APPROVAL_TIMEOUT_MS` denies — fail
-closed). Ctrl-C restores the terminal before exiting. The final mission
-JSON still prints to stdout after the TUI tears down, so `| jq` pipelines
-and exit codes are unchanged.
+closed). Ctrl-C restores the terminal before exiting; a panic path
+(`emergencyRestore`) repairs the terminal too. While the TUI owns fd 2,
+stray stderr writers are redirected to a log file; `ZYGOS_TUI_CAPTURE=<path>`
+tees raw frames for debugging. The final mission JSON still prints to
+stdout after the TUI tears down, so `| jq` pipelines and exit codes are
+unchanged.
 
 Opt out with `--no-tui` or `ZYGOS_NO_TUI=1`; piped/CI runs (no tty) keep
 the plain path automatically — the `trace →` banner, stderr approval

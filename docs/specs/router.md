@@ -38,8 +38,9 @@ turn but with different reasons).
 
 ## API
 
-- `Config.parse(gpa, zon_text) !Config` / `Config.load(gpa, path)` /
-  `deinit` — std.zon.parse into owned memory.
+- `Config.parse(gpa, zon_text) !Config` / `deinit` — std.zon.parse into
+  owned memory. (There is deliberately no `Config.load(path)` — file IO
+  stays in the binaries; callers read the file and pass the text.)
 - `RouterWorker.start(gpa, actor, registry, config)`.
 
 ## Test contract (RED first)

@@ -68,8 +68,11 @@ pub const Event = enum {
 the table, exactly like `turn.Fsm`.
 
 A `Mission` struct tracks `mission_id`, `state`, `objective`, `acceptance`,
-`tasks: []Task` (`desc`, `done`), `task_index`, `fail_count` (consecutive
-verify failures), `gate_denials`, `role_turns_used`,
+`tasks: []Task` (`desc`, `done`, `result` — a clipped outcome excerpt carried
+into later executor turns), `task_index`, `fail_count` (consecutive
+verify failures), `exec_fail_count` (consecutive executor `max_steps`
+exhaustions — persisted, defaulting to 0 on legacy state files),
+`gate_denials`, `role_turns_used`,
 `stop: enum { none, completed, aborted, escalated, gate_failed, role_failed,
 role_turns_exhausted }`, `detail` (human-readable stop/feedback text), and
 `feedback` (the text fed to the next planner turn after a verify failure or
@@ -104,15 +107,25 @@ mission request's `provider_function`, `router_function`, `policy_function`,
 |---|---|---|---|---|
 | product-owner | `product-owner` | the request's seed `objective` | final assistant text = JSON `{"objective":"...","acceptance":"..."}` | `MISSION.md` |
 | planner | `planner` | `MISSION.md` content + `feedback` when replanning | `{"tasks":["...", ...]}`, 1–32 non-empty strings | `PLAN.md` (rewritten per replan; task list and `task_index` reset) |
-| executor | `executor` | objective + the current task description | free text; the turn just has to stop `end_turn` | — |
+| executor | `executor` | objective + the current task description + a progress block of completed-task outcomes (`Task.result` excerpts, so later turns don't redo done work) | free text ending `end_turn`; a `max_steps` stop is **retried** with feedback (see below), not an instant failure | — |
 | verifier | `verifier` | `MISSION.md` + `PLAN.md` contents | `{"passed":true|false,"reason":"..."}` | `VERIFY.md` |
 
 Role output parsing is **fail-closed**: the final assistant text of a
 structured role (product-owner, planner, verifier) must parse to the exact
 shape above — anything else fires `role_failed` (stop `role_failed`, detail
-says which role and why). A role turn that ends with any stop other than
-`end_turn`, or errors on the bus, also fires `role_failed`. The driver never
-retries a role turn itself — provider-level failover is the router's job (U3).
+says which role and why), and the rejected raw output is persisted to
+`REJECTED-<role>.md` under the planning root for post-mortems. Whole-output
+markdown fences (```json … ```) are **unwrapped** before parsing — models
+that fence their JSON don't fail the mission. A structured role's turn that
+ends with any stop other than `end_turn`, or errors on the bus, also fires
+`role_failed`.
+
+**Executor exception (post-M3, dogfood-driven):** an executor turn stopping
+`max_steps` increments `exec_fail_count` and is **retried with feedback**
+(the re-prompt tells it steps ran out and to work incrementally); it only
+escalates to `role_failed` when `exec_fail_count` reaches `fail_threshold`.
+The driver never retries the other roles — provider-level failover is the
+router's job (U3).
 
 Each role turn increments `role_turns_used`; at every role boundary the
 driver first checks the abort flag (→ `abort`) and then
@@ -122,8 +135,10 @@ driver first checks the abort flag (→ `abort`) and then
 
 At `gating` the driver calls the request's `gate_function` (normally
 `zygos::approvals::request`) with
-`{"turn_id":"<mission_id>","tool":"mission::complete","summary":"<objective + verifier reason>"}`
-and blocks on the reply:
+`{"turn_id":"<mission_id>","tool":"mission::complete","reason":"<objective>","summary":"<objective>"}`
+(as built: `summary` carries the objective, not the verifier reason; a
+`reason` field is included for the approval worker's prompt) and blocks on
+the reply:
 
 - `{"approved":true}` ⇒ `gate_approved` → done, stop `completed`.
 - `{"approved":false, ...}` ⇒ denial: `gate_denials += 1`; if
@@ -160,11 +175,13 @@ Loop: run the role (or gate) for the current state, fire the event, persist
 the mission (`store.save`) after **every** transition, repeat until terminal.
 Verify pass resets `fail_count`. The reply is
 `{"state":"done|failed","stop":"...","detail":"...","role_turns":N,"tasks_done":K}`.
-Start of a `mission_id` that is already running ⇒ ErrorBody
-`mission_already_running`.
+Start of a `mission_id` that is already running fails the handler
+(generic bus error — the named `mission_already_running` ErrorBody was never
+built; `mission.zig`'s header flags this).
 
 - **Resume.** `resume:true` ignores the seed objective and loads
-  `<planning_root>/mission.json`: missing ⇒ ErrorBody `mission_not_found`;
+  `<planning_root>/mission.json`: missing ⇒ handler failure (generic — the
+  named `mission_not_found` ErrorBody was never built);
   terminal state ⇒ reply immediately with the persisted terminal result (no
   role turns — idempotent); otherwise the loop continues from the persisted
   state and counters, so already-completed roles are never re-run.
@@ -174,8 +191,8 @@ Start of a `mission_id` that is already running ⇒ ErrorBody
   Unknown mission ⇒ `{"ok":false}`, else `{"ok":true}`.
 - **Status.** `zygos::missions::status {"mission_id"}` reads the live
   tracked mission: `{"state":"...","stop":"...","role_turns":N,
-  "task_index":K,"fail_count":F,"gate_denials":G}`. Unknown ⇒ ErrorBody
-  `mission_not_found`.
+  "task_index":K,"fail_count":F,"gate_denials":G}`. Unknown ⇒ handler
+  failure (generic — no named ErrorBody, as above).
 
 ## Test contract (RED first)
 
@@ -208,8 +225,21 @@ must be asserted):
 21. `resume of a terminal mission replies without running any role turn`
 22. `no leaks across a full mission` (testing.allocator)
 
+## Post-M3 additions (present in code)
+
+- **Trace events**: the driver emits `task_start`/`task_done` per executor
+  task and role/mission boundary events through `worker/trace.zig` (the
+  TUI's task rail and `zygos mission trace` feed).
+- **W1 brief lint**: `missions::start` lints the brief before the FSM runs
+  (see brief.md) — fail closed.
+- **W3 continuity seam**: `continuity_function`/`continuity_project` on the
+  start request session-close over the bus at terminal states; a continuity
+  failure never changes the mission outcome.
+- **Fence unwrapping, rejected-role artifacts, executor retry, context
+  carry** — see the Role turns section above.
+
 ## Out of scope (M3)
 
 - Multi-mission concurrency beyond independent mission_ids; mission queues.
 - Context compaction, session-store, transcript persistence between roles.
-- Tessera/MCP adapters (M4). New budget machinery (`budget_scope` rides through).
+- New budget machinery (`budget_scope` rides through).

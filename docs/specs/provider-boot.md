@@ -1,10 +1,19 @@
 # Spec: `src/net/provider_boot.zig` — catalog → bus provider boot (X2)
 
-Boots one openai-compat provider worker instance per `providers.toml` catalog
-entry (X1, `src/config/providers.zig`), each registered on the bus as
-`zygos::providers::<slug>`. Lives in `src/net/` because it constructs
-`OpenAiProvider` instances holding `std.Io` (Z-02 boundary). `zig build test`
-never opens a socket — registration and config plumbing only.
+Boots one provider worker instance per `providers.toml` catalog entry (X1,
+`src/config/providers.zig`), each registered on the bus as
+`zygos::providers::<slug>`: `anthropic_compatible` entries get an
+**Anthropic-dialect** instance (`AnthropicProvider`), everything else
+(openai_compatible / ollama / google-via-compat) an OpenAI-dialect one.
+Lives in `src/net/` because it constructs instances holding `std.Io` (Z-02
+boundary; `IoBoot` owns the `std.Io.Threaded`). `zig build test` never opens
+a socket — registration and config plumbing only.
+
+**Idle watchdog wiring:** `streamIdleMs(env)` reads `ZYGOS_STREAM_IDLE_MS`
+(default 120s, `0` disables) and threads it into every instance's
+`StreamOptions.idle_timeout_ms` — the `net/stream_guard.zig` watchdog that
+shuts down provider streams that go silent (the hang protection under the
+invoke-timeout outer net).
 
 ## CatalogBoot
 

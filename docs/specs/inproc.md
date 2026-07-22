@@ -19,9 +19,12 @@ actor ──Outbound.send──▶ [Mux] ──▶ inproc worker's frame queue �
    plumbing, not registry state) and copies the frame into that worker's
    bounded queue; unknown ids fall through to a `fallback: ?Outbound`
    (the WS gateway). Composition happens in main.zig; the actor is untouched.
-2. **One thread per inproc worker**, draining its frame queue:
-   - `invokefunction` → local handler map by function_id → run handler →
-     post `invocationresult` frame command (or nothing if fire-and-forget).
+2. **One router thread per inproc worker**, draining its frame queue —
+   plus **one thread per invocation** for handler execution: `invokefunction`
+   spawns a handler thread (local handler map by function_id → run handler →
+   post `invocationresult` frame command, or nothing if fire-and-forget).
+   Handlers may therefore make blocking bus calls without deadlocking the
+   router thread.
    - `invocationresult` → correlate against the worker's own pending map
      (uuid → `sync.ResetEvent` + result slot) → wake the blocked caller.
    - `workerregistered`, acks → record/log. Unknown → drop.
@@ -40,11 +43,14 @@ pub const Worker = struct {
     pub fn spawn(gpa, actor: *Actor, registry: *Registry, name: []const u8) !*Worker;
     /// Registers on the bus (registerfunction frame) + local dispatch table.
     pub fn registerFunction(self, id: []const u8, ctx: ?*anyopaque, handler: *const Handler) !void;
-    /// Blocking invoke over the bus. Returns owned response JSON (caller
-    /// frees with gpa) or the invocation's ErrorBody code as error.RemoteError
-    /// (message in out_err if provided). timeout is the kernel's (T3 default);
-    /// the caller's wait is bounded by kernel timeout + margin.
-    pub fn call(self, function_id: []const u8, payload_json: []const u8) CallError![]u8;
+    /// Blocking invoke over the bus. Returns a CallResult union — `.ok` with
+    /// owned response JSON, or `.err` with the owned ErrorBody JSON (caller
+    /// frees either with gpa). Only OutOfMemory/Shutdown are Zig errors;
+    /// remote failures are data, not error codes. The kernel's invoke timeout
+    /// bounds the wait.
+    pub const CallResult = union(enum) { ok: []u8, err: []u8 };
+    pub fn call(self, function_id: []const u8, payload_json: []const u8)
+        error{ OutOfMemory, Shutdown }!CallResult;
     /// Fire-and-forget invoke (no invocation_id).
     pub fn cast(self, function_id: []const u8, payload_json: []const u8) !void;
     pub fn stop(self) void;   // deregister via worker_disconnected + join
@@ -84,6 +90,7 @@ pub const Registry = struct {
 8. `waiter completion carries a real duped payload; recipient frees` (kernel test)
 9. `channel bridge: create/takeSender/takeReceiver round-trip a stream between two threads` (kernel test)
 10. `no leaks under register/call loops` (≥100)
+11. `a handler result the protocol rejects errors the caller instead of hanging`
 
 ## Out of scope
 

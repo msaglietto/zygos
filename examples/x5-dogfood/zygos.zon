@@ -12,15 +12,12 @@
             .{ .provider_function = "zygos::providers::nvidia-deepseekv4-pro", .model = "deepseek-ai/deepseek-v4-pro" },
         } },
         .{ .step_id = "planner", .attempts = .{
-            .{ .provider_function = "zygos::providers::nvidia-deepseekv4-pro", .model = "deepseek-ai/deepseek-v4-pro" },
             .{ .provider_function = "zygos::providers::glm-5-2", .model = "glm-5.2" },
         } },
         .{ .step_id = "executor", .attempts = .{
-            .{ .provider_function = "zygos::providers::nvidia-deepseekv4-pro", .model = "deepseek-ai/deepseek-v4-pro" },
-            .{ .provider_function = "zygos::providers::nvidia-minimax-m3", .model = "minimaxai/minimax-m3" },
+            .{ .provider_function = "zygos::providers::glm-5-2", .model = "glm-5.2" },
         } },
         .{ .step_id = "verifier", .attempts = .{
-            .{ .provider_function = "zygos::providers::gemini-3-5-flash", .model = "gemini-3.5-flash" },
             .{ .provider_function = "zygos::providers::glm-5-2", .model = "glm-5.2" },
         } },
     },
