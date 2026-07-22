@@ -149,8 +149,17 @@ pub fn run(gpa: std.mem.Allocator, args: *std.process.Args.Iterator) u8 {
         return 2;
     }
 
+    // M7 executor worktree isolation: ZYGOS_WORKTREE=1 gives the executor a
+    // detached git worktree under the planning root — the main tree stays
+    // clean. A repo that cannot provide one refuses the run (fail closed:
+    // isolation was requested). Queue mode re-isolates per mission below.
+    var workspace: []const u8 = cwd;
+    if (!queue_mode and zygos.mission_boot.worktreeEnabled(env)) {
+        workspace = setupWorktree(gpa, cwd, planning) orelse return 2;
+    }
+
     const turns = zygos.turn.TurnOrchestrator.start(gpa, &actor, &registry) catch return boot_fail();
-    const tools = zygos.tools.ToolsWorker.start(gpa, &actor, &registry, cwd) catch return boot_fail();
+    const tools = zygos.tools.ToolsWorker.start(gpa, &actor, &registry, workspace) catch return boot_fail();
     _ = tools;
 
     // ---- MCP servers (.mcp_servers in zygos.zon): spawn + handshake ---------
@@ -323,12 +332,7 @@ pub fn run(gpa: std.mem.Allocator, args: *std.process.Args.Iterator) u8 {
     // executors iterating with tools — a real mission gets room by default.
     // The workspace path rides in the bash description: a model that does
     // not know its cwd wastes steps probing $HOME or inventing /home paths.
-    const bash_desc = std.fmt.allocPrint(
-        gpa,
-        "Run a shell command and get its output. The shell runs in the mission workspace: {s}. " ++
-            "Do all work inside this directory (relative paths work); never write to $HOME or system paths.",
-        .{cwd},
-    ) catch return oom();
+    const bash_desc = bashDesc(gpa, workspace) catch return oom();
 
     // ---- queue (M6): N missions sequentially under this one kernel ---------
     // Per-mission planning roots (<base>-<stem>) and budget scopes; an
@@ -373,6 +377,16 @@ pub fn run(gpa: std.mem.Allocator, args: *std.process.Args.Iterator) u8 {
                 if (std.Thread.spawn(.{}, sigintWatch, .{ gpa, sig_worker, mid })) |t| t.detach() else |_| {}
             }
 
+            // Per-mission worktree (the queue item is the wave): a fresh
+            // ToolsWorker re-registers zygos::tools::* (last-wins) at the
+            // new workspace.
+            var q_bash = bash_desc;
+            if (zygos.mission_boot.worktreeEnabled(env)) {
+                const q_workspace = setupWorktree(gpa, cwd, root) orelse return 2;
+                _ = zygos.tools.ToolsWorker.start(gpa, &actor, &registry, q_workspace) catch return boot_fail();
+                q_bash = bashDesc(gpa, q_workspace) catch return oom();
+            }
+
             const qtrace = std.fmt.allocPrint(gpa, "{s}/{s}", .{ root, zygos.trace.file_name }) catch return oom();
             eprint("mission queue: {s} → {s}{s}\n", .{ mid, root, if (resume_q) " (resume)" else "" });
             const qreq = buildStartRequest(gpa, .{
@@ -381,7 +395,7 @@ pub fn run(gpa: std.mem.Allocator, args: *std.process.Args.Iterator) u8 {
                 .brief_text = qtext,
                 .trace_path = qtrace,
                 .resume_flag = resume_q,
-                .bash_desc = bash_desc,
+                .bash_desc = q_bash,
                 .mcp_entries = if (mcp) |mm| mm.toolEntriesJson(gpa) catch return oom() else "",
                 .ctx_kind = ctx_cfg.kind,
                 .ctx_max_tokens = ctx_cfg.max_tokens,
@@ -519,6 +533,33 @@ fn usage() u8 {
         .{},
     );
     return 2;
+}
+
+fn bashDesc(gpa: std.mem.Allocator, workspace: []const u8) error{OutOfMemory}![]u8 {
+    return std.fmt.allocPrint(
+        gpa,
+        "Run a shell command and get its output. The shell runs in the mission workspace: {s}. " ++
+            "Do all work inside this directory (relative paths work); never write to $HOME or system paths.",
+        .{workspace},
+    );
+}
+
+/// Create (or reuse) the mission's detached git worktree under the planning
+/// root. Null = refusal: isolation was requested and the repo cannot
+/// provide it (fail closed). An existing worktree (resume) is reused.
+fn setupWorktree(gpa: std.mem.Allocator, repo: []const u8, planning: []const u8) ?[]const u8 {
+    const path = zygos.mission_boot.worktreePath(gpa, planning) catch return null;
+    if (fileExists(gpa, path, ".git")) return path; // resumed run: reuse
+    mkdirQuiet(gpa, planning);
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const argv = zygos.mission_boot.worktreeAddArgv(repo, path);
+    const runner = zygos.context_thread.PopenRunner.runner();
+    _ = runner.run(arena_state.allocator(), &argv) orelse {
+        eprint("mission: git worktree add failed in {s} (is it a git repo?)\n", .{repo});
+        return null;
+    };
+    return path;
 }
 
 const StartParams = struct {

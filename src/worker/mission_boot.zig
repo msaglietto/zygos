@@ -180,6 +180,28 @@ pub fn planningRoot(
 }
 
 // ---------------------------------------------------------------------------
+// executor worktree isolation (M7)
+// ---------------------------------------------------------------------------
+
+/// ZYGOS_WORKTREE=1|true opts the mission's executor into a detached git
+/// worktree under the planning root — the main tree stays clean while the
+/// executor works. v1 wave = the whole (sequential) mission.
+pub fn worktreeEnabled(env: []const EnvPair) bool {
+    const raw = getEnv(env, "ZYGOS_WORKTREE") orelse return false;
+    return std.mem.eql(u8, raw, "1") or std.mem.eql(u8, raw, "true");
+}
+
+pub fn worktreePath(gpa: std.mem.Allocator, planning: []const u8) error{OutOfMemory}![]u8 {
+    return std.fmt.allocPrint(gpa, "{s}/worktree", .{planning});
+}
+
+/// The fixed git invocation (never user input): detached so no branch is
+/// claimed; the worktree is left behind for inspection, not auto-removed.
+pub fn worktreeAddArgv(repo: []const u8, path: []const u8) [7][]const u8 {
+    return .{ "git", "-C", repo, "worktree", "add", "--detach", path };
+}
+
+// ---------------------------------------------------------------------------
 // policy seeding
 // ---------------------------------------------------------------------------
 
@@ -359,6 +381,26 @@ test "searchConfigFromEnv: searxng requires endpoint; unknown engine is null" {
         .{ .name = "ZYGOS_SEARCH_ENGINE", .value = "bing" },
     };
     try t.expectEqual(@as(?web_tools.SearchConfig, null), searchConfigFromEnv(&unknown));
+}
+
+test "worktree isolation: env gate, path shape, and the git argv" {
+    try t.expect(!worktreeEnabled(&.{}));
+    try t.expect(worktreeEnabled(&.{.{ .name = "ZYGOS_WORKTREE", .value = "1" }}));
+    try t.expect(worktreeEnabled(&.{.{ .name = "ZYGOS_WORKTREE", .value = "true" }}));
+    try t.expect(!worktreeEnabled(&.{.{ .name = "ZYGOS_WORKTREE", .value = "0" }}));
+
+    const path = try worktreePath(t.allocator, "/w/.planning");
+    defer t.allocator.free(path);
+    try t.expectEqualStrings("/w/.planning/worktree", path);
+
+    const argv = worktreeAddArgv("/repo", "/w/.planning/worktree");
+    try t.expectEqualStrings("git", argv[0]);
+    try t.expectEqualStrings("-C", argv[1]);
+    try t.expectEqualStrings("/repo", argv[2]);
+    try t.expectEqualStrings("worktree", argv[3]);
+    try t.expectEqualStrings("add", argv[4]);
+    try t.expectEqualStrings("--detach", argv[5]);
+    try t.expectEqualStrings("/w/.planning/worktree", argv[6]);
 }
 
 test "refuseStart: fresh start over existing substrate refuses; resume/run-stamp proceed" {
