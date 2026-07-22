@@ -273,6 +273,27 @@ test "over-budget executor assembly is refused by the seam" {
     }, .{ .max_tokens = 50 }, &diag));
 }
 
+test "SubstrateStrategy passes the strategy conformance harness" {
+    const conformance = @import("context_conformance.zig");
+    var sub = FakeSubstrate{ .mission_md = "# Mission m\n\ngizmo\n", .plan_md = "# Plan\n\n- [ ] t\n" };
+    const tasks = [_]context.TaskView{
+        .{ .desc = "build", .done = true, .result = "built" },
+        .{ .desc = "ship" },
+    };
+    for ([_][]const u8{ "product-owner", "planner", "executor", "verifier" }) |role| {
+        try conformance.conform(testing.allocator, .{ .strategy = strategy() }, .{
+            .role = role,
+            .mission = .{
+                .mission_id = "m",
+                .objective = "ship it",
+                .tasks = &tasks,
+                .task_index = 1,
+            },
+            .substrate = sub.substrate(),
+        });
+    }
+}
+
 test "absorb is a no-op that never fails" {
     var sub = FakeSubstrate{};
     try strategy().absorb(.{
