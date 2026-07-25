@@ -11,6 +11,12 @@ fail-closed decision lives here, tested:
   `zygos::missions::` override), approval (5m), budget tokens, role
   steps/turns. Env overrides parse; malformed values keep defaults (boot
   must not die on a typo).
+- **Brief budget** — `briefBudgetMaxTokens(text)` + `budgetMaxTokens(env,
+  text)`: the frontmatter `budget.max_tokens` W1 already requires is the
+  enforced budget; an explicitly set `ZYGOS_BUDGET_MAX_TOKENS` overrides
+  it, the Timeouts default (1M) backstops both. Queue mode resolves per
+  brief. Before this, the declared budget was decorative and the CLI
+  default silently governed (issues/0003).
 - **Search backend** — `searchConfigFromEnv(env)`: brave|searxng from
   `ZYGOS_SEARCH_*`. The brave branch resolves the `key_env` variable into
   `SearchConfig.key` HERE — web_tools never reads the environment (the Y5

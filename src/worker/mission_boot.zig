@@ -129,6 +129,52 @@ pub fn timeouts(env: []const EnvPair) Timeouts {
 }
 
 // ---------------------------------------------------------------------------
+// brief budget (issues/0003 — the declared budget must be the enforced one)
+// ---------------------------------------------------------------------------
+
+/// Reads `budget.max_tokens` out of the brief's YAML frontmatter: the
+/// top-level `budget:` key W1 already requires, then an indented
+/// `max_tokens:` line inside that block (any later top-level key closes
+/// it). Pure line scan; absent or malformed ⇒ null, never a boot failure.
+pub fn briefBudgetMaxTokens(brief_text: []const u8) ?i64 {
+    var opened = false;
+    var in_budget = false;
+    var it = std.mem.splitScalar(u8, brief_text, '\n');
+    while (it.next()) |raw| {
+        const line = std.mem.trimEnd(u8, raw, "\r");
+        if (!opened) {
+            if (line.len == 0) continue; // W1 allows leading blank lines
+            if (!std.mem.eql(u8, line, "---")) return null;
+            opened = true;
+            continue;
+        }
+        if (std.mem.eql(u8, line, "---")) return null; // frontmatter closed
+        if (line.len > 0 and line[0] != ' ' and line[0] != '\t') {
+            in_budget = std.mem.startsWith(u8, line, "budget:");
+            continue;
+        }
+        if (!in_budget) continue;
+        const trimmed = std.mem.trim(u8, line, " \t");
+        if (std.mem.startsWith(u8, trimmed, "max_tokens:")) {
+            const val = std.mem.trim(u8, trimmed["max_tokens:".len..], " \t");
+            return std.fmt.parseInt(i64, val, 10) catch null;
+        }
+    }
+    return null;
+}
+
+/// Budget precedence for one mission: an explicitly set
+/// ZYGOS_BUDGET_MAX_TOKENS (operator override) → the brief's declared
+/// `budget.max_tokens` → the Timeouts default. Queue mode resolves this
+/// per brief.
+pub fn budgetMaxTokens(env: []const EnvPair, brief_text: []const u8) i64 {
+    const d: Timeouts = .{};
+    if (getEnv(env, "ZYGOS_BUDGET_MAX_TOKENS") != null)
+        return envInt(env, "ZYGOS_BUDGET_MAX_TOKENS", d.budget_max_tokens);
+    return briefBudgetMaxTokens(brief_text) orelse d.budget_max_tokens;
+}
+
+// ---------------------------------------------------------------------------
 // search backend (Y5 brave key_env defect lives here)
 // ---------------------------------------------------------------------------
 
@@ -330,6 +376,47 @@ test "timeouts: env overrides apply; malformed values keep defaults" {
     try t.expectEqual(@as(i64, 42), tm.budget_max_tokens);
     try t.expectEqual(@as(i64, 7), tm.role_max_steps);
     try t.expectEqual(@as(i64, 9), tm.max_role_turns);
+}
+
+const budget_brief =
+    \\---
+    \\mission: zahir-radar-verifier-infra
+    \\budget:
+    \\  max_tokens: 2000000
+    \\gates:
+    \\  external_actions: human
+    \\---
+    \\# Mission
+    \\
+;
+
+test "briefBudgetMaxTokens: frontmatter budget.max_tokens is extracted (Y5 regression)" {
+    try t.expectEqual(@as(?i64, 2_000_000), briefBudgetMaxTokens(budget_brief));
+}
+
+test "briefBudgetMaxTokens: absent or malformed is null, never a failure" {
+    try t.expectEqual(@as(?i64, null), briefBudgetMaxTokens("# no frontmatter\n"));
+    try t.expectEqual(@as(?i64, null), briefBudgetMaxTokens("---\nbudget:\n  other: 1\n---\n"));
+    try t.expectEqual(@as(?i64, null), briefBudgetMaxTokens("---\nbudget:\n  max_tokens: lots\n---\n"));
+}
+
+test "briefBudgetMaxTokens: max_tokens outside the budget block is not a budget" {
+    try t.expectEqual(
+        @as(?i64, null),
+        briefBudgetMaxTokens("---\nmax_tokens: 5\nbudget:\n  cap: 1\ngates:\n  x: y\n---\n"),
+    );
+    // A later top-level key closes the budget block.
+    try t.expectEqual(
+        @as(?i64, null),
+        briefBudgetMaxTokens("---\nbudget:\n  cap: 1\ngates:\n  max_tokens: 5\n---\n"),
+    );
+}
+
+test "budgetMaxTokens precedence: explicit env beats brief beats default" {
+    const env = [_]EnvPair{.{ .name = "ZYGOS_BUDGET_MAX_TOKENS", .value = "42" }};
+    try t.expectEqual(@as(i64, 42), budgetMaxTokens(&env, budget_brief));
+    try t.expectEqual(@as(i64, 2_000_000), budgetMaxTokens(&.{}, budget_brief));
+    try t.expectEqual(@as(i64, 1_000_000), budgetMaxTokens(&.{}, "# briefless\n"));
 }
 
 test "searchConfigFromEnv: brave resolves key_env into key at boot (Y5 regression)" {

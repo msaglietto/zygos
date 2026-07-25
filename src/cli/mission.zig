@@ -217,7 +217,7 @@ pub fn run(gpa: std.mem.Allocator, args: *std.process.Args.Iterator) u8 {
 
     if (!queue_mode) {
         const budget_req = std.fmt.allocPrint(gpa, "{{\"scope\":{f},\"max_tokens\":{d}}}", .{
-            json.fmt(mission_id, .{}), tm.budget_max_tokens,
+            json.fmt(mission_id, .{}), zygos.mission_boot.budgetMaxTokens(env, brief_text),
         }) catch return oom();
         const conf = caller.call("zygos::budget::configure", budget_req) catch return boot_fail();
         conf.deinit(gpa);
@@ -352,7 +352,7 @@ pub fn run(gpa: std.mem.Allocator, args: *std.process.Args.Iterator) u8 {
             const resume_q = fileExists(gpa, root, "mission.json");
 
             const bconf = std.fmt.allocPrint(gpa, "{{\"scope\":{f},\"max_tokens\":{d}}}", .{
-                json.fmt(mid, .{}), tm.budget_max_tokens,
+                json.fmt(mid, .{}), zygos.mission_boot.budgetMaxTokens(env, qtext),
             }) catch return oom();
             const conf = caller.call("zygos::budget::configure", bconf) catch return boot_fail();
             conf.deinit(gpa);
