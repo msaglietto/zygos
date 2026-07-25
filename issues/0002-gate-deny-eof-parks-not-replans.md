@@ -1,8 +1,13 @@
 ---
 title: Unanswered completion gate parks the mission instead of replanning
-status: open
+status: closed
 labels: [ready-for-agent]
 created: 2026-07-25
+closed: 2026-07-25
+resolution: >
+  Fixed in d6dfad2 (feat(worker/mission)): approval deny replies carry
+  resolved:bool; the gate parks at gating on resolved:false (named tests
+  in approval.zig and mission.zig), replans on answered denies.
 origin: Y5 run .planning-20260725-040525 (zahir-radar vault) — verified work
   destroyed by a gate-deny → replan → budget-death loop
 ---

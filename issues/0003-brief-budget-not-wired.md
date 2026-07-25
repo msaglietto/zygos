@@ -1,8 +1,13 @@
 ---
 title: Brief frontmatter budget.max_tokens is decorative — wire it into the budget scope
-status: open
+status: closed
 labels: [ready-for-agent]
 created: 2026-07-25
+closed: 2026-07-25
+resolution: >
+  Fixed in 63710f7 (feat(worker/mission_boot)): briefBudgetMaxTokens +
+  budgetMaxTokens with env > brief > default precedence, wired into both
+  CLI budget-configure sites (named tests in mission_boot.zig).
 origin: Y5 run .planning-20260725-040525 (zahir-radar vault) — brief declared
   2M tokens, mission died at the CLI's 1M default
 ---
