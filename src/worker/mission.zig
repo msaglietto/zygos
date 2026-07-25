@@ -675,7 +675,13 @@ fn runMission(self: *MissionOrchestrator, arena: std.mem.Allocator, request_json
                 .planning => try rolePlan(self, arena, cfg, &m),
                 .executing => try roleExecute(self, arena, cfg, &m),
                 .verifying => try roleVerify(self, arena, cfg, &m),
-                .gating => try gate(self, arena, cfg, &m),
+                .gating => if (try gate(self, arena, cfg, &m)) {
+                    // Unanswered gate: park durably at gating (same shape
+                    // as M6 pause) — resume re-asks the gate.
+                    log.info("mission {s}: gate unanswered — parked at gating", .{m.mission_id});
+                    try self.persist(cfg.store, ctl, &m);
+                    return replyParked(arena, &m);
+                },
                 .done, .failed => unreachable,
             }
             m.steer = "";
@@ -1234,7 +1240,12 @@ fn roleVerify(self: *MissionOrchestrator, arena: std.mem.Allocator, cfg: RunConf
 /// V5 — the hard gate. Reaching done REQUIRES an affirmative reply from a
 /// real gate function; every other outcome (no function configured, bus
 /// error, malformed reply) is gate_failed. Fail closed, no exceptions.
-fn gate(self: *MissionOrchestrator, arena: std.mem.Allocator, cfg: RunConfig, m: *Mission) MissionError!void {
+///
+/// Returns true when the gate went UNANSWERED (`resolved:false` on the
+/// deny — an approval timeout/EOF, not a human refusal): the caller parks
+/// the mission at `gating` instead of replanning, so an unattended run
+/// stops burning budget on verified work and `resume` re-asks the gate.
+fn gate(self: *MissionOrchestrator, arena: std.mem.Allocator, cfg: RunConfig, m: *Mission) MissionError!bool {
     const gate_fn = cfg.gate_function orelse
         return gateFail(m, "no gate_function: a mission cannot complete ungated");
 
@@ -1266,7 +1277,13 @@ fn gate(self: *MissionOrchestrator, arena: std.mem.Allocator, cfg: RunConfig, m:
                 m.stop = .completed;
                 m.detail = "";
                 m.state = try Fsm.apply(m.state, .gate_approved);
-                return;
+                return false;
+            }
+            // An unanswered deny (approval timeout/EOF, `resolved:false`)
+            // is silence, not refusal: park, don't replan. A deny without
+            // the field (older approvers) keeps the replan semantics.
+            if (parsed.object.get("resolved")) |rv| {
+                if (rv == .bool and !rv.bool) return true;
             }
             const reason = try arena.dupe(u8, strField(parsed.object, "reason") orelse "gate denied");
             journal(self, cfg, "redo", reason);
@@ -1276,14 +1293,16 @@ fn gate(self: *MissionOrchestrator, arena: std.mem.Allocator, cfg: RunConfig, m:
             }
             m.feedback = reason;
             m.state = try Fsm.apply(m.state, .gate_denied);
+            return false;
         },
     }
 }
 
-fn gateFail(m: *Mission, reason: []const u8) error{IllegalTransition}!void {
+fn gateFail(m: *Mission, reason: []const u8) error{IllegalTransition}!bool {
     m.stop = .gate_failed;
     m.detail = reason;
     m.state = try Fsm.apply(m.state, .gate_failed);
+    return false;
 }
 
 fn putArtifact(self: *MissionOrchestrator, cfg: RunConfig, name: []const u8, bytes: []const u8) MissionError!void {
@@ -2013,6 +2032,74 @@ test "gate_threshold denials fail the mission as gate_failed" {
     try testing.expect(res == .ok);
     try expectTerminal(res.ok, "failed", "gate_failed");
     try testing.expect(std.mem.indexOf(u8, res.ok, "not good enough") != null);
+}
+
+test "unanswered gate deny (resolved:false) parks at gating; resume + approve completes" {
+    var h = try Harness.init(testing.allocator, &.{ po_ok, plan1, exec_ok, verify_pass });
+    defer h.deinit();
+    const gate_worker = try FakeGate.start(testing.allocator, &h.actor, &h.registry, &.{
+        "{\"approved\":false,\"resolved\":false}",
+        "{\"approved\":true}",
+    });
+    defer gate_worker.stop();
+
+    const req = try h.startReq(
+        testing.allocator,
+        ",\"objective\":\"seed: gizmo\",\"gate_function\":\"test::gate::request\"",
+    );
+    defer testing.allocator.free(req);
+    const res = try h.caller.call("zygos::missions::start", req);
+    defer res.deinit(testing.allocator);
+    try testing.expect(res == .ok);
+
+    // Parked, not terminal, not replanned: verified work stays done.
+    try testing.expect(std.mem.indexOf(u8, res.ok, "\"paused\":true") != null);
+    try testing.expect(std.mem.indexOf(u8, res.ok, "\"state\":\"gating\"") != null);
+    var parked = try h.store().load(testing.allocator);
+    defer parked.deinit(testing.allocator);
+    try testing.expectEqual(State.gating, parked.state);
+    {
+        // Exactly the 4 role turns of the first pass — no replanning burn.
+        h.provider.mutex.lock();
+        defer h.provider.mutex.unlock();
+        try testing.expectEqual(@as(usize, 4), h.provider.requests.items.len);
+    }
+
+    // Resume re-enters gating and re-asks the gate; an answered approve
+    // completes without a single new role turn.
+    const rreq = try h.startReq(
+        testing.allocator,
+        ",\"objective\":\"seed: gizmo\",\"gate_function\":\"test::gate::request\",\"resume\":true",
+    );
+    defer testing.allocator.free(rreq);
+    const rres = try h.caller.call("zygos::missions::start", rreq);
+    defer rres.deinit(testing.allocator);
+    try testing.expect(rres == .ok);
+    try expectTerminal(rres.ok, "done", "completed");
+    try testing.expectEqual(@as(usize, 2), gate_worker.calls);
+}
+
+test "gate deny with resolved:true replans like a plain deny (a human said no)" {
+    var h = try Harness.init(testing.allocator, &.{
+        po_ok, plan1, exec_ok, verify_pass, plan1, exec_ok, verify_pass,
+    });
+    defer h.deinit();
+    const gate_worker = try FakeGate.start(testing.allocator, &h.actor, &h.registry, &.{
+        "{\"approved\":false,\"resolved\":true,\"reason\":\"needs polish\"}",
+        "{\"approved\":true}",
+    });
+    defer gate_worker.stop();
+
+    const req = try h.startReq(
+        testing.allocator,
+        ",\"objective\":\"seed: gizmo\",\"gate_function\":\"test::gate::request\"",
+    );
+    defer testing.allocator.free(req);
+    const res = try h.caller.call("zygos::missions::start", req);
+    defer res.deinit(testing.allocator);
+    try testing.expect(res == .ok);
+    try expectTerminal(res.ok, "done", "completed");
+    try testing.expectEqual(@as(usize, 2), gate_worker.calls);
 }
 
 test "no gate_function: mission can never complete (fail closed)" {

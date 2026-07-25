@@ -141,9 +141,16 @@ At `gating` the driver calls the request's `gate_function` (normally
 the reply:
 
 - `{"approved":true}` ⇒ `gate_approved` → done, stop `completed`.
-- `{"approved":false, ...}` ⇒ denial: `gate_denials += 1`; if
-  `gate_denials >= gate_threshold` ⇒ `gate_failed`, else `gate_denied` →
-  planning with the denial reason as `feedback`.
+- `{"approved":false,"resolved":false, ...}` ⇒ **unanswered** (approval
+  timeout/EOF, not a human refusal): the mission parks at `gating` exactly
+  like an M6 pause — substrate persisted, non-terminal `"paused":true`
+  reply, no FSM transition. `resume` re-enters `gating` and re-asks the
+  gate; an unattended run stops burning budget on verified work instead
+  of replanning it (issues/0002).
+- `{"approved":false, ...}` (no `resolved` field, or `resolved:true`) ⇒
+  denial: `gate_denials += 1`; if `gate_denials >= gate_threshold` ⇒
+  `gate_failed`, else `gate_denied` → planning with the denial reason as
+  `feedback`.
 - **No `gate_function` in the request, bus error, or malformed reply ⇒
   `gate_failed`** — a mission can never reach `done` without a real,
   reachable gate saying yes. Fail closed, no exceptions.

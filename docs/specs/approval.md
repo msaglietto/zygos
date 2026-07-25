@@ -9,7 +9,11 @@ test thread) answers via `zygos::approvals::resolve`.
 - `zygos::approvals::request` — blocking. Request
   `{"tool":"bash","input":{...},"reason":"policy ask"}`; the worker assigns an
   approval id, parks the invocation, and replies only when resolved:
-  `{"approved":true|false,"id":"a-1"}`.
+  `{"approved":true|false,"id":"a-1","resolved":true|false}`. `resolved` is
+  `true` when a resolve call (or an auto mode) actually answered, `false`
+  when the timeout expired or the worker stopped — callers can tell "a
+  human said no" from "nobody answered" (the mission gate parks on the
+  latter, issues/0002).
 - `zygos::approvals::resolve` — `{"id":"a-1","approved":true}` →
   `{"resolved":true}`; unknown id → `{"resolved":false}`.
 - `zygos::approvals::pending` — `{}` →
@@ -46,6 +50,9 @@ tests and `pending` consumers.
 6. `manual with timeout_ms: unresolved request denies after deadline`
 7. `resolve with unknown id → resolved:false`
 8. `no leaks under park/resolve loops`
+9. `timeout deny replies resolved:false (unanswered, not refused)`
+10. `explicit resolve deny replies resolved:true`
+11. `auto modes reply resolved:true (a configured decision, not silence)`
 
 Turn-side integration (ask verdict → awaiting_approval → dispatch/deny) is
 tested in `turn.zig`.

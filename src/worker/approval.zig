@@ -23,6 +23,10 @@ const Pending = struct {
     reason: []const u8,
     event: sync.ResetEvent = .{},
     approved: bool = false,
+    /// True only when a resolve call answered this request; a timeout or
+    /// worker-stop wake leaves it false, so callers can tell "denied by a
+    /// human" from "denied because nobody answered".
+    resolved: bool = false,
 };
 
 pub const ApprovalWorker = struct {
@@ -75,8 +79,8 @@ pub const ApprovalWorker = struct {
         const self: *ApprovalWorker = @ptrCast(@alignCast(ctx.?));
 
         switch (self.mode) {
-            .auto_approve => return arena.dupe(u8, "{\"approved\":true,\"id\":\"auto\"}"),
-            .auto_deny => return arena.dupe(u8, "{\"approved\":false,\"id\":\"auto\"}"),
+            .auto_approve => return arena.dupe(u8, "{\"approved\":true,\"id\":\"auto\",\"resolved\":true}"),
+            .auto_deny => return arena.dupe(u8, "{\"approved\":false,\"id\":\"auto\",\"resolved\":true}"),
             .manual => {},
         }
         const timeout_ms = self.mode.manual.timeout_ms;
@@ -112,14 +116,18 @@ pub const ApprovalWorker = struct {
             entry.event.wait();
             break :blk true;
         };
-        const approved = blk: {
+        const outcome = blk: {
             self.mutex.lock();
             defer self.mutex.unlock();
             _ = self.pending.remove(entry.id);
-            break :blk in_time and entry.approved;
+            break :blk .{ in_time and entry.approved, in_time and entry.resolved };
         };
 
-        return std.fmt.allocPrint(arena, "{{\"approved\":{},\"id\":\"{s}\"}}", .{ approved, entry.id });
+        return std.fmt.allocPrint(
+            arena,
+            "{{\"approved\":{},\"id\":\"{s}\",\"resolved\":{}}}",
+            .{ outcome[0], entry.id, outcome[1] },
+        );
     }
 
     fn resolveHandler(ctx: ?*anyopaque, arena: std.mem.Allocator, request_json: []const u8) error{ Failed, OutOfMemory }![]const u8 {
@@ -137,6 +145,7 @@ pub const ApprovalWorker = struct {
         const p = self.pending.get(id) orelse
             return arena.dupe(u8, "{\"resolved\":false}");
         p.approved = approved;
+        p.resolved = true;
         p.event.set();
         return arena.dupe(u8, "{\"resolved\":true}");
     }
@@ -340,6 +349,48 @@ test "manual with timeout_ms denies unresolved requests" {
     defer res.deinit(testing.allocator);
     try testing.expect(res == .ok);
     try testing.expect(!try approvedOf(res.ok));
+}
+
+test "timeout deny replies resolved:false (unanswered, not refused)" {
+    var h = try Harness.init(testing.allocator);
+    defer h.deinit();
+    const aw = try ApprovalWorker.start(testing.allocator, &h.actor, &h.registry, .{ .manual = .{ .timeout_ms = 20 } });
+    defer aw.stop();
+
+    const res = try h.caller.call("zygos::approvals::request", req_bash);
+    defer res.deinit(testing.allocator);
+    try testing.expect(res == .ok);
+    try testing.expect(!try approvedOf(res.ok));
+    try testing.expect(std.mem.indexOf(u8, res.ok, "\"resolved\":false") != null);
+}
+
+test "explicit resolve deny replies resolved:true (a human said no)" {
+    var h = try Harness.init(testing.allocator);
+    defer h.deinit();
+    const aw = try ApprovalWorker.start(testing.allocator, &h.actor, &h.registry, .{ .manual = .{} });
+    defer aw.stop();
+
+    var resolver: Resolver = .{ .worker = h.caller, .approve = false };
+    const rt = try std.Thread.spawn(.{}, Resolver.run, .{&resolver});
+    const requester = try inproc.Worker.spawn(testing.allocator, &h.actor, &h.registry, "requester");
+    defer requester.stop();
+    const res = try requester.call("zygos::approvals::request", req_bash);
+    defer res.deinit(testing.allocator);
+    rt.join();
+
+    try testing.expect(!try approvedOf(res.ok));
+    try testing.expect(std.mem.indexOf(u8, res.ok, "\"resolved\":true") != null);
+}
+
+test "auto modes reply resolved:true (a configured decision, not silence)" {
+    var h = try Harness.init(testing.allocator);
+    defer h.deinit();
+    const aw = try ApprovalWorker.start(testing.allocator, &h.actor, &h.registry, .auto_deny);
+    defer aw.stop();
+
+    const res = try h.caller.call("zygos::approvals::request", req_bash);
+    defer res.deinit(testing.allocator);
+    try testing.expect(std.mem.indexOf(u8, res.ok, "\"resolved\":true") != null);
 }
 
 test "resolve with unknown id reports resolved:false" {
