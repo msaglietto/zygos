@@ -404,16 +404,30 @@ pub const TurnOrchestrator = struct {
     }
 
     /// The `output::compress` seam (ARCHITECTURE.md M1 line): every ok tool
-    /// output is offered to `zygos::output::compress` on the bus —
-    /// `{"content":<str>}` in, `{"content":<str>}` out. Nothing registered
-    /// (function_not_found) or any malformed reply = pass-through. The real
-    /// output-trim filters land in M2 (decision Z-09).
+    /// output is offered to `zygos::output::compress` on the bus. Request is
+    /// `{"content":<str>, "tool":<str>, "input":<the tool's input>}` — the
+    /// context fields (S8.1) let command-aware filters dispatch on what
+    /// actually produced the output; a filter worker that ignores them still
+    /// works. Reply `{"content":<str>}`. Nothing registered
+    /// (function_not_found) or any malformed reply = pass-through.
+    ///
+    /// Escape hatch: `"raw": true` in the tool's input skips the seam
+    /// entirely — an agent that needs exact bytes says so (decision Z-09).
     fn compressSeam(
         self: *TurnOrchestrator,
         arena: std.mem.Allocator,
         out: []const u8,
+        tool_name: []const u8,
+        input: json.Value,
     ) error{OutOfMemory}![]const u8 {
-        const request = try std.fmt.allocPrint(arena, "{{\"content\":{f}}}", .{json.fmt(out, .{})});
+        if (input == .object) if (input.object.get("raw")) |v|
+            if (v == .bool and v.bool) return arena.dupe(u8, out);
+
+        const request = try std.fmt.allocPrint(
+            arena,
+            "{{\"content\":{f},\"tool\":{f},\"input\":{s}}}",
+            .{ json.fmt(out, .{}), json.fmt(tool_name, .{}), try rawJson(arena, input) },
+        );
         const res = self.worker.call("zygos::output::compress", request) catch
             return arena.dupe(u8, out);
         switch (res) {
@@ -760,7 +774,7 @@ fn runTurn(self: *TurnOrchestrator, arena: std.mem.Allocator, request_json: []co
                     switch (tool_res) {
                         .ok => |out| {
                             defer self.gpa.free(out);
-                            const final = try self.compressSeam(arena, out);
+                            const final = try self.compressSeam(arena, out, tool_name, input);
                             try traceToolResult(arena, trace_path, steps, tool_name, final, false);
                             try results.append(arena, try toolResult(arena, tool_id, final, false));
                         },
@@ -1311,6 +1325,80 @@ test "output::compress seam transforms tool_results when registered; pass-throug
     defer h.provider.mutex.unlock();
     try testing.expect(std.mem.indexOf(u8, h.provider.last_request.?, "OUTPUT") != null);
     try testing.expect(std.mem.indexOf(u8, h.provider.last_request.?, "RAN") != null);
+}
+
+/// S8.1: records the seam request verbatim so tests can assert the context
+/// fields; passes the content through untouched.
+const SeamSpy = struct {
+    gpa: std.mem.Allocator,
+    mutex: sync.Mutex = .{},
+    last_request: ?[]const u8 = null,
+    calls: usize = 0,
+
+    fn deinit(self: *SeamSpy) void {
+        if (self.last_request) |r| self.gpa.free(r);
+        self.mutex.deinit();
+    }
+
+    fn handler(ctx: ?*anyopaque, arena: std.mem.Allocator, request_json: []const u8) error{ Failed, OutOfMemory }![]const u8 {
+        const self: *SeamSpy = @ptrCast(@alignCast(ctx.?));
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.last_request) |r| self.gpa.free(r);
+        self.last_request = self.gpa.dupe(u8, request_json) catch null;
+        self.calls += 1;
+        const root = json.parseFromSliceLeaky(json.Value, arena, request_json, .{}) catch
+            return error.Failed;
+        const content = root.object.get("content") orelse return error.Failed;
+        return std.fmt.allocPrint(arena, "{{\"content\":{f}}}", .{json.fmt(content.string, .{})});
+    }
+};
+
+test "S8.1: seam request carries tool name and tool input" {
+    var h = try Harness.init(testing.allocator, &.{ tool_use_msg, end_turn_msg });
+    defer h.deinit();
+
+    var spy: SeamSpy = .{ .gpa = testing.allocator };
+    defer spy.deinit();
+    const w = try inproc.Worker.spawn(testing.allocator, &h.actor, &h.registry, "seam-spy");
+    defer w.stop();
+    try w.registerFunction("zygos::output::compress", &spy, &SeamSpy.handler);
+
+    const res = try h.runTurnCall(baseRequest(""));
+    defer res.deinit(testing.allocator);
+    try testing.expect(res == .ok);
+
+    spy.mutex.lock();
+    defer spy.mutex.unlock();
+    const req = spy.last_request orelse return error.SeamNeverCalled;
+    // The model's tool_use names "runner" with input {"command":"echo hi"}.
+    try testing.expect(std.mem.indexOf(u8, req, "\"tool\":\"runner\"") != null);
+    try testing.expect(std.mem.indexOf(u8, req, "\"command\":\"echo hi\"") != null);
+    try testing.expect(std.mem.indexOf(u8, req, "\"content\"") != null);
+}
+
+const raw_tool_use_msg =
+    \\{"stop_reason":"tool_use","content":[
+    \\ {"type":"tool_use","id":"toolu_r","name":"runner","input":{"command":"echo hi","raw":true}}]}
+;
+
+test "S8.1: raw:true in tool input bypasses the seam entirely" {
+    var h = try Harness.init(testing.allocator, &.{ raw_tool_use_msg, end_turn_msg });
+    defer h.deinit();
+
+    var spy: SeamSpy = .{ .gpa = testing.allocator };
+    defer spy.deinit();
+    const w = try inproc.Worker.spawn(testing.allocator, &h.actor, &h.registry, "seam-spy");
+    defer w.stop();
+    try w.registerFunction("zygos::output::compress", &spy, &SeamSpy.handler);
+
+    const res = try h.runTurnCall(baseRequest(""));
+    defer res.deinit(testing.allocator);
+    try testing.expect(res == .ok);
+
+    spy.mutex.lock();
+    defer spy.mutex.unlock();
+    try testing.expectEqual(@as(usize, 0), spy.calls);
 }
 
 extern "c" fn realpath(path: [*:0]const u8, resolved: [*]u8) ?[*:0]u8;
