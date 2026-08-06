@@ -244,6 +244,28 @@ $ ./test/e2e/m8/run.sh
 M8 E2E OK: real git output 1013 -> 378 bytes (63% saved), filtered=2 deduped=1 budget_saved=680
 ```
 
+`zig build filter-probe` measures the filters against a mix of real commands
+on this repo — a measurement tool, not a gate. Its first run reported 6%, with
+four of six filters silently declining on real output that every fixture had
+passed:
+
+```console
+$ zig build filter-probe
+command                          raw  filtered   saved  filter
+--------------------------------------------------------------------------
+git status                       557       239    +57%  git_status
+git log -20                    15141      1627    +89%  git_log
+git diff HEAD~1                19957     17584    +11%  git_diff
+ls -la src/worker               2430       537    +77%  listing
+find src -name *.zig            1945      1945     +0%  listing
+zig build test                 10081      2194    +78%  testrun
+--------------------------------------------------------------------------
+TOTAL                          50111     24126     51%
+```
+
+`find` declines because there is nothing to strip, and that `git diff` is 84%
+real changes — the filters do not invent savings where there is no noise.
+
 The per-mission rollup lands in `LEDGER.md` at terminal state:
 
 ```

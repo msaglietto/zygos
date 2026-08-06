@@ -1,9 +1,14 @@
 # Spec: command-aware output filters (M8, decision Z-09 second half)
 
-> **Status: implemented 2026-08-06** (commits 3ddba50..a3eb78c). All of
-> S8.1–S8.5 landed; measured 4026 → 538 bytes (86.6%) on the fixture corpus
-> against the ≥60% exit floor. Modules: `src/worker/filter/{dispatch,guard,
-> git,testrun,listing,buildlint,cache}.zig`, wired in `src/worker/trim.zig`.
+> **Status: implemented 2026-08-06** (commits 3ddba50..8b0af27). All of
+> S8.1–S8.5 landed. Modules: `src/worker/filter/{dispatch,guard,git,testrun,
+> listing,buildlint,cache}.zig`, wired in `src/worker/trim.zig`.
+>
+> **Measured three ways, and the numbers differ — trust the last one:**
+> fixture corpus 86.6%, e2e leg over real git output 63%, and
+> `zig build filter-probe` over a seven-command real mix **51%**. The probe is
+> authoritative because it is the only measurement over output nobody wrote
+> to be measured.
 >
 > Two deviations from the draft below, both deliberate:
 > - The error-signal guard is **not** part of the universal `shouldSkip`. It
@@ -13,6 +18,17 @@
 > - The S8.5 ratio floor is asserted both in-process in `trim.zig` over a
 >   fixture corpus **and** in `test/e2e/m8/` (`zig build e2e-m8`) against real
 >   `git` output from a real scratch repo.
+>
+> **What the probe caught that fixtures and the e2e leg both missed.** The
+> first probe run reported **6%**, with four of six filters silently
+> declining. `hasErrorSignal` substring-matched the whole text, so any output
+> merely *discussing* errors counted as failed — this repo's own `git log`
+> disabled the git filter because commit messages say "assertion". It is now
+> line-anchored, skips diff payload lines, and parses the located
+> `file:line:col:` form. Separately, real runners flood output with identical
+> repeated lines (`zig build test` here emits one warning 100+ times), a shape
+> no fixture had; `guard.collapseRepeats` folds those with a count. Result:
+> 6% → 51%, with `zig build test` going 0% → 78%.
 >
 > **Envelope unwrapping — the thing fixtures could not catch.** Tools reply
 > with an envelope, not bare text: `bash` gives `{"exit_code":N,"output":...}`

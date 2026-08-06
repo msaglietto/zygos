@@ -178,22 +178,46 @@ green). ROADMAP.md was exhausted after M7; this was the first milestone of the
 next cycle, and it closed a gap rather than opening a frontier: **decision Z-09
 was only half-built.**
 
-Result: the fixture corpus (`git diff` + `cargo test` + `ls -la`) went from
-4026 to 538 model-facing bytes — **86.6% reduction**, against the 60% exit
-floor. All five items landed; per-item status:
+Result on **real** command output from this repo: **51% fewer model-facing
+bytes** (43092 → 24126 over a seven-command mix, `zig build filter-probe`).
+The fixture corpus shows 86.6% and the e2e leg 63%; the probe number is the
+honest one, because it is the only one measured over output nobody authored.
+All five items landed; per-item status:
 
 - **S8.1** seam context + `raw: true` escape hatch (3b2b3a7)
 - **S8.2/S8.3** dispatcher, guards, and the four filters (8394ce1)
 - **S8.4/S8.5** dedup cache, `output::stats`, seam wiring (a3eb78c)
-- **S8-exit** `test/e2e/m8` against real git output + two production fixes it
-  caught (5a4c032, 720ee44) and the operator-facing ledger ratio (e2ec487)
+- **S8-exit** `test/e2e/m8` against real git output + the production fixes it
+  caught (5a4c032, 720ee44), the operator-facing ledger ratio (e2ec487), and
+  `zig build filter-probe` + the fixes *it* caught (f47d8d4, 8b0af27)
 
-The e2e leg earned its keep immediately: the filters were **inert on the real
-path**, because every tool replies with a JSON envelope the structured-data
-guard skipped, and trimming that envelope generically handed the model
-unparseable JSON. Every unit test was green throughout — each fed the filters
-bare text no real tool produces. Lesson for future filter work: a fixture
-proves the algorithm, only a real command proves the wiring.
+**Two rounds of reality-checking, both of which overturned a green suite.**
+
+The e2e leg found the filters were **inert on the real path**: every tool
+replies with a JSON envelope the structured-data guard skipped, and trimming
+that envelope generically handed the model unparseable JSON.
+
+`filter-probe` (real commands → real filters → a savings table) then reported
+**6%** overall, with four of six filters silently declining. Two more causes:
+`hasErrorSignal` substring-matched the whole text, so this repo's own git log
+(commit messages say "assertion") disabled the git filter; and real runners
+flood output with identical repeated lines, a shape no fixture had.
+
+Measured on this repo after both rounds — **6% → 51% overall**:
+
+| command | saved |
+|---|---|
+| `git log -20` | 89% |
+| `zig build test` | 78% (was 0%) |
+| `ls -la src/worker` | 77% |
+| `git status` | 57% |
+| `git diff HEAD~1` | 11% (that diff is 84% real changes) |
+| `find src -name '*.zig'` | 0% (nothing to strip — correct) |
+
+Lesson, recorded because it will apply to every future filter: **a fixture
+proves the algorithm, a real command proves the wiring, and only a probe over
+real output proves the ratio.** The headline 86.6% measured earlier was
+fixture-inflated; 51% is what this repo's actual command mix yields.
 
 `src/worker/trim.zig` (U6) delivers the generic seam — ANSI strip, blank-run
 collapse, head/tail elision, `saved_bytes` to the budget worker. What Z-09
