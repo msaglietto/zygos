@@ -714,7 +714,8 @@ fn runMission(self: *MissionOrchestrator, arena: std.mem.Allocator, request_json
 
 /// M7 mission-level budget ledger: the scope's spend rollup (tokens +
 /// saved_bytes from the budget worker's data) written into the substrate at
-/// terminal state. Fail-open — an unreachable budget worker skips the
+/// terminal state, plus the M8 compression breakdown when an output filter
+/// worker is on the bus. Fail-open — an unreachable budget worker skips the
 /// ledger, never the outcome.
 fn writeLedger(self: *MissionOrchestrator, arena: std.mem.Allocator, cfg: RunConfig, m: *const Mission) void {
     const scope = cfg.budget_scope orelse return;
@@ -728,13 +729,42 @@ fn writeLedger(self: *MissionOrchestrator, arena: std.mem.Allocator, cfg: RunCon
     const saved = if (parsed.object.get("saved_bytes")) |v| (if (v == .integer) v.integer else 0) else 0;
     const md = std.fmt.allocPrint(
         arena,
-        "# Ledger — {s}\n\nused_tokens: {d}\nsaved_bytes: {d}\nrole_turns: {d}\nstate: {t} ({t})\n",
-        .{ m.mission_id, used, saved, m.role_turns_used, m.state, m.stop },
+        "# Ledger — {s}\n\nused_tokens: {d}\nsaved_bytes: {d}\nrole_turns: {d}\nstate: {t} ({t})\n{s}",
+        .{ m.mission_id, used, saved, m.role_turns_used, m.state, m.stop, compressionSection(self, arena) },
     ) catch return;
     cfg.store.writeArtifact(self.gpa, "LEDGER.md", md) catch {};
     log.info("mission {s}: ledger — {d} tokens, {d} bytes saved, {d} role turns", .{
         m.mission_id, used, saved, m.role_turns_used,
     });
+}
+
+/// M8 (S8.5): the compression ratio, so the operator sees what the filters
+/// actually bought rather than a raw byte count. Empty string when no filter
+/// worker is registered — the ledger predates M8 and must still render.
+fn compressionSection(self: *MissionOrchestrator, arena: std.mem.Allocator) []const u8 {
+    const res = self.worker.call("zygos::output::stats", "{}") catch return "";
+    defer res.deinit(self.gpa);
+    if (res != .ok) return "";
+    const p = json.parseFromSliceLeaky(json.Value, arena, res.ok, .{}) catch return "";
+    if (p != .object) return "";
+    const int = struct {
+        fn get(o: json.ObjectMap, k: []const u8) i64 {
+            const v = o.get(k) orelse return 0;
+            return if (v == .integer) v.integer else 0;
+        }
+    }.get;
+    const raw = int(p.object, "raw_bytes");
+    if (raw <= 0) return "";
+    const sent = int(p.object, "sent_bytes");
+    return std.fmt.allocPrint(
+        arena,
+        "\n## Tool-output compression\n\ncalls: {d}\nfiltered: {d}\ndeduped: {d}\n" ++
+            "raw_bytes: {d}\nsent_bytes: {d}\nreduction: {d}%\n",
+        .{
+            int(p.object, "calls"), int(p.object, "filtered"), int(p.object, "deduped"),
+            raw,                    sent,                      @divTrunc((raw - sent) * 100, raw),
+        },
+    ) catch "";
 }
 
 /// W3 seam: when a continuity function + project ride the start request, the
@@ -2419,6 +2449,57 @@ test "budget ledger: terminal mission writes LEDGER.md with the scope rollup" {
     try testing.expect(std.mem.indexOf(u8, text, "used_tokens: 120") != null);
     try testing.expect(std.mem.indexOf(u8, text, "saved_bytes:") != null);
     try testing.expect(std.mem.indexOf(u8, text, "state: done (completed)") != null);
+    // No trim worker on this bus: the M8 section is absent, and the ledger
+    // still renders (it predates M8).
+    try testing.expect(std.mem.indexOf(u8, text, "Tool-output compression") == null);
+}
+
+test "M8: the ledger reports the compression ratio when a trim worker rides the bus" {
+    const exec_usage = "{\"stop_reason\":\"end_turn\",\"content\":[{\"type\":\"text\",\"text\":\"done\"}]," ++
+        "\"usage\":{\"input_tokens\":100,\"output_tokens\":20}}";
+    var h = try Harness.init(testing.allocator, &.{ po_ok, plan1, exec_usage, verify_pass });
+    defer h.deinit();
+    const approvals = try approval_mod.ApprovalWorker.start(testing.allocator, &h.actor, &h.registry, .auto_approve);
+    defer approvals.stop();
+    const budget_mod = @import("budget.zig");
+    const budget = try budget_mod.BudgetWorker.start(testing.allocator, &h.actor, &h.registry);
+    defer budget.stop();
+    const trim_mod = @import("trim.zig");
+    const trim = try trim_mod.TrimWorker.start(testing.allocator, &h.actor, &h.registry, .{}, "m-1");
+    defer trim.stop();
+    const conf = try h.caller.call("zygos::budget::configure", "{\"scope\":\"m-1\",\"max_tokens\":1000000}");
+    conf.deinit(testing.allocator);
+
+    // A filterable tool result rides the seam before the mission ends, so the
+    // ledger has something real to report.
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(testing.allocator);
+    try body.appendSlice(testing.allocator, "diff --git a/x b/x\nindex aaa..bbb 100644\n@@ -1,9 +1,9 @@\n");
+    for (0..30) |_| try body.appendSlice(testing.allocator, " untouched context line\n");
+    try body.appendSlice(testing.allocator, "-old\n+new\n");
+    for (0..30) |_| try body.appendSlice(testing.allocator, " more untouched context\n");
+    const creq = try std.fmt.allocPrint(
+        testing.allocator,
+        "{{\"content\":{f},\"tool\":\"bash\",\"input\":{{\"command\":\"git diff\"}}}}",
+        .{json.fmt(body.items, .{})},
+    );
+    defer testing.allocator.free(creq);
+    const cres = try h.caller.call("zygos::output::compress", creq);
+    cres.deinit(testing.allocator);
+
+    const req = try h.startReq(testing.allocator, seed_and_gate ++ ",\"budget_scope\":\"m-1\"");
+    defer testing.allocator.free(req);
+    const res = try h.caller.call("zygos::missions::start", req);
+    defer res.deinit(testing.allocator);
+    try expectTerminal(res.ok, "done", "completed");
+
+    const text = try h.store().readArtifact(testing.allocator, "LEDGER.md");
+    defer testing.allocator.free(text);
+    try testing.expect(std.mem.indexOf(u8, text, "Tool-output compression") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "filtered: 1") != null);
+    // The ratio is a real percentage, not a placeholder.
+    try testing.expect(std.mem.indexOf(u8, text, "reduction: 0%") == null);
+    try testing.expect(std.mem.indexOf(u8, text, "reduction: ") != null);
 }
 
 test "PO decision journal: gate denial, verify failure, and acceptance land in DECISIONS.md" {
