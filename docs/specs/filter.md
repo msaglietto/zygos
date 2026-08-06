@@ -30,6 +30,14 @@
 > no fixture had; `guard.collapseRepeats` folds those with a count. Result:
 > 6% → 51%, with `zig build test` going 0% → 78%.
 >
+> **Guards are mutation-checked.** `test/mutation/guards.sh` deletes each
+> load-bearing invariant in turn and requires the suite to go red. This exists
+> because M8 produced two tests that *looked* like evidence and were not: a
+> concurrency test that passed with the mutex deleted, and a diff-payload-skip
+> test that passed with the skip deleted. A guard nothing detects the removal
+> of is indistinguishable from a vacuous one. All 9 mutants are currently
+> killed; run it when touching the guards.
+>
 > **Tool reply shapes — the corruption class that shipped twice.** The seam
 > mishandled a tool's reply shape three separate times: `bash`'s
 > `{"exit_code","output"}` made every filter inert; `web_fetch`'s

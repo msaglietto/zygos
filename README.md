@@ -266,6 +266,25 @@ TOTAL                          50111     24126     51%
 `find` declines because there is nothing to strip, and that `git diff` is 84%
 real changes — the filters do not invent savings where there is no noise.
 
+`./test/mutation/guards.sh` deletes each load-bearing guard in turn and
+requires `zig build test` to go red for every one. It exists because two M8
+tests passed with the invariant they claimed to protect deleted:
+
+```console
+$ ./test/mutation/guards.sh
+KILLED guard: diff-payload skip in hasErrorSignal
+KILLED guard: error signals bail out git/listing
+KILLED guard: small-output threshold
+KILLED guard: structured output is never reshaped
+KILLED guard: keepIfSmaller rejects non-savings
+KILLED trim: UTF-8 boundary walk in byteFallback
+KILLED trim: stats mutex in note()
+KILLED turn: raw:true bypasses the seam
+KILLED turn: seam carries the tool name
+
+MUTATION CHECK OK: every guard is pinned by a test that detects its removal.
+```
+
 The per-mission rollup lands in `LEDGER.md` at terminal state:
 
 ```
