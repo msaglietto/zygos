@@ -168,3 +168,44 @@ Deliberately absent (traces to neither consumer): iii console clone, worker
 registry service, Windows, protocol divergence, Zig async — all standing
 GOAL.md non-goals — plus DESIGN.md's fusion/prompt-pipeline (Z-06) and the
 `directory` skills worker, which serve neither radar nor orchy today.
+
+---
+
+## PROPOSED — M8: command-aware output compression (Z-09, second half)
+
+Drafted 2026-08-06. ROADMAP.md was exhausted after M7; this is the first
+milestone of the next cycle, and it closes a gap rather than opening a
+frontier: **decision Z-09 was only half-built.**
+
+`src/worker/trim.zig` (U6) delivers the generic seam — ANSI strip, blank-run
+collapse, head/tail elision, `saved_bytes` to the budget worker. What Z-09
+also promised and nobody built: *"deterministic filters (ztk's rule set: strip
+diff metadata/test noise/listing bloat; never touch errors, exit codes, small
+or structured output), per-call `raw: true` escape hatch, session dedup cache"*.
+
+The difference is not cosmetic. Blunt head/tail elision cuts the **middle** out
+of a `git diff` — the part with the changes — and compresses a green test run
+exactly as hard as a stack trace. Command-aware filtering keeps the signal and
+drops the noise; ztk reports ~90% on a real command mix where truncation gets
+a fraction of that, with worse fidelity.
+
+Full design: `docs/specs/filter.md`. **Port the ideas, not the code** — taking
+ztk as a `build.zig.zon` entry is a human-gated `new_dependency`, and our seam
+sees structured tool input that ztk's hook-rewrite approach never gets.
+
+| Item | Serves | Size |
+|---|---|---|
+| **S8.1 Seam context** — `output::compress` request gains optional `tool` + `input` (the driver has both in scope at the call site); `raw: true` in a tool's input bypasses the seam. Additive: content-only requests still trim, every existing test stays green. The enabling change — no filter can dispatch without it | RADAR + FACTORY | S |
+| **S8.2 Filter dispatcher** — `filter/dispatch.zig`: basenamed argv[0] (+argv[1]) → filter table, so `/usr/bin/git` cannot dodge compression; shell metacharacters ⇒ fail open. Filter output still passes through the generic `trim()` as a budget backstop | RADAR + FACTORY | S |
+| **S8.3 The filters** — one small module per family, each pure + fixture-tested: `filter/git.zig` (hunks, not index/mode metadata — the highest-value one, lands first), `filter/testrun.zig` (failures + tally, not per-test PASS lines), `filter/listing.zig` (names, not permission bits), `filter/buildlint.zig` (diagnostics, not `Compiling …`). Universal invariants tested per filter: never touch errors, <80 bytes passes, JSON passes, markers count honestly | FACTORY (primary — build/test/diff output dominates executor turns) + RADAR | M |
+| **S8.4 Session dedup cache** — `filter/cache.zig` owned by `TrimWorker`: repeat command + unchanged output within a class TTL (30s volatile / 120s tests / 300s log) ⇒ one-line "unchanged" reply; mutating commands invalidate; bounded 64-entry LRU | FACTORY (executors re-run the same checks constantly) | S |
+| **S8.5 Savings evidence** — `zygos::output::stats` (calls, raw vs sent bytes, by-filter breakdown) feeding M7's mission budget ledger; `test/e2e/m8/` asserts an end-to-end ratio floor of **≥60%** over the golden fixture corpus | RADAR (weekly cost) + FACTORY (per-phase attribution) | S |
+
+**Sequencing:** S8.1 → S8.2 → S8.3 (git first, then testrun, listing,
+buildlint — each independently shippable) → S8.4 → S8.5. Each filter is its
+own file with its own test block, per the file-size-creep note: this milestone
+adds modules, it does not grow `trim.zig`.
+
+**Exit criterion (S8-exit):** a scripted turn over the golden fixture corpus
+sends ≥60% fewer bytes to the model than the same turn with filters disabled,
+with every error message, exit code, and JSON payload byte-identical.
