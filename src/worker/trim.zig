@@ -8,6 +8,9 @@
 const std = @import("std");
 const json = std.json;
 const actor_mod = @import("../kernel/actor.zig");
+const sync = @import("../kernel/sync.zig");
+const dispatch = @import("filter/dispatch.zig");
+const cache_mod = @import("filter/cache.zig");
 const inproc = @import("../kernel/inproc.zig");
 
 pub const Limits = struct {
@@ -139,11 +142,35 @@ fn byteFallback(arena: std.mem.Allocator, text: []const u8, limits: Limits) erro
     return out.items;
 }
 
+/// Wall-clock ms (same contract as kernel/inproc.zig — Zig 0.16 std has no
+/// io-free milliTimestamp).
+fn nowMs() i64 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.REALTIME, &ts);
+    return @as(i64, @intCast(ts.sec)) * 1000 + @divTrunc(@as(i64, @intCast(ts.nsec)), std.time.ns_per_ms);
+}
+
 pub const TrimWorker = struct {
     gpa: std.mem.Allocator,
     worker: *inproc.Worker,
     limits: Limits,
     budget_scope: ?[]const u8, // owned
+
+    /// S8.4 dedup + S8.5 stats. Guarded by `mutex`: the bus may deliver
+    /// concurrent invocations, and neither is safe to touch unsynchronized.
+    mutex: sync.Mutex = .{},
+    cache: cache_mod.Cache = .{},
+    stats: Stats = .{},
+
+    /// S8.5: compression evidence, so a mission's ratio is inspectable
+    /// rather than asserted.
+    pub const Stats = struct {
+        calls: usize = 0,
+        filtered: usize = 0,
+        deduped: usize = 0,
+        raw_bytes: usize = 0,
+        sent_bytes: usize = 0,
+    };
 
     pub fn start(
         gpa: std.mem.Allocator,
@@ -162,17 +189,21 @@ pub const TrimWorker = struct {
         };
         errdefer self.worker.stop();
         try self.worker.registerFunction("zygos::output::compress", self, &handler);
+        try self.worker.registerFunction("zygos::output::stats", self, &statsHandler);
         return self;
     }
 
     pub fn stop(self: *TrimWorker) void {
         self.worker.stop();
         if (self.budget_scope) |s| self.gpa.free(s);
+        self.mutex.deinit();
         const gpa = self.gpa;
         gpa.destroy(self);
     }
 
-    /// Seam contract (turn driver): {"content":"..."} → {"content":"..."}.
+    /// Seam contract (turn driver): `{"content":..., "tool":..., "input":...}`
+    /// → `{"content":...}`. `tool`/`input` are optional (S8.1): without them
+    /// only the generic trim runs, which is what every pre-M8 caller gets.
     /// Malformed requests fail the handler — the driver's seam falls back
     /// to the untrimmed output on any error.
     fn handler(ctx: ?*anyopaque, arena: std.mem.Allocator, request_json: []const u8) error{ Failed, OutOfMemory }![]const u8 {
@@ -183,19 +214,99 @@ pub const TrimWorker = struct {
         if (root != .object) return error.Failed;
         const content = root.object.get("content") orelse return error.Failed;
         if (content != .string) return error.Failed;
+        const raw = content.string;
 
-        const out = try trim(arena, content.string, self.limits);
-        if (out.len < content.string.len) {
-            if (self.budget_scope) |scope| {
-                const rec = std.fmt.allocPrint(
-                    arena,
-                    "{{\"scope\":{f},\"kind\":\"saved_bytes\",\"amount\":{d}}}",
-                    .{ json.fmt(scope, .{}), content.string.len - out.len },
-                ) catch null;
-                if (rec) |r| self.worker.cast("zygos::budget::record", r) catch {};
+        const tool = if (root.object.get("tool")) |v|
+            (if (v == .string) v.string else "")
+        else
+            "";
+        const command = if (root.object.get("input")) |v| blk: {
+            if (v != .object) break :blk null;
+            const c = v.object.get("command") orelse break :blk null;
+            break :blk if (c == .string) c.string else null;
+        } else null;
+
+        const out = try self.compress(arena, raw, tool, command);
+        if (raw.len > out.len) self.recordSavings(arena, raw.len - out.len);
+        return std.fmt.allocPrint(arena, "{{\"content\":{f}}}", .{json.fmt(out, .{})});
+    }
+
+    /// The M8 pipeline: dedup → command-aware filter → generic trim.
+    ///
+    /// The generic trim always runs last, even behind a filter, so a filter
+    /// that under-compresses still cannot blow the budget. Every stage fails
+    /// open to the stage below it.
+    fn compress(
+        self: *TrimWorker,
+        arena: std.mem.Allocator,
+        raw: []const u8,
+        tool: []const u8,
+        command: ?[]const u8,
+    ) error{OutOfMemory}![]const u8 {
+        const selection = dispatch.select(tool, command);
+
+        self.mutex.lock();
+        self.stats.calls += 1;
+        self.stats.raw_bytes += raw.len;
+        // The cache is consulted for anything we can classify; a mutating
+        // command invalidates it even when no filter applies.
+        const now_ms = nowMs();
+        const unchanged_age: ?i64 = if (selection) |sel|
+            self.cache.seenUnchanged(tool, command, raw, sel.family, now_ms)
+        else blk: {
+            if (dispatch.isMutating(tool, command)) self.cache.reset();
+            break :blk null;
+        };
+        self.mutex.unlock();
+
+        if (unchanged_age) |age| {
+            const short = try cache_mod.unchangedMarker(arena, age);
+            self.note(.{ .deduped = true, .sent = short.len });
+            return short;
+        }
+
+        var text = raw;
+        var did_filter = false;
+        if (selection) |sel| {
+            if (try sel.filter(arena, text)) |filtered| {
+                text = filtered;
+                did_filter = true;
             }
         }
-        return std.fmt.allocPrint(arena, "{{\"content\":{f}}}", .{json.fmt(out, .{})});
+        const final = try trim(arena, text, self.limits);
+        self.note(.{ .filtered = did_filter, .sent = final.len });
+        return final;
+    }
+
+    fn note(self: *TrimWorker, ev: struct { filtered: bool = false, deduped: bool = false, sent: usize }) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (ev.filtered) self.stats.filtered += 1;
+        if (ev.deduped) self.stats.deduped += 1;
+        self.stats.sent_bytes += ev.sent;
+    }
+
+    /// Fire-and-forget: accounting must never slow the tool path.
+    fn recordSavings(self: *TrimWorker, arena: std.mem.Allocator, saved: usize) void {
+        const scope = self.budget_scope orelse return;
+        const rec = std.fmt.allocPrint(
+            arena,
+            "{{\"scope\":{f},\"kind\":\"saved_bytes\",\"amount\":{d}}}",
+            .{ json.fmt(scope, .{}), saved },
+        ) catch return;
+        self.worker.cast("zygos::budget::record", rec) catch {};
+    }
+
+    fn statsHandler(ctx: ?*anyopaque, arena: std.mem.Allocator, _: []const u8) error{ Failed, OutOfMemory }![]const u8 {
+        const self: *TrimWorker = @ptrCast(@alignCast(ctx.?));
+        self.mutex.lock();
+        const s = self.stats;
+        self.mutex.unlock();
+        return std.fmt.allocPrint(
+            arena,
+            "{{\"calls\":{d},\"filtered\":{d},\"deduped\":{d},\"raw_bytes\":{d},\"sent_bytes\":{d}}}",
+            .{ s.calls, s.filtered, s.deduped, s.raw_bytes, s.sent_bytes },
+        );
     }
 };
 
@@ -386,5 +497,211 @@ test "no leaks under trim loops" {
     var i: usize = 0;
     while (i < 100) : (i += 1) {
         _ = try trim(arena_state.allocator(), "some \x1b[32mtext\x1b[0m\n\n\n\n\nend\n", .{});
+    }
+}
+
+// ===========================================================================
+// M8 integration: the seam end-to-end (docs/specs/filter.md S8.3-S8.5).
+// The filter modules own their own unit contracts; these pin the wiring.
+// ===========================================================================
+
+/// A real `git diff` shape, big enough that the generic trim alone would
+/// have to cut into the middle of it.
+const e2e_diff = blk: {
+    var s: []const u8 =
+        \\diff --git a/src/worker/turn.zig b/src/worker/turn.zig
+        \\index 1a2b3c4..5d6e7f8 100644
+        \\--- a/src/worker/turn.zig
+        \\+++ b/src/worker/turn.zig
+        \\@@ -406,10 +406,20 @@ fn compressSeam(
+        \\
+    ;
+    // Padding context, of the sort a real diff carries and the model cannot act on.
+    for (0..40) |_| s = s ++ "     const untouched_context_line_here = 0;\n";
+    s = s ++ "-    const request = old_shape;\n";
+    s = s ++ "+    const request = new_shape_with_context;\n";
+    for (0..40) |_| s = s ++ "     const more_untouched_context = 1;\n";
+    break :blk s;
+};
+
+fn compressReq(gpa: std.mem.Allocator, content: []const u8, tool: []const u8, command: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(
+        gpa,
+        "{{\"content\":{f},\"tool\":{f},\"input\":{{\"command\":{f}}}}}",
+        .{ json.fmt(content, .{}), json.fmt(tool, .{}), json.fmt(command, .{}) },
+    );
+}
+
+test "M8: a git diff is filtered, not blindly truncated" {
+    var h = try Harness.init(testing.allocator);
+    defer h.deinit();
+    const tw = try TrimWorker.start(testing.allocator, &h.actor, &h.registry, .{}, null);
+    defer tw.stop();
+
+    const req = try compressReq(testing.allocator, e2e_diff, "bash", "git diff HEAD~1");
+    defer testing.allocator.free(req);
+    const res = try h.caller.call("zygos::output::compress", req);
+    defer res.deinit(testing.allocator);
+    try testing.expect(res == .ok);
+
+    // The change survived; the metadata and far context did not.
+    try testing.expect(std.mem.indexOf(u8, res.ok, "new_shape_with_context") != null);
+    try testing.expect(std.mem.indexOf(u8, res.ok, "old_shape") != null);
+    try testing.expect(std.mem.indexOf(u8, res.ok, "index 1a2b3c4") == null);
+    try testing.expect(std.mem.indexOf(u8, res.ok, "zygos diff:") != null);
+    try testing.expect(res.ok.len < req.len / 2);
+}
+
+test "M8: an unknown command still gets the generic trim (back-compat)" {
+    var h = try Harness.init(testing.allocator);
+    defer h.deinit();
+    const tw = try TrimWorker.start(testing.allocator, &h.actor, &h.registry, tiny, null);
+    defer tw.stop();
+
+    var big: std.ArrayList(u8) = .empty;
+    defer big.deinit(testing.allocator);
+    for (0..40) |_| try big.appendSlice(testing.allocator, "unrecognized output line\n");
+
+    const req = try compressReq(testing.allocator, big.items, "bash", "some-unknown-tool --flag");
+    defer testing.allocator.free(req);
+    const res = try h.caller.call("zygos::output::compress", req);
+    defer res.deinit(testing.allocator);
+    try testing.expect(res == .ok);
+    try testing.expect(std.mem.indexOf(u8, res.ok, "zygos trimmed") != null);
+}
+
+test "M8: a piped command is never filtered (fail open)" {
+    var h = try Harness.init(testing.allocator);
+    defer h.deinit();
+    const tw = try TrimWorker.start(testing.allocator, &h.actor, &h.registry, .{}, null);
+    defer tw.stop();
+
+    const req = try compressReq(testing.allocator, e2e_diff, "bash", "git diff | head -50");
+    defer testing.allocator.free(req);
+    const res = try h.caller.call("zygos::output::compress", req);
+    defer res.deinit(testing.allocator);
+    try testing.expect(res == .ok);
+    // Untouched by the git filter: the metadata is still there.
+    try testing.expect(std.mem.indexOf(u8, res.ok, "index 1a2b3c4") != null);
+}
+
+test "M8: repeating an unchanged command collapses to one line" {
+    var h = try Harness.init(testing.allocator);
+    defer h.deinit();
+    const tw = try TrimWorker.start(testing.allocator, &h.actor, &h.registry, .{}, null);
+    defer tw.stop();
+
+    const status_out =
+        "On branch master\nYour branch is up to date with 'origin/master'.\n" ++
+        "\nChanges not staged for commit:\n  (use \"git add <file>...\" to update)\n" ++
+        "  modified:   src/worker/trim.zig\n\nno changes added to commit\n";
+
+    const req = try compressReq(testing.allocator, status_out, "bash", "git status");
+    defer testing.allocator.free(req);
+
+    const first = try h.caller.call("zygos::output::compress", req);
+    defer first.deinit(testing.allocator);
+    try testing.expect(std.mem.indexOf(u8, first.ok, "src/worker/trim.zig") != null);
+
+    const second = try h.caller.call("zygos::output::compress", req);
+    defer second.deinit(testing.allocator);
+    try testing.expect(std.mem.indexOf(u8, second.ok, "output unchanged since") != null);
+    try testing.expect(second.ok.len < first.ok.len);
+}
+
+test "M8: a mutating command invalidates the dedup cache" {
+    var h = try Harness.init(testing.allocator);
+    defer h.deinit();
+    const tw = try TrimWorker.start(testing.allocator, &h.actor, &h.registry, .{}, null);
+    defer tw.stop();
+
+    const status_out = "On branch master\n  modified:   a.zig\n  modified:   b.zig\n" ++
+        "  modified:   c.zig\n  modified:   d.zig\nno changes added to commit\n";
+    const req = try compressReq(testing.allocator, status_out, "bash", "git status");
+    defer testing.allocator.free(req);
+
+    const r1 = try h.caller.call("zygos::output::compress", req);
+    defer r1.deinit(testing.allocator);
+    const r2 = try h.caller.call("zygos::output::compress", req);
+    defer r2.deinit(testing.allocator);
+    try testing.expect(std.mem.indexOf(u8, r2.ok, "output unchanged since") != null);
+
+    // `git add` clears the cache; the next identical status is full again.
+    const mut = try compressReq(testing.allocator, "", "bash", "git add -A");
+    defer testing.allocator.free(mut);
+    const rm = try h.caller.call("zygos::output::compress", mut);
+    defer rm.deinit(testing.allocator);
+
+    const r3 = try h.caller.call("zygos::output::compress", req);
+    defer r3.deinit(testing.allocator);
+    try testing.expect(std.mem.indexOf(u8, r3.ok, "output unchanged since") == null);
+    try testing.expect(std.mem.indexOf(u8, r3.ok, "a.zig") != null);
+}
+
+test "M8: output::stats reports the compression ratio (S8.5 exit floor)" {
+    var h = try Harness.init(testing.allocator);
+    defer h.deinit();
+    const tw = try TrimWorker.start(testing.allocator, &h.actor, &h.registry, .{}, null);
+    defer tw.stop();
+
+    // A small corpus in the shape of a real executor turn.
+    const green_tests =
+        "   Compiling zygos v0.1.0\n    Finished test target(s) in 2.3s\nrunning 4 tests\n" ++
+        "test a::b ... ok\ntest c::d ... ok\ntest e::f ... ok\ntest g::h ... ok\n" ++
+        "test result: ok. 4 passed; 0 failed\n";
+    const ls_out =
+        "total 96\n" ++
+        "-rw-r--r--   1 msaglietto  staff   1024 Aug  5 12:00 actor.zig\n" ++
+        "-rw-r--r--   1 msaglietto  staff   2048 Aug  5 12:00 catalog.zig\n" ++
+        "-rw-r--r--   1 msaglietto  staff   4096 Aug  5 12:00 protocol.zig\n" ++
+        "-rw-r--r--   1 msaglietto  staff   8192 Aug  5 12:00 invocation.zig\n";
+
+    const corpus = [_]struct { out: []const u8, cmd: []const u8 }{
+        .{ .out = e2e_diff, .cmd = "git diff HEAD~1" },
+        .{ .out = green_tests, .cmd = "cargo test" },
+        .{ .out = ls_out, .cmd = "ls -la src/kernel" },
+    };
+    for (corpus) |c| {
+        const req = try compressReq(testing.allocator, c.out, "bash", c.cmd);
+        defer testing.allocator.free(req);
+        const res = try h.caller.call("zygos::output::compress", req);
+        defer res.deinit(testing.allocator);
+        try testing.expect(res == .ok);
+    }
+
+    const s = try h.caller.call("zygos::output::stats", "{}");
+    defer s.deinit(testing.allocator);
+    try testing.expect(s == .ok);
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const root = try json.parseFromSliceLeaky(json.Value, arena_state.allocator(), s.ok, .{});
+    const raw_bytes: usize = @intCast(root.object.get("raw_bytes").?.integer);
+    const sent_bytes: usize = @intCast(root.object.get("sent_bytes").?.integer);
+    try testing.expectEqual(@as(i64, 3), root.object.get("calls").?.integer);
+    try testing.expectEqual(@as(i64, 3), root.object.get("filtered").?.integer);
+
+    // S8-exit: ≥60% fewer bytes reach the model over the fixture corpus.
+    // Reported on failure so a regression shows the real ratio, not just red.
+    if (sent_bytes * 100 >= raw_bytes * 40) {
+        std.debug.print("\nM8 ratio regressed: {d} -> {d} bytes\n", .{ raw_bytes, sent_bytes });
+    }
+    try testing.expect(sent_bytes * 100 < raw_bytes * 40);
+}
+
+test "M8: no leaks across many filtered calls" {
+    var h = try Harness.init(testing.allocator);
+    defer h.deinit();
+    const tw = try TrimWorker.start(testing.allocator, &h.actor, &h.registry, .{}, "leak-scope");
+    defer tw.stop();
+
+    for (0..40) |i| {
+        var cb: [64]u8 = undefined;
+        const cmd = try std.fmt.bufPrint(&cb, "git diff HEAD~{d}", .{i});
+        const req = try compressReq(testing.allocator, e2e_diff, "bash", cmd);
+        defer testing.allocator.free(req);
+        const res = try h.caller.call("zygos::output::compress", req);
+        defer res.deinit(testing.allocator);
+        try testing.expect(res == .ok);
     }
 }
