@@ -1075,3 +1075,65 @@ test "M8: multi-array JSON falls back rather than guessing which to cut" {
     const one = "{\"a\":[1,2,3,4,5,6,7,8,9,10]}";
     try testing.expect(try TrimWorker.truncateJsonArray(arena, one, 20) != null);
 }
+
+test "M8: multibyte text is never cut mid-character" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // A web article in a non-ASCII language is the RADAR case: a byte cut
+    // landing inside a multibyte sequence produces mojibake the model then
+    // reasons over. Sweep every limit so no single boundary can be lucky.
+    const source = "café — naïve 日本語 текст ✓ emoji 🚀 " ** 40;
+    var limit: usize = 40;
+    while (limit < 400) : (limit += 1) {
+        const out = try trim(arena, source, .{
+            .max_bytes = limit,
+            .max_lines = 1,
+            .head_lines = 1,
+            .tail_lines = 1,
+        });
+        try testing.expect(std.unicode.utf8ValidateSlice(out));
+    }
+}
+
+test "M8: multibyte content survives the compress seam intact" {
+    var h = try Harness.init(testing.allocator);
+    defer h.deinit();
+    const tw = try TrimWorker.start(testing.allocator, &h.actor, &h.registry, tiny, null);
+    defer tw.stop();
+
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(testing.allocator);
+    for (0..40) |i| {
+        var lb: [128]u8 = undefined;
+        try body.appendSlice(testing.allocator, try std.fmt.bufPrint(
+            &lb,
+            "Ligne {d} — accentué, 日本語, кириллица ✓\n",
+            .{i},
+        ));
+    }
+    const envelope = try std.fmt.allocPrint(
+        testing.allocator,
+        "{{\"url\":\"https://example.fr\",\"text\":{f}}}",
+        .{json.fmt(body.items, .{})},
+    );
+    defer testing.allocator.free(envelope);
+
+    const req = try compressReq(testing.allocator, envelope, "web_fetch", "");
+    defer testing.allocator.free(req);
+    const res = try h.caller.call("zygos::output::compress", req);
+    defer res.deinit(testing.allocator);
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const content = (try json.parseFromSliceLeaky(json.Value, arena, res.ok, .{}))
+        .object.get("content").?.string;
+    // Still valid JSON, still valid UTF-8, and the head is readable.
+    const inner = json.parseFromSliceLeaky(json.Value, arena, content, .{}) catch
+        return error.MultibyteEnvelopeCorrupted;
+    const text = inner.object.get("text").?.string;
+    try testing.expect(std.unicode.utf8ValidateSlice(text));
+    try testing.expect(std.mem.indexOf(u8, text, "Ligne 0 — accentué") != null);
+}
