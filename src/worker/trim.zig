@@ -142,6 +142,13 @@ fn byteFallback(arena: std.mem.Allocator, text: []const u8, limits: Limits) erro
     return out.items;
 }
 
+fn rawJson(alloc: std.mem.Allocator, value: json.Value) error{OutOfMemory}![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    json.Stringify.value(value, .{}, &out.writer) catch return error.OutOfMemory;
+    return out.written();
+}
+
 /// Wall-clock ms (same contract as kernel/inproc.zig — Zig 0.16 std has no
 /// io-free milliTimestamp).
 fn nowMs() i64 {
@@ -226,9 +233,63 @@ pub const TrimWorker = struct {
             break :blk if (c == .string) c.string else null;
         } else null;
 
-        const out = try self.compress(arena, raw, tool, command);
+        const out = try self.compressEnvelope(arena, raw, tool, command);
         if (raw.len > out.len) self.recordSavings(arena, raw.len - out.len);
         return std.fmt.allocPrint(arena, "{{\"content\":{f}}}", .{json.fmt(out, .{})});
+    }
+
+    /// Tool replies are usually an envelope, not bare text: `zygos::tools::bash`
+    /// answers `{"exit_code":N,"output":"..."}`. Compressing the envelope as
+    /// one blob is wrong twice over — the guard sees JSON and skips every
+    /// filter (M8 was dead on the real path until test/e2e/m8 caught it), and
+    /// the payload inside is escaped, so line-based filters see one long line.
+    ///
+    /// So: unwrap, compress the payload, re-wrap. The model still gets the
+    /// tool's declared reply shape; only the payload shrinks. Anything that
+    /// is not a recognizable envelope is compressed as-is.
+    fn compressEnvelope(
+        self: *TrimWorker,
+        arena: std.mem.Allocator,
+        raw: []const u8,
+        tool: []const u8,
+        command: ?[]const u8,
+    ) error{OutOfMemory}![]const u8 {
+        const payload = envelopePayload(arena, raw) orelse
+            return self.compress(arena, raw, tool, command);
+
+        const compressed = try self.compress(arena, payload.text, tool, command);
+        if (compressed.len >= payload.text.len) return raw;
+        return std.fmt.allocPrint(arena, "{{{s}\"output\":{f}}}", .{
+            payload.prefix,
+            json.fmt(compressed, .{}),
+        });
+    }
+
+    const Envelope = struct {
+        /// Preserved sibling fields, already serialized with a trailing comma.
+        prefix: []const u8,
+        text: []const u8,
+    };
+
+    /// Recognize `{... ,"output": <string>, ...}` — the tool reply shape.
+    /// Returns null for anything else, including genuine structured data the
+    /// filters must never reshape.
+    fn envelopePayload(arena: std.mem.Allocator, raw: []const u8) ?Envelope {
+        const t = std.mem.trim(u8, raw, " \t\r\n");
+        if (t.len == 0 or t[0] != '{') return null;
+        const root = json.parseFromSliceLeaky(json.Value, arena, t, .{}) catch return null;
+        if (root != .object) return null;
+        const out = root.object.get("output") orelse return null;
+        if (out != .string) return null;
+
+        var prefix: std.ArrayList(u8) = .empty;
+        var it = root.object.iterator();
+        while (it.next()) |e| {
+            if (std.mem.eql(u8, e.key_ptr.*, "output")) continue;
+            const rendered = rawJson(arena, e.value_ptr.*) catch return null;
+            prefix.print(arena, "{f}:{s},", .{ json.fmt(e.key_ptr.*, .{}), rendered }) catch return null;
+        }
+        return .{ .prefix = prefix.items, .text = out.string };
     }
 
     /// The M8 pipeline: dedup → command-aware filter → generic trim.
@@ -704,4 +765,52 @@ test "M8: no leaks across many filtered calls" {
         defer res.deinit(testing.allocator);
         try testing.expect(res == .ok);
     }
+}
+
+test "M8: the bash tool's JSON envelope does not defeat the filters" {
+    var h = try Harness.init(testing.allocator);
+    defer h.deinit();
+    const tw = try TrimWorker.start(testing.allocator, &h.actor, &h.registry, .{}, null);
+    defer tw.stop();
+
+    // What `zygos::tools::bash` actually replies with: the output wrapped in
+    // an envelope. Without unwrapping, `looksStructured` skips every filter
+    // and M8 is dead on the real path (caught by test/e2e/m8).
+    const envelope = try std.fmt.allocPrint(
+        testing.allocator,
+        "{{\"exit_code\":0,\"output\":{f}}}",
+        .{json.fmt(e2e_diff, .{})},
+    );
+    defer testing.allocator.free(envelope);
+
+    const req = try compressReq(testing.allocator, envelope, "bash", "git diff HEAD~1");
+    defer testing.allocator.free(req);
+    const res = try h.caller.call("zygos::output::compress", req);
+    defer res.deinit(testing.allocator);
+    try testing.expect(res == .ok);
+
+    // Filtered...
+    try testing.expect(std.mem.indexOf(u8, res.ok, "zygos diff:") != null);
+    try testing.expect(std.mem.indexOf(u8, res.ok, "new_shape_with_context") != null);
+    try testing.expect(std.mem.indexOf(u8, res.ok, "index 1a2b3c4") == null);
+    // ...while the envelope itself survives: the driver's contract with the
+    // model is the tool's reply shape, not our compression detail.
+    try testing.expect(std.mem.indexOf(u8, res.ok, "exit_code") != null);
+    try testing.expect(res.ok.len < req.len / 2);
+}
+
+test "M8: a non-envelope JSON tool result is still left alone" {
+    var h = try Harness.init(testing.allocator);
+    defer h.deinit();
+    const tw = try TrimWorker.start(testing.allocator, &h.actor, &h.registry, .{}, null);
+    defer tw.stop();
+
+    // No "output" string field ⇒ genuine structured data ⇒ untouched.
+    const payload = "{\"results\":[{\"url\":\"https://example.com\",\"title\":\"" ++ "t" ** 120 ++ "\"}]}";
+    const req = try compressReq(testing.allocator, payload, "bash", "git diff");
+    defer testing.allocator.free(req);
+    const res = try h.caller.call("zygos::output::compress", req);
+    defer res.deinit(testing.allocator);
+    try testing.expect(std.mem.indexOf(u8, res.ok, "example.com") != null);
+    try testing.expect(std.mem.indexOf(u8, res.ok, "zygos diff:") == null);
 }

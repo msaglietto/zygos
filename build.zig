@@ -155,6 +155,21 @@ pub fn build(b: *std.Build) void {
     const e2e_m2_step = b.step("e2e-m2", "Run the M2 policy+routing e2e (U6)");
     e2e_m2_step.dependOn(&b.addRunArtifact(e2e_m2).step);
 
+    // S8 exit test (M8): command-aware compression over REAL git output.
+    // Run with `zig build e2e-m8`.
+    const e2e_m8 = b.addExecutable(.{
+        .name = "zygos-e2e-m8",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/e2e/m8/main.zig"),
+            .link_libc = true,
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "zygos", .module = mod }},
+        }),
+    });
+    const e2e_m8_step = b.step("e2e-m8", "Run the M8 output-compression e2e (S8-exit)");
+    e2e_m8_step.dependOn(&b.addRunArtifact(e2e_m8).step);
+
     // V6 exit test (GOAL.md M3): the mission loop + resume-from-disk leg.
     // Run with `zig build e2e-m3` (or test/e2e/m3/run.sh).
     const e2e_m3 = b.addExecutable(.{
