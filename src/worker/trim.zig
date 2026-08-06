@@ -257,16 +257,94 @@ pub const TrimWorker = struct {
         tool: []const u8,
         command: ?[]const u8,
     ) error{OutOfMemory}![]const u8 {
-        const payload = envelopePayload(arena, raw) orelse
-            return self.compress(arena, raw, tool, command);
+        if (envelopePayload(arena, raw)) |payload| {
+            const compressed = try self.compress(arena, payload.text, tool, command);
+            if (compressed.len >= payload.text.len) return raw;
+            return std.fmt.allocPrint(arena, "{{{s}{f}:{f}}}", .{
+                payload.prefix,
+                json.fmt(payload.key, .{}),
+                json.fmt(compressed, .{}),
+            });
+        }
+        // Structured data with no text payload (e.g. web_search's
+        // `{"results":[...]}`): a byte-level cut lands mid-JSON and hands the
+        // model something unparseable. Drop whole elements instead, so what
+        // arrives is always valid — shorter, but still parseable.
+        if (raw.len > self.limits.max_bytes) {
+            if (try truncateJsonArray(arena, raw, self.limits.max_bytes)) |shorter| {
+                self.note(.{ .sent = shorter.len });
+                self.mutex.lock();
+                self.stats.calls += 1;
+                self.stats.raw_bytes += raw.len;
+                self.mutex.unlock();
+                return shorter;
+            }
+        }
+        return self.compress(arena, raw, tool, command);
+    }
 
-        const compressed = try self.compress(arena, payload.text, tool, command);
-        if (compressed.len >= payload.text.len) return raw;
-        return std.fmt.allocPrint(arena, "{{{s}{f}:{f}}}", .{
-            payload.prefix,
-            json.fmt(payload.key, .{}),
-            json.fmt(compressed, .{}),
-        });
+    /// Shrink `{"key":[...]}` by dropping trailing array elements until it
+    /// fits, appending a count of what was dropped as a final string element.
+    /// Null when the value is not an object holding exactly one array, in
+    /// which case the caller falls back to the generic path.
+    fn truncateJsonArray(
+        arena: std.mem.Allocator,
+        raw: []const u8,
+        max_bytes: usize,
+    ) error{OutOfMemory}!?[]const u8 {
+        const root = json.parseFromSliceLeaky(json.Value, arena, raw, .{}) catch return null;
+        if (root != .object) return null;
+
+        var array_key: ?[]const u8 = null;
+        var it = root.object.iterator();
+        while (it.next()) |e| {
+            if (e.value_ptr.* != .array) continue;
+            if (array_key != null) return null; // ambiguous: more than one
+            array_key = e.key_ptr.*;
+        }
+        const key = array_key orelse return null;
+        const items = root.object.get(key).?.array.items;
+        if (items.len == 0) return null;
+
+        // Binary search the largest prefix that fits.
+        var lo: usize = 0;
+        var hi: usize = items.len;
+        var best: ?[]const u8 = null;
+        while (lo < hi) {
+            const mid = lo + (hi - lo + 1) / 2;
+            const candidate = try renderPrefix(arena, key, items, mid);
+            if (candidate.len <= max_bytes) {
+                best = candidate;
+                lo = mid;
+                if (lo == items.len) break;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        return best orelse try renderPrefix(arena, key, items, 0);
+    }
+
+    fn renderPrefix(
+        arena: std.mem.Allocator,
+        key: []const u8,
+        items: []const json.Value,
+        keep: usize,
+    ) error{OutOfMemory}![]const u8 {
+        var out: std.ArrayList(u8) = .empty;
+        try out.print(arena, "{{{f}:[", .{json.fmt(key, .{})});
+        for (items[0..keep], 0..) |item, i| {
+            if (i > 0) try out.append(arena, ',');
+            try out.appendSlice(arena, try rawJson(arena, item));
+        }
+        if (keep < items.len) {
+            if (keep > 0) try out.append(arena, ',');
+            try out.print(arena, "{f}", .{json.fmt(
+                try std.fmt.allocPrint(arena, "[... zygos dropped {d} more entries ...]", .{items.len - keep}),
+                .{},
+            )});
+        }
+        try out.appendSlice(arena, "]}");
+        return out.items;
     }
 
     const Envelope = struct {
@@ -879,4 +957,121 @@ test "M8: web_fetch's text envelope is unwrapped too (RADAR profile)" {
     try testing.expect(inner == .object);
     try testing.expectEqualStrings("https://example.com", inner.object.get("url").?.string);
     try testing.expect(inner.object.get("text").? == .string);
+}
+
+test "M8: oversized structured JSON is never cut into invalid JSON" {
+    var h = try Harness.init(testing.allocator);
+    defer h.deinit();
+    const tw = try TrimWorker.start(testing.allocator, &h.actor, &h.registry, tiny, null);
+    defer tw.stop();
+
+    // `zygos::tools::web_search` replies {"results":[{title,url,snippet}...]}
+    // — structured, with no output/text/content field to unwrap. The generic
+    // trim would byte-slice it and hand the model unparseable JSON.
+    var results: std.ArrayList(u8) = .empty;
+    defer results.deinit(testing.allocator);
+    try results.appendSlice(testing.allocator, "{\"results\":[");
+    for (0..40) |i| {
+        var lb: [256]u8 = undefined;
+        const item = try std.fmt.bufPrint(
+            &lb,
+            "{s}{{\"title\":\"Result number {d}\",\"url\":\"https://example.com/{d}\"," ++
+                "\"snippet\":\"A snippet of text for result {d} with some padding.\"}}",
+            .{ if (i == 0) "" else ",", i, i, i },
+        );
+        try results.appendSlice(testing.allocator, item);
+    }
+    try results.appendSlice(testing.allocator, "]}");
+
+    const req = try compressReq(testing.allocator, results.items, "web_search", "");
+    defer testing.allocator.free(req);
+    const res = try h.caller.call("zygos::output::compress", req);
+    defer res.deinit(testing.allocator);
+    try testing.expect(res == .ok);
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const root = try json.parseFromSliceLeaky(json.Value, arena, res.ok, .{});
+    const content = root.object.get("content").?.string;
+    const inner = json.parseFromSliceLeaky(json.Value, arena, content, .{}) catch
+        return error.StructuredJsonWasCutIntoInvalidJson;
+    try testing.expect(inner == .object);
+    try testing.expect(inner.object.get("results").? == .array);
+}
+
+test "M8: structured-JSON truncation keeps entries whole and counts the rest" {
+    var h = try Harness.init(testing.allocator);
+    defer h.deinit();
+    const tw = try TrimWorker.start(testing.allocator, &h.actor, &h.registry, tiny, null);
+    defer tw.stop();
+
+    var results: std.ArrayList(u8) = .empty;
+    defer results.deinit(testing.allocator);
+    try results.appendSlice(testing.allocator, "{\"results\":[");
+    for (0..30) |i| {
+        var lb: [128]u8 = undefined;
+        try results.appendSlice(testing.allocator, try std.fmt.bufPrint(
+            &lb,
+            "{s}{{\"url\":\"https://example.com/{d}\",\"title\":\"Entry {d}\"}}",
+            .{ if (i == 0) "" else ",", i, i },
+        ));
+    }
+    try results.appendSlice(testing.allocator, "]}");
+
+    const req = try compressReq(testing.allocator, results.items, "web_search", "");
+    defer testing.allocator.free(req);
+    const res = try h.caller.call("zygos::output::compress", req);
+    defer res.deinit(testing.allocator);
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const content = (try json.parseFromSliceLeaky(json.Value, arena, res.ok, .{}))
+        .object.get("content").?.string;
+    const inner = try json.parseFromSliceLeaky(json.Value, arena, content, .{});
+    const items = inner.object.get("results").?.array.items;
+
+    // Kept entries are whole objects, never half-serialized fragments.
+    try testing.expect(items.len >= 2);
+    try testing.expect(items[0] == .object);
+    try testing.expect(items[0].object.get("url").? == .string);
+    // The tail is an honest count, not silence.
+    const last = items[items.len - 1];
+    try testing.expect(last == .string);
+    try testing.expect(std.mem.indexOf(u8, last.string, "zygos dropped") != null);
+    try testing.expect(content.len <= tiny.max_bytes);
+}
+
+test "M8: structured JSON under the limit is byte-identical" {
+    var h = try Harness.init(testing.allocator);
+    defer h.deinit();
+    const tw = try TrimWorker.start(testing.allocator, &h.actor, &h.registry, .{}, null);
+    defer tw.stop();
+
+    const small = "{\"results\":[{\"url\":\"https://example.com\",\"title\":\"Only one\"}]}";
+    const req = try compressReq(testing.allocator, small, "web_search", "");
+    defer testing.allocator.free(req);
+    const res = try h.caller.call("zygos::output::compress", req);
+    defer res.deinit(testing.allocator);
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const content = (try json.parseFromSliceLeaky(json.Value, arena_state.allocator(), res.ok, .{}))
+        .object.get("content").?.string;
+    try testing.expectEqualStrings(small, content);
+}
+
+test "M8: multi-array JSON falls back rather than guessing which to cut" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Two arrays: which one is the payload is ambiguous, so structured
+    // truncation declines and the generic path takes over.
+    const two = "{\"a\":[1,2,3],\"b\":[4,5,6]}";
+    try testing.expect(try TrimWorker.truncateJsonArray(arena, two, 10) == null);
+    // A single array is handled.
+    const one = "{\"a\":[1,2,3,4,5,6,7,8,9,10]}";
+    try testing.expect(try TrimWorker.truncateJsonArray(arena, one, 20) != null);
 }
