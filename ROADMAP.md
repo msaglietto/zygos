@@ -185,6 +185,15 @@ floor. All five items landed; per-item status:
 - **S8.1** seam context + `raw: true` escape hatch (3b2b3a7)
 - **S8.2/S8.3** dispatcher, guards, and the four filters (8394ce1)
 - **S8.4/S8.5** dedup cache, `output::stats`, seam wiring (a3eb78c)
+- **S8-exit** `test/e2e/m8` against real git output + two production fixes it
+  caught (5a4c032, 720ee44) and the operator-facing ledger ratio (e2ec487)
+
+The e2e leg earned its keep immediately: the filters were **inert on the real
+path**, because every tool replies with a JSON envelope the structured-data
+guard skipped, and trimming that envelope generically handed the model
+unparseable JSON. Every unit test was green throughout — each fed the filters
+bare text no real tool produces. Lesson for future filter work: a fixture
+proves the algorithm, only a real command proves the wiring.
 
 `src/worker/trim.zig` (U6) delivers the generic seam — ANSI strip, blank-run
 collapse, head/tail elision, `saved_bytes` to the budget worker. What Z-09

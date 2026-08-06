@@ -222,6 +222,41 @@ provider (accepts, never responds) must trip the idle guard, must not let
 a tight invoke timeout kill the mission call, and must still honor the
 mission ceiling.
 
+## M8 output-compression e2e (documented run)
+
+`test/e2e/m8/run.sh` (= `zig build e2e-m8`) proves decision Z-09's
+command-aware half (M8). It builds a **real** scratch git repo with a real
+uncommitted change, then runs the turn loop with the **real** bash tool
+executing real `git` commands, and asserts four things a fixture cannot:
+the driver's seam context reaches the filter dispatcher, a repeated
+`git status` collapses to a one-line "unchanged" reply, `raw: true` in the
+tool input bypasses compression entirely, and the savings reach the budget
+ledger.
+
+This leg found what 731 unit tests could not: the filters were **inert on the
+real path**, because every tool replies with a JSON envelope
+(`{"exit_code":0,"output":"..."}`) that the structured-data guard skipped —
+and trimming that envelope generically handed the model unparseable JSON. A
+fixture proves the algorithm; only a real command proves the wiring.
+
+```console
+$ ./test/e2e/m8/run.sh
+M8 E2E OK: real git output 1013 -> 378 bytes (63% saved), filtered=2 deduped=1 budget_saved=680
+```
+
+The per-mission rollup lands in `LEDGER.md` at terminal state:
+
+```
+## Tool-output compression
+
+calls: 4
+filtered: 2
+deduped: 1
+raw_bytes: 1013
+sent_bytes: 378
+reduction: 63%
+```
+
 ## Mission TUI — live progress view
 
 When `zygos mission start` runs on a real terminal (tty on stdin and

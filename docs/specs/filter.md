@@ -10,9 +10,20 @@
 >   lives in `shouldSkipOrErrored`, used by git/listing only. Folding it in
 >   would have made `testrun`/`buildlint` no-ops on failing runs — exactly the
 >   runs whose output matters most.
-> - `test/e2e/m8/` was not added as a separate binary; the S8.5 ratio floor is
->   asserted in-process in `trim.zig` over the same corpus, which keeps the
->   evidence next to the code it measures.
+> - The S8.5 ratio floor is asserted both in-process in `trim.zig` over a
+>   fixture corpus **and** in `test/e2e/m8/` (`zig build e2e-m8`) against real
+>   `git` output from a real scratch repo.
+>
+> **Envelope unwrapping — the thing fixtures could not catch.** Tools reply
+> with an envelope, not bare text: `bash` gives `{"exit_code":N,"output":...}`
+> and `web_fetch` gives `{"url":...,"text":...}`. Feeding that straight into
+> the pipeline is wrong three ways: the structured-data guard skips every
+> filter (M8 was inert on the real path), the payload is escaped so line-based
+> filters see one long line, and a byte-level cut lands inside the JSON and
+> hands the model something unparseable. `compressEnvelope` unwraps on
+> `output`/`text`/`content`, compresses the payload, and re-wraps. Every unit
+> test passed before this fix, because each fed the filters bare text no real
+> tool produces — the e2e leg is what found it.
 
 `src/worker/trim.zig` implements the *generic* half of Z-09: ANSI strip,
 blank-run collapse, head/tail elision. That is lossy in the middle and blind —
