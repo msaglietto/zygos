@@ -1137,3 +1137,96 @@ test "M8: multibyte content survives the compress seam intact" {
     try testing.expect(std.unicode.utf8ValidateSlice(text));
     try testing.expect(std.mem.indexOf(u8, text, "Ligne 0 — accentué") != null);
 }
+
+/// Every reply shape the harness's own tools actually produce. Kept as one
+/// table so a new tool cannot quietly acquire a shape the seam corrupts —
+/// the failure mode that shipped twice during M8.
+const tool_reply_shapes = [_]struct { tool: []const u8, template: []const u8 }{
+    .{ .tool = "bash", .template = "{{\"exit_code\":0,\"output\":{f}}}" },
+    .{ .tool = "read_file", .template = "{{\"content\":{f}}}" },
+    .{ .tool = "web_fetch", .template = "{{\"url\":\"https://e.co\",\"text\":{f},\"truncated\":false}}" },
+};
+
+test "M8: every harness tool reply shape survives the seam as valid JSON" {
+    var h = try Harness.init(testing.allocator);
+    defer h.deinit();
+    const tw = try TrimWorker.start(testing.allocator, &h.actor, &h.registry, tiny, null);
+    defer tw.stop();
+
+    // Oversized, multibyte, and filterable all at once — the hostile case.
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(testing.allocator);
+    for (0..60) |i| {
+        var lb: [128]u8 = undefined;
+        try body.appendSlice(testing.allocator, try std.fmt.bufPrint(
+            &lb,
+            "line {d} — with accents é and 日本語\n",
+            .{i},
+        ));
+    }
+
+    inline for (tool_reply_shapes) |shape| {
+        const envelope = try std.fmt.allocPrint(
+            testing.allocator,
+            shape.template,
+            .{json.fmt(body.items, .{})},
+        );
+        defer testing.allocator.free(envelope);
+
+        const req = try compressReq(testing.allocator, envelope, shape.tool, "");
+        defer testing.allocator.free(req);
+        const res = try h.caller.call("zygos::output::compress", req);
+        defer res.deinit(testing.allocator);
+        try testing.expect(res == .ok);
+
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const content = (try json.parseFromSliceLeaky(json.Value, arena, res.ok, .{}))
+            .object.get("content").?.string;
+
+        // The compressed reply must still parse, and still be UTF-8: this is
+        // what the driver hands the model as a tool_result.
+        const inner = json.parseFromSliceLeaky(json.Value, arena, content, .{}) catch {
+            std.debug.print("\ntool {s}: seam produced invalid JSON: {s}\n", .{ shape.tool, content });
+            return error.ToolReplyShapeCorrupted;
+        };
+        try testing.expect(inner == .object);
+        try testing.expect(std.unicode.utf8ValidateSlice(content));
+    }
+}
+
+test "M8: web_search's array reply also survives (no text field to unwrap)" {
+    var h = try Harness.init(testing.allocator);
+    defer h.deinit();
+    const tw = try TrimWorker.start(testing.allocator, &h.actor, &h.registry, tiny, null);
+    defer tw.stop();
+
+    var results: std.ArrayList(u8) = .empty;
+    defer results.deinit(testing.allocator);
+    try results.appendSlice(testing.allocator, "{\"results\":[");
+    for (0..25) |i| {
+        var lb: [160]u8 = undefined;
+        try results.appendSlice(testing.allocator, try std.fmt.bufPrint(
+            &lb,
+            "{s}{{\"title\":\"Résultat {d} 日本\",\"url\":\"https://e.co/{d}\",\"snippet\":\"…\"}}",
+            .{ if (i == 0) "" else ",", i, i },
+        ));
+    }
+    try results.appendSlice(testing.allocator, "]}");
+
+    const req = try compressReq(testing.allocator, results.items, "web_search", "");
+    defer testing.allocator.free(req);
+    const res = try h.caller.call("zygos::output::compress", req);
+    defer res.deinit(testing.allocator);
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const content = (try json.parseFromSliceLeaky(json.Value, arena, res.ok, .{}))
+        .object.get("content").?.string;
+    const inner = json.parseFromSliceLeaky(json.Value, arena, content, .{}) catch
+        return error.ToolReplyShapeCorrupted;
+    try testing.expect(inner.object.get("results").? == .array);
+    try testing.expect(std.unicode.utf8ValidateSlice(content));
+}
