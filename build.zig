@@ -155,6 +155,21 @@ pub fn build(b: *std.Build) void {
     const e2e_m2_step = b.step("e2e-m2", "Run the M2 policy+routing e2e (U6)");
     e2e_m2_step.dependOn(&b.addRunArtifact(e2e_m2).step);
 
+    // Filter reality check (M8): real commands -> real filters -> a savings
+    // table. A measurement tool, not a gate. `zig build filter-probe`.
+    const filter_probe = b.addExecutable(.{
+        .name = "zygos-filter-probe",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/probe/filter/main.zig"),
+            .link_libc = true,
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "zygos", .module = mod }},
+        }),
+    });
+    const filter_probe_step = b.step("filter-probe", "Measure the M8 filters against real command output");
+    filter_probe_step.dependOn(&b.addRunArtifact(filter_probe).step);
+
     // S8 exit test (M8): command-aware compression over REAL git output.
     // Run with `zig build e2e-m8`.
     const e2e_m8 = b.addExecutable(.{

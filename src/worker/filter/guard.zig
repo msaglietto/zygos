@@ -36,19 +36,86 @@ fn looksStructured(text: []const u8) bool {
         std.mem.startsWith(u8, t, "---\n");
 }
 
-/// Error text is the whole reason the agent ran the command. Case-sensitive
-/// on purpose: `Error:`/`error:` are signals, the word "errors" in prose is
-/// matched too — over-preserving is the safe direction.
+/// Does the output carry a genuine failure diagnostic?
+///
+/// **Line-anchored on purpose.** A substring scan over the whole text is
+/// useless in practice: `zig build filter-probe` showed it disabling the git
+/// filter on this repo's own `git log`, because commit messages discuss
+/// assertions and warnings, and on any `git diff` touching error-handling
+/// code. A diagnostic is a *line that starts with* the signal, or one
+/// prefixed by a `file:line:col:` location and then carrying it — that is
+/// where compilers, test runners and git actually put it.
+///
+/// A diff's `+`/`-` lines are skipped entirely: quoting `return error.X` is
+/// content, not a failure of the command that printed it.
 pub fn hasErrorSignal(text: []const u8) bool {
-    inline for (.{
-        "error:",    "Error:",       "ERROR",    "fatal:",
-        "panic:",    "Panic",        "FAILED",   "FAIL ",
-        "Traceback", "Exception",    "assert",   "SIGSEGV",
-        "error[",    "thread 'main", "warning:",
-    }) |needle| {
-        if (std.mem.indexOf(u8, text, needle) != null) return true;
+    var it = lines(text);
+    while (it.next()) |line| {
+        const t = std.mem.trim(u8, line, " \t\r");
+        if (t.len == 0) continue;
+        // Diff payload lines quote code; they say nothing about this command.
+        // `---`/`+++` are diff file headers, not payload, and `--- FAIL:` is
+        // go test's failure banner — so only single +/- lines are skipped.
+        if ((t[0] == '+' or t[0] == '-') and !(t.len > 1 and (t[1] == '-' or t[1] == '+'))) continue;
+        if (lineIsDiagnostic(t)) return true;
     }
     return false;
+}
+
+fn lineIsDiagnostic(t: []const u8) bool {
+    // Leading-signal forms: `error: ...`, `fatal: ...`, `FAILED ...`.
+    inline for (.{
+        "error:",             "Error:",  "ERROR:",    "error[",
+        "fatal:",             "Fatal:",  "panic:",    "panicked",
+        "Traceback",          "FAILED",  "FAIL:",     "FAIL ",
+        "--- FAIL",           "SIGSEGV", "Unhandled", "Uncaught",
+        "Segmentation fault",
+    }) |p| {
+        if (std.mem.startsWith(u8, t, p)) return true;
+    }
+    // Located form: `path/file.ext:LINE[:COL]: error: message`. Only the
+    // segment after the location counts, so a path containing the word
+    // "error" is not a diagnostic.
+    if (afterLocation(t)) |rest| {
+        inline for (.{ "error", "fatal", "panic" }) |p| {
+            if (std.mem.startsWith(u8, rest, p)) return true;
+        }
+    }
+    // Runtime panic banners: `thread 'main' panicked at ...`.
+    if (std.mem.startsWith(u8, t, "thread '") and
+        std.mem.indexOf(u8, t, "panicked") != null) return true;
+    return false;
+}
+
+/// For `a/b.zig:12:5: error: msg`, return `error: msg`. Null when the line is
+/// not location-prefixed. Walks colon-separated segments, remembering whether
+/// a purely numeric one (the line/column) has been seen; the first
+/// non-numeric segment after that starts the message.
+fn afterLocation(t: []const u8) ?[]const u8 {
+    var rest = t;
+    var seen_numeric = false;
+    var hops: usize = 0;
+    while (hops < 5) : (hops += 1) {
+        const colon = std.mem.indexOfScalar(u8, rest, ':') orelse return null;
+        const seg = rest[0..colon];
+        const after = std.mem.trimStart(u8, rest[colon + 1 ..], " ");
+        if (seg.len == 0) return null;
+        if (allDigits(seg)) {
+            seen_numeric = true;
+            rest = after;
+            continue;
+        }
+        // A non-numeric segment: the message iff a line number preceded it.
+        if (seen_numeric) return seg;
+        rest = after;
+    }
+    return null;
+}
+
+fn allDigits(s: []const u8) bool {
+    if (s.len == 0) return false;
+    for (s) |c| if (!std.ascii.isDigit(c)) return false;
+    return true;
 }
 
 /// Honest marker, same voice as the generic trim's.
@@ -74,6 +141,57 @@ pub fn countLines(text: []const u8) usize {
 /// Guards against a filter that "compresses" into something longer.
 pub fn keepIfSmaller(original: []const u8, compressed: []const u8) ?[]const u8 {
     return if (compressed.len < original.len) compressed else null;
+}
+
+/// Collapse runs of the identical line into one plus a count.
+///
+/// Real tool output is full of these — `zig build test` on this repo emits
+/// the same worker warning 100+ times, which dwarfs the actual result. No
+/// hand-written fixture had that shape, so `zig build filter-probe` is what
+/// surfaced it. Only *consecutive* repeats collapse, so interleaved output
+/// keeps its ordering.
+///
+/// Returns the number of lines dropped; appends to `out`.
+pub fn collapseRepeats(
+    arena: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    text: []const u8,
+    comptime min_run: usize,
+) error{OutOfMemory}!usize {
+    var dropped: usize = 0;
+    var it = lines(text);
+    var pending: ?[]const u8 = null;
+    var run: usize = 0;
+
+    while (true) {
+        const line = it.next();
+        const same = if (line != null and pending != null)
+            std.mem.eql(u8, line.?, pending.?)
+        else
+            false;
+        if (same) {
+            run += 1;
+            continue;
+        }
+        if (pending) |p| {
+            try out.appendSlice(arena, p);
+            try out.append(arena, '\n');
+            if (run >= min_run) {
+                try out.appendSlice(arena, try marker(arena, "{d} more identical lines", .{run}));
+                try out.append(arena, '\n');
+                dropped += run;
+            } else if (run > 0) {
+                for (0..run) |_| {
+                    try out.appendSlice(arena, p);
+                    try out.append(arena, '\n');
+                }
+            }
+        }
+        if (line == null) break;
+        pending = line;
+        run = 0;
+    }
+    return dropped;
 }
 
 const testing = std.testing;
@@ -116,4 +234,50 @@ test "S8.3 guard: countLines handles trailing newline" {
     try testing.expectEqual(@as(usize, 1), countLines("a"));
     try testing.expectEqual(@as(usize, 1), countLines("a\n"));
     try testing.expectEqual(@as(usize, 3), countLines("a\nb\nc\n"));
+}
+
+// --- Reality-check regressions (found by `zig build filter-probe`) ---
+
+test "S8.3 guard: prose mentioning errors is not an error signal" {
+    // Real git log output. Commit messages discuss assertions, warnings and
+    // failures constantly; substring matching disabled the git filter on
+    // this repo's own history.
+    const log_text =
+        \\commit 63e0b39958020b70a3c2f71d777698768f3d1e60
+        \\Author: Someone <s@example.com>
+        \\Date:   Wed Aug 5 22:18:09 2026 -0500
+        \\
+        \\    fix: the assertion was wrong and the warning was noise
+        \\
+        \\    Explains why the test failed and what error handling changed.
+        \\
+    ;
+    try testing.expect(!hasErrorSignal(log_text));
+}
+
+test "S8.3 guard: a real diagnostic line is still an error signal" {
+    // The signal must survive at the start of a line, which is where
+    // compilers and runtimes actually put it.
+    try testing.expect(hasErrorSignal("src/main.zig:3:5: error: expected type\n"));
+    try testing.expect(hasErrorSignal("error: could not compile\n"));
+    try testing.expect(hasErrorSignal("fatal: not a git repository\n"));
+    try testing.expect(hasErrorSignal("thread 'main' panicked at src/x.rs:1:1\n"));
+    try testing.expect(hasErrorSignal("Traceback (most recent call last):\n"));
+    try testing.expect(hasErrorSignal("--- FAIL: TestThing (0.00s)\n"));
+    try testing.expect(hasErrorSignal("FAILED tests/test_x.py::test_y\n"));
+    try testing.expect(hasErrorSignal("  error[E0502]: cannot borrow\n"));
+}
+
+test "S8.3 guard: a diff that merely touches error-handling code is filterable" {
+    // Real `git diff` on this repo: +/- lines quoting error strings must not
+    // be read as the command having failed.
+    const d =
+        \\diff --git a/src/x.zig b/src/x.zig
+        \\@@ -1,3 +1,3 @@
+        \\-    return error.Failed;
+        \\+    return error.Refused;
+        \\     // warning: this comment mentions a warning
+        \\
+    ;
+    try testing.expect(!hasErrorSignal(d));
 }

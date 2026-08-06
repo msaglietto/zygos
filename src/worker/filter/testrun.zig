@@ -15,7 +15,8 @@ pub fn run(arena: std.mem.Allocator, text: []const u8) error{OutOfMemory}!?[]con
     // Note: NOT shouldSkipOrErrored — failures are this filter's payload.
     if (guard.shouldSkip(text)) return null;
 
-    var out: std.ArrayList(u8) = .empty;
+    // Pass 1: drop the noise lines.
+    var kept: std.ArrayList(u8) = .empty;
     var dropped: usize = 0;
     var kept_any = false;
     var it = guard.lines(text);
@@ -24,14 +25,22 @@ pub fn run(arena: std.mem.Allocator, text: []const u8) error{OutOfMemory}!?[]con
             dropped += 1;
             continue;
         }
-        try out.appendSlice(arena, line);
-        try out.append(arena, '\n');
+        try kept.appendSlice(arena, line);
+        try kept.append(arena, '\n');
         kept_any = true;
     }
-    if (dropped == 0 or !kept_any) return null;
+    if (!kept_any) return null;
+
+    // Pass 2: collapse runs of the identical line. Real runners flood their
+    // output with repeated worker/log lines that no per-line rule catches;
+    // `zig build filter-probe` found this dominating `zig build test` here.
+    var out: std.ArrayList(u8) = .empty;
+    dropped += try guard.collapseRepeats(arena, &out, kept.items, 3);
+
+    if (dropped == 0) return null;
     try out.appendSlice(arena, try guard.marker(
         arena,
-        "tests: dropped {d} passing/progress lines",
+        "tests: dropped {d} passing/progress/repeated lines",
         .{dropped},
     ));
     try out.append(arena, '\n');
@@ -199,7 +208,13 @@ test "S8.3 testrun: output with nothing to drop passes through" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const dense = "some meaningful line about the suite\n" ** 4;
+    // Distinct, non-noise lines: no per-line rule fires and no run repeats,
+    // so the filter declines and the generic trim handles it.
+    const dense =
+        "a meaningful line about the suite\n" ++
+        "a different meaningful line here\n" ++
+        "a third distinct line of detail\n" ++
+        "and a fourth, all unlike each other\n";
     try testing.expect(try run(arena, dense) == null);
 }
 
@@ -210,5 +225,57 @@ test "S8.3 testrun: no leaks over repeated filtering" {
         const arena = arena_state.allocator();
         _ = try run(arena, green_fixture);
         _ = try run(arena, red_fixture);
+    }
+}
+
+// --- Reality-check regressions (found by `zig build filter-probe`) ---
+
+test "S8.3 testrun: floods of identical log lines collapse with a count" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Real `zig build test` output on this repo: hundreds of identical
+    // worker log lines dwarf the actual result. No fixture had this shape,
+    // so the filter declined and saved 0% on the single most-run command.
+    const flood = "test\n+- run test w\n" ++
+        ("[actor] (warn): registerfunction f: overwrote existing registration (last wins)\n" ** 120) ++
+        "All 736 tests passed.\n";
+    const got = (try run(arena, flood)).?;
+    try testing.expect(std.mem.indexOf(u8, got, "All 736 tests passed.") != null);
+    // The line survives once, with an honest count of the repeats.
+    try testing.expect(std.mem.indexOf(u8, got, "overwrote existing registration") != null);
+    try testing.expect(std.mem.indexOf(u8, got, "119 more identical") != null);
+    try testing.expect(got.len < flood.len / 4);
+}
+
+test "S8.3 testrun: distinct lines are never collapsed into each other" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const mixed = "test a::b ... ok\n" ** 4 ++
+        "[warn] alpha happened\n[warn] beta happened\n[warn] gamma happened\n" ++
+        "test result: ok. 4 passed\n";
+    const got = (try run(arena, mixed)).?;
+    try testing.expect(std.mem.indexOf(u8, got, "alpha") != null);
+    try testing.expect(std.mem.indexOf(u8, got, "beta") != null);
+    try testing.expect(std.mem.indexOf(u8, got, "gamma") != null);
+}
+
+test "S8.3 testrun: a repeated FAILURE line is still shown in full" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Collapsing repeats must never hide a failure: if the same assertion
+    // fires 50 times, the agent still needs to see it is a failure.
+    const repeated_fail = "running tests\n" ++
+        ("error: assertion failed at src/x.zig:12\n" ** 50) ++
+        "test result: FAILED\n";
+    const got = try run(arena, repeated_fail);
+    if (got) |g| {
+        try testing.expect(std.mem.indexOf(u8, g, "assertion failed at src/x.zig:12") != null);
+        try testing.expect(std.mem.indexOf(u8, g, "test result: FAILED") != null);
     }
 }
