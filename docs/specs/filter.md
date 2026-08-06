@@ -30,6 +30,17 @@
 > no fixture had; `guard.collapseRepeats` folds those with a count. Result:
 > 6% → 51%, with `zig build test` going 0% → 78%.
 >
+> **Tool reply shapes — the corruption class that shipped twice.** The seam
+> mishandled a tool's reply shape three separate times: `bash`'s
+> `{"exit_code","output"}` made every filter inert; `web_fetch`'s
+> `{"url","text"}` and `web_search`'s `{"results":[...]}` were byte-cut into
+> unparseable JSON. Each was found individually, after shipping. All five
+> shapes the harness produces are now enumerated in one table test
+> (`tool_reply_shapes` in `trim.zig`) asserting valid JSON + valid UTF-8 under
+> the hostile case (oversized, multibyte, filterable at once). **Any new tool
+> must be added to that table.** Structured replies with no text payload are
+> shrunk by dropping whole array entries with a count, never by byte offset.
+>
 > **Envelope unwrapping — the thing fixtures could not catch.** Tools reply
 > with an envelope, not bare text: `bash` gives `{"exit_code":N,"output":...}`
 > and `web_fetch` gives `{"url":...,"text":...}`. Feeding that straight into
