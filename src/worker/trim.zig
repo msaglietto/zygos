@@ -1230,3 +1230,171 @@ test "M8: web_search's array reply also survives (no text field to unwrap)" {
     try testing.expect(inner.object.get("results").? == .array);
     try testing.expect(std.unicode.utf8ValidateSlice(content));
 }
+
+test "M8: MCP tool replies ride the seam safely under an arbitrary tool name" {
+    var h = try Harness.init(testing.allocator);
+    defer h.deinit();
+    const tw = try TrimWorker.start(testing.allocator, &h.actor, &h.registry, tiny, null);
+    defer tw.stop();
+
+    // MCP tools are model-visible as <server>_<tool> (mcp/client.zig) and
+    // reply with a content string. Their names come from third-party servers
+    // and are outside our control — one could plausibly expose a tool called
+    // "bash" or "git". The seam must stay safe whatever it is called.
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(testing.allocator);
+    for (0..40) |i| {
+        var lb: [96]u8 = undefined;
+        try body.appendSlice(testing.allocator, try std.fmt.bufPrint(&lb, "mcp output line {d} — é\n", .{i}));
+    }
+    const reply = try std.fmt.allocPrint(
+        testing.allocator,
+        "{{\"content\":{f}}}",
+        .{json.fmt(body.items, .{})},
+    );
+    defer testing.allocator.free(reply);
+
+    inline for (.{ "tessera_project_status", "bash", "git", "" }) |name| {
+        const req = try compressReq(testing.allocator, reply, name, "");
+        defer testing.allocator.free(req);
+        const res = try h.caller.call("zygos::output::compress", req);
+        defer res.deinit(testing.allocator);
+        try testing.expect(res == .ok);
+
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const content = (try json.parseFromSliceLeaky(json.Value, arena, res.ok, .{}))
+            .object.get("content").?.string;
+        const inner = json.parseFromSliceLeaky(json.Value, arena, content, .{}) catch
+            return error.McpReplyCorrupted;
+        try testing.expect(inner.object.get("content").? == .string);
+        try testing.expect(std.unicode.utf8ValidateSlice(content));
+    }
+}
+
+test "M8: a tool named bash with no command never triggers command filters" {
+    var h = try Harness.init(testing.allocator);
+    defer h.deinit();
+    const tw = try TrimWorker.start(testing.allocator, &h.actor, &h.registry, .{}, null);
+    defer tw.stop();
+
+    // Dispatch requires BOTH tool == bash AND a command string. A tool whose
+    // input carries no command must never be filtered as a shell command:
+    // the filters would be reasoning about output they cannot attribute.
+    const diffish = "diff --git a/x b/x\nindex aaa..bbb 100644\n@@ -1,2 +1,2 @@\n-a\n+b\n" ++
+        (" context line\n" ** 20);
+    const req = try std.fmt.allocPrint(
+        testing.allocator,
+        "{{\"content\":{f},\"tool\":\"bash\",\"input\":{{\"query\":\"not a command\"}}}}",
+        .{json.fmt(diffish, .{})},
+    );
+    defer testing.allocator.free(req);
+    const res = try h.caller.call("zygos::output::compress", req);
+    defer res.deinit(testing.allocator);
+    // Untouched by the git filter: its metadata survives.
+    try testing.expect(std.mem.indexOf(u8, res.ok, "index aaa..bbb") != null);
+}
+
+test "M8: concurrent seam calls never produce a corrupted reply" {
+    // inproc.dispatchInvoke spawns a thread per invocation, so seam handlers
+    // really do run in parallel over one shared cache. This checks the
+    // property that would hurt the model — a torn or invalid reply — while
+    // the counter race is pinned precisely by the mutex test below.
+    var h = try Harness.init(testing.allocator);
+    defer h.deinit();
+    const tw = try TrimWorker.start(testing.allocator, &h.actor, &h.registry, .{}, null);
+    defer tw.stop();
+
+    const Runner = struct {
+        harness: *Harness,
+        seed: usize,
+        failed: bool = false,
+
+        fn go(self: *@This()) void {
+            const gpa = testing.allocator;
+            const caller = inproc.Worker.spawn(gpa, &self.harness.actor, &self.harness.registry, "c") catch {
+                self.failed = true;
+                return;
+            };
+            defer caller.stop();
+            for (0..12) |i| {
+                var cb: [64]u8 = undefined;
+                const cmd = std.fmt.bufPrint(&cb, "git diff HEAD~{d}", .{self.seed * 100 + i}) catch {
+                    self.failed = true;
+                    return;
+                };
+                const req = compressReq(gpa, e2e_diff, "bash", cmd) catch {
+                    self.failed = true;
+                    return;
+                };
+                defer gpa.free(req);
+                const res = caller.call("zygos::output::compress", req) catch {
+                    self.failed = true;
+                    return;
+                };
+                defer res.deinit(gpa);
+                if (res != .ok) {
+                    self.failed = true;
+                    return;
+                }
+                var arena_state = std.heap.ArenaAllocator.init(gpa);
+                defer arena_state.deinit();
+                const root = json.parseFromSliceLeaky(json.Value, arena_state.allocator(), res.ok, .{}) catch {
+                    self.failed = true;
+                    return;
+                };
+                const c = root.object.get("content") orelse {
+                    self.failed = true;
+                    return;
+                };
+                if (c != .string or std.mem.indexOf(u8, c.string, "new_shape_with_context") == null) {
+                    self.failed = true;
+                    return;
+                }
+            }
+        }
+    };
+
+    var runners: [8]Runner = undefined;
+    var threads: [8]std.Thread = undefined;
+    for (&runners, 0..) |*r, i| r.* = .{ .harness = h, .seed = i };
+    for (&threads, 0..) |*t, i| t.* = try std.Thread.spawn(.{}, Runner.go, .{&runners[i]});
+    for (&threads) |t| t.join();
+    for (runners) |r| try testing.expect(!r.failed);
+}
+
+test "M8: stats counters are mutex-guarded against concurrent handlers" {
+    // inproc.dispatchInvoke spawns a thread per invocation, so seam handlers
+    // genuinely run in parallel and `stats` is contended shared state.
+    //
+    // Driving that race through the bus proved too coarse to detect a lost
+    // update (each call does far more work than the unguarded window), so
+    // this hits `note` directly at high contention — the tightest form of
+    // the same hazard. Removing the mutex in `note` makes this fail.
+    var h = try Harness.init(testing.allocator);
+    defer h.deinit();
+    const tw = try TrimWorker.start(testing.allocator, &h.actor, &h.registry, .{}, null);
+    defer tw.stop();
+
+    const iterations: usize = 20_000;
+    const thread_count: usize = 8;
+
+    const Hammer = struct {
+        fn go(worker: *TrimWorker, n: usize) void {
+            for (0..n) |_| worker.note(.{ .filtered = true, .sent = 1 });
+        }
+    };
+
+    var threads: [thread_count]std.Thread = undefined;
+    for (&threads) |*t| t.* = try std.Thread.spawn(.{}, Hammer.go, .{ tw, iterations });
+    for (&threads) |t| t.join();
+
+    tw.mutex.lock();
+    const s = tw.stats;
+    tw.mutex.unlock();
+
+    const expected = iterations * thread_count;
+    try testing.expectEqual(expected, s.filtered);
+    try testing.expectEqual(expected, s.sent_bytes);
+}
