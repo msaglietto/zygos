@@ -103,6 +103,18 @@ grep -q '"state":"done"' "$TMP/out1.json" || { echo "M45 E2E FAIL leg1: $(cat "$
 [ "$(cat "$TMP/ws/greeting.txt")" = "hello" ] || { echo "M45 E2E FAIL leg1: greeting.txt missing/wrong"; exit 1; }
 grep -q '"state":"done"' "$TMP/planning/mission.json" || { echo "M45 E2E FAIL leg1: substrate not terminal"; exit 1; }
 
+# M8: the ledger the operator reads must carry the compression rollup, and the
+# filters must have actually engaged on a real command through the real binary
+# — the last link in the chain that unit tests, the probe and e2e/m8 each cover
+# only in part.
+[ -f "$TMP/planning/LEDGER.md" ] || { echo "M45 E2E FAIL leg1: no LEDGER.md"; exit 1; }
+grep -q 'Tool-output compression' "$TMP/planning/LEDGER.md" || {
+  echo "M45 E2E FAIL leg1: ledger has no compression section"; cat "$TMP/planning/LEDGER.md"; exit 1; }
+grep -qE '^filtered: [1-9]' "$TMP/planning/LEDGER.md" || {
+  echo "M45 E2E FAIL leg1: no tool output was filtered in a real mission"; cat "$TMP/planning/LEDGER.md"; exit 1; }
+grep -qE '^reduction: [0-9]+%' "$TMP/planning/LEDGER.md" || {
+  echo "M45 E2E FAIL leg1: ledger reports no reduction"; cat "$TMP/planning/LEDGER.md"; exit 1; }
+
 # ---- Leg 2: a seeded mid-flight substrate resumes through the real CLI -------
 # Seed exactly what a killed mission leaves: persisted `executing` state with
 # the second task not yet done (the e2e/m3 leg-2 pattern, via the CLI).
@@ -203,4 +215,6 @@ set -e
 [ "$CODE" = "2" ] || { echo "M45 E2E FAIL leg7b: expected exit 2, got $CODE"; cat "$TMP/err8.log"; exit 1; }
 grep -q "MCP server handshake failed" "$TMP/err8.log" || { echo "M45 E2E FAIL leg7b: wrong error"; cat "$TMP/err8.log"; exit 1; }
 
-echo "M45 E2E OK: start→done, seeded resume→done, unknown-slug boot refusal, rerun refusal, vault checkpoint, trace, mcp"
+echo "--- LEDGER.md (leg 1, from the real binary) ---"
+cat "$TMP/planning/LEDGER.md"
+echo "M45 E2E OK: start→done, seeded resume→done, unknown-slug boot refusal, rerun refusal, vault checkpoint, trace, mcp, ledger compression"

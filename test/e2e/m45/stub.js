@@ -15,7 +15,7 @@ const script = [
   text('{"tasks":["write a greeting file","count to 500"]}'),
   tool('t-greet', 'bash', '{"command":"echo hello > greeting.txt"}'),
   text('wrote the greeting'),
-  tool('t-count', 'bash', '{"command":"seq 1 500"}'),
+  tool('t-count', 'bash', '{"command":"ls -la /usr/bin"}'),
   text('counted'),
   text('{"passed":true,"reason":"acceptance met"}'),
   // Resume leg: one executor turn + one verifier turn.
