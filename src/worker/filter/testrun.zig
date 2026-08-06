@@ -279,3 +279,33 @@ test "S8.3 testrun: a repeated FAILURE line is still shown in full" {
         try testing.expect(std.mem.indexOf(u8, g, "test result: FAILED") != null);
     }
 }
+
+test "S8.3 testrun: a REAL zig compile failure survives intact" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Verbatim `zig build test` output from a deliberately broken build in
+    // this repo (min_bytes made a string). This is the highest-stakes case
+    // in the whole filter set: lose a compiler diagnostic and the agent
+    // cannot fix its own code.
+    const real =
+        \\test
+        \\+- run test
+        \\   +- compile test Debug native 1 errors
+        \\src/worker/filter/guard.zig:7:30: error: expected type 'usize', found '*const [6:0]u8'
+        \\pub const min_bytes: usize = "eighty";
+        \\                             ^~~~~~~~
+        \\    test.S8.3 guard: small output is skipped: src/worker/filter/guard.zig:200:34
+        \\    3 reference(s) hidden; use '-freference-trace=5' to see all references
+        \\error: 1 compilation errors
+        \\
+    ;
+    const got = try run(arena, real);
+    const body = got orelse real; // declining is also acceptable here
+    // Every part the agent needs to act on must survive verbatim.
+    try testing.expect(std.mem.indexOf(u8, body, "guard.zig:7:30: error: expected type 'usize'") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "pub const min_bytes: usize = \"eighty\";") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "^~~~~~~~") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "error: 1 compilation errors") != null);
+}

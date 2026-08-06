@@ -192,3 +192,44 @@ test "S8.4: marker reports age in seconds" {
     const m = try unchangedMarker(arena_state.allocator(), 12_400);
     try testing.expect(std.mem.indexOf(u8, m, "unchanged since 12s ago") != null);
 }
+
+// --- Reality checks: the cache is the one feature that can actively lie ---
+
+test "S8.4: a mutation via any recognized command clears the cache" {
+    // Every mutating verb must invalidate. A stale 'unchanged' reply after a
+    // real edit would send the agent down a false path.
+    const mutations = [_][]const u8{
+        "git add -A",         "git commit -m x",   "git checkout main",
+        "git switch feature", "git merge main",    "git rebase main",
+        "git reset --hard",   "git stash",         "git pull",
+        "git apply p.patch",  "git restore f.zig", "git rm f.zig",
+        "git mv a b",         "rm -rf build",      "mv a b",
+        "cp a b",             "touch f",           "mkdir d",
+    };
+    for (mutations) |m| {
+        var c: Cache = .{};
+        const out = "On branch master";
+        try testing.expect(null == c.seenUnchanged("bash", "git status", out, .git_status, 0));
+        try testing.expect(null != c.seenUnchanged("bash", "git status", out, .git_status, 100));
+        _ = c.seenUnchanged("bash", m, "", .git_status, 200);
+        // After the mutation the identical output must NOT be called unchanged.
+        try testing.expect(null == c.seenUnchanged("bash", "git status", out, .git_status, 300));
+    }
+}
+
+test "S8.4: a one-byte difference is never reported as unchanged" {
+    var c: Cache = .{};
+    const a = "On branch master\n  modified:   a.zig\n";
+    const b = "On branch master\n  modified:   b.zig\n";
+    try testing.expect(null == c.seenUnchanged("bash", "git status", a, .git_status, 0));
+    try testing.expect(null == c.seenUnchanged("bash", "git status", b, .git_status, 100));
+}
+
+test "S8.4: write_file invalidates even without a command string" {
+    var c: Cache = .{};
+    const out = "On branch master";
+    try testing.expect(null == c.seenUnchanged("bash", "git status", out, .git_status, 0));
+    try testing.expect(null != c.seenUnchanged("bash", "git status", out, .git_status, 100));
+    _ = c.seenUnchanged("write_file", null, "", .git_status, 200);
+    try testing.expect(null == c.seenUnchanged("bash", "git status", out, .git_status, 300));
+}

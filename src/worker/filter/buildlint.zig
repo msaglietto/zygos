@@ -171,3 +171,48 @@ test "S8.3 buildlint: no leaks over repeated filtering" {
         _ = try run(arena, build_fixture);
     }
 }
+
+test "S8.3 buildlint: a REAL zig build failure survives intact" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Verbatim shape of a real `zig build` failure. The probe could not
+    // exercise buildlint (a cached clean build prints nothing), so this
+    // pins the failing case by hand from real output.
+    const real =
+        \\install
+        \\+- install zygos
+        \\   +- compile exe zygos Debug native 1 errors
+        \\src/worker/filter/guard.zig:7:30: error: expected type 'usize', found '*const [6:0]u8'
+        \\pub const min_bytes: usize = "eighty";
+        \\                             ^~~~~~~~
+        \\referenced by:
+        \\    shouldSkip: src/worker/filter/guard.zig:19:20
+        \\error: the following build command failed with exit code 1:
+        \\
+    ;
+    const got = try run(arena, real);
+    const body = got orelse real;
+    try testing.expect(std.mem.indexOf(u8, body, "guard.zig:7:30: error: expected type 'usize'") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "pub const min_bytes: usize = \"eighty\";") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "^~~~~~~~") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "referenced by:") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "exit code 1") != null);
+}
+
+test "S8.3 buildlint: dedup never merges same-message diagnostics at different sites" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Identical message, different file:line — two separate things to fix.
+    // Only a byte-identical repeat may collapse.
+    const two_sites = "   Compiling x v0.1.0\n" ** 6 ++
+        "a.zig:1:1: error: expected type 'usize'\n" ++
+        "b.zig:9:4: error: expected type 'usize'\n" ++
+        "   Compiling y v0.1.0\n" ** 6;
+    const got = (try run(arena, two_sites)).?;
+    try testing.expect(std.mem.indexOf(u8, got, "a.zig:1:1") != null);
+    try testing.expect(std.mem.indexOf(u8, got, "b.zig:9:4") != null);
+}
