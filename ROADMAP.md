@@ -171,11 +171,20 @@ GOAL.md non-goals — plus DESIGN.md's fusion/prompt-pipeline (Z-06) and the
 
 ---
 
-## PROPOSED — M8: command-aware output compression (Z-09, second half)
+## IMPLEMENTED — M8: command-aware output compression (Z-09, second half)
 
-Drafted 2026-08-06. ROADMAP.md was exhausted after M7; this is the first
-milestone of the next cycle, and it closes a gap rather than opening a
-frontier: **decision Z-09 was only half-built.**
+Drafted and implemented 2026-08-06 (commits 3ddba50..a3eb78c, 719 → 731 tests
+green). ROADMAP.md was exhausted after M7; this was the first milestone of the
+next cycle, and it closed a gap rather than opening a frontier: **decision Z-09
+was only half-built.**
+
+Result: the fixture corpus (`git diff` + `cargo test` + `ls -la`) went from
+4026 to 538 model-facing bytes — **86.6% reduction**, against the 60% exit
+floor. All five items landed; per-item status:
+
+- **S8.1** seam context + `raw: true` escape hatch (3b2b3a7)
+- **S8.2/S8.3** dispatcher, guards, and the four filters (8394ce1)
+- **S8.4/S8.5** dedup cache, `output::stats`, seam wiring (a3eb78c)
 
 `src/worker/trim.zig` (U6) delivers the generic seam — ANSI strip, blank-run
 collapse, head/tail elision, `saved_bytes` to the budget worker. What Z-09

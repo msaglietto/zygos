@@ -1,5 +1,19 @@
 # Spec: command-aware output filters (M8, decision Z-09 second half)
 
+> **Status: implemented 2026-08-06** (commits 3ddba50..a3eb78c). All of
+> S8.1–S8.5 landed; measured 4026 → 538 bytes (86.6%) on the fixture corpus
+> against the ≥60% exit floor. Modules: `src/worker/filter/{dispatch,guard,
+> git,testrun,listing,buildlint,cache}.zig`, wired in `src/worker/trim.zig`.
+>
+> Two deviations from the draft below, both deliberate:
+> - The error-signal guard is **not** part of the universal `shouldSkip`. It
+>   lives in `shouldSkipOrErrored`, used by git/listing only. Folding it in
+>   would have made `testrun`/`buildlint` no-ops on failing runs — exactly the
+>   runs whose output matters most.
+> - `test/e2e/m8/` was not added as a separate binary; the S8.5 ratio floor is
+>   asserted in-process in `trim.zig` over the same corpus, which keeps the
+>   evidence next to the code it measures.
+
 `src/worker/trim.zig` implements the *generic* half of Z-09: ANSI strip,
 blank-run collapse, head/tail elision. That is lossy in the middle and blind —
 it drops the same fraction of a `git diff` as of a stack trace, and it cannot
