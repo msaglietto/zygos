@@ -65,14 +65,16 @@ pub fn hasErrorSignal(text: []const u8) bool {
 fn lineIsDiagnostic(t: []const u8) bool {
     // Leading-signal forms: `error: ...`, `fatal: ...`, `FAILED ...`.
     inline for (.{
-        "error:",             "Error:",  "ERROR:",    "error[",
-        "fatal:",             "Fatal:",  "panic:",    "panicked",
-        "Traceback",          "FAILED",  "FAIL:",     "FAIL ",
-        "--- FAIL",           "SIGSEGV", "Unhandled", "Uncaught",
-        "Segmentation fault",
+        "error:",  "Error:",    "ERROR:",   "error[",
+        "fatal:",  "Fatal:",    "panic:",   "panicked",
+        "FAILED",  "FAIL:",     "FAIL ",    "--- FAIL",
+        "SIGSEGV", "Unhandled", "Uncaught", "Segmentation fault",
     }) |p| {
         if (std.mem.startsWith(u8, t, p)) return true;
     }
+    // Python's banner is a fixed phrase. The bare word "Traceback" shows up
+    // in prose *about* tracebacks, which is not a failure.
+    if (std.mem.startsWith(u8, t, "Traceback (most recent call last)")) return true;
     // Located form: `path/file.ext:LINE[:COL]: error: message`. Only the
     // segment after the location counts, so a path containing the word
     // "error" is not a diagnostic.
@@ -88,10 +90,31 @@ fn lineIsDiagnostic(t: []const u8) bool {
 }
 
 /// For `a/b.zig:12:5: error: msg`, return `error: msg`. Null when the line is
-/// not location-prefixed. Walks colon-separated segments, remembering whether
-/// a purely numeric one (the line/column) has been seen; the first
-/// non-numeric segment after that starts the message.
+/// not location-prefixed.
+///
+/// The location must begin the line. Prose *quoting* a diagnostic — which
+/// this repo's own commit messages do — is not a diagnostic, and matching it
+/// mid-line silently took `git log` from 89% saved back to 0%. Walks
+/// colon-separated segments, remembering whether a purely numeric one (the
+/// line/column) has been seen; the first non-numeric segment after that
+/// starts the message.
 fn afterLocation(t: []const u8) ?[]const u8 {
+    // The first segment must look like a real path: no whitespace or quoting,
+    // and either a directory separator or a file extension. Prose like
+    // `skip: '-a.zig:1:1: error: msg'` passes a naive no-space check (the
+    // word `skip` has none), which is exactly how a commit message quoting a
+    // diagnostic re-broke the git filter.
+    const first_colon = std.mem.indexOfScalar(u8, t, ':') orelse return null;
+    const head = t[0..first_colon];
+    if (head.len == 0) return null;
+    for (head) |c| switch (c) {
+        ' ', '\t', '\'', '"', '`', '(', '[', ',' => return null,
+        else => {},
+    };
+    const looks_like_path = std.mem.indexOfScalar(u8, head, '/') != null or
+        std.mem.lastIndexOfScalar(u8, head, '.') != null;
+    if (!looks_like_path) return null;
+
     var rest = t;
     var seen_numeric = false;
     var hops: usize = 0;
@@ -238,6 +261,24 @@ test "S8.3 guard: countLines handles trailing newline" {
 
 // --- Reality-check regressions (found by `zig build filter-probe`) ---
 
+test "S8.3 guard: prose quoting a diagnostic is not an error signal" {
+    // Found by filter-probe: this repo's own git log quotes a diagnostic
+    // inside a commit message, and afterLocation matched it mid-line, which
+    // silently took git log from 89% saved back to 0%.
+    const commit_prose =
+        \\commit abc123
+        \\Author: Someone <s@example.com>
+        \\
+        \\    fix: line-anchor the guard
+        \\
+        \\    '-src/x.zig:12:5: error: msg' still parses as file:line:col + message
+        \\    once the exclusion is gone, so a diff that edits a diagnostic string
+        \\    reads as a failed command.
+        \\
+    ;
+    try testing.expect(!hasErrorSignal(commit_prose));
+}
+
 test "S8.3 guard: prose mentioning errors is not an error signal" {
     // Real git log output. Commit messages discuss assertions, warnings and
     // failures constantly; substring matching disabled the git filter on
@@ -312,4 +353,42 @@ test "S8.3 guard: a diff whose changed lines look like diagnostics is still filt
         \\
     ;
     try testing.expect(hasErrorSignal(with_real));
+}
+
+test "S8.3 guard: quoted diagnostics in prose never look like a real one" {
+    // This exact class regressed twice, both times from THIS repo's commit
+    // messages, and both times it silently took git log from ~90% saved to
+    // 0%. The corpus below is drawn from real commit bodies written during
+    // M8; each line must read as prose, not as a failed command.
+    const prose_lines = [_][]const u8{
+        "    skip: '-src/x.zig:12:5: error: msg' still parses as file:line:col + message",
+        "    the assertion was wrong and the warning was noise",
+        "    Explains why the test failed and what error handling changed",
+        "    fix: line-anchor the guard so error: in prose does not match",
+        "    note: a.zig:1:1: error: one and b.zig:9:4: error: two are distinct",
+        "    (see docs/specs/filter.md: error handling section)",
+        "    Traceback handling was reworked, see below",
+        "    Reported: 3 FAILED cases became 0",
+    };
+    for (prose_lines) |line| {
+        if (hasErrorSignal(line)) {
+            std.debug.print("\nprose misread as a diagnostic: {s}\n", .{line});
+            return error.ProseMisreadAsDiagnostic;
+        }
+    }
+
+    // The genuine article must still register, at the line start.
+    const real_lines = [_][]const u8{
+        "src/x.zig:12:5: error: expected type 'usize'",
+        "/abs/path/to/file.rs:1:1: error: boom",
+        "error: could not compile",
+        "fatal: not a git repository",
+        "--- FAIL: TestThing (0.00s)",
+    };
+    for (real_lines) |line| {
+        if (!hasErrorSignal(line)) {
+            std.debug.print("\nreal diagnostic missed: {s}\n", .{line});
+            return error.RealDiagnosticMissed;
+        }
+    }
 }
