@@ -281,3 +281,35 @@ test "S8.3 guard: a diff that merely touches error-handling code is filterable" 
     ;
     try testing.expect(!hasErrorSignal(d));
 }
+
+test "S8.3 guard: a diff whose changed lines look like diagnostics is still filterable" {
+    // The diff-payload skip in hasErrorSignal must be load-bearing. Without
+    // it, any commit that adds or removes a line beginning with `error:` --
+    // routine in this codebase -- makes every later `git diff` unfilterable.
+    // The located form is what actually needs the skip: `-a.zig:1:1: error:`
+    // still parses as file:line:col + message once the leading +/- is not
+    // excluded, so without the skip this diff reads as a failed command.
+    const d =
+        \\diff --git a/src/x.zig b/src/x.zig
+        \\@@ -1,4 +1,4 @@
+        \\-src/x.zig:12:5: error: old message
+        \\+src/x.zig:12:5: error: new message
+        \\ fn main() void {}
+        \\-error: could not compile
+        \\+error: could not compile the module
+        \\ const pad = 0;
+        \\
+    ;
+    // These are content lines, not this command's failure.
+    try testing.expect(!hasErrorSignal(d));
+
+    // But an unprefixed diagnostic line in the same output still counts:
+    // that is git itself reporting failure.
+    const with_real =
+        \\diff --git a/src/x.zig b/src/x.zig
+        \\-error: this is content
+        \\fatal: your current branch has no commits yet
+        \\
+    ;
+    try testing.expect(hasErrorSignal(with_real));
+}
