@@ -285,17 +285,26 @@ KILLED turn: seam carries the tool name
 MUTATION CHECK OK: every guard is pinned by a test that detects its removal.
 ```
 
-The per-mission rollup lands in `LEDGER.md` at terminal state:
+The per-mission rollup lands in `LEDGER.md` at terminal state. This is real
+output from `zygos mission start` in `test/e2e/m45` — the actual binary, the
+real bash tool, the ledger an operator reads:
 
 ```
+# Ledger — brief
+
+used_tokens: 105
+saved_bytes: 55861
+role_turns: 5
+state: done (completed)
+
 ## Tool-output compression
 
-calls: 4
-filtered: 2
-deduped: 1
-raw_bytes: 1013
-sent_bytes: 378
-reduction: 63%
+calls: 2
+filtered: 1
+deduped: 0
+raw_bytes: 57214
+sent_bytes: 2079
+reduction: 96%
 ```
 
 ## Mission TUI — live progress view

@@ -214,9 +214,13 @@ Measured on this repo after both rounds — **6% → 51% overall**:
 | `git diff HEAD~1` | 11% (that diff is 84% real changes) |
 | `find src -name '*.zig'` | 0% (nothing to strip — correct) |
 
+End of chain: `test/e2e/m45` now asserts the rollup in `LEDGER.md` from the
+**real `zygos mission` binary** — a live mission compressed 57214 → 2079 bytes
+(**96%**) on its tool output.
+
 Lesson, recorded because it will apply to every future filter: **a fixture
-proves the algorithm, a real command proves the wiring, and only a probe over
-real output proves the ratio.** The headline 86.6% measured earlier was
+proves the algorithm, a real command proves the wiring, a probe proves the
+ratio, and only the real binary proves the outcome.** The headline 86.6% measured earlier was
 fixture-inflated; 51% is what this repo's actual command mix yields.
 
 `src/worker/trim.zig` (U6) delivers the generic seam — ANSI strip, blank-run
