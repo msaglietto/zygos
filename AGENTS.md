@@ -25,6 +25,19 @@ zig build test       # the check that matters — must be green before any commi
 zig fmt src/         # format before committing
 ```
 
+When touching `src/worker/filter/*` or `src/worker/trim.zig`, also run:
+
+```bash
+./test/probe/filter/run.sh   # real commands through the real filters, with a ratio floor
+./test/mutation/guards.sh    # each guard must fail the suite when deleted
+./test/e2e/m8/run.sh         # the seam over real git output
+```
+
+Why these exist: M8 shipped three defects behind a fully green suite (filters
+inert in production, tool output corrupted into invalid JSON, and prose read as
+a failed command — twice). Unit tests prove the algorithm; only real command
+output proves the wiring and the ratio.
+
 ## Conventions
 
 - Zig 0.16.0. `std` only for kernel modules (deps are human-gated, see GOAL.md).
