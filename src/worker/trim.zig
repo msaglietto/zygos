@@ -238,11 +238,14 @@ pub const TrimWorker = struct {
         return std.fmt.allocPrint(arena, "{{\"content\":{f}}}", .{json.fmt(out, .{})});
     }
 
-    /// Tool replies are usually an envelope, not bare text: `zygos::tools::bash`
-    /// answers `{"exit_code":N,"output":"..."}`. Compressing the envelope as
-    /// one blob is wrong twice over — the guard sees JSON and skips every
-    /// filter (M8 was dead on the real path until test/e2e/m8 caught it), and
-    /// the payload inside is escaped, so line-based filters see one long line.
+    /// Tool replies are usually an envelope, not bare text:
+    /// `zygos::tools::bash` answers `{"exit_code":N,"output":"..."}` and
+    /// `web_fetch` answers `{"url":...,"text":...,"truncated":...}`.
+    /// Compressing an envelope as one blob is wrong three ways over — the
+    /// guard sees JSON and skips every filter (M8 was dead on the real path
+    /// until test/e2e/m8 caught it), the payload inside is escaped so
+    /// line-based filters see one long line, and a byte-level cut lands
+    /// inside the JSON and hands the model something unparseable.
     ///
     /// So: unwrap, compress the payload, re-wrap. The model still gets the
     /// tool's declared reply shape; only the payload shrinks. Anything that
@@ -259,8 +262,9 @@ pub const TrimWorker = struct {
 
         const compressed = try self.compress(arena, payload.text, tool, command);
         if (compressed.len >= payload.text.len) return raw;
-        return std.fmt.allocPrint(arena, "{{{s}\"output\":{f}}}", .{
+        return std.fmt.allocPrint(arena, "{{{s}{f}:{f}}}", .{
             payload.prefix,
+            json.fmt(payload.key, .{}),
             json.fmt(compressed, .{}),
         });
     }
@@ -268,28 +272,39 @@ pub const TrimWorker = struct {
     const Envelope = struct {
         /// Preserved sibling fields, already serialized with a trailing comma.
         prefix: []const u8,
+        /// Which field held the payload, so it is re-wrapped under its own name.
+        key: []const u8,
         text: []const u8,
     };
 
-    /// Recognize `{... ,"output": <string>, ...}` — the tool reply shape.
-    /// Returns null for anything else, including genuine structured data the
-    /// filters must never reshape.
+    /// The field names tools use for their human-readable payload, in
+    /// priority order. A reply carrying one of these is an envelope; anything
+    /// else is genuine structured data the filters must never reshape.
+    const payload_keys = [_][]const u8{ "output", "text", "content" };
+
     fn envelopePayload(arena: std.mem.Allocator, raw: []const u8) ?Envelope {
         const t = std.mem.trim(u8, raw, " \t\r\n");
         if (t.len == 0 or t[0] != '{') return null;
         const root = json.parseFromSliceLeaky(json.Value, arena, t, .{}) catch return null;
         if (root != .object) return null;
-        const out = root.object.get("output") orelse return null;
-        if (out != .string) return null;
+
+        const key = blk: {
+            for (payload_keys) |k| {
+                const v = root.object.get(k) orelse continue;
+                if (v == .string) break :blk k;
+            }
+            return null;
+        };
+        const text = root.object.get(key).?.string;
 
         var prefix: std.ArrayList(u8) = .empty;
         var it = root.object.iterator();
         while (it.next()) |e| {
-            if (std.mem.eql(u8, e.key_ptr.*, "output")) continue;
+            if (std.mem.eql(u8, e.key_ptr.*, key)) continue;
             const rendered = rawJson(arena, e.value_ptr.*) catch return null;
             prefix.print(arena, "{f}:{s},", .{ json.fmt(e.key_ptr.*, .{}), rendered }) catch return null;
         }
-        return .{ .prefix = prefix.items, .text = out.string };
+        return .{ .prefix = prefix.items, .key = key, .text = text };
     }
 
     /// The M8 pipeline: dedup → command-aware filter → generic trim.
@@ -813,4 +828,55 @@ test "M8: a non-envelope JSON tool result is still left alone" {
     defer res.deinit(testing.allocator);
     try testing.expect(std.mem.indexOf(u8, res.ok, "example.com") != null);
     try testing.expect(std.mem.indexOf(u8, res.ok, "zygos diff:") == null);
+}
+
+test "M8: web_fetch's text envelope is unwrapped too (RADAR profile)" {
+    var h = try Harness.init(testing.allocator);
+    defer h.deinit();
+    const tw = try TrimWorker.start(testing.allocator, &h.actor, &h.registry, tiny, null);
+    defer tw.stop();
+
+    // `zygos::tools::web_fetch` replies {"url":...,"text":...,"truncated":...}.
+    // Without unwrapping, the whole reply is one escaped line and the generic
+    // trim can only cut it mid-token.
+    var article: std.ArrayList(u8) = .empty;
+    defer article.deinit(testing.allocator);
+    for (0..60) |i| {
+        var lb: [64]u8 = undefined;
+        try article.appendSlice(testing.allocator, try std.fmt.bufPrint(&lb, "paragraph line {d}\n", .{i}));
+    }
+    const envelope = try std.fmt.allocPrint(
+        testing.allocator,
+        "{{\"url\":\"https://example.com\",\"text\":{f},\"truncated\":false}}",
+        .{json.fmt(article.items, .{})},
+    );
+    defer testing.allocator.free(envelope);
+
+    const req = try compressReq(testing.allocator, envelope, "web_fetch", "");
+    defer testing.allocator.free(req);
+    const res = try h.caller.call("zygos::output::compress", req);
+    defer res.deinit(testing.allocator);
+    try testing.expect(res == .ok);
+
+    // The URL and shape survive; the body was trimmed line-wise, not
+    // byte-sliced through the middle of the JSON.
+    try testing.expect(std.mem.indexOf(u8, res.ok, "https://example.com") != null);
+    try testing.expect(std.mem.indexOf(u8, res.ok, "truncated") != null);
+    try testing.expect(std.mem.indexOf(u8, res.ok, "zygos trimmed") != null);
+    try testing.expect(std.mem.indexOf(u8, res.ok, "paragraph line 0") != null);
+    try testing.expect(res.ok.len < req.len);
+
+    // The real requirement: what reaches the model is still parseable. A
+    // generic byte-slice through an escaped envelope satisfies every
+    // assertion above while handing the model broken JSON.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const root = try json.parseFromSliceLeaky(json.Value, arena, res.ok, .{});
+    const content = root.object.get("content").?.string;
+    const inner = json.parseFromSliceLeaky(json.Value, arena, content, .{}) catch
+        return error.TrimmedEnvelopeIsNotValidJson;
+    try testing.expect(inner == .object);
+    try testing.expectEqualStrings("https://example.com", inner.object.get("url").?.string);
+    try testing.expect(inner.object.get("text").? == .string);
 }
