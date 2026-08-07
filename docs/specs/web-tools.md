@@ -12,12 +12,38 @@ behind a pure response-processing layer tested over recorded fixtures.
 Request `{"url":"https://..."}`; reply `{"url":..., "text":..., "truncated":bool}`.
 - https/http only; anything else ⇒ structured is_error reply (tool-result
   shape, like tools_ops errors), never a crash.
-- Response body → readable text: strip `<script>/<style>` blocks whole, strip
-  tags, decode the five basic entities (`&amp; &lt; &gt; &quot; &#39;`),
-  collapse blank runs. Non-text content types ⇒ error reply.
+- Response body → readable text (boilerplate-stripping extraction, tuned for
+  token cost — see "HTML compression" below). Non-text content types ⇒ error
+  reply.
 - Size caps: read at most `max_fetch_bytes` (option, default 512 KiB) off the
   wire; emit at most `max_text_bytes` (default 64 KiB) with `truncated:true`.
 - Non-2xx ⇒ error reply naming the status. Redirects: follow ≤ 3.
+
+### HTML compression
+
+`htmlToText` is an extractor, not a tag stripper: the goal is the fewest
+tokens that still carry the page's content.
+
+1. **Drop non-content elements whole** (open tag through matching close, or to
+   EOF if unclosed): `script`, `style`, `noscript`, `svg`, `head`, `nav`,
+   `header`, `footer`, `aside`, `form`, `iframe`, `template`, `select`,
+   `button`. Case-insensitive. HTML comments (`<!-- ... -->`, incl. doctype-ish
+   `<!...>`) are dropped too.
+2. **Structure survives as text.** Block-level tags (`p`, `div`, `br`, `li`,
+   `tr`, `section`, `article`, `ul`, `ol`, `table`, `blockquote`, `pre`,
+   `h1`–`h6`) emit a newline; every other tag emits a single space so inline
+   text never glues. `h1`–`h6` are prefixed with the matching number of `#`
+   and `li` with `- `, so headings and lists stay machine-readable at zero
+   extra token cost.
+3. **Entities**: the five basic ones plus `&nbsp;` and numeric decimal/hex
+   (`&#160;`, `&#x27;`). Unknown entities pass through verbatim.
+4. **Whitespace**: runs of spaces/tabs collapse to one space, runs of blank
+   lines collapse to at most one blank line, trailing spaces per line are
+   dropped, and the whole output is trimmed.
+5. Caps unchanged: at most `max_text_bytes`, `truncated:true` when clipped.
+
+The reply is unchanged in shape; the worker logs input bytes, output bytes,
+and the compression ratio so the saving is observable in production.
 
 ## `zygos::tools::web_search`
 
@@ -51,6 +77,12 @@ bytes, max_out) {text, truncated}`, `parseBraveResults(arena, json_text)`,
 
 1. `htmlToText: tags/script/style stripped, entities decoded, blank runs collapsed`
 2. `htmlToText: max_text_bytes cap sets truncated`
+2a. `htmlToText: boilerplate elements (nav/header/footer/aside/form/svg/noscript) dropped whole`
+2b. `htmlToText: comments and doctype dropped`
+2c. `htmlToText: block tags become newlines, headings get #, list items get -`
+2d. `htmlToText: nbsp and numeric entities decoded; unknown entity passes through`
+2e. `htmlToText: blank-line runs collapse to at most one`
+2f. `htmlToText: realistic page compresses to a small fraction of input`
 3. `validateUrl: https/http pass; file:, ftp:, garbage ⇒ error`
 4. `parseBraveResults + parseSearxngResults: recorded fixtures → neutral shape`
 5. `malformed upstream search JSON ⇒ error, no crash, no leak`
