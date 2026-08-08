@@ -36,6 +36,10 @@ pub const Fsm = fsm.Fsm;
 pub const registry_mod = @import("turn/registry.zig");
 const TurnControl = registry_mod.Control;
 
+const req_mod = @import("turn/req.zig");
+const toolResult = req_mod.toolResult;
+const joinComma = req_mod.joinComma;
+
 /// In-process observer of streamed text deltas (e.g. the mission TUI).
 /// Called on the per-step drain thread; `bytes` are valid only for the
 /// duration of the call — observers copy, never retain.
@@ -340,12 +344,6 @@ pub const TurnOrchestrator = struct {
     }
 };
 
-/// Per-turn tool table entry, resolved from the request's `tools` array.
-const ToolRoute = struct {
-    function_id: []const u8,
-    requires_approval: bool,
-};
-
 /// Collects streamed deltas across the turn; the drain thread appends while
 /// the driver blocks on the provider call. gpa-backed on purpose: the turn
 /// arena is NOT thread-safe and must never be touched from the drain thread;
@@ -392,48 +390,22 @@ fn runTurnHandler(
 const TurnError = error{ OutOfMemory, Failed, MalformedRequest, IllegalTransition, Shutdown };
 
 fn runTurn(self: *TurnOrchestrator, arena: std.mem.Allocator, request_json: []const u8) TurnError![]const u8 {
-    const root = json.parseFromSliceLeaky(json.Value, arena, request_json, .{}) catch
-        return error.MalformedRequest;
-    const obj = if (root == .object) root.object else return error.MalformedRequest;
-
-    const model = strField(obj, "model") orelse "unknown";
-    const system = strField(obj, "system") orelse "";
-    const max_steps: usize = if (obj.get("max_steps")) |v|
-        (if (v == .integer and v.integer > 0) @intCast(v.integer) else 8)
-    else
-        8;
-    const static_provider = strField(obj, "provider_function");
-    const router_fn = strField(obj, "router_function");
-    const step_id = strField(obj, "step_id") orelse "";
-    if (static_provider == null and router_fn == null) return error.MalformedRequest;
-    const policy_fn = strField(obj, "policy_function");
-    const approval_fn = strField(obj, "approval_function");
-    const turn_id = strField(obj, "turn_id");
-    const budget_scope = strField(obj, "budget_scope");
-    const budget_fn = strField(obj, "budget_function") orelse "zygos::budget::check";
-    const trace_path = strField(obj, "trace_path");
-
-    // Tool routing table: name → {function_id, requires_approval}.
-    var routes = std.StringHashMap(ToolRoute).init(arena);
-    const tools_json = blk: {
-        const tools_val = obj.get("tools") orelse break :blk "[]";
-        if (tools_val != .array) return error.MalformedRequest;
-        for (tools_val.array.items) |tv| {
-            if (tv != .object) return error.MalformedRequest;
-            const name = strField(tv.object, "name") orelse return error.MalformedRequest;
-            const fid = strField(tv.object, "function_id") orelse return error.MalformedRequest;
-            const approval = if (tv.object.get("requires_approval")) |a| a == .bool and a.bool else false;
-            try routes.put(name, .{ .function_id = fid, .requires_approval = approval });
-        }
-        break :blk try rawJson(arena, tools_val);
-    };
-
-    // Transcript: raw message JSON texts, in order.
-    var transcript: std.ArrayList([]const u8) = .empty;
-    if (obj.get("messages")) |msgs| {
-        if (msgs != .array) return error.MalformedRequest;
-        for (msgs.array.items) |m| try transcript.append(arena, try rawJson(arena, m));
-    }
+    const q = try req_mod.parse(arena, request_json);
+    const model = q.model;
+    const system = q.system;
+    const max_steps = q.max_steps;
+    const static_provider = q.static_provider;
+    const router_fn = q.router_fn;
+    const step_id = q.step_id;
+    const policy_fn = q.policy_fn;
+    const approval_fn = q.approval_fn;
+    const turn_id = q.turn_id;
+    const budget_scope = q.budget_scope;
+    const budget_fn = q.budget_fn;
+    const trace_path = q.trace_path;
+    const routes = q.routes;
+    const tools_json = q.tools_json;
+    var transcript = q.transcript;
 
     var deltas: DeltaLog = .{
         .observer = self.delta_observer,
@@ -736,14 +708,6 @@ fn traceToolResult(
     } });
 }
 
-fn toolResult(arena: std.mem.Allocator, tool_use_id: []const u8, content: []const u8, is_error: bool) error{OutOfMemory}![]const u8 {
-    return std.fmt.allocPrint(
-        arena,
-        "{{\"type\":\"tool_result\",\"tool_use_id\":{f},\"content\":{f},\"is_error\":{}}}",
-        .{ json.fmt(tool_use_id, .{}), json.fmt(content, .{}), is_error },
-    );
-}
-
 const strField = jsonx.strField;
 
 fn intField(obj: json.ObjectMap, key: []const u8) i64 {
@@ -752,10 +716,6 @@ fn intField(obj: json.ObjectMap, key: []const u8) i64 {
 
 fn controlTarget(arena: std.mem.Allocator, request_json: []const u8) ?[]const u8 {
     return jsonx.topStrField(arena, request_json, "turn_id");
-}
-
-fn joinComma(arena: std.mem.Allocator, items: []const []const u8) error{OutOfMemory}![]const u8 {
-    return std.mem.join(arena, ",", items);
 }
 
 const rawJson = jsonx.rawJson;
