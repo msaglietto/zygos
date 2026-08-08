@@ -18,6 +18,7 @@ const width = @import("width.zig");
 const partialjson = @import("partialjson.zig");
 const chatlog = @import("chatlog.zig");
 const band = @import("band.zig");
+const steerinput = @import("steerinput.zig");
 const entries = @import("entries.zig");
 const tasks_mod = @import("tasks.zig");
 const previewLen = @import("fmt.zig").previewLen;
@@ -55,8 +56,8 @@ pub const Model = struct {
     tokens_in: i64 = 0,
     tokens_out: i64 = 0,
     approval: ?[]u8 = null,
-    /// M6 intervention: open steer input line (null = closed) + pause state.
-    steer_input: ?std.ArrayList(u8) = null,
+    /// M6 intervention: steer input line editor + pause state.
+    steer_input: steerinput.SteerInput = .{},
     paused: bool = false,
     /// The executor's live task (task_start .. task_done window).
     current_task: ?tasks_mod.Current = null,
@@ -102,7 +103,7 @@ pub const Model = struct {
         if (self.role) |r| self.gpa.free(r);
         if (self.step_model) |m| self.gpa.free(m);
         if (self.approval) |a| self.gpa.free(a);
-        if (self.steer_input) |*b| b.deinit(self.gpa);
+        self.steer_input.deinit(self.gpa);
         if (self.current_task) |t| self.gpa.free(t.desc);
         self.dirty.deinit();
         self.mutex.deinit();
@@ -215,13 +216,13 @@ pub const Model = struct {
     pub fn steerInputOpen(self: *Model) bool {
         self.mutex.lock();
         defer self.mutex.unlock();
-        return self.steer_input != null;
+        return self.steer_input.isOpen();
     }
 
     pub fn steerOpen(self: *Model) void {
         self.mutex.lock();
         defer self.mutex.unlock();
-        if (self.steer_input == null) self.steer_input = .empty;
+        self.steer_input.open();
         self.dirty.set();
     }
 
@@ -230,20 +231,13 @@ pub const Model = struct {
     pub fn steerKey(self: *Model, key: u8) void {
         self.mutex.lock();
         defer self.mutex.unlock();
-        const buf = if (self.steer_input) |*b| b else return;
-        if (key == 0x7f or key == 0x08) {
-            if (buf.items.len > 0) buf.items.len -= 1;
-        } else if (key >= 0x20 and key < 0x7f) {
-            buf.append(self.gpa, key) catch {};
-        } else return;
-        self.dirty.set();
+        if (self.steer_input.key(self.gpa, key)) self.dirty.set();
     }
 
     pub fn steerCancel(self: *Model) void {
         self.mutex.lock();
         defer self.mutex.unlock();
-        if (self.steer_input) |*b| b.deinit(self.gpa);
-        self.steer_input = null;
+        self.steer_input.cancel(self.gpa);
         self.dirty.set();
     }
 
@@ -252,17 +246,8 @@ pub const Model = struct {
     pub fn steerTake(self: *Model) ?[]u8 {
         self.mutex.lock();
         defer self.mutex.unlock();
-        var buf = self.steer_input orelse return null;
-        self.steer_input = null;
-        self.dirty.set();
-        if (buf.items.len == 0) {
-            buf.deinit(self.gpa);
-            return null;
-        }
-        return buf.toOwnedSlice(self.gpa) catch {
-            buf.deinit(self.gpa);
-            return null;
-        };
+        if (self.steer_input.isOpen()) self.dirty.set();
+        return self.steer_input.take(self.gpa);
     }
 
     pub fn setPaused(self: *Model, paused: bool) void {
@@ -473,7 +458,7 @@ pub const Model = struct {
             .tokens_in = self.tokens_in,
             .tokens_out = self.tokens_out,
             .approval = self.approval,
-            .steer_input = if (self.steer_input) |b| b.items else null,
+            .steer_input = self.steer_input.text(),
             .paused = self.paused,
             .current_task = self.current_task,
             .tools = self.tools.items,

@@ -18,6 +18,7 @@ pub const tasks = @import("tasks.zig");
 pub const frame = @import("frame.zig");
 pub const markdown = @import("markdown.zig");
 pub const highlight = @import("highlight.zig");
+pub const steerinput = @import("steerinput.zig");
 pub const model = @import("model.zig");
 pub const partialjson = @import("partialjson.zig");
 pub const loop = @import("loop.zig");
