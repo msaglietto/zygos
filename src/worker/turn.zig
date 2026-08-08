@@ -33,15 +33,8 @@ pub const Fsm = fsm.Fsm;
 // Driver
 // ---------------------------------------------------------------------------
 
-/// Cross-thread controls for one running turn (U2): `zygos::turns::abort`
-/// flips the flag, `zygos::turns::steer` queues text; the driver polls at
-/// step boundaries. ALL fields are guarded by the orchestrator's ctl_mutex —
-/// a per-control mutex would dangle when the owning turn untracks between a
-/// handler's map lookup and its lock.
-const TurnControl = struct {
-    aborted: bool = false,
-    steer_text: std.ArrayList(u8) = .empty,
-};
+pub const registry_mod = @import("turn/registry.zig");
+const TurnControl = registry_mod.Control;
 
 /// In-process observer of streamed text deltas (e.g. the mission TUI).
 /// Called on the per-step drain thread; `bytes` are valid only for the
@@ -55,8 +48,7 @@ pub const TurnOrchestrator = struct {
     gpa: std.mem.Allocator,
     actor: *actor_mod.Actor,
     worker: *inproc.Worker,
-    ctl_mutex: sync.Mutex = .{},
-    controls: std.StringHashMap(*TurnControl),
+    registry: registry_mod.Registry,
     /// Set before any turn runs (unsynchronized: turns snapshot it at start).
     delta_observer: ?DeltaObserver = null,
 
@@ -71,7 +63,7 @@ pub const TurnOrchestrator = struct {
             .gpa = gpa,
             .actor = actor,
             .worker = try inproc.Worker.spawn(gpa, actor, registry, "turn-orchestrator"),
-            .controls = std.StringHashMap(*TurnControl).init(gpa),
+            .registry = registry_mod.Registry.init(gpa),
         };
         errdefer self.worker.stop();
         try self.worker.registerFunction("zygos::turns::run", self, &runTurnHandler);
@@ -88,54 +80,32 @@ pub const TurnOrchestrator = struct {
 
     pub fn stop(self: *TurnOrchestrator) void {
         // worker.stop() joins every runTurn handler thread; each untracks
-        // its own control on the way out, so the map must drain to empty.
+        // its own control on the way out, so the registry must drain empty.
         self.worker.stop();
-        std.debug.assert(self.controls.count() == 0);
-        self.controls.deinit();
-        self.ctl_mutex.deinit();
+        self.registry.deinit();
         const gpa = self.gpa;
         gpa.destroy(self);
     }
 
     fn trackTurn(self: *TurnOrchestrator, turn_id: []const u8) error{ OutOfMemory, MalformedRequest }!*TurnControl {
-        const ctl = try self.gpa.create(TurnControl);
-        errdefer self.gpa.destroy(ctl);
-        ctl.* = .{};
-        const key = try self.gpa.dupe(u8, turn_id);
-        errdefer self.gpa.free(key);
-
-        self.ctl_mutex.lock();
-        defer self.ctl_mutex.unlock();
-        const gop = try self.controls.getOrPut(key);
-        if (gop.found_existing) return error.MalformedRequest; // duplicate live turn_id
-        gop.value_ptr.* = ctl;
-        return ctl;
+        return self.registry.track(turn_id) catch |err| switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.Duplicate => error.MalformedRequest, // duplicate live turn_id
+        };
     }
 
     fn untrackTurn(self: *TurnOrchestrator, turn_id: []const u8) void {
-        const kv = blk: {
-            self.ctl_mutex.lock();
-            defer self.ctl_mutex.unlock();
-            break :blk self.controls.fetchRemove(turn_id) orelse return;
-        };
-        kv.value.steer_text.deinit(self.gpa);
-        self.gpa.destroy(kv.value);
-        self.gpa.free(kv.key);
+        self.registry.untrack(turn_id);
     }
 
-    /// Both control handlers: look up the turn by id and act while STILL
-    /// holding ctl_mutex, reply {"ok":bool}. Unknown/finished turns are
+    /// Both control handlers reply {"ok":bool}. Unknown/finished turns are
     /// ok:false, not errors.
     fn abortHandler(ctx: ?*anyopaque, arena: std.mem.Allocator, request_json: []const u8) error{ Failed, OutOfMemory }![]const u8 {
         const self: *TurnOrchestrator = @ptrCast(@alignCast(ctx.?));
-        const tid = controlTarget(arena, request_json);
-        const ok = blk: {
-            self.ctl_mutex.lock();
-            defer self.ctl_mutex.unlock();
-            const ctl = self.controls.get(tid orelse break :blk false) orelse break :blk false;
-            ctl.aborted = true;
-            break :blk true;
-        };
+        const ok = if (controlTarget(arena, request_json)) |tid|
+            self.registry.markAborted(tid)
+        else
+            false;
         return std.fmt.allocPrint(arena, "{{\"ok\":{}}}", .{ok});
     }
 
@@ -147,33 +117,17 @@ pub const TurnOrchestrator = struct {
             if (obj != .object) break :blk false;
             const tid = strField(obj.object, "turn_id") orelse break :blk false;
             const text = strField(obj.object, "text") orelse break :blk false;
-            self.ctl_mutex.lock();
-            defer self.ctl_mutex.unlock();
-            const ctl = self.controls.get(tid) orelse break :blk false;
-            try ctl.steer_text.appendSlice(self.gpa, text);
-            break :blk true;
+            break :blk try self.registry.appendSteer(tid, text);
         };
         return std.fmt.allocPrint(arena, "{{\"ok\":{}}}", .{ok});
     }
 
     fn pollAborted(self: *TurnOrchestrator, ctl: ?*TurnControl) bool {
-        const c = ctl orelse return false;
-        self.ctl_mutex.lock();
-        defer self.ctl_mutex.unlock();
-        return c.aborted;
+        return self.registry.aborted(ctl);
     }
 
-    /// Drain-and-clear queued steer text (duped into the turn's arena so the
-    /// control can keep mutating). Distinct from pollAborted so an abort
-    /// check never silently discards queued steering.
     fn drainSteer(self: *TurnOrchestrator, ctl: ?*TurnControl, arena: std.mem.Allocator) error{OutOfMemory}!?[]const u8 {
-        const c = ctl orelse return null;
-        self.ctl_mutex.lock();
-        defer self.ctl_mutex.unlock();
-        if (c.steer_text.items.len == 0) return null;
-        const copy = try arena.dupe(u8, c.steer_text.items);
-        c.steer_text.clearRetainingCapacity();
-        return copy;
+        return self.registry.drainSteer(ctl, arena);
     }
 
     const Resolved = struct { provider_function: []const u8, model: []const u8 };
