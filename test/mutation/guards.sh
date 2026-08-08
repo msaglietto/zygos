@@ -49,7 +49,7 @@ mutate "guard: structured output is never reshaped" "$G" \
 mutate "guard: keepIfSmaller rejects non-savings" "$G" \
   "s/    return if \(compressed\.len < original\.len\) compressed else null;/    return compressed;/"
 
-mutate "trim: UTF-8 boundary walk in byteFallback" "$T" \
+mutate "trim: UTF-8 boundary walk in byteFallback" "src/worker/trim/text.zig" \
   "s/    while \(front_end > 0 and \(text\[front_end\] & 0xC0\) == 0x80\) front_end -= 1;\n//"
 
 mutate "trim: stats mutex in note()" "$T" \

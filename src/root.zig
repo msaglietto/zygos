@@ -51,6 +51,7 @@ pub const approval = @import("worker/approval.zig");
 pub const router = @import("worker/router.zig");
 pub const budget = @import("worker/budget.zig");
 pub const trim = @import("worker/trim.zig");
+pub const trim_text = @import("worker/trim/text.zig");
 pub const filter_dispatch = @import("worker/filter/dispatch.zig");
 pub const filter_guard = @import("worker/filter/guard.zig");
 pub const filter_git = @import("worker/filter/git.zig");

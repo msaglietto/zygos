@@ -25,7 +25,8 @@ zig build test       # the check that matters — must be green before any commi
 zig fmt src/         # format before committing
 ```
 
-When touching `src/worker/filter/*` or `src/worker/trim.zig`, also run:
+When touching `src/worker/filter/*`, `src/worker/trim.zig` or
+`src/worker/trim/*`, also run:
 
 ```bash
 ./test/probe/filter/run.sh   # real commands through the real filters, with a ratio floor
@@ -83,7 +84,7 @@ sockets. Only `actor.zig` and `net/` compose them.
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **zygos** (444 symbols, 438 relationships, 0 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **zygos** (552 symbols, 546 relationships, 0 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
 > Index stale? Run `node .gitnexus/run.cjs analyze` from the project root — it auto-selects an available runner. No `.gitnexus/run.cjs` yet? `npx gitnexus analyze` (npm 11 crash → `npm i -g gitnexus`; #1939).
 
