@@ -10,23 +10,7 @@ const model = @import("model.zig");
 
 const Mission = model.Mission;
 
-/// Concatenated text blocks of a provider assistant message. A string
-/// `content` passes through whole; non-text blocks are skipped.
-pub fn assistantText(arena: std.mem.Allocator, msg: json.ObjectMap) error{OutOfMemory}![]const u8 {
-    var out: std.ArrayList(u8) = .empty;
-    const content = msg.get("content") orelse return out.toOwnedSlice(arena);
-    switch (content) {
-        .string => |s| try out.appendSlice(arena, s),
-        .array => |blocks| for (blocks.items) |b| {
-            if (b != .object) continue;
-            const btype = jsonx.strField(b.object, "type") orelse continue;
-            if (!std.mem.eql(u8, btype, "text")) continue;
-            if (jsonx.strField(b.object, "text")) |t| try out.appendSlice(arena, t);
-        },
-        else => {},
-    }
-    return out.toOwnedSlice(arena);
-}
+pub const assistantText = jsonx.assistantText;
 
 /// Real providers wrap role JSON in one whole-output markdown fence.
 /// Unwrapping exactly that shape is deterministic — anything else is

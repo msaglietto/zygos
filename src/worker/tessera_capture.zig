@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const jsonx = @import("jsonx.zig");
+const assistantText = jsonx.assistantText;
 const fsx = @import("fsx.zig");
 const readFileOrEmpty = fsx.readFileOrEmpty;
 const mkdirP = fsx.mkdirP;
@@ -288,23 +289,6 @@ fn buildSystemPrompt(arena: std.mem.Allocator, taxonomy: *const Taxonomy) error{
     }
     w.writeAll("\n") catch return error.OutOfMemory;
     return out.toOwnedSlice() catch return error.OutOfMemory;
-}
-
-/// Concatenated text blocks of an assistant message (mission.zig idiom).
-fn assistantText(arena: std.mem.Allocator, msg: json.ObjectMap) error{OutOfMemory}![]const u8 {
-    var out: std.ArrayList(u8) = .empty;
-    const content = msg.get("content") orelse return out.toOwnedSlice(arena);
-    switch (content) {
-        .string => |s| try out.appendSlice(arena, s),
-        .array => |blocks| for (blocks.items) |b| {
-            if (b != .object) continue;
-            const btype = strField(b.object, "type") orelse continue;
-            if (!std.mem.eql(u8, btype, "text")) continue;
-            if (strField(b.object, "text")) |t| try out.appendSlice(arena, t);
-        },
-        else => {},
-    }
-    return out.toOwnedSlice(arena);
 }
 
 fn joinTags(arena: std.mem.Allocator, tags: []const []const u8) error{OutOfMemory}![]const u8 {

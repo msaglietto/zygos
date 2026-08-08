@@ -57,6 +57,24 @@ pub fn topStrField(arena: std.mem.Allocator, request_json: []const u8, key: []co
     return strField(root.object, key);
 }
 
+/// Concatenated text blocks of a provider assistant message. A string
+/// `content` passes through whole; non-text blocks are skipped.
+pub fn assistantText(arena: std.mem.Allocator, msg: json.ObjectMap) error{OutOfMemory}![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    const content = msg.get("content") orelse return out.toOwnedSlice(arena);
+    switch (content) {
+        .string => |s| try out.appendSlice(arena, s),
+        .array => |blocks| for (blocks.items) |b| {
+            if (b != .object) continue;
+            const btype = strField(b.object, "type") orelse continue;
+            if (!std.mem.eql(u8, btype, "text")) continue;
+            if (strField(b.object, "text")) |t| try out.appendSlice(arena, t);
+        },
+        else => {},
+    }
+    return out.toOwnedSlice(arena);
+}
+
 const testing = std.testing;
 
 fn parseObj(arena: std.mem.Allocator, src: []const u8) json.ObjectMap {
