@@ -11,3 +11,5 @@ zig-pkg/
 .ua
 wm
 CLAUDE.md
+.agents/
+skills-lock.json
