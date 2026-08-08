@@ -26,6 +26,7 @@ pub const stream_tap = @import("worker/stream_tap.zig");
 pub const mission = @import("worker/mission.zig");
 pub const mission_fsm = @import("worker/mission/fsm.zig");
 pub const mission_model = @import("worker/mission/model.zig");
+pub const mission_registry = @import("worker/mission/registry.zig");
 pub const mission_store = @import("worker/mission_store.zig");
 pub const mission_boot = @import("worker/mission_boot.zig");
 pub const brief = @import("worker/brief.zig");

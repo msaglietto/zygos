@@ -44,22 +44,8 @@ pub const Mission = model.Mission;
 pub const Role = model.Role;
 const cloneToArena = model.cloneToArena;
 
-/// Cross-thread control block per live mission. ALL access goes through
-/// the orchestrator's ctl_mutex; the running mission updates the snapshot
-/// after every persisted transition, status/abort read it.
-const MissionControl = struct {
-    aborted: bool = false,
-    /// M6: pause parks the run durably at the next role boundary.
-    paused: bool = false,
-    /// M6: pending operator steer, gpa-owned, consumed at the next boundary.
-    steer: ?[]u8 = null,
-    state: State = .defining,
-    stop: StopReason = .none,
-    task_index: usize = 0,
-    fail_count: usize = 0,
-    gate_denials: usize = 0,
-    role_turns_used: usize = 0,
-};
+pub const registry_mod = @import("mission/registry.zig");
+const MissionControl = registry_mod.Control;
 
 /// Everything runMission needs, parsed once from the start request.
 /// Slices point into the handler arena.
@@ -123,8 +109,7 @@ fn journal(self: *MissionOrchestrator, cfg: RunConfig, kind: []const u8, reason:
 pub const MissionOrchestrator = struct {
     gpa: std.mem.Allocator,
     worker: *inproc.Worker,
-    ctl_mutex: sync.Mutex = .{},
-    live: std.StringHashMap(*MissionControl),
+    registry: registry_mod.Registry,
 
     pub fn start(
         gpa: std.mem.Allocator,
@@ -136,7 +121,7 @@ pub const MissionOrchestrator = struct {
         self.* = .{
             .gpa = gpa,
             .worker = try inproc.Worker.spawn(gpa, actor, registry, "mission-orchestrator"),
-            .live = std.StringHashMap(*MissionControl).init(gpa),
+            .registry = registry_mod.Registry.init(gpa),
         };
         errdefer self.worker.stop();
         try self.worker.registerFunction("zygos::missions::start", self, &startHandler);
@@ -151,59 +136,35 @@ pub const MissionOrchestrator = struct {
 
     pub fn stop(self: *MissionOrchestrator) void {
         // worker.stop() joins every start handler thread; each untracks its
-        // own mission on the way out, so the map must drain empty.
+        // own mission on the way out, so the registry must drain empty.
         self.worker.stop();
-        std.debug.assert(self.live.count() == 0);
-        self.live.deinit();
-        self.ctl_mutex.deinit();
+        self.registry.deinit();
         const gpa = self.gpa;
         gpa.destroy(self);
     }
 
     fn track(self: *MissionOrchestrator, mission_id: []const u8) error{ OutOfMemory, MalformedRequest }!*MissionControl {
-        const ctl = try self.gpa.create(MissionControl);
-        errdefer self.gpa.destroy(ctl);
-        ctl.* = .{};
-        const key = try self.gpa.dupe(u8, mission_id);
-        errdefer self.gpa.free(key);
-
-        self.ctl_mutex.lock();
-        defer self.ctl_mutex.unlock();
-        const gop = try self.live.getOrPut(key);
-        if (gop.found_existing) return error.MalformedRequest; // duplicate live mission_id
-        gop.value_ptr.* = ctl;
-        return ctl;
+        return self.registry.track(mission_id) catch |err| switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.Duplicate => error.MalformedRequest, // duplicate live mission_id
+        };
     }
 
     fn untrack(self: *MissionOrchestrator, mission_id: []const u8) void {
-        self.ctl_mutex.lock();
-        defer self.ctl_mutex.unlock();
-        if (self.live.fetchRemove(mission_id)) |kv| {
-            if (kv.value.steer) |s| self.gpa.free(s);
-            self.gpa.destroy(kv.value);
-            self.gpa.free(kv.key);
-        }
+        self.registry.untrack(mission_id);
     }
 
     fn pollAborted(self: *MissionOrchestrator, ctl: *MissionControl) bool {
-        self.ctl_mutex.lock();
-        defer self.ctl_mutex.unlock();
-        return ctl.aborted;
+        return self.registry.aborted(ctl);
     }
 
     fn pollPaused(self: *MissionOrchestrator, ctl: *MissionControl) bool {
-        self.ctl_mutex.lock();
-        defer self.ctl_mutex.unlock();
-        return ctl.paused;
+        return self.registry.paused(ctl);
     }
 
     /// The pending steer text (gpa-owned, caller frees), clearing the slot.
     fn takeSteer(self: *MissionOrchestrator, ctl: *MissionControl) ?[]u8 {
-        self.ctl_mutex.lock();
-        defer self.ctl_mutex.unlock();
-        const s = ctl.steer;
-        ctl.steer = null;
-        return s;
+        return self.registry.takeSteer(ctl);
     }
 
     /// Persist first, then publish the snapshot — status never reports a
@@ -213,14 +174,7 @@ pub const MissionOrchestrator = struct {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.Failed,
         };
-        self.ctl_mutex.lock();
-        defer self.ctl_mutex.unlock();
-        ctl.state = m.state;
-        ctl.stop = m.stop;
-        ctl.task_index = m.task_index;
-        ctl.fail_count = m.fail_count;
-        ctl.gate_denials = m.gate_denials;
-        ctl.role_turns_used = m.role_turns_used;
+        self.registry.updateSnapshot(ctl, m);
     }
 };
 
@@ -247,14 +201,12 @@ fn statusHandler(
     const self: *MissionOrchestrator = @ptrCast(@alignCast(ctx.?));
     const mid = controlTarget(arena, request_json) orelse return error.Failed;
 
-    self.ctl_mutex.lock();
-    defer self.ctl_mutex.unlock();
-    const ctl = self.live.get(mid) orelse return error.Failed;
+    const snap = self.registry.status(mid) orelse return error.Failed;
     return std.fmt.allocPrint(
         arena,
         "{{\"state\":\"{t}\",\"stop\":\"{t}\",\"role_turns\":{d},\"task_index\":{d}," ++
             "\"fail_count\":{d},\"gate_denials\":{d}}}",
-        .{ ctl.state, ctl.stop, ctl.role_turns_used, ctl.task_index, ctl.fail_count, ctl.gate_denials },
+        .{ snap.state, snap.stop, snap.role_turns_used, snap.task_index, snap.fail_count, snap.gate_denials },
     );
 }
 
@@ -264,14 +216,10 @@ fn abortHandler(
     request_json: []const u8,
 ) error{ Failed, OutOfMemory }![]const u8 {
     const self: *MissionOrchestrator = @ptrCast(@alignCast(ctx.?));
-    const ok = blk: {
-        const mid = controlTarget(arena, request_json) orelse break :blk false;
-        self.ctl_mutex.lock();
-        defer self.ctl_mutex.unlock();
-        const ctl = self.live.get(mid) orelse break :blk false;
-        ctl.aborted = true;
-        break :blk true;
-    };
+    const ok = if (controlTarget(arena, request_json)) |mid|
+        self.registry.markAborted(mid)
+    else
+        false;
     return std.fmt.allocPrint(arena, "{{\"ok\":{}}}", .{ok});
 }
 
@@ -289,20 +237,15 @@ fn listHandler(
     const w = &out.writer;
     w.writeAll("{\"missions\":[") catch return error.OutOfMemory;
 
-    self.ctl_mutex.lock();
-    defer self.ctl_mutex.unlock();
-    var it = self.live.iterator();
-    var first = true;
-    while (it.next()) |kv| {
-        if (!first) w.writeAll(",") catch return error.OutOfMemory;
-        first = false;
-        const ctl = kv.value_ptr.*;
+    const entries = self.registry.snapshotAll(arena) catch return error.OutOfMemory;
+    for (entries, 0..) |entry, i| {
+        if (i != 0) w.writeAll(",") catch return error.OutOfMemory;
         w.print(
             "{{\"mission_id\":{f},\"state\":\"{t}\",\"stop\":\"{t}\"," ++
                 "\"role_turns\":{d},\"task_index\":{d},\"paused\":{}}}",
             .{
-                json.fmt(kv.key_ptr.*, .{}), ctl.state,      ctl.stop,
-                ctl.role_turns_used,         ctl.task_index, ctl.paused,
+                json.fmt(entry.mission_id, .{}), entry.snap.state,      entry.snap.stop,
+                entry.snap.role_turns_used,      entry.snap.task_index, entry.snap.paused,
             },
         ) catch return error.OutOfMemory;
     }
@@ -324,16 +267,7 @@ fn steerHandler(
         const mid = strField(root.object, "mission_id") orelse break :blk false;
         const text = strField(root.object, "text") orelse break :blk false;
         if (text.len == 0) break :blk false;
-        const copy = try self.gpa.dupe(u8, text);
-        self.ctl_mutex.lock();
-        defer self.ctl_mutex.unlock();
-        const ctl = self.live.get(mid) orelse {
-            self.gpa.free(copy);
-            break :blk false;
-        };
-        if (ctl.steer) |old| self.gpa.free(old);
-        ctl.steer = copy;
-        break :blk true;
+        break :blk try self.registry.putSteer(mid, text);
     };
     return std.fmt.allocPrint(arena, "{{\"ok\":{}}}", .{ok});
 }
@@ -361,14 +295,10 @@ fn setPaused(
     paused: bool,
 ) error{ Failed, OutOfMemory }![]const u8 {
     const self: *MissionOrchestrator = @ptrCast(@alignCast(ctx.?));
-    const ok = blk: {
-        const mid = controlTarget(arena, request_json) orelse break :blk false;
-        self.ctl_mutex.lock();
-        defer self.ctl_mutex.unlock();
-        const ctl = self.live.get(mid) orelse break :blk false;
-        ctl.paused = paused;
-        break :blk true;
-    };
+    const ok = if (controlTarget(arena, request_json)) |mid|
+        self.registry.markPaused(mid, paused)
+    else
+        false;
     return std.fmt.allocPrint(arena, "{{\"ok\":{}}}", .{ok});
 }
 
