@@ -9,6 +9,7 @@
 //! std.Io, which Z-02 confines to src/net/ — binaries read the file.
 
 const std = @import("std");
+const jsonx = @import("jsonx.zig");
 const json = std.json;
 const actor_mod = @import("../kernel/actor.zig");
 const inproc = @import("../kernel/inproc.zig");
@@ -111,10 +112,7 @@ pub const RouterWorker = struct {
     }
 };
 
-fn strField(obj: json.ObjectMap, key: []const u8) ?[]const u8 {
-    const v = obj.get(key) orelse return null;
-    return if (v == .string) v.string else null;
-}
+const strField = jsonx.strField;
 
 // ===========================================================================
 // Tests (docs/specs/router.md contract, RED first)

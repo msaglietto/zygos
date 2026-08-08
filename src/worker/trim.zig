@@ -6,6 +6,7 @@
 //! path never blocks on accounting).
 
 const std = @import("std");
+const jsonx = @import("jsonx.zig");
 const json = std.json;
 const actor_mod = @import("../kernel/actor.zig");
 const sync = @import("../kernel/sync.zig");
@@ -142,12 +143,7 @@ fn byteFallback(arena: std.mem.Allocator, text: []const u8, limits: Limits) erro
     return out.items;
 }
 
-fn rawJson(alloc: std.mem.Allocator, value: json.Value) error{OutOfMemory}![]const u8 {
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    errdefer out.deinit();
-    json.Stringify.value(value, .{}, &out.writer) catch return error.OutOfMemory;
-    return out.written();
-}
+const rawJson = jsonx.rawJson;
 
 /// Wall-clock ms (same contract as kernel/inproc.zig — Zig 0.16 std has no
 /// io-free milliTimestamp).

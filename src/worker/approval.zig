@@ -5,6 +5,7 @@
 //! stops. Every non-affirmative outcome is a denial — fail closed.
 
 const std = @import("std");
+const jsonx = @import("jsonx.zig");
 const json = std.json;
 const actor_mod = @import("../kernel/actor.zig");
 const inproc = @import("../kernel/inproc.zig");
@@ -180,10 +181,7 @@ pub const ApprovalWorker = struct {
     }
 };
 
-fn strField(obj: json.ObjectMap, key: []const u8) ?[]const u8 {
-    const v = obj.get(key) orelse return null;
-    return if (v == .string) v.string else null;
-}
+const strField = jsonx.strField;
 
 // ===========================================================================
 // Tests (docs/specs/approval.md contract, RED first)

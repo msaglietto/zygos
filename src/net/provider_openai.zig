@@ -10,6 +10,7 @@
 //! registration is covered by provider_boot.zig over the bus without HTTP.
 
 const std = @import("std");
+const jsonx = @import("../worker/jsonx.zig");
 const json = std.json;
 const actor_mod = @import("../kernel/actor.zig");
 const inproc = @import("../kernel/inproc.zig");
@@ -180,10 +181,7 @@ pub const OpenAiProvider = struct {
     }
 };
 
-fn strField(obj: json.ObjectMap, key: []const u8) ?[]const u8 {
-    const v = obj.get(key) orelse return null;
-    return if (v == .string) v.string else null;
-}
+const strField = jsonx.strField;
 
 fn u32Field(obj: json.ObjectMap, key: []const u8) ?u32 {
     const v = obj.get(key) orelse return null;

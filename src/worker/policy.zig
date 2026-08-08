@@ -4,6 +4,7 @@
 //! (no rule matched), and the driver treats every failure mode as deny.
 
 const std = @import("std");
+const jsonx = @import("jsonx.zig");
 const json = std.json;
 const actor_mod = @import("../kernel/actor.zig");
 const inproc = @import("../kernel/inproc.zig");
@@ -96,10 +97,7 @@ pub const PolicyWorker = struct {
     }
 };
 
-fn strField(obj: json.ObjectMap, key: []const u8) ?[]const u8 {
-    const v = obj.get(key) orelse return null;
-    return if (v == .string) v.string else null;
-}
+const strField = jsonx.strField;
 
 // ===========================================================================
 // Tests (docs/specs/policy.md contract, RED first)

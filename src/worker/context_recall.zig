@@ -13,6 +13,7 @@
 //! (Z-02: no std.Io in workers); malformed lines are skipped, not fatal.
 
 const std = @import("std");
+const jsonx = @import("jsonx.zig");
 const json = std.json;
 const context = @import("context.zig");
 const substrate_mod = @import("context_substrate.zig");
@@ -284,15 +285,9 @@ pub fn parseSourceLine(arena: std.mem.Allocator, line: []const u8) ?Source {
     return .{ .id = id, .title = title, .text = text, .stamp_ms = ts, .pinned = pinned };
 }
 
-fn strField(obj: json.ObjectMap, key: []const u8) ?[]const u8 {
-    const v = obj.get(key) orelse return null;
-    return if (v == .string) v.string else null;
-}
+const strField = jsonx.strField;
 
-fn intField(obj: json.ObjectMap, key: []const u8) ?i64 {
-    const v = obj.get(key) orelse return null;
-    return if (v == .integer) v.integer else null;
-}
+const intField = jsonx.intField;
 
 // ---------------------------------------------------------------------------
 // Strategy

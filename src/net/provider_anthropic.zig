@@ -7,6 +7,7 @@
 //! GOAL.md M1 notes; `zig build test` never opens a socket.
 
 const std = @import("std");
+const jsonx = @import("../worker/jsonx.zig");
 const json = std.json;
 const actor_mod = @import("../kernel/actor.zig");
 const inproc = @import("../kernel/inproc.zig");
@@ -155,10 +156,7 @@ pub const AnthropicProvider = struct {
     }
 };
 
-fn strField(obj: json.ObjectMap, key: []const u8) ?[]const u8 {
-    const v = obj.get(key) orelse return null;
-    return if (v == .string) v.string else null;
-}
+const strField = jsonx.strField;
 
 fn u32Field(obj: json.ObjectMap, key: []const u8) ?u32 {
     const v = obj.get(key) orelse return null;

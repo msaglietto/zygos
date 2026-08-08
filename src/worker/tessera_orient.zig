@@ -5,6 +5,7 @@
 //! tessera/vault.zig. No Obsidian dependency; tests use a fixture vault only.
 
 const std = @import("std");
+const jsonx = @import("jsonx.zig");
 const c = std.c;
 const json = std.json;
 const actor_mod = @import("../kernel/actor.zig");
@@ -258,10 +259,7 @@ fn readFileOrEmpty(allocator: std.mem.Allocator, path: []const u8) error{OutOfMe
     return buf.toOwnedSlice(allocator) catch return error.OutOfMemory;
 }
 
-fn strField(obj: json.ObjectMap, key: []const u8) ?[]const u8 {
-    const v = obj.get(key) orelse return null;
-    return if (v == .string) v.string else null;
-}
+const strField = jsonx.strField;
 
 // ===========================================================================
 // Tests (docs/specs/tessera-vault.md worker layer, RED first)

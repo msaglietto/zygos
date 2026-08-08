@@ -6,6 +6,7 @@
 //! tagged `#needs-review`.
 
 const std = @import("std");
+const jsonx = @import("jsonx.zig");
 const c = std.c;
 const json = std.json;
 const actor_mod = @import("../kernel/actor.zig");
@@ -328,10 +329,7 @@ fn replyJson(
     return out.toOwnedSlice() catch return error.OutOfMemory;
 }
 
-fn strField(obj: json.ObjectMap, key: []const u8) ?[]const u8 {
-    const v = obj.get(key) orelse return null;
-    return if (v == .string) v.string else null;
-}
+const strField = jsonx.strField;
 
 /// Missing file ⇒ empty owned text. Other open failures also empty.
 fn readFileOrEmpty(allocator: std.mem.Allocator, path: []const u8) error{OutOfMemory}![]const u8 {

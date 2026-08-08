@@ -6,6 +6,7 @@
 //! everything provider-neutral lives here.
 
 const std = @import("std");
+const jsonx = @import("jsonx.zig");
 const json = std.json;
 
 pub const AssembleError = error{ OutOfMemory, MalformedEvent, ApiError, Incomplete };
@@ -86,32 +87,10 @@ pub fn canonicalizeDuplicateKeys(gpa: std.mem.Allocator, input: *std.ArrayList(u
 // JSON field helpers (tolerant: wrong type reads as absent)
 // ---------------------------------------------------------------------------
 
-pub fn objField(obj: json.ObjectMap, key: []const u8) ?json.ObjectMap {
-    const v = obj.get(key) orelse return null;
-    return if (v == .object) v.object else null;
-}
-
-pub fn strField(obj: json.ObjectMap, key: []const u8) ?[]const u8 {
-    const v = obj.get(key) orelse return null;
-    return if (v == .string) v.string else null;
-}
-
-pub fn intField(obj: json.ObjectMap, key: []const u8) ?u64 {
-    const v = obj.get(key) orelse return null;
-    return switch (v) {
-        .integer => |n| if (n >= 0) @intCast(n) else null,
-        else => null,
-    };
-}
-
-/// Re-serialize a parsed value as minified JSON text (arena-owned).
-pub fn rawJson(arena: std.mem.Allocator, value: json.Value) error{OutOfMemory}![]const u8 {
-    var out: std.Io.Writer.Allocating = .init(arena);
-    errdefer out.deinit();
-    var ws: json.Stringify = .{ .writer = &out.writer, .options = .{ .whitespace = .minified } };
-    ws.write(value) catch return error.OutOfMemory;
-    return out.toOwnedSlice() catch return error.OutOfMemory;
-}
+pub const objField = jsonx.objField;
+pub const strField = jsonx.strField;
+pub const intField = jsonx.uintField;
+pub const rawJson = jsonx.rawJson;
 
 // ===========================================================================
 // Tests

@@ -6,6 +6,7 @@
 //! stays out of worker modules per Z-02).
 
 const std = @import("std");
+const jsonx = @import("jsonx.zig");
 const c = std.c;
 const json = std.json;
 const mission_mod = @import("mission.zig");
@@ -238,10 +239,7 @@ fn deserialize(gpa: std.mem.Allocator, bytes: []const u8) StoreError!mission_mod
     };
 }
 
-fn strField(obj: json.ObjectMap, key: []const u8) ?[]const u8 {
-    const v = obj.get(key) orelse return null;
-    return if (v == .string) v.string else null;
-}
+const strField = jsonx.strField;
 
 fn uintField(obj: json.ObjectMap, key: []const u8) StoreError!usize {
     const v = obj.get(key) orelse return error.Corrupt;

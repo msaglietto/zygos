@@ -58,6 +58,7 @@ pub const tools = @import("worker/tools.zig");
 pub const tools_ops = @import("worker/tools_ops.zig");
 pub const anthropic = @import("worker/anthropic.zig");
 pub const assembler = @import("worker/assembler.zig");
+pub const jsonx = @import("worker/jsonx.zig");
 pub const providers_catalog = @import("config/providers.zig");
 pub const tui = @import("tui/tui.zig");
 pub const types = @import("kernel/types.zig");

@@ -10,6 +10,7 @@
 //! non-matching lines (server notifications) are skipped.
 
 const std = @import("std");
+const jsonx = @import("../jsonx.zig");
 const c = std.c;
 const json = std.json;
 const actor_mod = @import("../../kernel/actor.zig");
@@ -203,18 +204,8 @@ pub const Client = struct {
     }
 };
 
-fn strField(obj: json.ObjectMap, key: []const u8) ?[]const u8 {
-    const v = obj.get(key) orelse return null;
-    return if (v == .string) v.string else null;
-}
-
-fn rawJsonGpa(gpa: std.mem.Allocator, value: json.Value) error{OutOfMemory}![]u8 {
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    errdefer out.deinit();
-    var ws: json.Stringify = .{ .writer = &out.writer, .options = .{ .whitespace = .minified } };
-    ws.write(value) catch return error.OutOfMemory;
-    return out.toOwnedSlice() catch return error.OutOfMemory;
-}
+const strField = jsonx.strField;
+const rawJsonGpa = jsonx.rawJson;
 
 // ---------------------------------------------------------------------------
 // Config: `.mcp_servers` in zygos.zon (operator-owned, like routes)

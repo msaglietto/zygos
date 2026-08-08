@@ -10,6 +10,7 @@
 //! an injected CmdRunner vtable — tests never fork.
 
 const std = @import("std");
+const jsonx = @import("jsonx.zig");
 const json = std.json;
 const context = @import("context.zig");
 const substrate_mod = @import("context_substrate.zig");
@@ -311,15 +312,9 @@ pub const PopenRunner = struct {
     }
 };
 
-fn strField(obj: json.ObjectMap, key: []const u8) ?[]const u8 {
-    const v = obj.get(key) orelse return null;
-    return if (v == .string) v.string else null;
-}
+const strField = jsonx.strField;
 
-fn intField(obj: json.ObjectMap, key: []const u8) ?i64 {
-    const v = obj.get(key) orelse return null;
-    return if (v == .integer) v.integer else null;
-}
+const intField = jsonx.intField;
 
 // ===========================================================================
 // Tests

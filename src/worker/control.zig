@@ -11,6 +11,7 @@
 //! arrives.
 
 const std = @import("std");
+const jsonx = @import("jsonx.zig");
 const json = std.json;
 
 pub const file_name = "control.jsonl";
@@ -133,10 +134,7 @@ pub fn appendCommand(gpa: std.mem.Allocator, dir: []const u8, cmd: Command) erro
     _ = std.c.fwrite("\n", 1, 1, f);
 }
 
-fn strField(obj: json.ObjectMap, key: []const u8) ?[]const u8 {
-    const v = obj.get(key) orelse return null;
-    return if (v == .string) v.string else null;
-}
+const strField = jsonx.strField;
 
 fn readWholeFile(arena: std.mem.Allocator, path: []const u8) ?[]u8 {
     const path_z = std.fmt.allocPrintSentinel(arena, "{s}", .{path}, 0) catch return null;

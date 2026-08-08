@@ -14,6 +14,7 @@
 //! surface as the generic handler failure.
 
 const std = @import("std");
+const jsonx = @import("jsonx.zig");
 const json = std.json;
 const actor_mod = @import("../kernel/actor.zig");
 const inproc = @import("../kernel/inproc.zig");
@@ -1370,30 +1371,15 @@ fn cloneToArena(arena: std.mem.Allocator, m: *const Mission) error{OutOfMemory}!
     };
 }
 
-fn strField(obj: json.ObjectMap, key: []const u8) ?[]const u8 {
-    const v = obj.get(key) orelse return null;
-    return if (v == .string) v.string else null;
-}
+const strField = jsonx.strField;
 
-fn uintFieldOr(obj: json.ObjectMap, key: []const u8, default: usize) usize {
-    const v = obj.get(key) orelse return default;
-    if (v != .integer or v.integer <= 0) return default;
-    return @intCast(v.integer);
-}
+const uintFieldOr = jsonx.uintFieldOr;
 
 fn controlTarget(arena: std.mem.Allocator, request_json: []const u8) ?[]const u8 {
-    const root = json.parseFromSliceLeaky(json.Value, arena, request_json, .{}) catch return null;
-    if (root != .object) return null;
-    return strField(root.object, "mission_id");
+    return jsonx.topStrField(arena, request_json, "mission_id");
 }
 
-fn rawJson(arena: std.mem.Allocator, value: json.Value) error{OutOfMemory}![]const u8 {
-    var out: std.Io.Writer.Allocating = .init(arena);
-    errdefer out.deinit();
-    var ws: json.Stringify = .{ .writer = &out.writer, .options = .{ .whitespace = .minified } };
-    ws.write(value) catch return error.OutOfMemory;
-    return out.toOwnedSlice() catch return error.OutOfMemory;
-}
+const rawJson = jsonx.rawJson;
 
 // ===========================================================================
 // Tests (docs/specs/mission.md contract, RED first)

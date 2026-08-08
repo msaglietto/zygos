@@ -5,6 +5,7 @@
 //! fail-closed W5 seam — any failed/unreachable checkpoint blocks the write.
 
 const std = @import("std");
+const jsonx = @import("jsonx.zig");
 const c = std.c;
 const json = std.json;
 const actor_mod = @import("../kernel/actor.zig");
@@ -202,10 +203,7 @@ fn writeStringArray(w: *std.Io.Writer, items: []const []const u8) error{OutOfMem
     w.writeAll("]") catch return error.OutOfMemory;
 }
 
-fn strField(obj: json.ObjectMap, key: []const u8) ?[]const u8 {
-    const v = obj.get(key) orelse return null;
-    return if (v == .string) v.string else null;
-}
+const strField = jsonx.strField;
 
 fn strArrayField(arena: std.mem.Allocator, obj: json.ObjectMap, key: []const u8) error{ Failed, OutOfMemory }![]const []const u8 {
     const v = obj.get(key) orelse return &[_][]const u8{};

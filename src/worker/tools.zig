@@ -5,6 +5,7 @@
 //! results; only malformed requests fail the bus call.
 
 const std = @import("std");
+const jsonx = @import("jsonx.zig");
 const json = std.json;
 const actor_mod = @import("../kernel/actor.zig");
 const inproc = @import("../kernel/inproc.zig");
@@ -90,10 +91,7 @@ fn parseObject(arena: std.mem.Allocator, request_json: []const u8) error{Failed}
     return if (root == .object) root.object else error.Failed;
 }
 
-fn strField(obj: json.ObjectMap, key: []const u8) ?[]const u8 {
-    const v = obj.get(key) orelse return null;
-    return if (v == .string) v.string else null;
-}
+const strField = jsonx.strField;
 
 // ===========================================================================
 // Tests — bus-level round-trips over a real kernel; the op edge cases live
