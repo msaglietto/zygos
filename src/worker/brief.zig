@@ -4,6 +4,11 @@
 //! before the FSM; a failing lint refuses the mission (fail closed).
 
 const std = @import("std");
+const textx = @import("textx.zig");
+const nextLine = textx.nextLine;
+const isBlank = textx.isBlank;
+const containsIgnoreCase = textx.containsIgnoreCase;
+const eqlIgnoreCase = textx.eqlIgnoreCase;
 
 pub const LintError = enum {
     no_frontmatter,
@@ -200,41 +205,6 @@ fn parseHeading(line: []const u8) ?ParsedHeading {
         text = std.mem.trim(u8, text[0..end], " \t");
     }
     return .{ .level = @intCast(i), .text = text };
-}
-
-fn nextLine(text: []const u8, pos: *usize) ?[]const u8 {
-    if (pos.* >= text.len) return null;
-    const start = pos.*;
-    if (std.mem.indexOfScalarPos(u8, text, start, '\n')) |nl| {
-        var end = nl;
-        if (end > start and text[end - 1] == '\r') end -= 1;
-        pos.* = nl + 1;
-        return text[start..end];
-    }
-    pos.* = text.len;
-    return text[start..];
-}
-
-fn isBlank(line: []const u8) bool {
-    return std.mem.trim(u8, line, " \t").len == 0;
-}
-
-fn containsIgnoreCase(hay: []const u8, needle: []const u8) bool {
-    if (needle.len == 0) return true;
-    if (hay.len < needle.len) return false;
-    var i: usize = 0;
-    while (i + needle.len <= hay.len) : (i += 1) {
-        if (eqlIgnoreCase(hay[i .. i + needle.len], needle)) return true;
-    }
-    return false;
-}
-
-fn eqlIgnoreCase(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    for (a, b) |ac, bc| {
-        if (std.ascii.toLower(ac) != std.ascii.toLower(bc)) return false;
-    }
-    return true;
 }
 
 // ── tests ───────────────────────────────────────────────────────────────────
