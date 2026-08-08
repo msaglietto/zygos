@@ -12,6 +12,9 @@
 
 const std = @import("std");
 const jsonx = @import("jsonx.zig");
+const fsx = @import("fsx.zig");
+const readWholeFile = fsx.readWholeFile;
+
 const json = std.json;
 
 pub const file_name = "control.jsonl";
@@ -135,20 +138,6 @@ pub fn appendCommand(gpa: std.mem.Allocator, dir: []const u8, cmd: Command) erro
 }
 
 const strField = jsonx.strField;
-
-fn readWholeFile(arena: std.mem.Allocator, path: []const u8) ?[]u8 {
-    const path_z = std.fmt.allocPrintSentinel(arena, "{s}", .{path}, 0) catch return null;
-    const f = std.c.fopen(path_z.ptr, "r") orelse return null;
-    defer _ = std.c.fclose(f);
-    var buf: std.ArrayList(u8) = .empty;
-    var chunk: [4096]u8 = undefined;
-    while (true) {
-        const n = std.c.fread(&chunk, 1, chunk.len, f);
-        if (n == 0) break;
-        buf.appendSlice(arena, chunk[0..n]) catch return null;
-    }
-    return buf.items;
-}
 
 // ===========================================================================
 // Tests

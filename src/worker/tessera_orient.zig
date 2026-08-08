@@ -6,6 +6,10 @@
 
 const std = @import("std");
 const jsonx = @import("jsonx.zig");
+const fsx = @import("fsx.zig");
+const readFileOrEmpty = fsx.readFileOrEmpty;
+const mkdirP = fsx.mkdirP;
+
 const c = std.c;
 const json = std.json;
 const actor_mod = @import("../kernel/actor.zig");
@@ -238,27 +242,6 @@ fn direntName(ent: *const c.dirent) []const u8 {
 }
 
 /// Missing file ⇒ empty owned text. Other open failures also empty (treat as no data).
-fn readFileOrEmpty(allocator: std.mem.Allocator, path: []const u8) error{OutOfMemory}![]const u8 {
-    const path_z = std.fmt.allocPrintSentinel(allocator, "{s}", .{path}, 0) catch return error.OutOfMemory;
-    const fd = c.open(path_z, .{ .ACCMODE = .RDONLY });
-    if (fd < 0) return try allocator.dupe(u8, "");
-    defer _ = c.close(fd);
-
-    var buf: std.ArrayList(u8) = .empty;
-    errdefer buf.deinit(allocator);
-    var chunk: [64 * 1024]u8 = undefined;
-    while (true) {
-        const n = c.read(fd, &chunk, chunk.len);
-        if (n < 0) {
-            buf.deinit(allocator);
-            return try allocator.dupe(u8, "");
-        }
-        if (n == 0) break;
-        buf.appendSlice(allocator, chunk[0..@intCast(n)]) catch return error.OutOfMemory;
-    }
-    return buf.toOwnedSlice(allocator) catch return error.OutOfMemory;
-}
-
 const strField = jsonx.strField;
 
 // ===========================================================================
@@ -380,17 +363,6 @@ fn buildFixture(gpa: std.mem.Allocator, root: []const u8) !void {
     ;
     try writeAbs(gpa, root, "Projects/stale_stalled/SESSIONS.md", stalled_sessions);
     try writeAbs(gpa, root, "Projects/stale_stalled/PROJECT.md", "# stale_stalled\n");
-}
-
-fn mkdirP(gpa: std.mem.Allocator, abs: []const u8) !void {
-    var end: usize = 1;
-    while (end <= abs.len) : (end += 1) {
-        if (end == abs.len or abs[end] == '/') {
-            const dir_z = try gpa.dupeZ(u8, abs[0..end]);
-            defer gpa.free(dir_z);
-            _ = c.mkdir(dir_z, 0o755);
-        }
-    }
 }
 
 fn writeAbs(gpa: std.mem.Allocator, root: []const u8, rel: []const u8, bytes: []const u8) !void {

@@ -7,6 +7,11 @@
 
 const std = @import("std");
 const jsonx = @import("jsonx.zig");
+const fsx = @import("fsx.zig");
+const readFileOrEmpty = fsx.readFileOrEmpty;
+const mkdirP = fsx.mkdirP;
+const writeAtomic = fsx.writeAtomic;
+
 const c = std.c;
 const json = std.json;
 const actor_mod = @import("../kernel/actor.zig");
@@ -330,66 +335,6 @@ fn replyJson(
 }
 
 const strField = jsonx.strField;
-
-/// Missing file ⇒ empty owned text. Other open failures also empty.
-fn readFileOrEmpty(allocator: std.mem.Allocator, path: []const u8) error{OutOfMemory}![]const u8 {
-    const path_z = std.fmt.allocPrintSentinel(allocator, "{s}", .{path}, 0) catch return error.OutOfMemory;
-    const fd = c.open(path_z, .{ .ACCMODE = .RDONLY });
-    if (fd < 0) return try allocator.dupe(u8, "");
-    defer _ = c.close(fd);
-
-    var buf: std.ArrayList(u8) = .empty;
-    errdefer buf.deinit(allocator);
-    var chunk: [64 * 1024]u8 = undefined;
-    while (true) {
-        const n = c.read(fd, &chunk, chunk.len);
-        if (n < 0) {
-            buf.deinit(allocator);
-            return try allocator.dupe(u8, "");
-        }
-        if (n == 0) break;
-        buf.appendSlice(allocator, chunk[0..@intCast(n)]) catch return error.OutOfMemory;
-    }
-    return buf.toOwnedSlice(allocator) catch return error.OutOfMemory;
-}
-
-/// mkdir -p over every prefix of an absolute path (EEXIST is fine).
-fn mkdirP(gpa: std.mem.Allocator, abs: []const u8) error{ Failed, OutOfMemory }!void {
-    var end: usize = 1;
-    while (end <= abs.len) : (end += 1) {
-        if (end == abs.len or abs[end] == '/') {
-            const dir_z = gpa.dupeZ(u8, abs[0..end]) catch return error.OutOfMemory;
-            defer gpa.free(dir_z);
-            _ = c.mkdir(dir_z, 0o755);
-        }
-    }
-}
-
-/// Atomic tmp+rename write (mission_store idiom). Creates parent directories.
-fn writeAtomic(gpa: std.mem.Allocator, path: []const u8, bytes: []const u8) error{ Failed, OutOfMemory }!void {
-    if (std.mem.lastIndexOfScalar(u8, path, '/')) |slash| {
-        try mkdirP(gpa, path[0..slash]);
-    }
-
-    const tmp_z = std.fmt.allocPrintSentinel(gpa, "{s}.tmp", .{path}, 0) catch return error.OutOfMemory;
-    defer gpa.free(tmp_z);
-    const final_z = gpa.dupeZ(u8, path) catch return error.OutOfMemory;
-    defer gpa.free(final_z);
-
-    const fd = c.open(tmp_z, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(c.mode_t, 0o644));
-    if (fd < 0) return error.Failed;
-    var off: usize = 0;
-    while (off < bytes.len) {
-        const n = c.write(fd, bytes.ptr + off, bytes.len - off);
-        if (n <= 0) {
-            _ = c.close(fd);
-            return error.Failed;
-        }
-        off += @intCast(n);
-    }
-    if (c.close(fd) != 0) return error.Failed;
-    if (c.rename(tmp_z, final_z) != 0) return error.Failed;
-}
 
 // ===========================================================================
 // Tests (docs/specs/tessera-capture.md contract, RED first)

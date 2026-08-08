@@ -21,6 +21,9 @@ const stem = req_mod.stem;
 const terminalExitCode = req_mod.terminalExitCode;
 const absPath = req_mod.absPath;
 
+const readWholeFile = zygos.fsx.readWholeFileZ;
+const mkdirQuiet = zygos.fsx.mkdirQuiet;
+
 const eprint = std.debug.print; // stderr
 
 pub fn run(gpa: std.mem.Allocator, args: *std.process.Args.Iterator) u8 {
@@ -719,12 +722,6 @@ fn runStamp() []const u8 {
     return &stamp_buf;
 }
 
-fn mkdirQuiet(gpa: std.mem.Allocator, path: []const u8) void {
-    const path_z = std.fmt.allocPrintSentinel(gpa, "{s}", .{path}, 0) catch return;
-    defer gpa.free(path_z);
-    _ = std.c.mkdir(path_z.ptr, 0o755); // EEXIST and friends: fine, best-effort
-}
-
 fn fileExists(gpa: std.mem.Allocator, dir: []const u8, name: []const u8) bool {
     const path_z = std.fmt.allocPrintSentinel(gpa, "{s}/{s}", .{ dir, name }, 0) catch return false;
     defer gpa.free(path_z);
@@ -914,22 +911,6 @@ fn writeStdout(bytes: []const u8) void {
         if (n <= 0) return;
         off += @intCast(n);
     }
-}
-
-fn readWholeFile(gpa: std.mem.Allocator, path: []const u8) ?[:0]u8 {
-    const path_z = std.fmt.allocPrintSentinel(gpa, "{s}", .{path}, 0) catch return null;
-    defer gpa.free(path_z);
-    const f = std.c.fopen(path_z.ptr, "r") orelse return null;
-    defer _ = std.c.fclose(f);
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(gpa);
-    var chunk: [4096]u8 = undefined;
-    while (true) {
-        const n = std.c.fread(&chunk, 1, chunk.len, f);
-        if (n == 0) break;
-        buf.appendSlice(gpa, chunk[0..n]) catch return null;
-    }
-    return buf.toOwnedSliceSentinel(gpa, 0) catch null;
 }
 
 fn envPairs(gpa: std.mem.Allocator) error{OutOfMemory}![]zygos.providers_catalog.EnvPair {

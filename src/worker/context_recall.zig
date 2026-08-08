@@ -14,6 +14,10 @@
 
 const std = @import("std");
 const jsonx = @import("jsonx.zig");
+const fsx = @import("fsx.zig");
+const mkdirQuiet = fsx.mkdirQuiet;
+const readWholeFile = fsx.readWholeFile;
+
 const json = std.json;
 const context = @import("context.zig");
 const substrate_mod = @import("context_substrate.zig");
@@ -416,26 +420,6 @@ pub const RecallStrategy = struct {
         }
     }
 };
-
-fn mkdirQuiet(gpa: std.mem.Allocator, path: []const u8) void {
-    const path_z = std.fmt.allocPrintSentinel(gpa, "{s}", .{path}, 0) catch return;
-    defer gpa.free(path_z);
-    _ = std.c.mkdir(path_z.ptr, 0o755);
-}
-
-fn readWholeFile(arena: std.mem.Allocator, path: []const u8) ?[]u8 {
-    const path_z = std.fmt.allocPrintSentinel(arena, "{s}", .{path}, 0) catch return null;
-    const f = std.c.fopen(path_z.ptr, "r") orelse return null;
-    defer _ = std.c.fclose(f);
-    var buf: std.ArrayList(u8) = .empty;
-    var chunk: [4096]u8 = undefined;
-    while (true) {
-        const n = std.c.fread(&chunk, 1, chunk.len, f);
-        if (n == 0) break;
-        buf.appendSlice(arena, chunk[0..n]) catch return null;
-    }
-    return buf.items;
-}
 
 fn appendLine(gpa: std.mem.Allocator, path: []const u8, line: []const u8) void {
     const path_z = std.fmt.allocPrintSentinel(gpa, "{s}", .{path}, 0) catch return;
