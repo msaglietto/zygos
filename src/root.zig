@@ -19,6 +19,7 @@ pub const provider_boot = @import("net/provider_boot.zig");
 pub const web_tools = @import("net/web_tools.zig");
 pub const provider_fake = @import("worker/provider_fake.zig");
 pub const turn = @import("worker/turn.zig");
+pub const turn_fsm = @import("worker/turn/fsm.zig");
 pub const trace = @import("worker/trace.zig");
 pub const trace_event = @import("worker/trace_event.zig");
 pub const stream_tap = @import("worker/stream_tap.zig");
