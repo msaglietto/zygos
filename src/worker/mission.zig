@@ -47,6 +47,14 @@ const cloneToArena = model.cloneToArena;
 pub const registry_mod = @import("mission/registry.zig");
 const MissionControl = registry_mod.Control;
 
+const out_mod = @import("mission/out.zig");
+const assistantText = out_mod.assistantText;
+const unwrapFence = out_mod.unwrapFence;
+const outcomeExcerpt = out_mod.outcomeExcerpt;
+const replyTerminal = out_mod.replyTerminal;
+const replyParked = out_mod.replyParked;
+const nowStamp = out_mod.nowStamp;
+
 /// Everything runMission needs, parsed once from the start request.
 /// Slices point into the handler arena.
 const RunConfig = struct {
@@ -603,40 +611,6 @@ fn closeContinuity(
     }
 }
 
-/// Wall-clock "YYYY-MM-DD HH:MM" (UTC). Continuity stamps are advisory
-/// prose, not ordering keys, so UTC without a zone suffix is acceptable.
-fn nowStamp() [16]u8 {
-    var ts: std.c.timespec = undefined;
-    _ = std.c.clock_gettime(.REALTIME, &ts);
-    const secs: u64 = @intCast(@max(0, ts.sec));
-    const ep: std.time.epoch.EpochSeconds = .{ .secs = secs };
-    const yd = ep.getEpochDay().calculateYearDay();
-    const md = yd.calculateMonthDay();
-    const ds = ep.getDaySeconds();
-    var out: [16]u8 = undefined;
-    _ = std.fmt.bufPrint(&out, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}", .{
-        yd.year, md.month.numeric(), md.day_index + 1, ds.getHoursIntoDay(), ds.getMinutesIntoHour(),
-    }) catch unreachable;
-    return out;
-}
-
-fn replyTerminal(arena: std.mem.Allocator, m: *const Mission) error{OutOfMemory}![]const u8 {
-    return std.fmt.allocPrint(
-        arena,
-        "{{\"state\":\"{t}\",\"stop\":\"{t}\",\"detail\":{f},\"role_turns\":{d},\"tasks_done\":{d}}}",
-        .{ m.state, m.stop, json.fmt(m.detail, .{}), m.role_turns_used, m.tasksDone() },
-    );
-}
-
-/// Parked, not terminal: state is on disk, resume completes it.
-fn replyParked(arena: std.mem.Allocator, m: *const Mission) error{OutOfMemory}![]const u8 {
-    return std.fmt.allocPrint(
-        arena,
-        "{{\"state\":\"{t}\",\"stop\":\"{t}\",\"paused\":true,\"role_turns\":{d},\"tasks_done\":{d}}}",
-        .{ m.state, m.stop, m.role_turns_used, m.tasksDone() },
-    );
-}
-
 const RoleOut = union(enum) {
     ok: []const u8, // final assistant text, arena-owned
     failed: []const u8, // human-readable reason, arena-owned
@@ -775,34 +749,6 @@ fn runRoleTurn(
 
 /// Concatenated text blocks of an assistant message, duped into the arena
 /// (the parsed payload's string slices die with the payload buffer).
-fn assistantText(arena: std.mem.Allocator, msg: json.ObjectMap) error{OutOfMemory}![]const u8 {
-    var out: std.ArrayList(u8) = .empty;
-    const content = msg.get("content") orelse return out.toOwnedSlice(arena);
-    switch (content) {
-        .string => |s| try out.appendSlice(arena, s),
-        .array => |blocks| for (blocks.items) |b| {
-            if (b != .object) continue;
-            const btype = strField(b.object, "type") orelse continue;
-            if (!std.mem.eql(u8, btype, "text")) continue;
-            if (strField(b.object, "text")) |t| try out.appendSlice(arena, t);
-        },
-        else => {},
-    }
-    return out.toOwnedSlice(arena);
-}
-
-/// Real providers wrap role JSON in one whole-output markdown fence.
-/// Unwrapping exactly that shape is deterministic — anything else is
-/// returned untouched and must still parse as strict JSON (fail closed).
-fn unwrapFence(text: []const u8) []const u8 {
-    const trimmed = std.mem.trim(u8, text, " \t\r\n");
-    if (!std.mem.startsWith(u8, trimmed, "```")) return trimmed;
-    if (!std.mem.endsWith(u8, trimmed, "```")) return trimmed;
-    const open_end = std.mem.indexOfScalar(u8, trimmed, '\n') orelse return trimmed;
-    if (trimmed.len < open_end + 1 + 3) return trimmed;
-    return std.mem.trim(u8, trimmed[open_end + 1 .. trimmed.len - 3], " \t\r\n");
-}
-
 /// Neutral strategy view of the mission (TaskView slice arena-built).
 fn stepRefFor(
     arena: std.mem.Allocator,
@@ -949,17 +895,6 @@ fn rolePlan(self: *MissionOrchestrator, arena: std.mem.Allocator, cfg: RunConfig
 
 /// First `max` bytes of a role answer, cut back to a space (and never inside
 /// a UTF-8 sequence) — enough context for the next turn, not a transcript.
-fn outcomeExcerpt(arena: std.mem.Allocator, text: []const u8, max: usize) error{OutOfMemory}![]const u8 {
-    const trimmed = std.mem.trim(u8, text, " \t\r\n");
-    if (trimmed.len <= max) return arena.dupe(u8, trimmed);
-    var end = max;
-    while (end > 0 and (trimmed[end] & 0xC0) == 0x80) end -= 1;
-    if (std.mem.lastIndexOfScalar(u8, trimmed[0..end], ' ')) |sp| {
-        if (sp > max / 2) end = sp;
-    }
-    return std.fmt.allocPrint(arena, "{s}…", .{std.mem.trimEnd(u8, trimmed[0..end], " \t\r\n")});
-}
-
 fn roleExecute(self: *MissionOrchestrator, arena: std.mem.Allocator, cfg: RunConfig, m: *Mission) MissionError!void {
     std.debug.assert(m.task_index < m.tasks.len);
     const content = (try assembleContent(arena, cfg, m, .executor)) orelse return;
