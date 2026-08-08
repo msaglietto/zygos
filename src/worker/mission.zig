@@ -48,7 +48,8 @@ pub const registry_mod = @import("mission/registry.zig");
 const MissionControl = registry_mod.Control;
 
 const out_mod = @import("mission/out.zig");
-const assistantText = out_mod.assistantText;
+const role_turn_mod = @import("mission/role_turn.zig");
+const RoleOut = role_turn_mod.RoleOut;
 const unwrapFence = out_mod.unwrapFence;
 const outcomeExcerpt = out_mod.outcomeExcerpt;
 const replyTerminal = out_mod.replyTerminal;
@@ -611,12 +612,6 @@ fn closeContinuity(
     }
 }
 
-const RoleOut = union(enum) {
-    ok: []const u8, // final assistant text, arena-owned
-    failed: []const u8, // human-readable reason, arena-owned
-    exhausted, // the turn stopped on its step budget (max_steps), not an error
-};
-
 /// One role = one `zygos::turns::run` turn. Counts against max_role_turns
 /// whether it succeeds or not. Role boundaries bracket the turn's own events
 /// in the trace, so a stalled executor is attributable at a glance.
@@ -685,33 +680,21 @@ fn runRoleTurn(
     const system = (try playbook_mod.resolve(arena, cfg.substrate, role.stepId())) orelse
         playbook_mod.defaultSystem(role.stepId()).?;
 
-    var req: std.Io.Writer.Allocating = .init(arena);
-    errdefer req.deinit();
-    const w = &req.writer;
-    w.print("{{\"system\":{f},\"step_id\":{f},\"max_steps\":{d}," ++
-        "\"messages\":[{{\"role\":\"user\",\"content\":{f}}}]", .{
-        json.fmt(system, .{}),
-        json.fmt(role.stepId(), .{}),
-        cfg.role_max_steps,
-        json.fmt(content, .{}),
-    }) catch return error.OutOfMemory;
-    if (cfg.provider_function) |v|
-        w.print(",\"provider_function\":{f}", .{json.fmt(v, .{})}) catch return error.OutOfMemory;
-    if (cfg.router_function) |v|
-        w.print(",\"router_function\":{f}", .{json.fmt(v, .{})}) catch return error.OutOfMemory;
-    if (cfg.policy_function) |v|
-        w.print(",\"policy_function\":{f}", .{json.fmt(v, .{})}) catch return error.OutOfMemory;
-    if (cfg.approval_function) |v|
-        w.print(",\"approval_function\":{f}", .{json.fmt(v, .{})}) catch return error.OutOfMemory;
-    if (cfg.budget_scope) |v|
-        w.print(",\"budget_scope\":{f}", .{json.fmt(v, .{})}) catch return error.OutOfMemory;
-    if (with_tools) if (cfg.tools_json) |t|
-        w.print(",\"tools\":{s}", .{t}) catch return error.OutOfMemory;
-    if (cfg.trace_path) |v|
-        w.print(",\"trace_path\":{f}", .{json.fmt(v, .{})}) catch return error.OutOfMemory;
-    w.writeAll("}") catch return error.OutOfMemory;
+    const req = try role_turn_mod.buildRequest(arena, .{
+        .system = system,
+        .step_id = role.stepId(),
+        .max_steps = cfg.role_max_steps,
+        .content = content,
+        .provider_function = cfg.provider_function,
+        .router_function = cfg.router_function,
+        .policy_function = cfg.policy_function,
+        .approval_function = cfg.approval_function,
+        .budget_scope = cfg.budget_scope,
+        .tools_json = if (with_tools) cfg.tools_json else null,
+        .trace_path = cfg.trace_path,
+    });
 
-    const res = self.worker.call("zygos::turns::run", req.written()) catch |err| switch (err) {
+    const res = self.worker.call("zygos::turns::run", req) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.Shutdown => return .{ .failed = "bus shutdown during role turn" },
     };
@@ -722,33 +705,11 @@ fn runRoleTurn(
         },
         .ok => |payload| {
             defer self.gpa.free(payload);
-            const reply = json.parseFromSliceLeaky(json.Value, arena, payload, .{}) catch
-                return .{ .failed = "malformed turn reply" };
-            if (reply != .object) return .{ .failed = "malformed turn reply" };
-            const stop = strField(reply.object, "stop") orelse "failed";
-            if (std.mem.eql(u8, stop, "max_steps")) return .exhausted;
-            if (!std.mem.eql(u8, stop, "end_turn"))
-                return .{ .failed = try std.fmt.allocPrint(arena, "{s} turn stopped: {s}", .{ role.stepId(), stop }) };
-
-            const transcript = reply.object.get("transcript") orelse
-                return .{ .failed = "turn reply carried no transcript" };
-            if (transcript != .array) return .{ .failed = "turn reply carried no transcript" };
-            var i = transcript.array.items.len;
-            while (i > 0) {
-                i -= 1;
-                const msg = transcript.array.items[i];
-                if (msg != .object) continue;
-                const mrole = strField(msg.object, "role") orelse continue;
-                if (!std.mem.eql(u8, mrole, "assistant")) continue;
-                return .{ .ok = try assistantText(arena, msg.object) };
-            }
-            return .{ .failed = "no assistant message in the turn transcript" };
+            return role_turn_mod.parseReply(arena, role.stepId(), payload);
         },
     }
 }
 
-/// Concatenated text blocks of an assistant message, duped into the arena
-/// (the parsed payload's string slices die with the payload buffer).
 /// Neutral strategy view of the mission (TaskView slice arena-built).
 fn stepRefFor(
     arena: std.mem.Allocator,
