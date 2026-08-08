@@ -10,6 +10,15 @@
 const std = @import("std");
 const json = std.json;
 const zygos = @import("zygos");
+const req_mod = @import("mission/req.zig");
+
+const StartParams = req_mod.StartParams;
+const buildStartRequest = req_mod.buildStartRequest;
+const bashDesc = req_mod.bashDesc;
+const extractObjective = req_mod.extractObjective;
+const stem = req_mod.stem;
+const terminalExitCode = req_mod.terminalExitCode;
+const absPath = req_mod.absPath;
 
 const eprint = std.debug.print; // stderr
 
@@ -535,15 +544,6 @@ fn usage() u8 {
     return 2;
 }
 
-fn bashDesc(gpa: std.mem.Allocator, workspace: []const u8) error{OutOfMemory}![]u8 {
-    return std.fmt.allocPrint(
-        gpa,
-        "Run a shell command and get its output. The shell runs in the mission workspace: {s}. " ++
-            "Do all work inside this directory (relative paths work); never write to $HOME or system paths.",
-        .{workspace},
-    );
-}
-
 /// Create (or reuse) the mission's detached git worktree under the planning
 /// root. Null = refusal: isolation was requested and the repo cannot
 /// provide it (fail closed). An existing worktree (resume) is reused.
@@ -560,56 +560,6 @@ fn setupWorktree(gpa: std.mem.Allocator, repo: []const u8, planning: []const u8)
         return null;
     };
     return path;
-}
-
-const StartParams = struct {
-    mission_id: []const u8,
-    planning: []const u8,
-    brief_text: []const u8,
-    trace_path: []const u8,
-    resume_flag: bool,
-    bash_desc: []const u8,
-    mcp_entries: []const u8,
-    ctx_kind: zygos.context.Kind,
-    ctx_max_tokens: usize,
-    role_max_steps: i64,
-    max_role_turns: i64,
-};
-
-/// The missions::start request body — shared by the single-mission path and
-/// the queue loop so the wire shape can never drift between them.
-fn buildStartRequest(gpa: std.mem.Allocator, p: StartParams) error{OutOfMemory}![]u8 {
-    return std.fmt.allocPrint(gpa,
-        \\{{"mission_id":{f},"planning_root":{f},"objective":{f},"brief":{f},
-        \\ "router_function":"zygos::models::resolve",
-        \\ "gate_function":"zygos::approvals::request",
-        \\ "policy_function":"zygos::policy::check",
-        \\ "approval_function":"zygos::approvals::request",
-        \\ "budget_scope":{f},"trace_path":{f},
-        \\ "context_strategy":{{"kind":"{t}","max_tokens":{d}}},
-        \\ "role_max_steps":{d},"max_role_turns":{d}{s},
-        \\ "tools":[
-        \\  {{"name":"bash","function_id":"zygos::tools::bash",
-        \\   "description":{f},
-        \\   "input_schema":{{"type":"object","properties":{{"command":{{"type":"string",
-        \\    "description":"the shell command to run"}}}},"required":["command"]}}}},
-        \\  {{"name":"web_search","function_id":"zygos::tools::web_search",
-        \\   "description":"Search the web; returns a list of {{title,url,snippet}} results.",
-        \\   "input_schema":{{"type":"object","properties":{{"query":{{"type":"string",
-        \\    "description":"the search query"}}}},"required":["query"]}}}},
-        \\  {{"name":"web_fetch","function_id":"zygos::tools::web_fetch",
-        \\   "description":"Fetch a URL and return its readable text content.",
-        \\   "input_schema":{{"type":"object","properties":{{"url":{{"type":"string",
-        \\    "description":"the absolute http(s) URL to fetch"}}}},"required":["url"]}}}}{s}]}}
-    , .{
-        json.fmt(p.mission_id, .{}),                   json.fmt(p.planning, .{}),
-        json.fmt(extractObjective(p.brief_text), .{}), json.fmt(p.brief_text, .{}),
-        json.fmt(p.mission_id, .{}),                   json.fmt(p.trace_path, .{}),
-        p.ctx_kind,                                    p.ctx_max_tokens,
-        p.role_max_steps,                              p.max_role_turns,
-        if (p.resume_flag) ",\"resume\":true" else "", json.fmt(p.bash_desc, .{}),
-        p.mcp_entries,
-    });
 }
 
 /// Detached control-channel poller inside the RUNNING mission: tail
@@ -792,34 +742,6 @@ fn boot_fail() u8 {
     return 2;
 }
 
-/// 0 only for state:"done"; a W1 server-side refusal is config-shaped (2).
-fn terminalExitCode(gpa: std.mem.Allocator, payload: []const u8) u8 {
-    var p = json.parseFromSlice(json.Value, gpa, payload, .{}) catch return 1;
-    defer p.deinit();
-    if (p.value != .object) return 1;
-    if (p.value.object.get("refused") != null) return 2;
-    const state = p.value.object.get("state") orelse return 1;
-    if (state == .string and std.mem.eql(u8, state.string, "done")) return 0;
-    return 1;
-}
-
-/// The brief's `## Objective` section body when present, else the whole text.
-fn extractObjective(text: []const u8) []const u8 {
-    const heading = "## Objective";
-    const start = std.mem.indexOf(u8, text, heading) orelse return text;
-    const body_start = start + heading.len;
-    const rel_end = std.mem.indexOf(u8, text[body_start..], "\n## ") orelse
-        return std.mem.trim(u8, text[body_start..], " \t\r\n");
-    return std.mem.trim(u8, text[body_start .. body_start + rel_end], " \t\r\n");
-}
-
-/// Filename stem: basename minus the last extension.
-fn stem(path: []const u8) []const u8 {
-    const base = if (std.mem.lastIndexOfScalar(u8, path, '/')) |i| path[i + 1 ..] else path;
-    const dot = std.mem.lastIndexOfScalar(u8, base, '.') orelse return base;
-    return if (dot == 0) base else base[0..dot];
-}
-
 var stamp_buf: [15]u8 = undefined;
 
 /// Wall-clock "YYYYMMDD-HHMMSS" (UTC) for --run-stamp planning roots.
@@ -849,12 +771,6 @@ fn fileExists(gpa: std.mem.Allocator, dir: []const u8, name: []const u8) bool {
     const f = std.c.fopen(path_z.ptr, "r") orelse return false;
     _ = std.c.fclose(f);
     return true;
-}
-
-fn absPath(gpa: std.mem.Allocator, cwd: []const u8, path: []const u8) error{OutOfMemory}![]u8 {
-    if (path.len > 0 and path[0] == '/') return gpa.dupe(u8, path);
-    const rel = if (std.mem.startsWith(u8, path, "./")) path[2..] else path;
-    return std.fmt.allocPrint(gpa, "{s}/{s}", .{ cwd, rel });
 }
 
 // ---- console approvals ------------------------------------------------------

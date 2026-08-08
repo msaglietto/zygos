@@ -238,3 +238,10 @@ fn todayStamp(buf: *[10]u8) []const u8 {
     }) catch unreachable;
     return buf;
 }
+
+test {
+    // The exe test binary's root is this file; nothing references cli/ in
+    // test mode (main() is not a test-root), so pull the CLI's pure
+    // submodules in explicitly for test discovery.
+    std.testing.refAllDecls(@import("cli/mission/req.zig"));
+}
