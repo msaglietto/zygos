@@ -244,4 +244,5 @@ test {
     // test mode (main() is not a test-root), so pull the CLI's pure
     // submodules in explicitly for test discovery.
     std.testing.refAllDecls(@import("cli/mission/req.zig"));
+    std.testing.refAllDecls(@import("cli/mission/view.zig"));
 }

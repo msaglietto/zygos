@@ -11,6 +11,7 @@ const std = @import("std");
 const json = std.json;
 const zygos = @import("zygos");
 const req_mod = @import("mission/req.zig");
+const view_mod = @import("mission/view.zig");
 
 const StartParams = req_mod.StartParams;
 const buildStartRequest = req_mod.buildStartRequest;
@@ -617,28 +618,7 @@ fn runDashboard(gpa: std.mem.Allocator, dir: []const u8) u8 {
 
 fn dashboardLine(arena: std.mem.Allocator, state_path: []const u8) ?[]const u8 {
     const text = readWholeFile(arena, state_path) orelse return null;
-    const v = json.parseFromSliceLeaky(json.Value, arena, text, .{}) catch return null;
-    if (v != .object) return null;
-    const state = strOf(v.object.get("state")) orelse "?";
-    const stop = strOf(v.object.get("stop")) orelse "?";
-    const mid = strOf(v.object.get("mission_id")) orelse "?";
-    var tasks: usize = 0;
-    var done: usize = 0;
-    if (v.object.get("tasks")) |tv| if (tv == .array) {
-        tasks = tv.array.items.len;
-        for (tv.array.items) |t| {
-            if (t == .object) if (t.object.get("done")) |d| {
-                if (d == .bool and d.bool) done += 1;
-            };
-        }
-    };
-    const turns = if (v.object.get("role_turns_used")) |n| (if (n == .integer) n.integer else 0) else 0;
-    const root = if (std.mem.lastIndexOfScalar(u8, state_path, '/')) |i| state_path[0..i] else state_path;
-    return std.fmt.allocPrint(
-        arena,
-        "{s}  {s} ({s})  tasks {d}/{d}  role_turns {d}  {s}\n",
-        .{ mid, state, stop, done, tasks, turns, root },
-    ) catch null;
+    return view_mod.dashboardLine(arena, state_path, text);
 }
 
 /// `zygos mission attach <planning-dir>` — tail the run's events.jsonl as a
@@ -680,33 +660,13 @@ fn runAttach(gpa: std.mem.Allocator, target: []const u8) u8 {
 
     var line_buf: [4096]u8 = undefined;
     while (readStdinLine(&line_buf)) |line| {
-        const trimmed = std.mem.trim(u8, line, " \t");
-        if (trimmed.len == 0) continue;
-        const cmd: zygos.control.Command = blk: {
-            if (std.mem.eql(u8, trimmed, "pause")) break :blk .pause;
-            if (std.mem.eql(u8, trimmed, "resume")) break :blk .@"resume";
-            if (std.mem.startsWith(u8, trimmed, "steer ")) {
-                const text = std.mem.trim(u8, trimmed["steer ".len..], " \t");
-                if (text.len == 0) {
-                    eprint("attach: steer needs text\n", .{});
-                    continue;
-                }
-                break :blk .{ .steer = .{ .text = text } };
-            }
-            if (std.mem.startsWith(u8, trimmed, "approve ")) {
-                var it = std.mem.tokenizeScalar(u8, trimmed["approve ".len..], ' ');
-                const id = it.next() orelse {
-                    eprint("attach: approve needs an id\n", .{});
-                    continue;
-                };
-                const verdict = it.next() orelse "n";
-                break :blk .{ .approve = .{
-                    .id = id,
-                    .approved = verdict.len > 0 and (verdict[0] == 'y' or verdict[0] == 'Y'),
-                } };
-            }
-            eprint("attach: unknown command: {s}\n", .{trimmed});
-            continue;
+        const cmd: zygos.control.Command = switch (view_mod.parseAttachCommand(line)) {
+            .ignore => continue,
+            .err => |msg| {
+                eprint("attach: {s}: {s}\n", .{ msg, std.mem.trim(u8, line, " \t") });
+                continue;
+            },
+            .cmd => |c| c,
         };
         zygos.control.appendCommand(gpa, dir, cmd) catch return oom();
         eprint("attach: queued\n", .{});
