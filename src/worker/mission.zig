@@ -47,11 +47,12 @@ const cloneToArena = model.cloneToArena;
 pub const registry_mod = @import("mission/registry.zig");
 const MissionControl = registry_mod.Control;
 
+pub const start = @import("mission/start.zig");
+const start_mod = start;
+
 const out_mod = @import("mission/out.zig");
 const role_turn_mod = @import("mission/role_turn.zig");
 const RoleOut = role_turn_mod.RoleOut;
-const unwrapFence = out_mod.unwrapFence;
-const outcomeExcerpt = out_mod.outcomeExcerpt;
 const replyTerminal = out_mod.replyTerminal;
 const replyParked = out_mod.replyParked;
 const nowStamp = out_mod.nowStamp;
@@ -314,21 +315,17 @@ fn setPaused(
 const MissionError = error{ OutOfMemory, Failed, MalformedRequest, IllegalTransition, Shutdown };
 
 fn runMission(self: *MissionOrchestrator, arena: std.mem.Allocator, request_json: []const u8) MissionError![]const u8 {
-    const root = json.parseFromSliceLeaky(json.Value, arena, request_json, .{}) catch
-        return error.MalformedRequest;
-    const obj = if (root == .object) root.object else return error.MalformedRequest;
-
-    const mission_id = strField(obj, "mission_id") orelse return error.MalformedRequest;
-    const planning_root = strField(obj, "planning_root") orelse return error.MalformedRequest;
-    if (planning_root.len < 2 or planning_root[0] != '/') return error.MalformedRequest;
-    const resume_flag = if (obj.get("resume")) |v| v == .bool and v.bool else false;
+    const p = start_mod.parse(arena, request_json) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.MalformedRequest => return error.MalformedRequest,
+    };
 
     // W1 (brief validation): when a mission brief document rides the start
     // request, it is linted before anything is persisted or tracked. A
     // malformed brief refuses the mission with a structured reason and never
     // starts the FSM — fail closed. A brief-less start (raw objective, the M3
     // path) is unaffected.
-    if (strField(obj, "brief")) |brief_text| {
+    if (p.brief) |brief_text| {
         switch (brief_mod.lint(brief_text)) {
             .ok => {},
             .invalid => |e| return std.fmt.allocPrint(
@@ -342,18 +339,8 @@ fn runMission(self: *MissionOrchestrator, arena: std.mem.Allocator, request_json
     // .context_strategy on the start request (from zygos.zon at boot):
     // {"kind":"substrate"|"recall"|"thread","max_tokens":N}. Absent ⇒
     // substrate with the default budget; an unknown kind refuses the start.
-    const ctx_cfg: context_mod.Config = blk: {
-        const v = obj.get("context_strategy") orelse
-            break :blk .{ .kind = .substrate, .max_tokens = context_mod.default_max_tokens };
-        if (v != .object) return error.MalformedRequest;
-        const kind_s = strField(v.object, "kind") orelse "substrate";
-        const kind = std.meta.stringToEnum(context_mod.Kind, kind_s) orelse
-            return error.MalformedRequest;
-        break :blk .{
-            .kind = kind,
-            .max_tokens = uintFieldOr(v.object, "max_tokens", context_mod.default_max_tokens),
-        };
-    };
+    // Field names live in mission/start.zig, shared with the CLI builder.
+    const ctx_cfg = p.context;
     var recall_owned: ?*context_recall.RecallStrategy = null;
     defer if (recall_owned) |r| r.destroy();
     var thread_owned: ?*context_thread.ThreadStrategy = null;
@@ -361,7 +348,7 @@ fn runMission(self: *MissionOrchestrator, arena: std.mem.Allocator, request_json
     const strategy: context_mod.ContextStrategy = switch (ctx_cfg.kind) {
         .substrate => context_substrate.strategy(),
         .recall => blk: {
-            const dir = try std.fmt.allocPrint(arena, "{s}/memory", .{planning_root});
+            const dir = try std.fmt.allocPrint(arena, "{s}/memory", .{p.planning_root});
             recall_owned = context_recall.RecallStrategy.create(self.gpa, dir, .{}) catch
                 return error.OutOfMemory;
             break :blk recall_owned.?.strategy();
@@ -372,7 +359,7 @@ fn runMission(self: *MissionOrchestrator, arena: std.mem.Allocator, request_json
             // workspace), fail-open when it is not a repo.
             thread_owned = context_thread.ThreadStrategy.create(
                 self.gpa,
-                planning_root,
+                p.planning_root,
                 ".",
                 context_thread.PopenRunner.runner(),
                 .{},
@@ -382,55 +369,48 @@ fn runMission(self: *MissionOrchestrator, arena: std.mem.Allocator, request_json
     };
     var store_substrate = StoreSubstrate{
         .gpa = self.gpa,
-        .store = store_mod.Store.init(planning_root),
+        .store = store_mod.Store.init(p.planning_root),
     };
 
     const cfg: RunConfig = .{
-        .mission_id = mission_id,
-        .store = store_mod.Store.init(planning_root),
+        .mission_id = p.mission_id,
+        .store = store_mod.Store.init(p.planning_root),
         .strategy = strategy,
         .context_budget = .{ .max_tokens = ctx_cfg.max_tokens },
         .substrate = store_substrate.substrate(),
-        .provider_function = strField(obj, "provider_function"),
-        .router_function = strField(obj, "router_function"),
-        .gate_function = strField(obj, "gate_function"),
-        .policy_function = strField(obj, "policy_function"),
-        .approval_function = strField(obj, "approval_function"),
-        .budget_scope = strField(obj, "budget_scope"),
-        .continuity_function = strField(obj, "continuity_function"),
-        .continuity_project = strField(obj, "continuity_project"),
-        .tools_json = blk: {
-            const tv = obj.get("tools") orelse break :blk null;
-            if (tv != .array) return error.MalformedRequest;
-            break :blk try rawJson(arena, tv);
-        },
-        .max_role_turns = uintFieldOr(obj, "max_role_turns", 16),
-        .fail_threshold = uintFieldOr(obj, "fail_threshold", 3),
-        .gate_threshold = uintFieldOr(obj, "gate_threshold", 3),
-        .role_max_steps = uintFieldOr(obj, "role_max_steps", 8),
-        .trace_path = strField(obj, "trace_path"),
+        .provider_function = p.provider_function,
+        .router_function = p.router_function,
+        .gate_function = p.gate_function,
+        .policy_function = p.policy_function,
+        .approval_function = p.approval_function,
+        .budget_scope = p.budget_scope,
+        .continuity_function = p.continuity_function,
+        .continuity_project = p.continuity_project,
+        .tools_json = p.tools_json,
+        .max_role_turns = p.max_role_turns,
+        .fail_threshold = p.fail_threshold,
+        .gate_threshold = p.gate_threshold,
+        .role_max_steps = p.role_max_steps,
+        .trace_path = p.trace_path,
     };
-    if (cfg.provider_function == null and cfg.router_function == null)
-        return error.MalformedRequest;
 
     var m: Mission = undefined;
-    if (resume_flag) {
+    if (p.resume_flag) {
         var loaded = cfg.store.load(self.gpa) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.Failed, // mission_not_found / corrupt state file
         };
         defer loaded.deinit(self.gpa);
-        if (!std.mem.eql(u8, loaded.mission_id, mission_id)) return error.MalformedRequest;
+        if (!std.mem.eql(u8, loaded.mission_id, p.mission_id)) return error.MalformedRequest;
         m = try cloneToArena(arena, &loaded);
         // Resuming a terminal mission is idempotent: report, run nothing.
         if (m.state == .done or m.state == .failed) return replyTerminal(arena, &m);
     } else {
-        const objective = strField(obj, "objective") orelse return error.MalformedRequest;
-        m = .{ .mission_id = mission_id, .objective = objective };
+        m = .{ .mission_id = p.mission_id, .objective = p.objective orelse return error.MalformedRequest };
     }
 
-    const ctl = try self.track(mission_id);
-    defer self.untrack(mission_id);
+    const ctl = try self.track(p.mission_id);
+    defer self.untrack(p.mission_id);
 
     // The pre-first-turn state hits the disk too: a mission killed before
     // its first role turn still resumes.
@@ -797,24 +777,21 @@ fn roleDefine(self: *MissionOrchestrator, arena: std.mem.Allocator, cfg: RunConf
     switch (try runRole(self, arena, cfg, m, .product_owner, content, false)) {
         .failed => |reason| try failRole(m, reason),
         .exhausted => try failRole(m, "product-owner turn stopped: max_steps"),
-        .ok => |text| {
-            const parsed = json.parseFromSliceLeaky(json.Value, arena, unwrapFence(text), .{}) catch
-                return rejectRole(self, arena, cfg, m, .product_owner, text, "product-owner output is not JSON");
-            if (parsed != .object)
-                return rejectRole(self, arena, cfg, m, .product_owner, text, "product-owner output is not an object");
-            const objective = strField(parsed.object, "objective") orelse
-                return rejectRole(self, arena, cfg, m, .product_owner, text, "product-owner output lacks objective");
-            const acceptance = strField(parsed.object, "acceptance") orelse
-                return rejectRole(self, arena, cfg, m, .product_owner, text, "product-owner output lacks acceptance");
-            m.objective = objective;
-            m.acceptance = acceptance;
-            const md = try std.fmt.allocPrint(
-                arena,
-                "# Mission {s}\n\n## Objective\n\n{s}\n\n## Acceptance\n\n{s}\n",
-                .{ m.mission_id, objective, acceptance },
-            );
-            try putArtifact(self, cfg, mission_artifact, md);
-            m.state = try Fsm.apply(m.state, .objective_ready);
+        .ok => |text| switch (try role_turn_mod.interpretDefine(arena, text)) {
+            .reject => |r| return rejectRole(self, arena, cfg, m, .product_owner, r.raw, r.reason),
+            .ok => |defined| {
+                const objective = defined.objective;
+                const acceptance = defined.acceptance;
+                m.objective = objective;
+                m.acceptance = acceptance;
+                const md = try std.fmt.allocPrint(
+                    arena,
+                    "# Mission {s}\n\n## Objective\n\n{s}\n\n## Acceptance\n\n{s}\n",
+                    .{ m.mission_id, objective, acceptance },
+                );
+                try putArtifact(self, cfg, mission_artifact, md);
+                m.state = try Fsm.apply(m.state, .objective_ready);
+            },
         },
     }
 }
@@ -824,32 +801,24 @@ fn rolePlan(self: *MissionOrchestrator, arena: std.mem.Allocator, cfg: RunConfig
     switch (try runRole(self, arena, cfg, m, .planner, content, false)) {
         .failed => |reason| try failRole(m, reason),
         .exhausted => try failRole(m, "planner turn stopped: max_steps"),
-        .ok => |text| {
-            const parsed = json.parseFromSliceLeaky(json.Value, arena, unwrapFence(text), .{}) catch
-                return rejectRole(self, arena, cfg, m, .planner, text, "planner output is not JSON");
-            if (parsed != .object)
-                return rejectRole(self, arena, cfg, m, .planner, text, "planner output is not an object");
-            const tasks_val = parsed.object.get("tasks") orelse
-                return rejectRole(self, arena, cfg, m, .planner, text, "planner output lacks tasks");
-            if (tasks_val != .array or tasks_val.array.items.len == 0 or tasks_val.array.items.len > 32)
-                return rejectRole(self, arena, cfg, m, .planner, text, "planner tasks must be 1..32 entries");
-
-            const tasks = try arena.alloc(Task, tasks_val.array.items.len);
-            var md: std.ArrayList(u8) = .empty;
-            try md.appendSlice(arena, "# Plan\n\n");
-            for (tasks_val.array.items, 0..) |tv, i| {
-                if (tv != .string or tv.string.len == 0)
-                    return rejectRole(self, arena, cfg, m, .planner, text, "planner tasks must be non-empty strings");
-                tasks[i] = .{ .desc = tv.string };
-                try md.appendSlice(arena, "- [ ] ");
-                try md.appendSlice(arena, tv.string);
-                try md.append(arena, '\n');
-            }
-            try putArtifact(self, cfg, plan_artifact, md.items);
-            m.tasks = tasks;
-            m.task_index = 0;
-            m.feedback = "";
-            m.state = try Fsm.apply(m.state, .plan_ready);
+        .ok => |text| switch (try role_turn_mod.interpretPlan(arena, text)) {
+            .reject => |r| return rejectRole(self, arena, cfg, m, .planner, r.raw, r.reason),
+            .ok => |descs| {
+                const tasks = try arena.alloc(Task, descs.len);
+                var md: std.ArrayList(u8) = .empty;
+                try md.appendSlice(arena, "# Plan\n\n");
+                for (descs, 0..) |desc, i| {
+                    tasks[i] = .{ .desc = desc };
+                    try md.appendSlice(arena, "- [ ] ");
+                    try md.appendSlice(arena, desc);
+                    try md.append(arena, '\n');
+                }
+                try putArtifact(self, cfg, plan_artifact, md.items);
+                m.tasks = tasks;
+                m.task_index = 0;
+                m.feedback = "";
+                m.state = try Fsm.apply(m.state, .plan_ready);
+            },
         },
     }
 }
@@ -893,7 +862,7 @@ fn roleExecute(self: *MissionOrchestrator, arena: std.mem.Allocator, cfg: RunCon
             m.feedback = "";
             m.exec_fail_count = 0;
             m.tasks[m.task_index].done = true;
-            m.tasks[m.task_index].result = try outcomeExcerpt(arena, text, 600);
+            m.tasks[m.task_index].result = try role_turn_mod.outcomeExcerpt(arena, text, 600);
             try trace_mod.emit(arena, cfg.trace_path, .{ .task_done = .{
                 .index = @intCast(m.task_index + 1),
                 .total = @intCast(m.tasks.len),
@@ -910,40 +879,35 @@ fn roleVerify(self: *MissionOrchestrator, arena: std.mem.Allocator, cfg: RunConf
     switch (try runRole(self, arena, cfg, m, .verifier, content, false)) {
         .failed => |reason| try failRole(m, reason),
         .exhausted => try failRole(m, "verifier turn stopped: max_steps"),
-        .ok => |text| {
-            const parsed = json.parseFromSliceLeaky(json.Value, arena, unwrapFence(text), .{}) catch
-                return rejectRole(self, arena, cfg, m, .verifier, text, "verifier output is not JSON");
-            if (parsed != .object)
-                return rejectRole(self, arena, cfg, m, .verifier, text, "verifier output is not an object");
-            const passed_val = parsed.object.get("passed") orelse
-                return rejectRole(self, arena, cfg, m, .verifier, text, "verifier output lacks passed");
-            if (passed_val != .bool)
-                return rejectRole(self, arena, cfg, m, .verifier, text, "verifier passed must be a bool");
-            const passed = passed_val.bool;
-            const reason = strField(parsed.object, "reason") orelse "";
+        .ok => |text| switch (try role_turn_mod.interpretVerify(arena, text)) {
+            .reject => |r| return rejectRole(self, arena, cfg, m, .verifier, r.raw, r.reason),
+            .ok => |verdict| {
+                const passed = verdict.passed;
+                const reason = verdict.reason;
 
-            const md = try std.fmt.allocPrint(arena, "# Verify\n\npassed: {}\n\n{s}\n", .{ passed, reason });
-            try putArtifact(self, cfg, verify_artifact, md);
+                const md = try std.fmt.allocPrint(arena, "# Verify\n\npassed: {}\n\n{s}\n", .{ passed, reason });
+                try putArtifact(self, cfg, verify_artifact, md);
 
-            if (passed) {
-                m.fail_count = 0;
-                m.state = try Fsm.apply(m.state, .verify_passed);
-            } else {
-                journal(self, cfg, "replan", reason);
-                m.fail_count += 1;
-                if (m.fail_count >= cfg.fail_threshold) {
-                    m.stop = .escalated;
-                    m.detail = try std.fmt.allocPrint(
-                        arena,
-                        "verify failed {d} consecutive times; last: {s}",
-                        .{ m.fail_count, reason },
-                    );
-                    m.state = try Fsm.apply(m.state, .escalate);
+                if (passed) {
+                    m.fail_count = 0;
+                    m.state = try Fsm.apply(m.state, .verify_passed);
                 } else {
-                    m.feedback = reason;
-                    m.state = try Fsm.apply(m.state, .verify_failed);
+                    journal(self, cfg, "replan", reason);
+                    m.fail_count += 1;
+                    if (m.fail_count >= cfg.fail_threshold) {
+                        m.stop = .escalated;
+                        m.detail = try std.fmt.allocPrint(
+                            arena,
+                            "verify failed {d} consecutive times; last: {s}",
+                            .{ m.fail_count, reason },
+                        );
+                        m.state = try Fsm.apply(m.state, .escalate);
+                    } else {
+                        m.feedback = reason;
+                        m.state = try Fsm.apply(m.state, .verify_failed);
+                    }
                 }
-            }
+            },
         },
     }
 }
@@ -1031,13 +995,9 @@ fn getArtifact(self: *MissionOrchestrator, arena: std.mem.Allocator, cfg: RunCon
 
 const strField = jsonx.strField;
 
-const uintFieldOr = jsonx.uintFieldOr;
-
 fn controlTarget(arena: std.mem.Allocator, request_json: []const u8) ?[]const u8 {
     return jsonx.topStrField(arena, request_json, "mission_id");
 }
-
-const rawJson = jsonx.rawJson;
 
 // ===========================================================================
 // Tests (docs/specs/mission.md contract, RED first)

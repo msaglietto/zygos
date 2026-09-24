@@ -1,60 +1,14 @@
-//! Pure request/reply shaping for the mission CLI: the missions::start body,
-//! brief parsing, and exit-code mapping. No sockets, no libc, no stderr —
-//! cli/mission.zig owns the wiring.
+//! CLI-side shaping around `zygos::missions::start`: exit codes, paths, and
+//! the brief objective. The start body itself is `zygos.mission.start`, so
+//! the CLI and the orchestrator share one description. No sockets.
 
 const std = @import("std");
 const json = std.json;
 const zygos = @import("zygos");
 
-pub const StartParams = struct {
-    mission_id: []const u8,
-    planning: []const u8,
-    brief_text: []const u8,
-    trace_path: []const u8,
-    resume_flag: bool,
-    bash_desc: []const u8,
-    mcp_entries: []const u8,
-    ctx_kind: zygos.context.Kind,
-    ctx_max_tokens: usize,
-    role_max_steps: i64,
-    max_role_turns: i64,
-};
-
-/// The missions::start request body — shared by the single-mission path and
-/// the queue loop so the wire shape can never drift between them.
-pub fn buildStartRequest(gpa: std.mem.Allocator, p: StartParams) error{OutOfMemory}![]u8 {
-    return std.fmt.allocPrint(gpa,
-        \\{{"mission_id":{f},"planning_root":{f},"objective":{f},"brief":{f},
-        \\ "router_function":"zygos::models::resolve",
-        \\ "gate_function":"zygos::approvals::request",
-        \\ "policy_function":"zygos::policy::check",
-        \\ "approval_function":"zygos::approvals::request",
-        \\ "budget_scope":{f},"trace_path":{f},
-        \\ "context_strategy":{{"kind":"{t}","max_tokens":{d}}},
-        \\ "role_max_steps":{d},"max_role_turns":{d}{s},
-        \\ "tools":[
-        \\  {{"name":"bash","function_id":"zygos::tools::bash",
-        \\   "description":{f},
-        \\   "input_schema":{{"type":"object","properties":{{"command":{{"type":"string",
-        \\    "description":"the shell command to run"}}}},"required":["command"]}}}},
-        \\  {{"name":"web_search","function_id":"zygos::tools::web_search",
-        \\   "description":"Search the web; returns a list of {{title,url,snippet}} results.",
-        \\   "input_schema":{{"type":"object","properties":{{"query":{{"type":"string",
-        \\    "description":"the search query"}}}},"required":["query"]}}}},
-        \\  {{"name":"web_fetch","function_id":"zygos::tools::web_fetch",
-        \\   "description":"Fetch a URL and return its readable text content.",
-        \\   "input_schema":{{"type":"object","properties":{{"url":{{"type":"string",
-        \\    "description":"the absolute http(s) URL to fetch"}}}},"required":["url"]}}}}{s}]}}
-    , .{
-        json.fmt(p.mission_id, .{}),                   json.fmt(p.planning, .{}),
-        json.fmt(extractObjective(p.brief_text), .{}), json.fmt(p.brief_text, .{}),
-        json.fmt(p.mission_id, .{}),                   json.fmt(p.trace_path, .{}),
-        p.ctx_kind,                                    p.ctx_max_tokens,
-        p.role_max_steps,                              p.max_role_turns,
-        if (p.resume_flag) ",\"resume\":true" else "", json.fmt(p.bash_desc, .{}),
-        p.mcp_entries,
-    });
-}
+pub const StartParams = zygos.mission.start.StartParams;
+pub const buildStartRequest = zygos.mission.start.build;
+pub const extractObjective = zygos.mission.start.extractObjective;
 
 pub fn bashDesc(gpa: std.mem.Allocator, workspace: []const u8) error{OutOfMemory}![]u8 {
     return std.fmt.allocPrint(
@@ -63,16 +17,6 @@ pub fn bashDesc(gpa: std.mem.Allocator, workspace: []const u8) error{OutOfMemory
             "Do all work inside this directory (relative paths work); never write to $HOME or system paths.",
         .{workspace},
     );
-}
-
-/// The brief's `## Objective` section body when present, else the whole text.
-pub fn extractObjective(text: []const u8) []const u8 {
-    const heading = "## Objective";
-    const start = std.mem.indexOf(u8, text, heading) orelse return text;
-    const body_start = start + heading.len;
-    const rel_end = std.mem.indexOf(u8, text[body_start..], "\n## ") orelse
-        return std.mem.trim(u8, text[body_start..], " \t\r\n");
-    return std.mem.trim(u8, text[body_start .. body_start + rel_end], " \t\r\n");
 }
 
 /// Filename stem: basename minus the last extension.

@@ -6,7 +6,6 @@
 const std = @import("std");
 const json = std.json;
 const jsonx = @import("../jsonx.zig");
-const out_mod = @import("out.zig");
 
 const strField = jsonx.strField;
 
@@ -87,9 +86,104 @@ pub fn parseReply(
         if (msg != .object) continue;
         const mrole = strField(msg.object, "role") orelse continue;
         if (!std.mem.eql(u8, mrole, "assistant")) continue;
-        return .{ .ok = try out_mod.assistantText(arena, msg.object) };
+        return .{ .ok = try jsonx.assistantText(arena, msg.object) };
     }
     return .{ .failed = "no assistant message in the turn transcript" };
+}
+
+pub const Reject = struct {
+    raw: []const u8,
+    reason: []const u8,
+};
+
+pub const DefineOut = union(enum) {
+    ok: struct { objective: []const u8, acceptance: []const u8 },
+    reject: Reject,
+};
+
+pub const PlanOut = union(enum) {
+    ok: []const []const u8,
+    reject: Reject,
+};
+
+pub const VerifyOut = union(enum) {
+    ok: struct { passed: bool, reason: []const u8 },
+    reject: Reject,
+};
+
+/// Real providers wrap role JSON in one whole-output markdown fence.
+/// Unwrapping exactly that shape is deterministic — anything else is
+/// returned untouched and must still parse as strict JSON (fail closed).
+pub fn unwrapFence(text: []const u8) []const u8 {
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    if (!std.mem.startsWith(u8, trimmed, "```")) return trimmed;
+    if (!std.mem.endsWith(u8, trimmed, "```")) return trimmed;
+    const open_end = std.mem.indexOfScalar(u8, trimmed, '\n') orelse return trimmed;
+    if (trimmed.len < open_end + 1 + 3) return trimmed;
+    return std.mem.trim(u8, trimmed[open_end + 1 .. trimmed.len - 3], " \t\r\n");
+}
+
+/// Excerpt of a task outcome carried into later executor turns. Cuts on a
+/// UTF-8 boundary, prefers a word break past max/2, appends an ellipsis.
+pub fn outcomeExcerpt(arena: std.mem.Allocator, text: []const u8, max: usize) error{OutOfMemory}![]const u8 {
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    if (trimmed.len <= max) return arena.dupe(u8, trimmed);
+    var end = max;
+    while (end > 0 and (trimmed[end] & 0xC0) == 0x80) end -= 1;
+    if (std.mem.lastIndexOfScalar(u8, trimmed[0..end], ' ')) |sp| {
+        if (sp > max / 2) end = sp;
+    }
+    return std.fmt.allocPrint(arena, "{s}…", .{std.mem.trimEnd(u8, trimmed[0..end], " \t\r\n")});
+}
+
+fn reject(text: []const u8, reason: []const u8) Reject {
+    return .{ .raw = text, .reason = reason };
+}
+
+pub fn interpretDefine(arena: std.mem.Allocator, text: []const u8) error{OutOfMemory}!DefineOut {
+    const parsed = json.parseFromSliceLeaky(json.Value, arena, unwrapFence(text), .{}) catch
+        return .{ .reject = reject(text, "product-owner output is not JSON") };
+    if (parsed != .object)
+        return .{ .reject = reject(text, "product-owner output is not an object") };
+    const objective = strField(parsed.object, "objective") orelse
+        return .{ .reject = reject(text, "product-owner output lacks objective") };
+    const acceptance = strField(parsed.object, "acceptance") orelse
+        return .{ .reject = reject(text, "product-owner output lacks acceptance") };
+    return .{ .ok = .{ .objective = objective, .acceptance = acceptance } };
+}
+
+pub fn interpretPlan(arena: std.mem.Allocator, text: []const u8) error{OutOfMemory}!PlanOut {
+    const parsed = json.parseFromSliceLeaky(json.Value, arena, unwrapFence(text), .{}) catch
+        return .{ .reject = reject(text, "planner output is not JSON") };
+    if (parsed != .object)
+        return .{ .reject = reject(text, "planner output is not an object") };
+    const tasks_val = parsed.object.get("tasks") orelse
+        return .{ .reject = reject(text, "planner output lacks tasks") };
+    if (tasks_val != .array or tasks_val.array.items.len == 0 or tasks_val.array.items.len > 32)
+        return .{ .reject = reject(text, "planner tasks must be 1..32 entries") };
+
+    const tasks = try arena.alloc([]const u8, tasks_val.array.items.len);
+    for (tasks_val.array.items, 0..) |tv, i| {
+        if (tv != .string or tv.string.len == 0)
+            return .{ .reject = reject(text, "planner tasks must be non-empty strings") };
+        tasks[i] = tv.string;
+    }
+    return .{ .ok = tasks };
+}
+
+pub fn interpretVerify(arena: std.mem.Allocator, text: []const u8) error{OutOfMemory}!VerifyOut {
+    const parsed = json.parseFromSliceLeaky(json.Value, arena, unwrapFence(text), .{}) catch
+        return .{ .reject = reject(text, "verifier output is not JSON") };
+    if (parsed != .object)
+        return .{ .reject = reject(text, "verifier output is not an object") };
+    const passed_val = parsed.object.get("passed") orelse
+        return .{ .reject = reject(text, "verifier output lacks passed") };
+    if (passed_val != .bool)
+        return .{ .reject = reject(text, "verifier passed must be a bool") };
+    return .{ .ok = .{
+        .passed = passed_val.bool,
+        .reason = strField(parsed.object, "reason") orelse "",
+    } };
 }
 
 // ===========================================================================
@@ -180,4 +274,63 @@ test "parseReply: malformed reply, missing transcript and no assistant all fail 
             \\{"stop":"end_turn","transcript":[{"role":"user","content":"x"}]}
         )).failed,
     );
+}
+
+test "unwrapFence: whole-output fence with and without a language tag" {
+    try testing.expectEqualStrings("{\"a\":1}", unwrapFence("```json\n{\"a\":1}\n```"));
+    try testing.expectEqualStrings("{\"a\":1}", unwrapFence("```\n{\"a\":1}\n```"));
+    try testing.expectEqualStrings("{\"a\":1}", unwrapFence("  ```json\n{\"a\":1}\n```  \n"));
+}
+
+test "unwrapFence: anything but exactly one whole-output fence is untouched" {
+    try testing.expectEqualStrings("{\"a\":1}", unwrapFence(" {\"a\":1} "));
+    try testing.expectEqualStrings("```{\"a\":1}```", unwrapFence("```{\"a\":1}```"));
+    try testing.expectEqualStrings("pre ```json\n{}\n```", unwrapFence("pre ```json\n{}\n```"));
+}
+
+test "outcomeExcerpt: short text is duped verbatim, long text cuts on a word" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try testing.expectEqualStrings("done", try outcomeExcerpt(arena, "  done \n", 10));
+    const cut = try outcomeExcerpt(arena, "alpha beta gamma delta", 12);
+    try testing.expectEqualStrings("alpha beta…", cut);
+}
+
+test "outcomeExcerpt: never cuts inside a UTF-8 sequence" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // "ééééé" is 10 bytes; max 9 lands mid-codepoint and must back up.
+    const cut = try outcomeExcerpt(arena, "ééééé", 9);
+    try testing.expect(std.unicode.utf8ValidateSlice(cut));
+}
+
+test "interpretDefine: a fenced object yields objective and acceptance" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const out = try interpretDefine(arena, "```json\n{\"objective\":\"ship\",\"acceptance\":\"tests green\"}\n```");
+    try testing.expectEqualStrings("ship", out.ok.objective);
+    try testing.expectEqualStrings("tests green", out.ok.acceptance);
+}
+
+test "interpretPlan: rejects an empty task list and keeps the raw text" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const out = try interpretPlan(arena, "{\"tasks\":[]}");
+    try testing.expectEqualStrings("planner tasks must be 1..32 entries", out.reject.reason);
+    try testing.expectEqualStrings("{\"tasks\":[]}", out.reject.raw);
+}
+
+test "interpretVerify: passed must be a bool" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const bad = try interpretVerify(arena, "{\"passed\":\"yes\"}");
+    try testing.expectEqualStrings("verifier passed must be a bool", bad.reject.reason);
+    const good = try interpretVerify(arena, "{\"passed\":false,\"reason\":\"nope\"}");
+    try testing.expect(!good.ok.passed);
+    try testing.expectEqualStrings("nope", good.ok.reason);
 }

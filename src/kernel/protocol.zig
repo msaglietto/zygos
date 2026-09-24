@@ -13,9 +13,9 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const json = std.json;
 
-pub const types = @import("protocol/types.zig");
-pub const parse_mod = @import("protocol/parse.zig");
-pub const serialize_mod = @import("protocol/serialize.zig");
+const types = @import("protocol/types.zig");
+const parse_mod = @import("protocol/parse.zig");
+const serialize_mod = @import("protocol/serialize.zig");
 
 pub const ProtocolError = types.ProtocolError;
 pub const ErrorBody = types.ErrorBody;

@@ -165,7 +165,7 @@ pub const WebToolsWorker = struct {
 
         validateUrl(url) catch return errorReply(arena, "InvalidUrl");
 
-        const body = httpGet(self.gpa, self.io, url, &.{}, self.max_fetch_bytes) catch |err| switch (err) {
+        const body = self.transport(self.transport_ctx, self.gpa, self.io, url, &.{}, self.max_fetch_bytes) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.HttpFailed => {
                 log.warn("web_fetch {s}: transport failure", .{url});
@@ -591,6 +591,47 @@ test "persistent 429 exhausts the retry budget and fails closed with the status"
     try testing.expect(res == .ok);
     try testing.expect(std.mem.indexOf(u8, res.ok, "\"status\":429") != null);
     try testing.expectEqual(@as(usize, 2), fake.calls); // 1 attempt + 1 retry
+}
+
+// Fetch must cross the same transport seam search already uses. A direct
+// httpGet leaves `calls` at 0 and answers HttpFailed for this dead port.
+test "fetch rides the transport seam" {
+    var h = try Harness.init(testing.allocator, .{});
+    defer h.deinit();
+
+    const FetchFake = struct {
+        calls: usize = 0,
+
+        fn transport(
+            ctx: ?*anyopaque,
+            gpa: std.mem.Allocator,
+            io: std.Io,
+            url: []const u8,
+            headers: []const std.http.Header,
+            max_bytes: usize,
+        ) HttpGetError!HttpBody {
+            _ = io;
+            _ = url;
+            _ = headers;
+            _ = max_bytes;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.calls += 1;
+            return .{
+                .bytes = try gpa.dupe(u8, "<html><body><p>Hello fetch seam</p></body></html>"),
+                .content_type = try gpa.dupe(u8, "text/html; charset=utf-8"),
+            };
+        }
+    };
+
+    var fake = FetchFake{};
+    h.worker.transport = FetchFake.transport;
+    h.worker.transport_ctx = &fake;
+
+    const res = try h.caller.call("zygos::tools::web_fetch", "{\"url\":\"http://127.0.0.1:1/x\"}");
+    defer res.deinit(testing.allocator);
+    try testing.expect(res == .ok);
+    try testing.expectEqual(@as(usize, 1), fake.calls);
+    try testing.expect(std.mem.indexOf(u8, res.ok, "Hello fetch seam") != null);
 }
 
 test "non-429 status is never retried" {
