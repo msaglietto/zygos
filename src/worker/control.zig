@@ -12,10 +12,12 @@
 
 const std = @import("std");
 const jsonx = @import("jsonx.zig");
-const fsx = @import("fsx.zig");
-const readWholeFile = fsx.readWholeFile;
-
 const json = std.json;
+
+extern "c" fn fseek(stream: *std.c.FILE, offset: c_long, whence: c_int) c_int;
+extern "c" fn ftell(stream: *std.c.FILE) c_long;
+const seek_set: c_int = 0;
+const seek_end: c_int = 2;
 
 pub const file_name = "control.jsonl";
 
@@ -106,9 +108,22 @@ pub const Tail = struct {
         arena: std.mem.Allocator,
         path: []const u8,
     ) error{OutOfMemory}![]const []const u8 {
-        const text = readWholeFile(arena, path) orelse return &.{};
-        if (text.len <= self.offset) return &.{};
-        const fresh = text[self.offset..];
+        // Append-only: read from the last consumed offset. A shorter file
+        // was replaced, so start over rather than stalling past EOF.
+        const path_z = try std.fmt.allocPrintSentinel(arena, "{s}", .{path}, 0);
+        const f = std.c.fopen(path_z.ptr, "r") orelse return &.{};
+        defer _ = std.c.fclose(f);
+        if (fseek(f, 0, seek_end) != 0) return &.{};
+        const end = ftell(f);
+        if (end < 0) return &.{};
+        const size: usize = @intCast(end);
+        if (size < self.offset) self.offset = 0;
+        if (size == self.offset) return &.{};
+        const start: c_long = @intCast(self.offset);
+        if (fseek(f, start, seek_set) != 0) return &.{};
+        const buf = try arena.alloc(u8, size - self.offset);
+        const got = std.c.fread(buf.ptr, 1, buf.len, f);
+        const fresh = buf[0..got];
         // Only up to the last newline: a mid-append tail waits for its line.
         const consumable = std.mem.lastIndexOfScalar(u8, fresh, '\n') orelse return &.{};
         var out: std.ArrayList([]const u8) = .empty;
@@ -241,4 +256,63 @@ test "Tail.poll returns only complete new lines, incrementally" {
     const third = try tail.poll(arena, path);
     try testing.expectEqual(@as(usize, 1), third.len);
     try testing.expect(parseCommandLine(arena, third[0]) != null);
+}
+
+test "Tail.poll reads only the suffix and notices a replaced file" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var rel_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const rel = try std.fmt.bufPrintZ(&rel_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const dir = std.mem.span(realpath(rel, &dir_buf) orelse return error.RealpathFailed);
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const path = try std.fmt.allocPrint(arena, "{s}/events.jsonl", .{dir});
+    const path_z = try std.fmt.allocPrintSentinel(arena, "{s}", .{path}, 0);
+
+    // One long complete line, then a short one. The second poll must not
+    // allocate the prefix: 4KB holds the path and the new line, not 64KB.
+    {
+        const f = std.c.fopen(path_z.ptr, "w") orelse return error.OpenFailed;
+        defer _ = std.c.fclose(f);
+        var chunk: [1024]u8 = undefined;
+        @memset(&chunk, 'a');
+        var left: usize = 64 * 1024;
+        while (left > 0) {
+            const n = @min(left, chunk.len);
+            if (std.c.fwrite(&chunk, 1, n, f) != n) return error.WriteFailed;
+            left -= n;
+        }
+        if (std.c.fwrite("\n", 1, 1, f) != 1) return error.WriteFailed;
+    }
+
+    var tail = Tail{};
+    const first = try tail.poll(arena, path);
+    try testing.expectEqual(@as(usize, 1), first.len);
+    try testing.expectEqual(@as(usize, 64 * 1024), first[0].len);
+
+    {
+        const f = std.c.fopen(path_z.ptr, "a") orelse return error.OpenFailed;
+        defer _ = std.c.fclose(f);
+        const extra = "z\n";
+        if (std.c.fwrite(extra.ptr, 1, extra.len, f) != extra.len) return error.WriteFailed;
+    }
+    var scratch: [4096]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&scratch);
+    const second = try tail.poll(fba.allocator(), path);
+    try testing.expectEqual(@as(usize, 1), second.len);
+    try testing.expectEqualStrings("z", second[0]);
+
+    // A shorter replacement is a new file, not "nothing appended".
+    {
+        const f = std.c.fopen(path_z.ptr, "w") orelse return error.OpenFailed;
+        defer _ = std.c.fclose(f);
+        const neu = "hi\n";
+        if (std.c.fwrite(neu.ptr, 1, neu.len, f) != neu.len) return error.WriteFailed;
+    }
+    const third = try tail.poll(arena, path);
+    try testing.expectEqual(@as(usize, 1), third.len);
+    try testing.expectEqualStrings("hi", third[0]);
 }
