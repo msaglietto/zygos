@@ -57,7 +57,7 @@ SDKs. See `GOAL.md` for the mission, `docs/ARCHITECTURE.md` and
 Requires Zig 0.16.0 (and libc — pthread + CSPRNG; macOS or Linux).
 
 ```bash
-zig build test   # full suite (579 tests, leak-checked, no network)
+zig build test   # full suite (848 tests, leak-checked, no network)
 zig build        # produces zig-out/bin/zygos
 ```
 
@@ -199,8 +199,9 @@ denies) when stdin closes. Knobs: `ZYGOS_APPROVAL_TIMEOUT_MS`,
 `ZYGOS_INVOKE_TIMEOUT_MS`, `ZYGOS_BUDGET_MAX_TOKENS`, `ZYGOS_ROLE_MAX_STEPS`
 (default 24), `ZYGOS_MAX_ROLE_TURNS` (default 48); web-search backend via
 `ZYGOS_SEARCH_ENGINE`/`ZYGOS_SEARCH_ENDPOINT`/`ZYGOS_SEARCH_KEY_ENV`
-(brave/searxng — see the known brave key_env defect flagged in
-`docs/specs/mission-cli.md`). Debugging: `ZYGOS_LOG=info`
+(brave/searxng). Brave resolves that key variable into `SearchConfig.key`
+at boot (`searchConfigFromEnv`); an unset key fails each search with
+`MissingSearchKey` and does not fail boot. Debugging: `ZYGOS_LOG=info`
 streams the harness's progress feed (mission transitions, role turns,
 per-step provider/model, tool dispatches) to stderr; `debug` for more.
 

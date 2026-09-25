@@ -1,8 +1,23 @@
 # Working in this repo (all agents)
 
 Read `GOAL.md` first — it is the mission brief and defines success criteria,
-non-goals, gates, and your decision authority. Architecture: `docs/ARCHITECTURE.md`.
-Wire format: `docs/PROTOCOL.md` (source of truth; human-gated).
+non-goals, gates, and your decision authority. Architecture sketch:
+`docs/ARCHITECTURE.md`. Implemented trust boundaries and operator contracts:
+`documentation/`. Wire format: `docs/PROTOCOL.md` (source of truth; human-gated).
+Operating prohibitions (what not to weaken): `CLAUDE.md`.
+
+The rules below stay in force. Do not delete them to shorten this file.
+`CLAUDE.md` repeats the prohibitions for this checkout; `.gitignore` keeps
+it untracked. The tracked copy is here.
+
+## Do not weaken
+
+- No new `build.zig.zon` entry, no `docs/PROTOCOL.md` edit, no deploys. Those are human gates in `GOAL.md`.
+- Do not edit `GOAL.md` success criteria so code looks compliant.
+- Policy, gate, and budget failures deny or stop. Do not default them to allow, approve, or continue.
+- File tools stay inside `Workspace.resolve`. Bash is a shell with workspace cwd, not a jail.
+- `web_fetch` stays http(s) with a host. Brave keys resolve in `searchConfigFromEnv`, not inside `web_tools`.
+- `zig build test` stays offline: no real catalog, vault, or network.
 
 ## TDD is the law here
 

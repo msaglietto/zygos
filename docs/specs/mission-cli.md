@@ -90,11 +90,12 @@ Others: `ZYGOS_BUDGET_MAX_TOKENS` (default 1M), `ZYGOS_ROLE_MAX_STEPS`
 above), `ZYGOS_NO_TUI`, `ZYGOS_TUI_CAPTURE` (raw-frame debug tee),
 `ZYGOS_LOG` (log filter), `COLORTERM` (truecolor detection).
 
-> ⚠️ **Known defect (flagged 2026-07-18, unfixed):** the brave search branch
-> of `searchConfigFromEnv` sets `key_env` but nothing ever resolves it into
-> `key`, and `web_tools` reads only `key`. Net effect: brave `web_search`
-> through the mission CLI always returns `MissingSearchKey` even with
-> `BRAVE_API_KEY` set. searxng (keyless) works.
+Brave search resolves the key at boot. `searchConfigFromEnv` sets `key_env`
+(default `BRAVE_API_KEY`, or `ZYGOS_SEARCH_KEY_ENV`) and copies `key` from
+that variable in the environment slice. `web_tools` reads `key` only. A
+missing variable leaves `key` null and each search returns `MissingSearchKey`
+naming `key_env`; boot still proceeds. searxng stays keyless and requires
+`ZYGOS_SEARCH_ENDPOINT`.
 
 ## Resume
 

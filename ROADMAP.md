@@ -54,7 +54,8 @@ bus as `zygos::mcp::<server>::<tool>`, riding policy/trim/budget).
 429-retry carve-out, fail-closed parsing) gated like any tool; unattended
 rerun semantics (`--run-stamp`, refuse-if-existing) + external cron recipe;
 zahir-radar Brief 2 ported and lint-clean. Y5 (real-vault unattended run)
-staged at the human gate — currently **blocked by the brave key_env defect**.
+stays at the human gate. The brave `key_env` boot bug is fixed (1ebe1aa);
+it is not what blocks that run.
 
 **Operator surface** — `zygos mission start|resume|trace` CLI; live mission
 TUI (streaming thinking/tool/answer entries, collapse lifecycle,

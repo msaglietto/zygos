@@ -54,3 +54,7 @@ new `zygos::*` bus functions, never frame changes.
 - **M3**: mission loop — durable mission FSM over the GSD `.planning/`
   substrate; product-owner/planner/executor/verifier role turns; hard gates.
 - **M4**: Tessera workers (continuity/capture/orient/undo) + MCP gateway.
+
+Implemented behavior, trust boundaries, and env/secrets inventory:
+`documentation/architecture.md` and the rest of `documentation/`. Milestone
+status: `README.md`. This file stays the layer sketch.
