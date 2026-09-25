@@ -559,7 +559,7 @@ fn setupWorktree(gpa: std.mem.Allocator, repo: []const u8, planning: []const u8)
     defer arena_state.deinit();
     const argv = zygos.mission_boot.worktreeAddArgv(repo, path);
     const runner = zygos.context_thread.PopenRunner.runner();
-    _ = runner.run(arena_state.allocator(), &argv) orelse {
+    _ = runner.run(arena_state.allocator(), &argv, null) orelse {
         eprint("mission: git worktree add failed in {s} (is it a git repo?)\n", .{repo});
         return null;
     };
@@ -603,7 +603,7 @@ fn runDashboard(gpa: std.mem.Allocator, dir: []const u8) u8 {
     var shown: usize = 0;
     for ([_][]const u8{ "/mission.json", "/*/mission.json" }) |suffix| {
         const glob = std.mem.concat(arena, u8, &.{ trimmed, suffix }) catch return oom();
-        const listing = runner.run(arena, &.{ "ls", "-1d", glob }) orelse continue;
+        const listing = runner.run(arena, &.{ "ls", "-1d", glob }, null) orelse continue;
         var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, listing, "\n"), '\n');
         while (lines.next()) |path| {
             if (path.len == 0) continue;

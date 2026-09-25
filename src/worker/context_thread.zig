@@ -23,10 +23,12 @@ pub const CmdRunner = struct {
     ctx: *anyopaque,
     /// Run `argv`, return stdout (arena-owned) or null on any failure —
     /// digest assembly is fail-open, a broken git never fails a step.
-    runFn: *const fn (ctx: *anyopaque, arena: std.mem.Allocator, argv: []const []const u8) ?[]const u8,
+    /// `limit` caps stdout bytes; null reads until EOF. A capped child that
+    /// dies on SIGPIPE still returns the bytes already read.
+    runFn: *const fn (ctx: *anyopaque, arena: std.mem.Allocator, argv: []const []const u8, limit: ?usize) ?[]const u8,
 
-    pub fn run(self: CmdRunner, arena: std.mem.Allocator, argv: []const []const u8) ?[]const u8 {
-        return self.runFn(self.ctx, arena, argv);
+    pub fn run(self: CmdRunner, arena: std.mem.Allocator, argv: []const []const u8, limit: ?usize) ?[]const u8 {
+        return self.runFn(self.ctx, arena, argv, limit);
     }
 };
 
@@ -209,8 +211,8 @@ pub const ThreadStrategy = struct {
     /// the whole block (fail-open — a broken git never fails a step).
     fn digestBlock(self: *ThreadStrategy, arena: std.mem.Allocator) ?[]const u8 {
         const r = self.runner orelse return null;
-        const files = r.run(arena, &.{ "git", "-C", self.workspace, "ls-files" }) orelse return null;
-        const history = r.run(arena, &.{ "git", "-C", self.workspace, "log", "--oneline", "-5" });
+        const files = r.run(arena, &.{ "git", "-C", self.workspace, "ls-files" }, self.opts.digest_bytes) orelse return null;
+        const history = r.run(arena, &.{ "git", "-C", self.workspace, "log", "--oneline", "-5" }, self.opts.digest_bytes);
         var w: std.Io.Writer.Allocating = .init(arena);
         w.writer.writeAll("\nCodebase state:\nFiles:\n") catch return null;
         w.writer.writeAll(capUtf8(arena, std.mem.trimEnd(u8, files, "\n"), self.opts.digest_bytes) catch return null) catch return null;
@@ -269,7 +271,7 @@ extern "c" fn pclose(stream: *std.c.FILE) c_int;
 /// Default runner: /bin/sh -c via popen. argv joins with spaces — callers
 /// pass fixed git invocations, never user input.
 pub const PopenRunner = struct {
-    pub fn run(ctx: *anyopaque, arena: std.mem.Allocator, argv: []const []const u8) ?[]const u8 {
+    pub fn run(ctx: *anyopaque, arena: std.mem.Allocator, argv: []const []const u8, limit: ?usize) ?[]const u8 {
         _ = ctx;
         var cmd: std.ArrayList(u8) = .empty;
         for (argv, 0..) |a, i| {
@@ -281,13 +283,20 @@ pub const PopenRunner = struct {
         const f = popen(cmd_z.ptr, "r") orelse return null;
         var buf: std.ArrayList(u8) = .empty;
         var chunk: [4096]u8 = undefined;
-        while (true) {
-            const n = std.c.fread(&chunk, 1, chunk.len, f);
+        const cap = limit orelse std.math.maxInt(usize);
+        while (buf.items.len < cap) {
+            const room = cap - buf.items.len;
+            const want = @min(chunk.len, room);
+            const n = std.c.fread(&chunk, 1, want, f);
             if (n == 0) break;
             buf.appendSlice(arena, chunk[0..n]) catch break;
         }
+        const hit_cap = limit != null and buf.items.len >= limit.?;
         const status = pclose(f);
-        if (status != 0) return null;
+        // A cap closes the pipe early; the child may die with SIGPIPE.
+        // That is the stop, not a failed command. A real failure with no
+        // capped bytes is still a failure.
+        if (!hit_cap and status != 0) return null;
         return buf.items;
     }
 
@@ -368,7 +377,8 @@ const FakeGit = struct {
     fail: bool = false,
     calls: usize = 0,
 
-    fn run(ctx: *anyopaque, arena: std.mem.Allocator, argv: []const []const u8) ?[]const u8 {
+    fn run(ctx: *anyopaque, arena: std.mem.Allocator, argv: []const []const u8, limit: ?usize) ?[]const u8 {
+        _ = limit;
         const self: *FakeGit = @ptrCast(@alignCast(ctx));
         self.calls += 1;
         if (self.fail) return null;
@@ -539,4 +549,17 @@ test "ThreadStrategy passes the conformance harness with resume-from-disk parity
         .reopenFn = &ReopenCtx.reopen,
         .reopen_ctx = @ptrCast(&reopen_ctx),
     }, executorStep(0));
+}
+
+test "PopenRunner stops at the read cap and still returns those bytes" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var dummy: u8 = 0;
+    const capped = PopenRunner.run(@ptrCast(&dummy), arena, &.{ "dd", "if=/dev/zero", "bs=8000", "count=1" }, 100);
+    const got = capped orelse return error.NoOutput;
+    try testing.expectEqual(@as(usize, 100), got.len);
+
+    const failed = PopenRunner.run(@ptrCast(&dummy), arena, &.{"false"}, null);
+    try testing.expect(failed == null);
 }
