@@ -227,6 +227,59 @@ test "build and parse name the same start fields" {
     try testing.expect(p.tools_json != null);
 }
 
+test "mission start offers bash, web_search, and web_fetch only" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const body = try build(arena, .{
+        .mission_id = "m-tools",
+        .planning = "/tmp/plan",
+        .brief_text = "# Brief\n## Objective\nList the tools\n",
+        .trace_path = "/tmp/plan/events.jsonl",
+        .resume_flag = false,
+        .bash_desc = "workspace shell",
+        .mcp_entries = "",
+        .ctx_kind = .substrate,
+        .ctx_max_tokens = 1000,
+        .role_max_steps = 24,
+        .max_role_turns = 48,
+    });
+    const parsed = try parse(arena, body);
+    const tools_json = parsed.tools_json orelse return error.MissingTools;
+    const tools = try json.parseFromSliceLeaky(json.Value, arena, tools_json, .{});
+    try testing.expect(tools == .array);
+    try testing.expectEqual(@as(usize, 3), tools.array.items.len);
+
+    var saw_bash = false;
+    var saw_search = false;
+    var saw_fetch = false;
+    for (tools.array.items) |item| {
+        try testing.expect(item == .object);
+        const name = strField(item.object, "name") orelse return error.MissingName;
+        const function_id = strField(item.object, "function_id") orelse return error.MissingFunction;
+        try testing.expect(std.mem.indexOf(u8, name, "read_file") == null);
+        try testing.expect(std.mem.indexOf(u8, function_id, "read_file") == null);
+        try testing.expect(std.mem.indexOf(u8, name, "write_file") == null);
+        try testing.expect(std.mem.indexOf(u8, function_id, "write_file") == null);
+        if (std.mem.eql(u8, name, "bash")) {
+            saw_bash = true;
+            try testing.expectEqualStrings("zygos::tools::bash", function_id);
+        } else if (std.mem.eql(u8, name, "web_search")) {
+            saw_search = true;
+            try testing.expectEqualStrings("zygos::tools::web_search", function_id);
+        } else if (std.mem.eql(u8, name, "web_fetch")) {
+            saw_fetch = true;
+            try testing.expectEqualStrings("zygos::tools::web_fetch", function_id);
+        } else {
+            return error.UnexpectedTool;
+        }
+    }
+    try testing.expect(saw_bash);
+    try testing.expect(saw_search);
+    try testing.expect(saw_fetch);
+}
+
 test "parse: a relative planning root and a missing router are malformed" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
