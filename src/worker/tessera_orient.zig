@@ -152,7 +152,9 @@ fn loadProject(arena: std.mem.Allocator, cfg: Config, name: []const u8) error{ F
         cfg.root, cfg.projects_subdir, name, cfg.project_file,
     }) catch return error.OutOfMemory;
 
-    const sessions_text = try readFileOrEmpty(arena, sessions_path);
+    // reflect's stalledLoop looks at the 3 newest sessions. Older entries
+    // are not part of any orient reply.
+    const sessions_text = try vault.readThroughSessions(arena, sessions_path, 3);
     const project_text = try readFileOrEmpty(arena, project_path);
 
     const sessions = vault.parseSessions(arena, sessions_text) catch return error.OutOfMemory;

@@ -18,6 +18,38 @@ pub const Session = struct {
 
 pub const STALE_DAYS: i64 = 14;
 
+pub fn isSessionHeader(line: []const u8) bool {
+    return parseSessionHeader(line) != null;
+}
+
+/// Read `path` only through `max_sessions` session entries (newest-first).
+/// Bytes after the next session header are not read. A missing file is "".
+pub fn readThroughSessions(alloc: std.mem.Allocator, path: []const u8, max_sessions: usize) error{OutOfMemory}![]u8 {
+    const path_z = try std.fmt.allocPrintSentinel(alloc, "{s}", .{path}, 0);
+    defer alloc.free(path_z);
+    const f = std.c.fopen(path_z.ptr, "r") orelse return alloc.dupe(u8, "");
+    defer _ = std.c.fclose(f);
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    var line_buf: [4096]u8 = undefined;
+    var headers: usize = 0;
+    while (fgets(&line_buf, @intCast(line_buf.len), f)) |got| {
+        const raw: []const u8 = std.mem.span(got);
+        var logical: []const u8 = raw;
+        if (logical.len > 0 and logical[logical.len - 1] == '\n') logical = logical[0 .. logical.len - 1];
+        if (logical.len > 0 and logical[logical.len - 1] == '\r') logical = logical[0 .. logical.len - 1];
+        if (isSessionHeader(logical)) {
+            headers += 1;
+            if (headers > max_sessions) break;
+        }
+        try out.appendSlice(alloc, raw);
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+extern "c" fn fgets(s: [*]u8, n: c_int, stream: *std.c.FILE) ?[*:0]u8;
+
 /// Parse SESSIONS.md newest-first (document order == reverse-chron already).
 /// Entries with no `## Session — DATE` header are skipped. Arena-owned.
 pub fn parseSessions(arena: std.mem.Allocator, text: []const u8) error{OutOfMemory}![]Session {
@@ -522,3 +554,46 @@ test "no leaks (arena freed by caller; test uses std.testing.allocator arena)" {
     _ = daysBetween(sessions[0].date, "2024-06-15");
     _ = stalledLoop(sessions, 2);
 }
+
+test "readThroughSessions stops before the next session header" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var rel_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const rel = try std.fmt.bufPrintZ(&rel_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const dir = std.mem.span(realpath(rel, &dir_buf) orelse return error.RealpathFailed);
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const path = try std.fmt.allocPrint(arena, "{s}/SESSIONS.md", .{dir});
+    const body =
+        \\## Session — 2026-02-02
+        \\
+        \\### Leaving behind
+        \\
+        \\newest
+        \\
+        \\## Session — 2026-01-01
+        \\
+        \\### Leaving behind
+        \\
+        \\UNIQUE_OLDER_MARKER
+        \\
+    ;
+    const path_z = try std.fmt.allocPrintSentinel(arena, "{s}", .{path}, 0);
+    const f = std.c.fopen(path_z.ptr, "w") orelse return error.OpenFailed;
+    if (std.c.fwrite(body.ptr, 1, body.len, f) != body.len) return error.WriteFailed;
+    _ = std.c.fclose(f);
+
+    const prefix = try readThroughSessions(testing.allocator, path, 1);
+    defer testing.allocator.free(prefix);
+    try testing.expect(std.mem.indexOf(u8, prefix, "newest") != null);
+    try testing.expect(std.mem.indexOf(u8, prefix, "UNIQUE_OLDER_MARKER") == null);
+    try testing.expect(prefix.len < body.len);
+
+    const missing = try readThroughSessions(testing.allocator, "/no/such/sessions.md", 1);
+    defer testing.allocator.free(missing);
+    try testing.expectEqual(@as(usize, 0), missing.len);
+}
+
+extern "c" fn realpath(path: [*:0]const u8, resolved: [*]u8) ?[*:0]u8;

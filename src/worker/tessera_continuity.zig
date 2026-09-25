@@ -69,7 +69,7 @@ pub const ContinuityWorker = struct {
         if (!validProjectName(project)) return error.Failed;
 
         const sessions_path = try projectPath(arena, self.config, project, self.config.sessions_file);
-        const sessions_text = try readFileOrEmpty(arena, sessions_path);
+        const sessions_text = try vault.readThroughSessions(arena, sessions_path, 1);
         const sessions = vault.parseSessions(arena, sessions_text) catch return error.OutOfMemory;
 
         if (sessions.len == 0) {
