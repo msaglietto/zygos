@@ -39,7 +39,7 @@ Actors: **operator** (the OS user), **kernel** (bus), **model** (a provider work
 
 - **Precondition.** Verifier passed and the mission is in `gating`.
 - **Sequence.** Orchestrator calls the gate through `approvals::request`. Only an explicit approval moves to `done`. Missing gate function, unreachable gate, or malformed reply cannot complete. A deny with `resolved:true` (or no `resolved` field) feeds back into planning, bounded by `gate_threshold`. A deny with `resolved:false` (manual timeout, including closed stdin) parks in `gating` with `paused:true`. `mission resume` re-asks.
-- **Authz.** The approver is the operator at the TUI/console, or the timeout. EOF does not approve.
+- **Authz.** The approver is the operator at the TUI/console, the timeout, or any writer of `<planning>/control.jsonl` (the attach channel, including the executor's shell). EOF does not approve. A line in that file can.
 - **Side effects.** State file updated. Parked missions do not replan and do not mark `done`.
 
 ## 5. Web fetch and search

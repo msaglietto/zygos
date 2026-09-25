@@ -38,7 +38,7 @@ There are no user accounts, sessions, or row-level policies. Identity is the OS 
 
 - Loopback bus is unauthenticated. A local process can invoke any registered function, including tools if those workers are running. Bare `zygos` does not boot the tool workers; `zygos mission` does, in-process, and does not open the WebSocket for them.
 - File-tool confinement is lexical. `tools_ops.zig` states symlink escapes are deferred. `open` follows links.
-- Bash is a shell with workspace `cwd`, not a sandbox. Default policy allows it.
+- Bash is a shell with workspace `cwd`, not a sandbox. Default policy allows it. The running mission treats `<planning>/control.jsonl` as attach commands, including approve (`src/cli/mission.zig` `controlLoop`). The executor can append that file. `mission attach` uses the same file.
 - `web_fetch` will request any `http`/`https` URL the model supplies, including private addresses. Size caps apply (`max_fetch_bytes`, `max_text_bytes`).
 - `events.jsonl` stores tool inputs and clipped outputs (`README` mission-trace section). A fetched page or a command that prints a secret lands in that file. Emission is fail-open.
 - Malformed integer env knobs (`envInt`) fall back to the compiled default. A typo does not refuse boot.
