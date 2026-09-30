@@ -16,6 +16,7 @@
 const std = @import("std");
 const types = @import("types.zig");
 const sync = @import("sync.zig");
+const entropy = @import("entropy.zig");
 
 pub const WorkerId = types.WorkerId;
 
@@ -396,9 +397,7 @@ fn reapEntry(gpa: std.mem.Allocator, entry: *Entry) void {
 
 fn randomKey(gpa: std.mem.Allocator) error{OutOfMemory}![]const u8 {
     var raw: [32]u8 = undefined;
-    // Zig 0.16 removed std.crypto.random (entropy now rides std.Io, barred by
-    // Z-02). libc's CSPRNG covers both targets: macOS always, Linux glibc>=2.36.
-    std.c.arc4random_buf(&raw, raw.len);
+    entropy.fill(&raw);
     const out = try gpa.alloc(u8, key_len);
     const hex = "0123456789abcdef";
     for (raw, 0..) |b, i| {

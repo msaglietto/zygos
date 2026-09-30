@@ -1,6 +1,731 @@
 {
-  "status": "blocked",
-  "reason": "Harbor is not installed and the Terminal-Bench 2.1 image set is not on disk, so no image platform was inventoried. The target triple stays unchosen until that inventory exists.",
-  "chosen_triple": null,
-  "images": []
+  "status": "ready",
+  "dataset": "terminal-bench/terminal-bench-2-1",
+  "source": "https://github.com/harbor-framework/terminal-bench-2-1",
+  "inventoried": "2026-09-30",
+  "chosen_platform": "linux/amd64",
+  "chosen_triple": "x86_64-linux.5.10...6.19-gnu.2.31",
+  "host_docker_platform": "linux/arm64",
+  "reason": "All 89 Terminal-Bench 2.1 environment images publish linux/amd64. 85 are a single-arch amd64 manifest. 4 also publish linux/arm64 (hf-model-inference, mteb-leaderboard, mteb-retrieve, pytorch-model-recovery, tag 20260430). None is arm64-only, so the dataset triple is x86_64 Linux, glibc 2.31. The Docker daemon here is linux/arm64, so those containers run under emulation. chosen_triple is the string std.Target.zigTriple stamps for -Dtarget=x86_64-linux-gnu.",
+  "image_count": 89,
+  "single_arch_amd64": 85,
+  "multi_arch_amd64_arm64": 4,
+  "images": [
+    {
+      "task": "adaptive-rejection-sampler",
+      "image": "alexgshaw/adaptive-rejection-sampler:20251031",
+      "kind": "single",
+      "platforms": [
+        "linux/amd64"
+      ]
+    },
+    {
+      "task": "bn-fit-modify",
+      "image": "alexgshaw/bn-fit-modify:20251031",
+      "kind": "single",
+      "platforms": [
+        "linux/amd64"
+      ]
+    },
+    {
+      "task": "break-filter-js-from-html",
+      "image": "alexgshaw/break-filter-js-from-html:20251031",
+      "kind": "single",
+      "platforms": [
+        "linux/amd64"
+      ]
+    },
+    {
+      "task": "build-cython-ext",
+      "image": "alexgshaw/build-cython-ext:20251031",
+      "kind": "single",
+      "platforms": [
+        "linux/amd64"
+      ]
+    },
+    {
+      "task": "build-pmars",
+      "image": "alexgshaw/build-pmars:20251031",
+      "kind": "single",
+      "platforms": [
+        "linux/amd64"
+      ]
+    },
+    {
+      "task": "build-pov-ray",
+      "image": "alexgshaw/build-pov-ray:20251031",
+      "kind": "single",
+      "platforms": [
+        "linux/amd64"
+      ]
+    },
+    {
+      "task": "caffe-cifar-10",
+      "image": "alexgshaw/caffe-cifar-10:20260403",
+      "kind": "single",
+      "platforms": [
+        "linux/amd64"
+      ]
+    },
+    {
+      "task": "cancel-async-tasks",
+      "image": "alexgshaw/cancel-async-tasks:20251031",
+      "kind": "single",
+      "platforms": [
+        "linux/amd64"
+      ]
+    },
+    {
+      "task": "chess-best-move",
+      "image": "alexgshaw/chess-best-move:20251031",
+      "kind": "single",
+      "platforms": [
+        "linux/amd64"
+      ]
+    },
+    {
+      "task": "circuit-fibsqrt",
+      "image": "alexgshaw/circuit-fibsqrt:20251031",
+      "kind": "single",
+      "platforms": [
+        "linux/amd64"
+      ]
+    },
+    {
+      "task": "cobol-modernization",
+      "image": "alexgshaw/cobol-modernization:20251031",
+      "kind": "single",
+      "platforms": [
+        "linux/amd64"
+      ]
+    },
+    {
+      "task": "code-from-image",
+      "image": "alexgshaw/code-from-image:20251031",
+      "kind": "single",
+      "platforms": [
+        "linux/amd64"
+      ]
+    },
+    {
+      "task": "compile-compcert",
+      "image": "alexgshaw/compile-compcert:20260403",
+      "kind": "single",
+      "platforms": [
+        "linux/amd64"
+      ]
+    },
+    {
+      "task": "configure-git-webserver",
+      "image": "alexgshaw/configure-git-webserver:20251031",
+      "kind": "single",
+      "platforms": [
+        "linux/amd64"
+      ]
+    },
+    {
+      "task": "constraints-scheduling",
+      "image": "alexgshaw/constraints-scheduling:20251031",
+      "kind": "single",
+      "platforms": [
+        "linux/amd64"
+      ]
+    },
+    {
+      "task": "count-dataset-tokens",
+      "image": "alexgshaw/count-dataset-tokens:20251031",
+      "kind": "single",
+      "platforms": [
+        "linux/amd64"
+      ]
+    },
+    {
+      "task": "crack-7z-hash",
+      "image": "alexgshaw/crack-7z-hash:20251031",
+      "kind": "single",
+      "platforms": [
+        "linux/amd64"
+      ]
+    },
+    {
+      "task": "custom-memory-heap-crash",
+      "image": "alexgshaw/custom-memory-heap-crash:20251031",
+      "kind": "single",
+      "platforms": [
+        "linux/amd64"
+      ]
+    },
+    {
+      "task": "db-wal-recovery",
+      "image": "alexgshaw/db-wal-recovery:20251031",
+      "kind": "single",
+      "platforms": [
+        "linux/amd64"
+      ]
+    },
+    {
+      "task": "distribution-search",
+      "image": "alexgshaw/distribution-search:20251031",
+      "kind": "single",
+      "platforms": [
+        "linux/amd64"
+      ]
+    },
+    {
+      "task": "dna-assembly",
+      "image": "alexgshaw/dna-assembly:20251031",
+      "kind": "single",
+      "platforms": [
+        "linux/amd64"
+      ]
+    },
+    {
+      "task": "dna-insert",
+      "image": "alexgshaw/dna-insert:20251031",
+      "kind": "single",
+      "platforms": [
+        "linux/amd64"
+      ]
+    },
+    {
+      "task": "extract-elf",
+      "image": "alexgshaw/extract-elf:20251031",
+      "kind": "single",
+      "platforms": [
+        "linux/amd64"
+      ]
+    },
+    {
+      "task": "extract-moves-from-video",
+      "image": "alexgshaw/extract-moves-from-video:20260403",
+      "kind": "single",
+      "platforms": [
+        "linux/amd64"
+      ]
+    },
+    {
+      "task": "feal-differential-cryptanalysis",
+      "image": "alexgshaw/feal-differential-cryptanalysis:20251031",
+      "kind": "single",
+      "platforms": [
+        "linux/amd64"
+      ]
+    },
+    {
+      "task": "feal-linear-cryptanalysis",
+      "image": "alexgshaw/feal-linear-cryptanalysis:20251031",
+      "kind": "single",
+      "platforms": [
+        "linux/amd64"
+      ]
+    },
+    {
+      "task": "filter-js-from-html",
+      "image": "alexgshaw/filter-js-from-html:20251031",
+      "kind": "single",
+      "platforms": [
+        "linux/amd64"
+      ]
+    },
+    {
+      "task": "financial-document-processor",
+      "image": "alexgshaw/financial-document-processor:20251031",
+      "kind": "single",
+      "platforms": [
+        "linux/amd64"
+      ]
+    },
+    {
+      "task": "fix-code-vulnerability",
+      "image": "alexgshaw/fix-code-vulnerability:20251031",
+      "kind": "single",
+      "platforms": [
+        "linux/amd64"
+      ]
+    },
+    {
+      "task": "fix-git",
+      "image": "alexgshaw/fix-git:20260403",
+      "kind": "single",
+      "platforms": [
+        "linux/amd64"
+      ]
+    },
+    {
+      "task": "fix-ocaml-gc",
+      "image": "alexgshaw/fix-ocaml-gc:20251031",
+      "kind": "single",
+      "platforms": [
+        "linux/amd64"
+      ]
+    },
+    {
+      "task": "gcode-to-text",
+      "image": "alexgshaw/gcode-to-text:20251031",
+      "kind": "single",
+      "platforms": [
+        "linux/amd64"
+      ]
+    },
+    {
+      "task": "git-leak-recovery",
+      "image": "alexgshaw/git-leak-recovery:20251031",
+      "kind": "single",
+      "platforms": [
+        "linux/amd64"
+      ]
+    },
+    {
+      "task": "git-multibranch",
+      "image": "alexgshaw/git-multibranch:20251031",
+      "kind": "single",
+      "platforms": [
+        "linux/amd64"
+      ]
+    },
+    {
+      "task": "gpt2-codegolf",
+      "image": "alexgshaw/gpt2-codegolf:20251031",
+      "kind": "single",
+      "platforms": [
+        "linux/amd64"
+      ]
+    },
+    {
+      "task": "headless-terminal",
+      "image": "alexgshaw/headless-terminal:20251031",
+      "kind": "single",
+      "platforms": [
+        "linux/amd64"
+      ]
+    },
+    {
+      "task": "hf-model-inference",
+      "image": "alexgshaw/hf-model-inference:20260430",
+      "kind": "index",
+      "platforms": [
+        "linux/amd64",
+        "linux/arm64"
+      ]
+    },
+    {
+      "task": "install-windows-3.11",
+      "image": "alexgshaw/install-windows-3.11:20251031",
+      "kind": "single",
+      "platforms": [
+        "linux/amd64"
+      ]
+    },
+    {
+      "task": "kv-store-grpc",
+      "image": "alexgshaw/kv-store-grpc:20251031",
+      "kind": "single",
+      "platforms": [
+        "linux/amd64"
+      ]
+    },
+    {
+      "task": "large-scale-text-editing",
+      "image": "alexgshaw/large-scale-text-editing:20251031",
+      "kind": "single",
+      "platforms": [
+        "linux/amd64"
+      ]
+    },
+    {
+      "task": "largest-eigenval",
+      "image": "alexgshaw/largest-eigenval:20251031",
+      "kind": "single",
+      "platforms": [
+        "linux/amd64"
+      ]
+    },
+    {
+      "task": "llm-inference-batching-scheduler",
+      "image": "alexgshaw/llm-inference-batching-scheduler:20251031",
+      "kind": "single",
+      "platforms": [
+        "linux/amd64"
+      ]
+    },
+    {
+      "task": "log-summary-date-ranges",
+      "image": "alexgshaw/log-summary-date-ranges:20251031",
+      "kind": "single",
+      "platforms": [
+        "linux/amd64"
+      ]
+    },
+    {
+      "task": "mailman",
+      "image": "alexgshaw/mailman:20251031",
+      "kind": "single",
+      "platforms": [
+        "linux/amd64"
+      ]
+    },
+    {
+      "task": "make-doom-for-mips",
+      "image": "alexgshaw/make-doom-for-mips:20251031",
+      "kind": "single",
+      "platforms": [
+        "linux/amd64"
+      ]
+    },
+    {
+      "task": "make-mips-interpreter",
+      "image": "alexgshaw/make-mips-interpreter:20251031",
+      "kind": "single",
+      "platforms": [
+        "linux/amd64"
+      ]
+    },
+    {
+      "task": "mcmc-sampling-stan",
+      "image": "alexgshaw/mcmc-sampling-stan:20251031",
+      "kind": "single",
+      "platforms": [
+        "linux/amd64"
+      ]
+    },
+    {
+      "task": "merge-diff-arc-agi-task",
+      "image": "alexgshaw/merge-diff-arc-agi-task:20251031",
+      "kind": "single",
+      "platforms": [
+        "linux/amd64"
+      ]
+    },
+    {
+      "task": "model-extraction-relu-logits",
+      "image": "alexgshaw/model-extraction-relu-logits:20251031",
+      "kind": "single",
+      "platforms": [
+        "linux/amd64"
+      ]
+    },
+    {
+      "task": "modernize-scientific-stack",
+      "image": "alexgshaw/modernize-scientific-stack:20251031",
+      "kind": "single",
+      "platforms": [
+        "linux/amd64"
+      ]
+    },
+    {
+      "task": "mteb-leaderboard",
+      "image": "alexgshaw/mteb-leaderboard:20260430",
+      "kind": "index",
+      "platforms": [
+        "linux/amd64",
+        "linux/arm64"
+      ]
+    },
+    {
+      "task": "mteb-retrieve",
+      "image": "alexgshaw/mteb-retrieve:20260430",
+      "kind": "index",
+      "platforms": [
+        "linux/amd64",
+        "linux/arm64"
+      ]
+    },
+    {
+      "task": "multi-source-data-merger",
+      "image": "alexgshaw/multi-source-data-merger:20251031",
+      "kind": "single",
+      "platforms": [
+        "linux/amd64"
+      ]
+    },
+    {
+      "task": "nginx-request-logging",
+      "image": "alexgshaw/nginx-request-logging:20251031",
+      "kind": "single",
+      "platforms": [
+        "linux/amd64"
+      ]
+    },
+    {
+      "task": "openssl-selfsigned-cert",
+      "image": "alexgshaw/openssl-selfsigned-cert:20251031",
+      "kind": "single",
+      "platforms": [
+        "linux/amd64"
+      ]
+    },
+    {
+      "task": "overfull-hbox",
+      "image": "alexgshaw/overfull-hbox:20260403",
+      "kind": "single",
+      "platforms": [
+        "linux/amd64"
+      ]
+    },
+    {
+      "task": "password-recovery",
+      "image": "alexgshaw/password-recovery:20251031",
+      "kind": "single",
+      "platforms": [
+        "linux/amd64"
+      ]
+    },
+    {
+      "task": "path-tracing",
+      "image": "alexgshaw/path-tracing:20251031",
+      "kind": "single",
+      "platforms": [
+        "linux/amd64"
+      ]
+    },
+    {
+      "task": "path-tracing-reverse",
+      "image": "alexgshaw/path-tracing-reverse:20251031",
+      "kind": "single",
+      "platforms": [
+        "linux/amd64"
+      ]
+    },
+    {
+      "task": "polyglot-c-py",
+      "image": "alexgshaw/polyglot-c-py:20251031",
+      "kind": "single",
+      "platforms": [
+        "linux/amd64"
+      ]
+    },
+    {
+      "task": "polyglot-rust-c",
+      "image": "alexgshaw/polyglot-rust-c:20251031",
+      "kind": "single",
+      "platforms": [
+        "linux/amd64"
+      ]
+    },
+    {
+      "task": "portfolio-optimization",
+      "image": "alexgshaw/portfolio-optimization:20251031",
+      "kind": "single",
+      "platforms": [
+        "linux/amd64"
+      ]
+    },
+    {
+      "task": "protein-assembly",
+      "image": "alexgshaw/protein-assembly:20260403",
+      "kind": "single",
+      "platforms": [
+        "linux/amd64"
+      ]
+    },
+    {
+      "task": "prove-plus-comm",
+      "image": "alexgshaw/prove-plus-comm:20251031",
+      "kind": "single",
+      "platforms": [
+        "linux/amd64"
+      ]
+    },
+    {
+      "task": "pypi-server",
+      "image": "alexgshaw/pypi-server:20251031",
+      "kind": "single",
+      "platforms": [
+        "linux/amd64"
+      ]
+    },
+    {
+      "task": "pytorch-model-cli",
+      "image": "alexgshaw/pytorch-model-cli:20251031",
+      "kind": "single",
+      "platforms": [
+        "linux/amd64"
+      ]
+    },
+    {
+      "task": "pytorch-model-recovery",
+      "image": "alexgshaw/pytorch-model-recovery:20260430",
+      "kind": "index",
+      "platforms": [
+        "linux/amd64",
+        "linux/arm64"
+      ]
+    },
+    {
+      "task": "qemu-alpine-ssh",
+      "image": "alexgshaw/qemu-alpine-ssh:20251031",
+      "kind": "single",
+      "platforms": [
+        "linux/amd64"
+      ]
+    },
+    {
+      "task": "qemu-startup",
+      "image": "alexgshaw/qemu-startup:20251031",
+      "kind": "single",
+      "platforms": [
+        "linux/amd64"
+      ]
+    },
+    {
+      "task": "query-optimize",
+      "image": "alexgshaw/query-optimize:20251031",
+      "kind": "single",
+      "platforms": [
+        "linux/amd64"
+      ]
+    },
+    {
+      "task": "raman-fitting",
+      "image": "alexgshaw/raman-fitting:20251031",
+      "kind": "single",
+      "platforms": [
+        "linux/amd64"
+      ]
+    },
+    {
+      "task": "regex-chess",
+      "image": "alexgshaw/regex-chess:20251031",
+      "kind": "single",
+      "platforms": [
+        "linux/amd64"
+      ]
+    },
+    {
+      "task": "regex-log",
+      "image": "alexgshaw/regex-log:20251031",
+      "kind": "single",
+      "platforms": [
+        "linux/amd64"
+      ]
+    },
+    {
+      "task": "reshard-c4-data",
+      "image": "alexgshaw/reshard-c4-data:20251031",
+      "kind": "single",
+      "platforms": [
+        "linux/amd64"
+      ]
+    },
+    {
+      "task": "rstan-to-pystan",
+      "image": "alexgshaw/rstan-to-pystan:20251031",
+      "kind": "single",
+      "platforms": [
+        "linux/amd64"
+      ]
+    },
+    {
+      "task": "sam-cell-seg",
+      "image": "alexgshaw/sam-cell-seg:20251031",
+      "kind": "single",
+      "platforms": [
+        "linux/amd64"
+      ]
+    },
+    {
+      "task": "sanitize-git-repo",
+      "image": "alexgshaw/sanitize-git-repo:20251031",
+      "kind": "single",
+      "platforms": [
+        "linux/amd64"
+      ]
+    },
+    {
+      "task": "schemelike-metacircular-eval",
+      "image": "alexgshaw/schemelike-metacircular-eval:20251031",
+      "kind": "single",
+      "platforms": [
+        "linux/amd64"
+      ]
+    },
+    {
+      "task": "sparql-university",
+      "image": "alexgshaw/sparql-university:20251031",
+      "kind": "single",
+      "platforms": [
+        "linux/amd64"
+      ]
+    },
+    {
+      "task": "sqlite-db-truncate",
+      "image": "alexgshaw/sqlite-db-truncate:20251031",
+      "kind": "single",
+      "platforms": [
+        "linux/amd64"
+      ]
+    },
+    {
+      "task": "sqlite-with-gcov",
+      "image": "alexgshaw/sqlite-with-gcov:20251031",
+      "kind": "single",
+      "platforms": [
+        "linux/amd64"
+      ]
+    },
+    {
+      "task": "torch-pipeline-parallelism",
+      "image": "alexgshaw/torch-pipeline-parallelism:20251031",
+      "kind": "single",
+      "platforms": [
+        "linux/amd64"
+      ]
+    },
+    {
+      "task": "torch-tensor-parallelism",
+      "image": "alexgshaw/torch-tensor-parallelism:20251031",
+      "kind": "single",
+      "platforms": [
+        "linux/amd64"
+      ]
+    },
+    {
+      "task": "train-fasttext",
+      "image": "alexgshaw/train-fasttext:20251031",
+      "kind": "single",
+      "platforms": [
+        "linux/amd64"
+      ]
+    },
+    {
+      "task": "tune-mjcf",
+      "image": "alexgshaw/tune-mjcf:20251031",
+      "kind": "single",
+      "platforms": [
+        "linux/amd64"
+      ]
+    },
+    {
+      "task": "video-processing",
+      "image": "alexgshaw/video-processing:20251031",
+      "kind": "single",
+      "platforms": [
+        "linux/amd64"
+      ]
+    },
+    {
+      "task": "vulnerable-secret",
+      "image": "alexgshaw/vulnerable-secret:20251031",
+      "kind": "single",
+      "platforms": [
+        "linux/amd64"
+      ]
+    },
+    {
+      "task": "winning-avg-corewars",
+      "image": "alexgshaw/winning-avg-corewars:20251031",
+      "kind": "single",
+      "platforms": [
+        "linux/amd64"
+      ]
+    },
+    {
+      "task": "write-compressor",
+      "image": "alexgshaw/write-compressor:20251031",
+      "kind": "single",
+      "platforms": [
+        "linux/amd64"
+      ]
+    }
+  ]
 }

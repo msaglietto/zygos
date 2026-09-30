@@ -19,6 +19,7 @@ const actor_mod = @import("../kernel/actor.zig");
 const protocol = @import("../kernel/protocol.zig");
 const types = @import("../kernel/types.zig");
 const sync = @import("../kernel/sync.zig");
+const entropy = @import("../kernel/entropy.zig");
 const ticker_mod = @import("ticker.zig");
 const writer_queue = @import("writer_queue.zig");
 
@@ -42,7 +43,7 @@ pub const nowMs = ticker_mod.nowMs;
 /// bits, so the uuid text the SDK sees is well-formed.
 fn newWorkerId() WorkerId {
     var id: WorkerId = undefined;
-    std.c.arc4random_buf(&id, id.len);
+    entropy.fill(&id);
     id[6] = (id[6] & 0x0f) | 0x40;
     id[8] = (id[8] & 0x3f) | 0x80;
     return id;

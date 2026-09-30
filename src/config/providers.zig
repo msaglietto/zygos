@@ -67,6 +67,27 @@ pub fn slug(gpa: std.mem.Allocator, name: []const u8) error{OutOfMemory}![]u8 {
     return out.toOwnedSlice(gpa);
 }
 
+pub const ModelLookupError = error{ OutOfMemory, ModelNotFound, ModelAmbiguous, ModelKind };
+
+/// Bus function for the one catalog row whose `model` equals `model`.
+/// Only an anthropic-compatible row is returned. Two rows, an unknown
+/// model, or any other backend is a refusal. Caller owns the result.
+pub fn functionForModel(gpa: std.mem.Allocator, catalog: *const Catalog, model: []const u8) ModelLookupError![]u8 {
+    var found: ?Provider = null;
+    for (catalog.providers) |entry| {
+        if (!std.mem.eql(u8, entry.model, model)) continue;
+        if (found != null) return error.ModelAmbiguous;
+        found = entry;
+    }
+    const entry = found orelse return error.ModelNotFound;
+    if (entry.kind != .anthropic_compatible) return error.ModelKind;
+    const s = try slug(gpa, entry.name);
+    defer gpa.free(s);
+    return std.fmt.allocPrint(gpa, "zygos::providers::{s}", .{s}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+}
+
 /// `AI_PROVIDERS_CONFIG` override, else `<HOME>/.agents/providers.toml`.
 /// Caller owns the result.
 pub fn configPath(gpa: std.mem.Allocator, env: []const EnvPair) error{ OutOfMemory, NoHome }![]u8 {
@@ -710,6 +731,57 @@ test "slug: mixed case, spaces, punctuation, leading/trailing junk" {
         defer t.allocator.free(s);
         try t.expectEqualStrings(case.out, s);
     }
+}
+
+test "functionForModel maps the approved pilot model and refuses the rest" {
+    const toml =
+        \\[[providers]]
+        \\name = "GLM Flash"
+        \\type = "anthropic_compatible"
+        \\model = "glm-5.3-flash"
+        \\endpoint = "https://api.z.ai/api/anthropic"
+        \\
+        \\[[providers]]
+        \\name = "GLM 5.2"
+        \\type = "openai_compatible"
+        \\model = "glm-5.3"
+        \\endpoint = "https://example.invalid"
+    ;
+    var cat = try Catalog.parse(t.allocator, toml, null);
+    defer cat.deinit();
+    const fn_name = try functionForModel(t.allocator, &cat, "glm-5.3-flash");
+    defer t.allocator.free(fn_name);
+    try t.expectEqualStrings("zygos::providers::glm-flash", fn_name);
+    try t.expectError(error.ModelKind, functionForModel(t.allocator, &cat, "glm-5.3"));
+    try t.expectError(error.ModelNotFound, functionForModel(t.allocator, &cat, "glm5.3-flash"));
+
+    const duped =
+        \\[[providers]]
+        \\name = "GLM Flash"
+        \\type = "anthropic_compatible"
+        \\model = "glm-5.3-flash"
+        \\endpoint = "https://api.z.ai/api/anthropic"
+        \\
+        \\[[providers]]
+        \\name = "GLM Flash Copy"
+        \\type = "anthropic_compatible"
+        \\model = "glm-5.3-flash"
+        \\endpoint = "https://api.z.ai/api/anthropic"
+    ;
+    var two = try Catalog.parse(t.allocator, duped, null);
+    defer two.deinit();
+    try t.expectError(error.ModelAmbiguous, functionForModel(t.allocator, &two, "glm-5.3-flash"));
+
+    const wrong_kind =
+        \\[[providers]]
+        \\name = "GLM Flash"
+        \\type = "openai_compatible"
+        \\model = "glm-5.3-flash"
+        \\endpoint = "https://example.invalid"
+    ;
+    var openai = try Catalog.parse(t.allocator, wrong_kind, null);
+    defer openai.deinit();
+    try t.expectError(error.ModelKind, functionForModel(t.allocator, &openai, "glm-5.3-flash"));
 }
 
 test "configPath: AI_PROVIDERS_CONFIG override, else HOME fallback" {

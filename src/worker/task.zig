@@ -40,6 +40,10 @@ pub const fixture_body = "alpha\nbeta\ngamma\n";
 pub const fixture_lines: u64 = 3;
 /// Four scripted provider messages: bash, read, write, end_turn.
 pub const offline_step_cap: usize = 4;
+/// The scripted provider. A live hook must name some other function.
+pub const fake_upstream = "zygos::provider::fake::messages";
+/// Phase 8 bound. A larger cap belongs to a later phase.
+pub const pilot_step_cap_max: usize = 32;
 
 pub const TaskError = error{ OutOfMemory, Refused, Failed };
 
@@ -54,6 +58,15 @@ fn mapBoot(err: anyerror) TaskError {
 pub const ExtraTool = struct {
     name: []const u8,
     function_id: []const u8,
+};
+
+/// Registers the real provider on the task actor. The task module does not
+/// open a socket and does not read a catalog; the caller does, and only
+/// when this hook is set. `stop` is idempotent.
+pub const LiveHooks = struct {
+    ctx: *anyopaque,
+    boot: *const fn (ctx: *anyopaque, gpa: std.mem.Allocator, actor: *actor_mod.Actor, registry: *inproc.Registry) anyerror!void,
+    stop: *const fn (ctx: *anyopaque) void,
 };
 
 pub const Config = struct {
@@ -75,6 +88,13 @@ pub const Config = struct {
     trim: bool = true,
     seed_fixture: bool = false,
     extra_tools: []const ExtraTool = &.{},
+    /// Cache-count bridge target. Offline stays on the scripted fake.
+    upstream: []const u8 = fake_upstream,
+    /// When set, the scripted provider is not started. `script` must be
+    /// empty and `upstream` must be the function `boot` registers.
+    live: ?LiveHooks = null,
+    /// Deadline for `zygos::turns::run`, which spans every step.
+    invoke_timeout_ms: i64 = 30_000,
 };
 
 pub const RunResult = struct {
@@ -140,7 +160,11 @@ pub fn run(gpa: std.mem.Allocator, cfg: Config) TaskError!RunResult {
     // "//" and "///" start with '/' and trim to empty, which `resolve` would treat as inside.
     if (cfg.workspace.len < 2 or cfg.workspace[0] != '/') return error.Refused;
     if (std.mem.trimEnd(u8, cfg.workspace, "/").len < 2) return error.Refused;
-    if (cfg.script.len == 0 or cfg.step_cap == 0) return error.Refused;
+    if (cfg.step_cap == 0) return error.Refused;
+    if (cfg.live != null) {
+        if (cfg.script.len != 0) return error.Refused;
+        if (cfg.upstream.len == 0 or std.mem.eql(u8, cfg.upstream, fake_upstream)) return error.Refused;
+    } else if (cfg.script.len == 0) return error.Refused;
     if (!trial_mod.identityComplete(cfg.identity)) return error.Refused;
     if (cfg.variable.len == 0) return error.Refused;
 
@@ -256,6 +280,8 @@ const Session = struct {
     policy: ?*policy_mod.PolicyWorker = null,
     trim: ?*trim_mod.TrimWorker = null,
     fake: ?*fake_mod.FakeProvider = null,
+    live_ctx: ?*anyopaque = null,
+    live_stop: ?*const fn (ctx: *anyopaque) void = null,
     bridge: ?*Bridge = null,
     turns: ?*turn_mod.TurnOrchestrator = null,
     caller: ?*inproc.Worker = null,
@@ -268,7 +294,9 @@ const Session = struct {
             .actor = undefined,
             .kernel = undefined,
         };
-        self.actor = actor_mod.Actor.init(gpa, .{}, self.registry.outbound()) catch |err| switch (err) {
+        self.actor = actor_mod.Actor.init(gpa, .{
+            .invoke_timeout_ms = cfg.invoke_timeout_ms,
+        }, self.registry.outbound()) catch |err| switch (err) {
             error.OutOfMemory => {
                 self.registry.deinit();
                 gpa.destroy(self);
@@ -298,10 +326,16 @@ const Session = struct {
                 return mapBoot(err);
             };
         }
-        self.fake = fake_mod.FakeProvider.start(gpa, &self.actor, &self.registry, cfg.script) catch |err| {
-            return mapBoot(err);
-        };
-        self.bridge = Bridge.start(gpa, &self.actor, &self.registry) catch |err| return mapBoot(err);
+        if (cfg.live) |hooks| {
+            hooks.boot(hooks.ctx, gpa, &self.actor, &self.registry) catch |err| return mapBoot(err);
+            self.live_ctx = hooks.ctx;
+            self.live_stop = hooks.stop;
+        } else {
+            self.fake = fake_mod.FakeProvider.start(gpa, &self.actor, &self.registry, cfg.script) catch |err| {
+                return mapBoot(err);
+            };
+        }
+        self.bridge = Bridge.start(gpa, &self.actor, &self.registry, cfg.upstream) catch |err| return mapBoot(err);
         self.turns = turn_mod.TurnOrchestrator.start(gpa, &self.actor, &self.registry) catch |err| {
             return mapBoot(err);
         };
@@ -316,6 +350,7 @@ const Session = struct {
         if (self.caller) |w| w.stop();
         if (self.turns) |w| w.stop();
         if (self.bridge) |w| w.stop();
+        if (self.live_stop) |stop| stop(self.live_ctx.?);
         if (self.fake) |w| w.stop();
         if (self.trim) |w| w.stop();
         if (self.policy) |w| w.stop();
@@ -374,6 +409,7 @@ const UsageTotals = struct {
 const Bridge = struct {
     gpa: std.mem.Allocator,
     worker: *inproc.Worker,
+    upstream: []const u8,
     mutex: sync.Mutex = .{},
     totals_value: UsageTotals = .{},
 
@@ -381,12 +417,14 @@ const Bridge = struct {
         gpa: std.mem.Allocator,
         actor: *actor_mod.Actor,
         registry: *inproc.Registry,
+        upstream: []const u8,
     ) TaskError!*Bridge {
         const self = try gpa.create(Bridge);
         errdefer gpa.destroy(self);
         self.* = .{
             .gpa = gpa,
             .worker = undefined,
+            .upstream = upstream,
         };
         errdefer self.mutex.deinit();
         self.worker = inproc.Worker.spawn(gpa, actor, registry, "task-provider") catch |err| return mapBoot(err);
@@ -410,7 +448,7 @@ const Bridge = struct {
 
     fn handler(ctx: ?*anyopaque, arena: std.mem.Allocator, request_json: []const u8) error{ Failed, OutOfMemory }![]const u8 {
         const self: *Bridge = @ptrCast(@alignCast(ctx.?));
-        const res = self.worker.call("zygos::provider::fake::messages", request_json) catch |err| switch (err) {
+        const res = self.worker.call(self.upstream, request_json) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.Shutdown => return error.Failed,
         };
@@ -726,6 +764,11 @@ test "eval runner stays outside zig build test and pins the dataset" {
     try testing.expect(std.mem.indexOf(u8, runner, "*ready*") == null);
     try testing.expect(std.mem.indexOf(u8, runner, "zygos task run --offline") != null);
     try testing.expect(std.mem.indexOf(u8, runner, "terminal-bench/terminal-bench@4.0.0") != null);
+    try testing.expect(std.mem.indexOf(u8, runner, "refusing a live Harbor run") != null);
+    try testing.expect(std.mem.indexOf(u8, runner, "glm-5.3-flash") != null);
+    try testing.expect(std.mem.indexOf(u8, runner, "DOCKER_DEFAULT_PLATFORM=linux/amd64") != null);
+    try testing.expect(std.mem.indexOf(u8, runner, "-k 1") != null);
+    try testing.expect(std.mem.indexOf(u8, runner, "--upload") == null);
 
     const trial_src = fsx_mod.readWholeFile(testing.allocator, "src/worker/trial.zig") orelse return error.NoTrial;
     defer testing.allocator.free(trial_src);
@@ -739,8 +782,13 @@ test "eval runner stays outside zig build test and pins the dataset" {
 
     const inventory = fsx_mod.readWholeFile(testing.allocator, "eval/image-platforms.json") orelse return error.NoInventory;
     defer testing.allocator.free(inventory);
-    try testing.expect(std.mem.indexOf(u8, inventory, "\"status\": \"blocked\"") != null);
-    try testing.expect(std.mem.indexOf(u8, inventory, "\"chosen_triple\": null") != null);
+    // The triple is the string std.Target.zigTriple stamps for -Dtarget=x86_64-linux-gnu.
+    // Every Terminal-Bench 2.1 environment image publishes linux/amd64.
+    try testing.expect(std.mem.indexOf(u8, inventory, "\"status\": \"ready\"") != null);
+    try testing.expect(std.mem.indexOf(u8, inventory, "\"chosen_platform\": \"linux/amd64\"") != null);
+    try testing.expect(std.mem.indexOf(u8, inventory, "\"chosen_triple\": \"x86_64-linux.5.10...6.19-gnu.2.31\"") != null);
+    try testing.expect(std.mem.indexOf(u8, inventory, "\"image_count\": 89") != null);
+    try testing.expect(std.mem.indexOf(u8, inventory, "\"chosen_triple\": null") == null);
 }
 
 test "bench rules allow bash, read_file, and write_file and deny everything else" {
@@ -779,4 +827,72 @@ test "bench rules allow bash, read_file, and write_file and deny everything else
         try testing.expect(res == .ok);
         try testing.expect(std.mem.indexOf(u8, res.ok, case.verdict) != null);
     }
+}
+
+const stub_end_turn = "{\"stop_reason\":\"end_turn\",\"usage\":{\"input_tokens\":4,\"output_tokens\":2,\"cache_read_input_tokens\":9},\"content\":[{\"type\":\"text\",\"text\":\"done\"}]}";
+
+const StubProvider = struct {
+    worker: ?*inproc.Worker = null,
+
+    fn boot(ctx: *anyopaque, gpa: std.mem.Allocator, actor: *actor_mod.Actor, registry: *inproc.Registry) anyerror!void {
+        const self: *StubProvider = @ptrCast(@alignCast(ctx));
+        const worker = try inproc.Worker.spawn(gpa, actor, registry, "stub-provider");
+        errdefer worker.stop();
+        try worker.registerFunction("zygos::providers::stub", self, &handler);
+        self.worker = worker;
+    }
+
+    fn stop(ctx: *anyopaque) void {
+        const self: *StubProvider = @ptrCast(@alignCast(ctx));
+        if (self.worker) |w| {
+            self.worker = null;
+            w.stop();
+        }
+    }
+
+    fn handler(_: ?*anyopaque, arena: std.mem.Allocator, _: []const u8) error{ Failed, OutOfMemory }![]const u8 {
+        return arena.dupe(u8, stub_end_turn);
+    }
+};
+
+test "a live hook is forwarded and an empty script without one is refused" {
+    var dir = try TestDir.init();
+    defer dir.deinit();
+    const root = try dir.root();
+    try testing.expectError(error.Refused, run(testing.allocator, .{
+        .workspace = root,
+        .instruction = "x",
+        .task_id = "t",
+        .dataset = "d",
+        .model_id = "m",
+        .variable = "trim-off",
+        .step_cap = 1,
+        .identity = testIdentity(),
+        .script = &.{},
+        .trim = false,
+    }));
+
+    var stub = StubProvider{};
+    const result = try run(testing.allocator, .{
+        .workspace = root,
+        .instruction = "Say done.",
+        .task_id = "pilot-stub",
+        .dataset = "terminal-bench/terminal-bench-2-1",
+        .model_id = "glm-5.3-flash",
+        .variable = "trim-off",
+        .step_cap = 1,
+        .identity = testIdentity(),
+        .script = &.{},
+        .trim = false,
+        .upstream = "zygos::providers::stub",
+        .live = .{
+            .ctx = @ptrCast(&stub),
+            .boot = StubProvider.boot,
+            .stop = StubProvider.stop,
+        },
+    });
+    defer result.deinit(testing.allocator);
+    try testing.expect(std.mem.indexOf(u8, result.trial_json, "\"model_id\":\"glm-5.3-flash\"") != null);
+    try testing.expect(std.mem.indexOf(u8, result.trial_json, "\"input_tokens\":4") != null);
+    try testing.expect(std.mem.indexOf(u8, result.trial_json, "\"cache_read_tokens\":9") != null);
 }

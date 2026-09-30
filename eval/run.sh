@@ -9,11 +9,41 @@ set -eu
 pinned="terminal-bench/terminal-bench-2-1"
 dataset="$pinned"
 dry=0
+pilot_task=""
+pilot_model=""
+pilot_dir=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run)
       dry=1
+      shift
+      ;;
+    --task)
+      shift
+      if [ $# -eq 0 ]; then
+        echo "eval: missing task" >&2
+        exit 2
+      fi
+      pilot_task="$1"
+      shift
+      ;;
+    --model)
+      shift
+      if [ $# -eq 0 ]; then
+        echo "eval: missing model" >&2
+        exit 2
+      fi
+      pilot_model="$1"
+      shift
+      ;;
+    --task-dir)
+      shift
+      if [ $# -eq 0 ]; then
+        echo "eval: missing task dir" >&2
+        exit 2
+      fi
+      pilot_dir="$1"
       shift
       ;;
     --dataset)
@@ -27,6 +57,7 @@ while [ $# -gt 0 ]; do
       ;;
     --help|-h)
       echo "usage: eval/run.sh [--dry-run] [--dataset terminal-bench/terminal-bench-2-1]"
+      echo "       eval/run.sh --task NAME --model glm-5.3-flash --task-dir DIR"
       exit 0
       ;;
     *)
@@ -66,6 +97,51 @@ if [ "$dry" -eq 1 ]; then
   echo "target: $target"
   echo "inventory: $inventory_status"
   exit 0
+fi
+
+# Phase 8 only: one task, n=1, model glm-5.3-flash, linux/amd64.
+# Any other shape falls through to the refusal below.
+if [ -n "$pilot_task" ] || [ -n "$pilot_model" ] || [ -n "$pilot_dir" ]; then
+  if [ "$pilot_model" != "glm-5.3-flash" ] || [ -z "$pilot_task" ] || [ -z "$pilot_dir" ]; then
+    echo "eval: refusing a live Harbor run until a dated model id and a spend approval exist" >&2
+    exit 2
+  fi
+  case "$pilot_task" in
+    *[!A-Za-z0-9._-]*)
+      echo "eval: refusing a live Harbor run until a dated model id and a spend approval exist" >&2
+      exit 2
+      ;;
+  esac
+  if [ "$(basename "$pilot_dir")" != "$pilot_task" ] || [ ! -f "$pilot_dir/task.toml" ]; then
+    echo "eval: refusing a live Harbor run until a dated model id and a spend approval exist" >&2
+    exit 2
+  fi
+  if [ "$inventory_status" != "ready" ]; then
+    echo "eval: refusing a live Harbor run until a dated model id and a spend approval exist" >&2
+    exit 2
+  fi
+  binary="$script_dir/../zig-out/linux-x86_64/bin/zygos"
+  if [ ! -f "$binary" ]; then
+    echo "eval: linux zygos binary is missing" >&2
+    exit 2
+  fi
+  repo=$(CDPATH= cd -- "$script_dir/.." && pwd)
+  export DOCKER_DEFAULT_PLATFORM=linux/amd64
+  export ZYGOS_LINUX_BIN="$repo/zig-out/linux-x86_64/bin/zygos"
+  export ZYGOS_TASK_ID="$pilot_task"
+  export ZYGOS_STEP_CAP=24
+  export ZYGOS_WORKSPACE=/app
+  cd "$repo"
+  PYTHONPATH="$repo" exec harbor run \
+    -p "$pilot_dir" \
+    -a eval.harbor.zygos_agent:ZygosAgent \
+    -m glm-5.3-flash \
+    -k 1 \
+    --n-concurrent 1 \
+    --n-concurrent-agents 1 \
+    --max-retries 0 \
+    --yes \
+    -o /tmp/zygos-phase8
 fi
 
 echo "eval: refusing a live Harbor run until a dated model id and a spend approval exist" >&2

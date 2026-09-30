@@ -59,6 +59,7 @@ pub const providers_catalog = @import("config/providers.zig");
 pub const tui = @import("tui/tui.zig");
 pub const types = @import("kernel/types.zig");
 pub const sync = @import("kernel/sync.zig");
+pub const entropy = @import("kernel/entropy.zig");
 pub const catalog = @import("kernel/catalog.zig");
 pub const channel = @import("kernel/channel.zig");
 pub const invocation = @import("kernel/invocation.zig");

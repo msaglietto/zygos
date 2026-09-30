@@ -73,7 +73,22 @@ Done. The only accepted pin is `terminal-bench/terminal-bench-2-1`. `./eval/run.
 
 ## Phase 8 — Pilot
 
-Not started. One short task, n=1, after its own spend approval and a dated catalog model id. The image would have to match a phase 7 triple. There is no triple and no approval.
+Inventory and the Linux binary are recorded on 2026-09-30. The paid task is not started. No dollar cap was named, so nothing here spends. The dated catalog model for the pilot, when it is approved, is `glm-5.3-flash`. Phases 9–12 stay unstarted.
+
+`eval/image-platforms.json` is `status: ready`. The source is the public task set at `https://github.com/harbor-framework/terminal-bench-2-1` (89 `task.toml` files under `tasks/`, each with `docker_image`). Registry manifests, read on 2026-09-30:
+
+| Manifest | Tasks |
+| --- | --- |
+| single-arch `linux/amd64` | 85 |
+| index `linux/amd64` + `linux/arm64` | 4 (`hf-model-inference`, `mteb-leaderboard`, `mteb-retrieve`, `pytorch-model-recovery`, tag `20260430`) |
+
+No image is arm64-only. The chosen platform is `linux/amd64`. The chosen triple is `x86_64-linux.5.10...6.19-gnu.2.31`, which is what `std.Target.zigTriple` stamps for `-Dtarget=x86_64-linux-gnu`. The glibc floor is 2.31. The Docker daemon on this machine is `linux/arm64` (client and server 29.8.1), so an amd64 container runs under emulation. Harbor 0.23.0 is on `PATH`.
+
+`std.c.arc4random_buf` does not exist on the Linux target in Zig 0.16, and glibc 2.36 is newer than this floor, so channel keys and worker ids take macOS `arc4random_buf` or the Linux `getrandom` syscall. The call signatures are unchanged.
+
+The Linux binary is a ReleaseSafe build (`zig build -Dtarget=x86_64-linux-gnu -Doptimize=ReleaseSafe --prefix zig-out/linux-x86_64`). `zig-out/` is gitignored. A dirty tree stamps git sha `unknown`, and `zygos task` refuses to write a trial for that sha. The pilot binary has to be rebuilt from a clean tree after this inventory is committed.
+
+The one Harbor task is still refused. `eval/run.sh` without `--dry-run` exits 2, and `zygos task run` without `--offline` exits 2. The shortest agent timeout in the set is `modernize-scientific-stack` at 600 seconds. That task was not started.
 
 ## Phase 9 — Freeze the canary
 
