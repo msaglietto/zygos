@@ -2,7 +2,7 @@
 
 Rules below are the ones whose failure crosses a trust, spend, or durability boundary. Status words are only: pinned by existing tests, proposed, guarded-live, unverified.
 
-`zig build test` is the merge gate this repo actually runs (848 tests, leak-checked, no network). It is not wired to a hosted required check. Adding that check is an operator decision.
+`zig build test` is the merge gate this repo actually runs (849 tests, leak-checked, no network). Pull requests and pushes to `master` run that suite and `zig fmt --check src/` via `.github/workflows/verify.yml`. GitHub Free rejects branch protection on a private repository, so a red check is reported and does not block the merge button.
 
 ## Existing coverage
 
@@ -31,14 +31,11 @@ Rules below are the ones whose failure crosses a trust, spend, or durability bou
 | Session read | Orient and `session_open` read only through the sessions they use | Bytes after the next header are absent | `src/worker/tessera/vault.zig` test `readThroughSessions stops before the next session header` | unit | pinned by existing tests |
 | Mission tool list | The start body offers bash, web_search, and web_fetch | `read_file` and `write_file` are not in the list | `src/worker/mission/start.zig` test `mission start offers bash, web_search, and web_fetch only` | unit | pinned by existing tests |
 | Output filters | Real git output is compressed; deleting a guard fails the suite | `raw: true` bypasses the seam | `test/e2e/m8/run.sh`, `test/mutation/guards.sh`, `test/probe/filter/run.sh` | integration | pinned by existing tests |
+| PR verify | Each pull request runs `zig fmt --check src/` and `zig build test` | A format or test failure fails the job. The merge button stays available on this GitHub plan | `.github/workflows/verify.yml` | integration | pinned by existing tests |
 
 ## Proposed tests
 
-| Use case | Rule | Expected, including the deny | Evidence | Type | Status |
-|---|---|---|---|---|---|
-| Hosted merge gate | `zig build test` and `zig fmt --check src/` are required on `main` | A red suite cannot merge | This file | integration | proposed |
-
-No other proposed case is written here. The two security items in the shipping packet are product decisions, not tests to add until a human picks the contract.
+No proposed case is written here. The two security items in the shipping packet are product decisions, not tests to add until a human picks the contract.
 
 ## Guarded-live
 
