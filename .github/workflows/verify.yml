@@ -1,0 +1,32 @@
+# Reports formatting and the offline test suite.
+# GitHub Free rejects branch protection on a private repo, so a red
+# job is visible on the pull request and does not block the merge button.
+name: verify
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verify-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: fmt and test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: xyzzylabs/setup-zig@ab632f9cc6f98d89d3b8f2c2e1577a929d0e70f3 # v1.0.4
+        with:
+          # Matches minimum_zig_version in build.zig.zon.
+          version: 0.16.0
+      - name: fmt
+        run: zig fmt --check src/
+      - name: test
+        run: zig build test
