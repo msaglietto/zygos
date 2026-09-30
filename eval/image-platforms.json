@@ -1,0 +1,6 @@
+{
+  "status": "blocked",
+  "reason": "Harbor is not installed and the Terminal-Bench 2.1 image set is not on disk, so no image platform was inventoried. The target triple stays unchosen until that inventory exists.",
+  "chosen_triple": null,
+  "images": []
+}

@@ -6,6 +6,22 @@ const std = @import("std");
 // for defining build steps and express dependencies between them, allowing the
 // build runner to parallelize the build automatically (and the cache system to
 // know when a step doesn't need to be re-run).
+fn embeddedGitSha(b: *std.Build) []const u8 {
+    var code: u8 = 0;
+    const argv: []const []const u8 = if (b.build_root.path) |dir|
+        &.{ "git", "-C", dir, "rev-parse", "HEAD" }
+    else
+        &.{ "git", "rev-parse", "HEAD" };
+    const raw = b.runAllowFail(argv, &code, .ignore) catch return "unknown";
+    const sha = std.mem.trim(u8, raw, " \t\r\n");
+    if (sha.len != 40) return "unknown";
+    for (sha) |byte| {
+        const hex = (byte >= '0' and byte <= '9') or (byte >= 'a' and byte <= 'f');
+        if (!hex) return "unknown";
+    }
+    return sha;
+}
+
 pub fn build(b: *std.Build) void {
     // Standard target options allow the person running `zig build` to choose
     // what target to build for. Here we do not override the defaults, which
@@ -92,6 +108,13 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+
+    // Trial build identity. A missing git checkout stores "unknown"; the task
+    // command then refuses to write a trial. Not a dependency and not a test
+    // step input beyond this string.
+    const build_options = b.addOptions();
+    build_options.addOption([]const u8, "git_sha", embeddedGitSha(b));
+    exe.root_module.addOptions("build_info", build_options);
 
     // This declares intent for the executable to be installed into the
     // install prefix when running `zig build` (i.e. when executing the default
