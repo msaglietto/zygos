@@ -43,11 +43,13 @@ fi
 
 inventory_status="blocked"
 target="pending-inventory"
-inventory_file="eval/image-platforms.json"
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+inventory_file="$script_dir/image-platforms.json"
 if [ -f "$inventory_file" ]; then
   status_line=$(grep -o '"status"[[:space:]]*:[[:space:]]*"[^"]*"' "$inventory_file" | head -n 1 || true)
-  case "$status_line" in
-    *ready*) inventory_status="ready" ;;
+  status_value=$(printf '%s' "$status_line" | sed 's/.*"\([^"]*\)"$/\1/')
+  case "$status_value" in
+    ready) inventory_status="ready" ;;
     *) inventory_status="blocked" ;;
   esac
   triple_line=$(grep -o '"chosen_triple"[[:space:]]*:[[:space:]]*"[^"]*"' "$inventory_file" | head -n 1 || true)
@@ -57,9 +59,10 @@ if [ -f "$inventory_file" ]; then
 fi
 
 if [ "$dry" -eq 1 ]; then
+  adapter_version=$(sed -n 's/^pub const adapter_version = "\([^"]*\)";.*/\1/p' "$script_dir/../src/worker/trial.zig")
   echo "dataset: $pinned"
   echo "command: zygos task run --offline --workspace <workspace> --out trial.json --events events.jsonl"
-  echo "adapter_version: 0.1.0"
+  echo "adapter_version: ${adapter_version:-unknown}"
   echo "target: $target"
   echo "inventory: $inventory_status"
   exit 0

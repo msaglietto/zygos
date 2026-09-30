@@ -57,7 +57,7 @@ SDKs. See `GOAL.md` for the mission, `docs/ARCHITECTURE.md` and
 Requires Zig 0.16.0 (and libc — pthread + CSPRNG; macOS or Linux).
 
 ```bash
-zig build test   # full suite (870 tests, leak-checked, no network)
+zig build test   # full suite (872 tests, leak-checked, no network)
 zig build        # produces zig-out/bin/zygos
 ```
 

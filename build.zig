@@ -14,11 +14,22 @@ fn embeddedGitSha(b: *std.Build) []const u8 {
         &.{ "git", "rev-parse", "HEAD" };
     const raw = b.runAllowFail(argv, &code, .ignore) catch return "unknown";
     const sha = std.mem.trim(u8, raw, " \t\r\n");
-    if (sha.len != 40) return "unknown";
+    // SHA-1 is 40 hex chars. SHA-256 is 64. Anything else is not a commit id.
+    if (sha.len != 40 and sha.len != 64) return "unknown";
     for (sha) |byte| {
         const hex = (byte >= '0' and byte <= '9') or (byte >= 'a' and byte <= 'f');
         if (!hex) return "unknown";
     }
+    // HEAD on a dirty tree is not the bytes in this binary. The task command
+    // refuses "unknown", so two arms cannot share a sha that does not contain
+    // the code.
+    var status_code: u8 = 0;
+    const status_argv: []const []const u8 = if (b.build_root.path) |dir|
+        &.{ "git", "-C", dir, "status", "--porcelain" }
+    else
+        &.{ "git", "status", "--porcelain" };
+    const status = b.runAllowFail(status_argv, &status_code, .ignore) catch return "unknown";
+    if (std.mem.trim(u8, status, " \t\r\n").len != 0) return "unknown";
     return sha;
 }
 

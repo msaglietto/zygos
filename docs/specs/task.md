@@ -28,7 +28,7 @@ Fixed key order so two offline runs match byte for byte. Cache keys are omitted 
 - `cache_read_tokens`, `cache_creation_tokens` when present
 - `trim`: `calls`, `filtered`, `deduped`, `raw_bytes`, `sent_bytes`, `reduction`
 
-`reduction` is `(raw - sent) * 100 / raw` when `raw > 0` and `sent < raw`, else 0. The git sha is the Zygos build, not the task workspace. `optimize` is the build mode name (`Debug`, `ReleaseSafe`, `ReleaseFast`, `ReleaseSmall`).
+`reduction` is `(raw - sent) * 100 / raw` when `raw > 0` and `sent < raw`, else 0. The git sha is the Zygos build, not the task workspace. A dirty worktree, a missing git checkout, or a hash that is not 40 or 64 hex characters embeds `unknown`, and the task command then refuses to write a trial. `optimize` is the build mode name (`Debug`, `ReleaseSafe`, `ReleaseFast`, `ReleaseSmall`).
 
 The trace file given to `--events` stays the usage line from `trace_event.zig`: `input_tokens` and `output_tokens`. Cache counts are not added there.
 
@@ -41,6 +41,8 @@ Deny by default. Allowed tool names: `bash`, `read_file`, `write_file`, inside t
 `zygos task score` exits 0 and prints `cents`, `source_lines_read`, and `reduction`, or exits 2 and prints the error name.
 
 Refused: trim-on with no snapshot, trim-on with `calls == 0`, trim-on with `reduction == 0`, empty build identity, missing price, any variable other than `trim-on` or `trim-off`. Accepted: trim-off with reduction 0.
+
+A trim-on snapshot whose `sent_bytes` exceeds `raw_bytes`, or whose recorded `reduction` is not the value computed from those two fields, is `MalformedTrial`. Token addition or the price multiplication that does not fit in a `u64` is the same error. A consistent zero on trim-on stays `TrimOnZeroReduction`.
 
 Cents are integer: `(input_tokens + output_tokens) * cents_per_mtok / 1000000`.
 

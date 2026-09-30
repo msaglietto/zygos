@@ -2,7 +2,7 @@
 
 Recorded 2026-09-28. This is the human follow-up for the revised Harbor / Terminal-Bench plan. Phases 1–7 are done. Phases 8–12 are not started. No dated model id was named, and no dollar cap was chosen, so nothing here spends.
 
-The offline binary that produced the trial below is git `a2a9bf03fe8b808c2a6dfd9a059e3f358346f7c7`, target `aarch64-macos.26.7...26.7-none`, optimize `Debug`, adapter `0.1.0`.
+The offline binary that produced the trial below is git `a2a9bf03fe8b808c2a6dfd9a059e3f358346f7c7`, target `aarch64-macos.26.7...26.7-none`, optimize `Debug`, adapter `0.1.0`. That binary was built from a dirty tree, so the stamped sha is the parent commit and does not contain this work. A later build stamps `unknown` when `git status --porcelain` is non-empty, and the task command refuses `unknown`.
 
 ## Where the decisions live
 
@@ -10,7 +10,7 @@ The offline binary that produced the trial below is git `a2a9bf03fe8b808c2a6dfd9
 | --- | --- |
 | `docs/adr/001-bench-allowlist.md` | Task runs allow bash, read_file, and write_file inside the workspace. Mission policy is unchanged. |
 | `docs/adr/002-cache-tokens-off-trace.md` | Cache counts are fields of `trial.json` only. The `events.jsonl` usage line stays `input_tokens` and `output_tokens`. |
-| `docs/adr/003-trim-on-zero-is-scorer-error.md` | A trim-on arm with a missing snapshot, zero calls, or zero reduction fails the scorer. Trim-off zero is the control. |
+| `docs/adr/003-trim-on-zero-is-scorer-error.md` | A trim-on arm with a missing snapshot, zero calls, or zero reduction fails the scorer. A reduction that does not match raw and sent is malformed. Trim-off zero is the control. |
 | `docs/adr/004-per-phase-spend.md` | Phases 8, 9, and 10 each need their own approval. This record does not pick a dollar amount. |
 
 Operator contract: `docs/specs/task.md` and the "Headless task (offline)" section of `README.md`. `docs/PROTOCOL.md` and `build.zig.zon` were not edited.

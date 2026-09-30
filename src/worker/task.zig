@@ -137,7 +137,9 @@ pub fn freeScript(gpa: std.mem.Allocator, script: []const []const u8) void {
 }
 
 pub fn run(gpa: std.mem.Allocator, cfg: Config) TaskError!RunResult {
+    // "//" and "///" start with '/' and trim to empty, which `resolve` would treat as inside.
     if (cfg.workspace.len < 2 or cfg.workspace[0] != '/') return error.Refused;
+    if (std.mem.trimEnd(u8, cfg.workspace, "/").len < 2) return error.Refused;
     if (cfg.script.len == 0 or cfg.step_cap == 0) return error.Refused;
     if (!trial_mod.identityComplete(cfg.identity)) return error.Refused;
     if (cfg.variable.len == 0) return error.Refused;
@@ -701,6 +703,8 @@ test "a non-absolute workspace or an empty build identity is refused" {
     const script = [_][]const u8{end_turn_line};
     try testing.expectError(error.Refused, run(testing.allocator, offlineConfig("relative", null, &script)));
     try testing.expectError(error.Refused, run(testing.allocator, offlineConfig("", null, &script)));
+    try testing.expectError(error.Refused, run(testing.allocator, offlineConfig("//", null, &script)));
+    try testing.expectError(error.Refused, run(testing.allocator, offlineConfig("///", null, &script)));
     var cfg = offlineConfig("/workspace", null, &script);
     cfg.identity.git_sha = "";
     cfg.seed_fixture = false;
@@ -715,9 +719,23 @@ test "eval runner stays outside zig build test and pins the dataset" {
     const runner = fsx_mod.readWholeFile(testing.allocator, "eval/run.sh") orelse return error.NoRunner;
     defer testing.allocator.free(runner);
     try testing.expect(std.mem.indexOf(u8, runner, "terminal-bench/terminal-bench-2-1") != null);
-    try testing.expect(std.mem.indexOf(u8, runner, "adapter_version: 0.1.0") != null);
+    // One adapter version: the shell reads `trial.adapter_version`. It does not echo a second copy.
+    try testing.expect(std.mem.indexOf(u8, runner, "pub const adapter_version") != null);
+    try testing.expect(std.mem.indexOf(u8, runner, "$script_dir/image-platforms.json") != null);
+    try testing.expect(std.mem.indexOf(u8, runner, "inventory_file=\"eval/image-platforms.json\"") == null);
+    try testing.expect(std.mem.indexOf(u8, runner, "*ready*") == null);
     try testing.expect(std.mem.indexOf(u8, runner, "zygos task run --offline") != null);
     try testing.expect(std.mem.indexOf(u8, runner, "terminal-bench/terminal-bench@4.0.0") != null);
+
+    const trial_src = fsx_mod.readWholeFile(testing.allocator, "src/worker/trial.zig") orelse return error.NoTrial;
+    defer testing.allocator.free(trial_src);
+    const decl = "pub const adapter_version = \"" ++ trial_mod.adapter_version ++ "\";";
+    try testing.expect(std.mem.indexOf(u8, trial_src, decl) != null);
+
+    const agent = fsx_mod.readWholeFile(testing.allocator, "eval/harbor/zygos_agent.py") orelse return error.NoAgent;
+    defer testing.allocator.free(agent);
+    try testing.expect(std.mem.indexOf(u8, agent, "src/worker/trial.zig") != null);
+    try testing.expect(std.mem.indexOf(u8, agent, "ADAPTER_VERSION = \"0.1.0\"") == null);
 
     const inventory = fsx_mod.readWholeFile(testing.allocator, "eval/image-platforms.json") orelse return error.NoInventory;
     defer testing.allocator.free(inventory);

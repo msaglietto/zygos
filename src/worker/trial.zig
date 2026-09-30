@@ -19,7 +19,14 @@ const trace_event = @import("trace_event.zig");
 pub const adapter_version = "0.1.0";
 
 pub const ParseError = error{ MalformedTrial, MissingBuildIdentity, OutOfMemory };
-pub const ScoreError = error{ MissingBuildIdentity, MissingPrice, TrimEvidenceMissing, TrimOnZeroReduction, UnknownVariable };
+pub const ScoreError = error{
+    MalformedTrial,
+    MissingBuildIdentity,
+    MissingPrice,
+    TrimEvidenceMissing,
+    TrimOnZeroReduction,
+    UnknownVariable,
+};
 
 pub const TrimSnap = struct {
     calls: u64,
@@ -194,15 +201,19 @@ pub fn score(trial: Trial, prices: []const Price) ScoreError!Scored {
         if (std.mem.eql(u8, trial.variable, "trim-on")) {
             const snap = trial.trim orelse return error.TrimEvidenceMissing;
             if (snap.calls == 0) return error.TrimEvidenceMissing;
+            if (snap.sent_bytes > snap.raw_bytes) return error.MalformedTrial;
+            if (snap.reduction != reductionOf(snap.raw_bytes, snap.sent_bytes)) return error.MalformedTrial;
             if (snap.reduction == 0) return error.TrimOnZeroReduction;
             break :trim_reduction snap.reduction;
         } else if (std.mem.eql(u8, trial.variable, "trim-off")) {
             break :trim_reduction if (trial.trim) |s| s.reduction else 0;
         } else return error.UnknownVariable;
     };
-    const tokens = trial.input_tokens + trial.output_tokens;
+    // ReleaseFast wraps; a wrapped cost can exit 0. Overflow is a bad trial.
+    const tokens = std.math.add(u64, trial.input_tokens, trial.output_tokens) catch return error.MalformedTrial;
+    const cost = std.math.mul(u64, tokens, price.cents_per_mtok) catch return error.MalformedTrial;
     return .{
-        .cents = tokens * price.cents_per_mtok / 1_000_000,
+        .cents = cost / 1_000_000,
         .source_lines_read = trial.source_lines_read,
         .reduction = reduction,
     };
@@ -347,6 +358,37 @@ test "score: trim-on zero reduction fails; missing evidence fails; trim-off zero
     off.trim.?.calls = 0;
     const off_scored = try score(off, &fixture_prices);
     try testing.expectEqual(@as(u64, 0), off_scored.reduction);
+}
+
+test "score: a trim-on reduction that disagrees with raw and sent is malformed" {
+    var lie = baseTrial();
+    lie.trim.?.reduction = 50;
+    try testing.expectError(error.MalformedTrial, score(lie, &fixture_prices));
+
+    // sent above raw with a recorded zero is not the trim-on-zero control.
+    var over = baseTrial();
+    over.trim.?.raw_bytes = 100;
+    over.trim.?.sent_bytes = 200;
+    over.trim.?.reduction = 0;
+    try testing.expectError(error.MalformedTrial, score(over, &fixture_prices));
+}
+
+test "score: token addition or price multiplication that overflows is malformed" {
+    var sum = baseTrial();
+    sum.input_tokens = std.math.maxInt(u64);
+    sum.output_tokens = 1;
+    try testing.expectError(error.MalformedTrial, score(sum, &fixture_prices));
+
+    // Two i64-max counts fit in a u64 sum (2^64-2) and then overflow the price multiply.
+    var wide = baseTrial();
+    wide.input_tokens = std.math.maxInt(i64);
+    wide.output_tokens = std.math.maxInt(i64);
+    try testing.expectError(error.MalformedTrial, score(wide, &fixture_prices));
+
+    var product = baseTrial();
+    product.input_tokens = std.math.maxInt(u64) / 2;
+    product.output_tokens = 0;
+    try testing.expectError(error.MalformedTrial, score(product, &fixture_prices));
 }
 
 test "score: missing price or empty build identity fails" {
