@@ -30,7 +30,7 @@ pub const Limits = struct {
 
 ## Worker
 
-`TrimWorker.start(gpa, actor, registry, limits, budget_scope)`. Handler:
+`TrimWorker.start(gpa, actor, registry, limits, budget_scope)`. The mission CLI and the headless task command (`zygos task`, trim-on) both start this worker; the task writes `zygos::output::stats` onto `trial.json`. A trim-on trial with a missing snapshot or a zero reduction is a scorer error. Trim-off does not register the worker. Handler:
 request `{"content":"..."}` → reply `{"content":"..."}` (the driver's seam
 contract). When bytes were saved and `budget_scope` is non-null, `cast`
 `zygos::budget::record {"scope":scope,"kind":"saved_bytes","amount":saved}` —

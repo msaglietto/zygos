@@ -57,7 +57,7 @@ SDKs. See `GOAL.md` for the mission, `docs/ARCHITECTURE.md` and
 Requires Zig 0.16.0 (and libc — pthread + CSPRNG; macOS or Linux).
 
 ```bash
-zig build test   # full suite (849 tests, leak-checked, no network)
+zig build test   # full suite (870 tests, leak-checked, no network)
 zig build        # produces zig-out/bin/zygos
 ```
 
@@ -66,6 +66,19 @@ zig build        # produces zig-out/bin/zygos
 ```bash
 ZYGOS_PORT=49134 ./zig-out/bin/zygos   # 49134 is the iii SDK default
 ```
+
+## Headless task (offline)
+
+`zygos task` is the entry a benchmark runner calls. It is not a mission: there is no product-owner gate, and exit 0 means the process finished, not that the task succeeded.
+
+```bash
+zygos task run --offline --workspace DIR --out trial.json --events events.jsonl
+zygos task score --trial trial.json --prices prices.txt
+```
+
+`--offline` is required. A live provider run is refused until a dated model id and a spend approval exist. The trial pins the git sha, target triple, optimize level, and adapter version. Bench policy allows only bash, read, and write inside the workspace. Mission policy is unchanged.
+
+`eval/run.sh --dry-run` prints the pinned dataset `terminal-bench/terminal-bench-2-1` and the task command. It is not part of `zig build test`. The contract is `docs/specs/task.md`.
 
 Any iii SDK connects unmodified:
 
