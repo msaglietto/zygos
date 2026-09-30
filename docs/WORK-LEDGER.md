@@ -73,7 +73,7 @@ Done. The only accepted pin is `terminal-bench/terminal-bench-2-1`. `./eval/run.
 
 ## Phase 8 — Pilot
 
-Inventory and the Linux binary are recorded on 2026-09-30. The paid task is not started. No dollar cap was named, so nothing here spends. The dated catalog model for the pilot, when it is approved, is `glm-5.3-flash`. Phases 9–12 stay unstarted.
+Inventory, the Linux binary, and one Harbor task are recorded on 2026-09-30. Spend for that single task was approved the same day for catalog model `glm-5.3-flash`. No dollar cap was named. Phases 9–12 stay unstarted.
 
 `eval/image-platforms.json` is `status: ready`. The source is the public task set at `https://github.com/harbor-framework/terminal-bench-2-1` (89 `task.toml` files under `tasks/`, each with `docker_image`). Registry manifests, read on 2026-09-30:
 
@@ -86,9 +86,19 @@ No image is arm64-only. The chosen platform is `linux/amd64`. The chosen triple 
 
 `std.c.arc4random_buf` does not exist on the Linux target in Zig 0.16, and glibc 2.36 is newer than this floor, so channel keys and worker ids take macOS `arc4random_buf` or the Linux `getrandom` syscall. The call signatures are unchanged.
 
-The Linux binary is a ReleaseSafe build (`zig build -Dtarget=x86_64-linux-gnu -Doptimize=ReleaseSafe --prefix zig-out/linux-x86_64`). `zig-out/` is gitignored. A dirty tree stamps git sha `unknown`, and `zygos task` refuses to write a trial for that sha. The pilot binary has to be rebuilt from a clean tree after this inventory is committed.
+The Linux binary is a ReleaseSafe build (`zig build -Dtarget=x86_64-linux-gnu -Doptimize=ReleaseSafe --prefix zig-out/linux-x86_64`). `zig-out/` is gitignored. A dirty tree stamps git sha `unknown`, and `zygos task` refuses to write a trial for that sha. The binary that ran the pilot was rebuilt from a clean tree at `f3a3bdca454d5d77bcd26487955e2ecc80f38585` (`f3a3bdc`). This note does not rebuild it.
 
-The one Harbor task is still refused. `eval/run.sh` without `--dry-run` exits 2, and `zygos task run` without `--offline` exits 2. The shortest agent timeout in the set is `modernize-scientific-stack` at 600 seconds. That task was not started.
+One Harbor task ran. Command: `./eval/run.sh --task modernize-scientific-stack --model glm-5.3-flash --task-dir /tmp/terminal-bench-2-1/tasks/modernize-scientific-stack`. n=1, step cap 24, trim on, no Hub upload. Harbor 0.23.0 wrote `/tmp/zygos-phase8/2026-09-30__03-54-51`. Trial name `modernize-scientific-stack__sq67hcP`. Harbor finished with exit 0, 0 exceptions, and reward 0.0. Wall time was 1m 22s. Any other live model, including `glm-5.3`, is still refused with exit 2.
+
+`agent/trial.json` records `model_id` `glm-5.3-flash`, dataset `terminal-bench/terminal-bench-2-1`, variable `trim-on`, `step_cap` 24, that git sha, triple `x86_64-linux.5.10...6.19-gnu.2.31`, optimize `ReleaseSafe`, and adapter `0.1.0`. Totals are `input_tokens` 1927 and `output_tokens` 1221. `cache_read_tokens` is absent. The binary Harbor uploaded matches `zig-out/linux-x86_64/bin/zygos` (sha256 `d550f399333fdaecdc24722001e6d7b458b16c3a4420f8285408e9705c18c674`). The verifier installed an `x86_64` uv and amd64 Debian packages, so the task container was `linux/amd64`. Harbor skipped its image OS check because `docker inspect` returned 1. The ELF binary executed and wrote the trial.
+
+`agent/events.jsonl` has four provider steps. Steps 1–3 dispatched two tool calls each (`bash`, then `read_file`, then `write_file`). Every recorded input is `{}` and every result is `handler_failed`. Step 4 stopped on `max_tokens` with `output_tokens` 1024, the request default when the catalog row sets no `max_tokens`. The trim snapshot is `calls` 0 and `reduction` 0. `zygos task score` against that trial, with a price row present, exits 2 and prints `TrimEvidenceMissing`. ADR 003 treats that as a failed score. The scorer's one `cents_per_mtok` figure is a separate check from the dollar total below.
+
+The published GLM-5.3-Flash rates (https://docs.z.ai/guides/overview/pricing, 2026-09-18) are $0.15 input, $0.03 cached input, and $0.50 output per 1M tokens. The trial has no cache field, so the cached rate is unused. 1927 × $0.15/M + 1221 × $0.50/M = $0.00089955.
+
+The verifier reward is 0 because `/app/analyze_climate_modern.py` was not created and neither `/app/requirements.txt` nor `/app/pyproject.toml` was created.
+
+Phases 9–12 are not started.
 
 ## Phase 9 — Freeze the canary
 
