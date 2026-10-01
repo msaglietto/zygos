@@ -80,17 +80,27 @@ pub const Store = struct {
         }
     }
 
+    var write_seq = std.atomic.Value(u64).init(0);
+
     fn writeAtomic(self: Store, gpa: std.mem.Allocator, name: []const u8, bytes: []const u8) StoreError!void {
         try mkdirP(gpa, self.root);
-        const tmp_z = std.fmt.allocPrintSentinel(gpa, "{s}/{s}.tmp", .{ self.root, name }, 0) catch
-            return error.OutOfMemory;
+        // Unique O_EXCL tmp per writer: two processes saving into one root
+        // (cron overlap) never interleave into a shared tmp file.
+        const tmp_z = std.fmt.allocPrintSentinel(gpa, "{s}/{s}.tmp.{d}.{d}", .{
+            self.root,
+            name,
+            std.c.getpid(),
+            write_seq.fetchAdd(1, .monotonic),
+        }, 0) catch return error.OutOfMemory;
         defer gpa.free(tmp_z);
         const final_z = std.fmt.allocPrintSentinel(gpa, "{s}/{s}", .{ self.root, name }, 0) catch
             return error.OutOfMemory;
         defer gpa.free(final_z);
 
-        const fd = c.open(tmp_z, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(c.mode_t, 0o644));
+        const fd = c.open(tmp_z, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true }, @as(c.mode_t, 0o644));
         if (fd < 0) return error.Io;
+        // No tmp residue survives any path after a successful create.
+        defer _ = c.unlink(tmp_z); // no-op after a successful rename
         var off: usize = 0;
         while (off < bytes.len) {
             const n = c.write(fd, bytes.ptr + off, bytes.len - off);
@@ -99,6 +109,12 @@ pub const Store = struct {
                 return error.Io;
             }
             off += @intCast(n);
+        }
+        // Durability: the final name must never resolve to an empty file
+        // after a crash — data blocks hit the disk before the rename does.
+        if (c.fsync(fd) != 0) {
+            _ = c.close(fd);
+            return error.Io;
         }
         if (c.close(fd) != 0) return error.Io;
         // rename(2) is the atomicity boundary: readers see the old file or
@@ -363,13 +379,44 @@ test "save is atomic: no tmp residue, overwrite replaces cleanly" {
     try testing.expectEqual(mission_mod.State.done, got.state);
     try testing.expectEqual(mission_mod.StopReason.completed, got.stop);
 
-    var tmp_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const tmp_z = try std.fmt.bufPrintZ(&tmp_path_buf, "{s}/{s}.tmp", .{ root, state_file });
-    const fd = c.open(tmp_z, .{ .ACCMODE = .RDONLY });
-    if (fd >= 0) {
-        _ = c.close(fd);
-        return error.TmpResidueLeftBehind;
+    // No tmp residue under ANY writer-unique name (pid.seq suffixes).
+    var dbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_z = try std.fmt.bufPrintZ(&dbuf, "{s}", .{root});
+    const dir = c.opendir(dir_z.ptr) orelse return error.TestUnexpectedResult;
+    defer _ = c.closedir(dir);
+    while (c.readdir(dir)) |e| {
+        const name = std.mem.sliceTo(&e.name, 0);
+        try std.testing.expect(!std.mem.startsWith(u8, name, state_file ++ ".tmp"));
     }
+}
+
+test "concurrent writeAtomic to one root publish exactly one writer's bytes" {
+    var t = TestRoot.init();
+    defer t.deinit();
+    const root = try t.path();
+    const store = Store.init(root);
+
+    const Writer = struct {
+        fn run(s: Store, name: []const u8, ch: u8) void {
+            var payload: [32 * 1024]u8 = undefined;
+            @memset(&payload, ch);
+            var i: usize = 0;
+            while (i < 40) : (i += 1) {
+                s.writeAtomic(std.testing.allocator, name, &payload) catch unreachable;
+            }
+        }
+    };
+
+    var a = try std.Thread.spawn(.{}, Writer.run, .{ store, "mission.json", 'a' });
+    var b = try std.Thread.spawn(.{}, Writer.run, .{ store, "mission.json", 'b' });
+    a.join();
+    b.join();
+
+    const bytes = try store.read(std.testing.allocator, "mission.json");
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expectEqual(@as(usize, 32 * 1024), bytes.len);
+    const first = bytes[0];
+    for (bytes) |ch| try std.testing.expectEqual(first, ch);
 }
 
 test "artifacts land under the planning root; root auto-created; separators rejected" {

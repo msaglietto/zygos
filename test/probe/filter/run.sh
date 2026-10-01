@@ -9,6 +9,10 @@
 # messages: prose that quotes a diagnostic was read as a failed command, which
 # silently disabled the git filter and cost ~90% of the git log saving with
 # every test still green. A ratio nobody re-measures is a ratio that rots.
+#
+# The probe also exits non-zero when a measured command did not produce its
+# output. `git diff` may exit 1 for a non-empty patch; exit 128 (a depth-1
+# clone has no HEAD~1) is git's fatal text and must not enter the ratio.
 set -uo pipefail
 cd "$(dirname "$0")/../../.."
 

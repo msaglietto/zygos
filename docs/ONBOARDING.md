@@ -16,7 +16,7 @@ on that same bus.
 
 - **Languages:** Zig (kernel + workers), Markdown (specs), shell/JS (e2e harnesses), ZON (configs)
 - **Dependencies:** `websocket.zig` only — external deps are human-gated (`GOAL.md`)
-- **Status:** M4.6 (M0–M4.5 closed); `zig build test` runs 579 leak-checked tests, no network
+- **Status:** M4.6 (M0–M4.5 closed); `zig build test` runs the leak-checked suite, no network
 - **Process:** TDD is law (`AGENTS.md`); wire format is human-gated (`docs/PROTOCOL.md`)
 
 ## Architecture Layers
@@ -154,4 +154,4 @@ Approach these with the spec open and run `zig build test` often:
 1. Read `GOAL.md` (decision authority) and `AGENTS.md` (TDD law, commands, conventions).
 2. Walk the tour above — or open the interactive dashboard: `/understand-dashboard`.
 3. Pick the spec in `docs/specs/` for the module you're touching; write the RED test first.
-4. Gate: `zig build test` green and `zig fmt --check src/` clean before any commit.
+4. Gate: `zig build test` green and `zig fmt --check build.zig src/ test/` clean before any commit.

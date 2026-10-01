@@ -32,6 +32,8 @@ const ToolAcc = struct {
 
 pub const Assembler = struct {
     gpa: std.mem.Allocator,
+    max_stream_bytes: usize = 16 * 1024 * 1024,
+    received_bytes: usize = 0,
     id: []const u8 = "",
     model: []const u8 = "",
     stop_reason: StopReason = .unknown,
@@ -66,6 +68,9 @@ pub const Assembler = struct {
     /// Feed one SSE data payload (the dialect has no event names). Returns
     /// the chunk's text delta (valid until the next call) or null.
     pub fn onEvent(self: *Assembler, data_json: []const u8) AssembleError!?[]const u8 {
+        if (self.received_bytes > self.max_stream_bytes or data_json.len > self.max_stream_bytes - self.received_bytes)
+            return error.TooLarge;
+        self.received_bytes += data_json.len;
         const payload = std.mem.trim(u8, data_json, " \t\r\n");
         if (std.mem.eql(u8, payload, "[DONE]")) {
             self.done = true;
@@ -101,6 +106,10 @@ pub const Assembler = struct {
             if (tcv != .object) return error.MalformedEvent;
             const tc = tcv.object;
             const index = intField(tc, "index") orelse return error.MalformedEvent;
+            // A hostile/buggy endpoint naming index:1e11 would preallocate
+            // the tool list to OOM; more than 64 concurrent tool calls in
+            // one delta is not a real stream.
+            if (index > 63) return error.MalformedEvent;
             while (self.tools.items.len <= index) try self.tools.append(self.gpa, .{});
             const acc = &self.tools.items[@intCast(index)];
             if (strField(tc, "id")) |cid| {
@@ -174,6 +183,25 @@ pub const Assembler = struct {
         };
     }
 };
+
+test "chat assembler caps accumulated stream bytes across events" {
+    var a = Assembler.init(std.testing.allocator);
+    defer a.deinit();
+    const event = "{\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}";
+    a.max_stream_bytes = event.len;
+    try std.testing.expectEqualStrings("hi", (try a.onEvent(event)).?);
+    try std.testing.expectError(error.TooLarge, a.onEvent(event));
+}
+
+test "chat assembler refuses hostile tool indexes without growing the tool list" {
+    var a = Assembler.init(std.testing.allocator);
+    defer a.deinit();
+    try std.testing.expectError(error.MalformedEvent, a.onEvent("{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":100000000000}]}}]}"));
+    try std.testing.expectError(error.MalformedEvent, a.onEvent("{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":-1}]}}]}"));
+    try std.testing.expectError(error.MalformedEvent, a.onEvent("{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":64}]}}]}"));
+    try std.testing.expectEqual(@as(usize, 0), a.tools.items.len);
+    try std.testing.expectEqualStrings("ok", (try a.onEvent("{\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}")).?);
+}
 
 const canonicalizeDuplicateKeys = core.canonicalizeDuplicateKeys;
 const parseFinish = core.parseFinish;

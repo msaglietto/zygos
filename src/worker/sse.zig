@@ -7,6 +7,25 @@
 
 const std = @import("std");
 
+test "SSE event budget includes data accumulated across complete lines" {
+    var decoder = Decoder.init(std.testing.allocator);
+    defer decoder.deinit();
+    var line: [4096]u8 = undefined;
+    @memset(&line, 'x');
+    @memcpy(line[0..6], "data: ");
+    line[line.len - 1] = '\n';
+    var refused = false;
+    for (0..max_raw_bytes / (line.len - 7) + 2) |_| {
+        decoder.feed(&line) catch |err| {
+            try std.testing.expectEqual(error.TooLarge, err);
+            refused = true;
+            break;
+        };
+        try std.testing.expectEqual(@as(?Event, null), try decoder.next());
+    }
+    try std.testing.expect(refused);
+}
+
 /// A decoded SSE event. Slices are owned by the `Decoder` and valid ONLY
 /// until the next call to `next()` or `feed()` — callers must copy what
 /// they intend to keep.
@@ -18,6 +37,11 @@ pub const Event = struct {
     /// null when no `id:` field was present.
     id: ?[]const u8,
 };
+
+/// Byte budget for the decoder's raw buffer. Real provider events are small
+/// (KiB-scale); 4 MiB is far past any legitimate single event and stops an
+/// endless unterminated stream from growing the process to OOM.
+pub const max_raw_bytes = 4 * 1024 * 1024;
 
 pub const Decoder = struct {
     gpa: std.mem.Allocator,
@@ -57,9 +81,15 @@ pub const Decoder = struct {
     }
 
     /// Append raw bytes from the stream.  Arbitrary chunk boundaries are
-    /// fine — the decoder just buffers.
-    pub fn feed(self: *Decoder, bytes: []const u8) error{OutOfMemory}!void {
+    /// fine — the decoder just buffers. A provider (or an http:// MITM)
+    /// streaming an endless unterminated line would grow `raw` to OOM: the
+    /// byte budget refuses the stream instead (`TooLarge` → BadStream).
+    pub fn feed(self: *Decoder, bytes: []const u8) error{ OutOfMemory, TooLarge }!void {
         if (self.ev_returned) self.resetEvent();
+        self.compact();
+        const used = self.raw.items.len + self.ev_data.items.len +
+            self.ev_name.items.len + self.ev_id.items.len;
+        if (used > max_raw_bytes or bytes.len > max_raw_bytes - used) return error.TooLarge;
         try self.raw.appendSlice(self.gpa, bytes);
     }
 

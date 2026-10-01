@@ -1,27 +1,40 @@
 //! Filter reality check (M8): runs REAL commands and pipes their REAL output
 //! through `zygos::output::compress` — the seam the turn driver uses, envelope
-//! and all. Not a pass/fail test — a measurement of what that seam keeps.
+//! and all. A measurement of what that seam keeps, not a filter unit test.
+//! A measured command that did not produce its output fails the process:
+//! `git diff` may exit 1 when the patch is non-empty; a higher status is
+//! git's fatal text, and scoring it would launder a shallow clone.
 //!
 //! Run with `zig build filter-probe`.
 
 const std = @import("std");
 const zygos = @import("zygos");
+const status = @import("status.zig");
 
 extern "c" fn popen(cmd: [*:0]const u8, mode: [*:0]const u8) ?*anyopaque;
 extern "c" fn pclose(stream: ?*anyopaque) c_int;
 extern "c" fn fread(ptr: *anyopaque, size: usize, n: usize, stream: ?*anyopaque) usize;
 
-fn capture(gpa: std.mem.Allocator, cmd: [:0]const u8) ![]u8 {
+const Captured = struct {
+    bytes: []u8,
+    exit_code: u8,
+};
+
+fn capture(gpa: std.mem.Allocator, cmd: [:0]const u8) !Captured {
     const f = popen(cmd.ptr, "r") orelse return error.PopenFailed;
-    defer _ = pclose(f);
     var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
     var chunk: [4096]u8 = undefined;
     while (true) {
         const n = fread(&chunk, 1, chunk.len, f);
         if (n == 0) break;
-        try out.appendSlice(gpa, chunk[0..n]);
+        out.appendSlice(gpa, chunk[0..n]) catch |err| {
+            _ = pclose(f);
+            return err;
+        };
     }
-    return out.toOwnedSlice(gpa);
+    const exit_code = try status.commandExit(pclose(f));
+    return .{ .bytes = try out.toOwnedSlice(gpa), .exit_code = exit_code };
 }
 
 const Seam = struct {
@@ -73,14 +86,16 @@ pub fn main(init: std.process.Init) !void {
     var seam = try Seam.init(gpa);
     defer seam.deinit();
 
-    const cases = [_]struct { cmd: [:0]const u8, label: []const u8 }{
-        .{ .cmd = "git status 2>&1", .label = "git status" },
-        .{ .cmd = "git log -20 2>&1", .label = "git log -20" },
-        .{ .cmd = "git diff HEAD~1 2>&1", .label = "git diff HEAD~1" },
-        .{ .cmd = "ls -la src/worker 2>&1", .label = "ls -la src/worker" },
-        .{ .cmd = "find src -name '*.zig' 2>&1", .label = "find src -name *.zig" },
-        .{ .cmd = "zig build test 2>&1", .label = "zig build test" },
-        .{ .cmd = "zig build 2>&1", .label = "zig build" },
+    // max_exit: git diff exits 1 when the patch is non-empty. Every other
+    // command must exit 0; a fatal (128 from a missing HEAD~1) is not a sample.
+    const cases = [_]struct { cmd: [:0]const u8, label: []const u8, max_exit: u8 }{
+        .{ .cmd = "git status 2>&1", .label = "git status", .max_exit = 0 },
+        .{ .cmd = "git log -20 2>&1", .label = "git log -20", .max_exit = 0 },
+        .{ .cmd = "git diff HEAD~1 2>&1", .label = "git diff HEAD~1", .max_exit = 1 },
+        .{ .cmd = "ls -la src/worker 2>&1", .label = "ls -la src/worker", .max_exit = 0 },
+        .{ .cmd = "find src -name '*.zig' 2>&1", .label = "find src -name *.zig", .max_exit = 0 },
+        .{ .cmd = "zig build test 2>&1", .label = "zig build test", .max_exit = 0 },
+        .{ .cmd = "zig build 2>&1", .label = "zig build", .max_exit = 0 },
     };
 
     var total_raw: usize = 0;
@@ -90,11 +105,19 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("{s}\n", .{"-" ** 74});
 
     for (cases) |c| {
-        const raw = capture(gpa, c.cmd) catch |e| {
+        const got = capture(gpa, c.cmd) catch |e| {
             std.debug.print("{s:<26} capture failed: {t}\n", .{ c.label, e });
-            continue;
+            return e;
         };
-        defer gpa.free(raw);
+        defer gpa.free(got.bytes);
+        if (!status.exitAccepted(got.exit_code, c.max_exit)) {
+            const shown = got.bytes[0..@min(got.bytes.len, 500)];
+            std.debug.print("{s:<26} exit {d} is not command output:\n{s}\n", .{
+                c.label, got.exit_code, shown,
+            });
+            return error.ProbeCommandFailed;
+        }
+        const raw = got.bytes;
 
         var arena_state = std.heap.ArenaAllocator.init(gpa);
         defer arena_state.deinit();
@@ -102,7 +125,7 @@ pub fn main(init: std.process.Init) !void {
 
         // The label is the command the seam classifies. The captured argv
         // carries `2>&1`, which the dispatcher treats as a pipeline and skips.
-        const envelope = try std.fmt.allocPrint(arena, "{{\"exit_code\":0,\"output\":{f}}}", .{std.json.fmt(raw, .{})});
+        const envelope = try std.fmt.allocPrint(arena, "{{\"exit_code\":{d},\"output\":{f}}}", .{ got.exit_code, std.json.fmt(raw, .{}) });
         const req = try std.fmt.allocPrint(
             arena,
             "{{\"content\":{f},\"tool\":\"bash\",\"input\":{{\"command\":{f}}}}}",

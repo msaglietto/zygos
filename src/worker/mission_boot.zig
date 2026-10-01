@@ -204,6 +204,14 @@ pub fn searchConfigFromEnv(env: []const EnvPair) ?web_tools.SearchConfig {
     return null;
 }
 
+/// SSRF screen escape hatch: ZYGOS_FETCH_ALLOW_PRIVATE=1|true lets web_fetch
+/// reach loopback/private hosts (localhost stubs, self-hosted mirrors).
+/// Malformed values keep the screen on (fail closed).
+pub fn fetchAllowPrivate(env: []const EnvPair) bool {
+    const raw = getEnv(env, "ZYGOS_FETCH_ALLOW_PRIVATE") orelse return false;
+    return std.mem.eql(u8, raw, "1") or std.ascii.eqlIgnoreCase(raw, "true");
+}
+
 // ---------------------------------------------------------------------------
 // run-stamp refusal + planning root
 // ---------------------------------------------------------------------------
@@ -223,6 +231,32 @@ pub fn planningRoot(
 ) error{OutOfMemory}![]u8 {
     if (!run_stamp) return gpa.dupe(u8, base);
     return std.fmt.allocPrint(gpa, "{s}-{s}", .{ base, stamp });
+}
+
+// ---------------------------------------------------------------------------
+// planning-root claim (exclusive run)
+// ---------------------------------------------------------------------------
+
+pub const ClaimDecision = union(enum) {
+    /// No holder, or the holder crashed: the run may claim the root.
+    claim,
+    /// A live process holds the root; its pid text (trimmed) names it.
+    busy: []const u8,
+};
+
+/// Verdict from a claim file's contents plus the liveness fact the caller
+/// supplies (kill(pid, 0) == 0 or EPERM). The refuseStart check above races
+/// any second starter whose mission.json lands late; the claim file is the
+/// close-the-window companion. Unparseable claims identify no live holder —
+/// takeover, never a wedged root.
+pub fn claimDecision(claim_text: []const u8, holder_alive: bool) ClaimDecision {
+    const trimmed = std.mem.trim(u8, claim_text, " \t\r\n");
+    // A claim we cannot parse (not digits) identifies no holder: takeover,
+    // never a wedged root — callers only get here past a valid pid.
+    if (trimmed.len == 0 or trimmed.len > 10) return .claim;
+    for (trimmed) |ch| if (!std.ascii.isDigit(ch)) return .claim;
+    if (holder_alive) return .{ .busy = trimmed };
+    return .claim;
 }
 
 // ---------------------------------------------------------------------------
@@ -495,6 +529,27 @@ test "refuseStart: fresh start over existing substrate refuses; resume/run-stamp
     try t.expect(!refuseStart(true, false, true));
     try t.expect(!refuseStart(false, true, true));
     try t.expect(!refuseStart(false, false, false));
+}
+
+test "claimDecision: live holder is busy; dead, empty, or garbage claims take over" {
+    // Live holder: refuse and name it.
+    try t.expect(claimDecision("4242\n", true) == .busy);
+    try t.expectEqualStrings("4242", claimDecision("4242\n", true).busy);
+    // Crashed holder (kill(pid,0) says gone): take over.
+    try t.expect(claimDecision("4242", false) == .claim);
+    // A claim we cannot parse identifies no live holder: take over.
+    try t.expect(claimDecision("not-a-pid", true) == .claim);
+    try t.expect(claimDecision("", true) == .claim);
+}
+
+test "fetchAllowPrivate: only 1/true opts out; unset and junk keep the screen" {
+    const on = [_]EnvPair{.{ .name = "ZYGOS_FETCH_ALLOW_PRIVATE", .value = "1" }};
+    try t.expect(fetchAllowPrivate(&on));
+    const on_word = [_]EnvPair{.{ .name = "ZYGOS_FETCH_ALLOW_PRIVATE", .value = "TRUE" }};
+    try t.expect(fetchAllowPrivate(&on_word));
+    const junk = [_]EnvPair{.{ .name = "ZYGOS_FETCH_ALLOW_PRIVATE", .value = "yes please" }};
+    try t.expect(!fetchAllowPrivate(&junk));
+    try t.expect(!fetchAllowPrivate(&.{}));
 }
 
 test "planningRoot: run-stamp suffixes the base; plain base unchanged" {

@@ -94,6 +94,10 @@ pub fn main(init: std.process.Init) !void {
     sh(gpa, root, "git init -q .");
     sh(gpa, root, "git config user.email e2e@zygos.local");
     sh(gpa, root, "git config user.name zygos-e2e");
+    // The ratio covers verbose status hints and standard diff context.
+    // Runner/user Git settings must not change the input to this exit gate.
+    sh(gpa, root, "git config advice.statusHints true");
+    sh(gpa, root, "git config diff.context 3");
     // A file with enough context that a diff carries real metadata + padding.
     {
         var p: [320]u8 = undefined;

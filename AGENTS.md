@@ -37,7 +37,7 @@ kernel must honor") each get a named test.
 ```bash
 zig build            # compile
 zig build test       # the check that matters — must be green before any commit
-zig fmt src/         # format before committing
+zig fmt build.zig src/ test/   # format before committing
 ```
 
 When touching `src/worker/filter/*`, `src/worker/trim.zig` or
@@ -70,7 +70,7 @@ output proves the wiring and the ratio.
   `test(kernel/catalog): ...`, `chore(build): ...`.
 - Test-first history is welcome: a `test(...)` commit followed by `feat(...)`.
 - **No Co-Authored-By trailers. No AI attribution in commit messages.**
-- Commit only with `zig build test` green and `zig fmt --check src/` clean.
+- Commit only with `zig build test` green and `zig fmt --check build.zig src/ test/` clean.
 
 ## Version
 

@@ -6,6 +6,26 @@ Reconstructed from git history on 2026-09-30. A commit that only added a library
 
 The agent that next changes operator-visible behavior adds the new heading in that same commit.
 
+## [4.0.0] - 2026-10-01
+
+### Breaking
+
+- Browser WebSocket peers must use an explicitly allowed Origin; local peers must supply the shared token when `ZYGOS_TOKEN` is set.
+- Shell children receive an environment allowlist rather than inheriting provider keys and arbitrary operator variables. Commands have a local two-minute deadline and their process group is terminated when the handler exits.
+- `web_fetch` refuses recognized literal private hosts and localhost unless the explicit override is enabled. DNS resolution and redirects remain outside this screening.
+
+### Fixed
+
+- Delivery lifetime barriers keep in-process workers and WebSocket connection entries alive until in-flight sends finish.
+- Duplicate invocation IDs receive an error without replacing the original request, trigger unregister checks ownership, and provider token limits reject u32 overflow.
+- Planning roots retain an OS lock through execution; run stamps contain only formatted timestamp/PID bytes. Atomic writers use unique exclusive temporary files and fsync their data.
+- SSE event storage, provider payloads, tool indexes, MCP reply lines/read waits, and TUI previews have limits. Decoded trace text and streamed tool names are scrubbed before terminal rendering.
+
+### Added
+
+- MIT license and dependency notice, public provider/brief examples, contribution and security policies, issue/PR templates, and macOS/Linux CI with fixture integrations.
+- Reviewed audit and readiness report distinguish implemented fixes, trusted-local-operator limits, remaining engineering work, and publication tasks.
+
 ## [3.5.3] - 2026-09-24
 
 ### Fixed
