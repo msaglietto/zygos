@@ -54,8 +54,11 @@ fetching. Runtime unit tests remain fixture-only and do not use the network.
    No release artifact or deployment was published here.
 
 Y5 remains an unrun real-vault milestone acceptance gate. It is distinct from
-the source-publication decision. GOAL.md, docs/PROTOCOL.md, and build.zig.zon
-were left unchanged by this review.
+the source-publication decision. GOAL.md and docs/PROTOCOL.md remain
+unchanged. The build manifest was left unchanged during implementation. PR preparation then incorporated
+the newer default-branch versioning/verification changes and records version
+4.0.0 in the existing manifest field and CHANGELOG; dependency entries and the
+package fingerprint remain unchanged.
 
 ## Remaining engineering work
 

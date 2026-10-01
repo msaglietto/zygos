@@ -72,6 +72,20 @@ output proves the wiring and the ratio.
 - **No Co-Authored-By trailers. No AI attribution in commit messages.**
 - Commit only with `zig build test` green and `zig fmt --check src/` clean.
 
+## Version
+
+The semver is `.version` in `build.zig.zon`. The history is `CHANGELOG.md`. The agent that changes operator-visible behavior edits both files in that same commit. The Zygos binary does not write them.
+
+- A fix of existing behavior increments patch (`1.4.2` → `1.4.3`). Section: `Fixed`.
+- A compatible new capability increments minor and resets patch (`1.4.3` → `1.5.0`). Section: `Added` or `Changed`.
+- A break in a contract an operator or a connected worker already had increments major and resets the rest (`0.9.1` → `1.0.0`, `1.4.2` → `2.0.0`). Section: `Breaking`.
+- The highest bump in the commit wins. One such commit, one new heading, dated with the commit date, inserted above the previous heading.
+- `test`, `refactor`, `docs`, `chore`, a behavior-preserving move, and a test-only commit leave the number and the changelog alone.
+
+Changing `.version` is the existing version field. It is not a new dependency entry. Leave `.fingerprint` and `.dependencies` alone.
+
+Apply the number in the same session, including a major bump. Do not stop to ask which component to increment.
+
 ## Module map (M0)
 
 ```
