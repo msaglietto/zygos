@@ -17,6 +17,7 @@ const theme = @import("theme.zig");
 const width = @import("width.zig");
 const partialjson = @import("partialjson.zig");
 const chatlog = @import("chatlog.zig");
+const scrub_mod = @import("scrub.zig");
 const band = @import("band.zig");
 const steerinput = @import("steerinput.zig");
 const entries = @import("entries.zig");
@@ -151,7 +152,7 @@ pub const Model = struct {
         defer self.mutex.unlock();
         // The answer starting is the end of the thinking phase.
         self.flushThinking() catch {};
-        self.live.appendSlice(self.gpa, bytes) catch {};
+        scrub_mod.appendScrubbed(self.gpa, &self.live, bytes) catch {};
         self.stream_bytes += bytes.len;
         self.touchPhase();
         self.dirty.set();
@@ -162,7 +163,7 @@ pub const Model = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         if (self.thinking_started_ms == null) self.thinking_started_ms = self.now_fn();
-        self.thinking.appendSlice(self.gpa, bytes) catch {};
+        scrub_mod.appendScrubbed(self.gpa, &self.thinking, bytes) catch {};
         self.stream_bytes += bytes.len;
         self.touchPhase();
         self.dirty.set();
@@ -188,7 +189,7 @@ pub const Model = struct {
     pub fn onToolArgs(self: *Model, fragment: []const u8) void {
         self.mutex.lock();
         defer self.mutex.unlock();
-        self.live_tool_args.appendSlice(self.gpa, fragment) catch {};
+        scrub_mod.appendScrubbed(self.gpa, &self.live_tool_args, fragment) catch {};
         self.dirty.set();
     }
 
@@ -198,7 +199,11 @@ pub const Model = struct {
     pub fn onLog(self: *Model, line: []const u8) void {
         self.mutex.lock();
         defer self.mutex.unlock();
-        self.log.appendLog(line) catch {};
+        // Captured stderr can embed worker-supplied bytes (frame snippets in
+        // warn lines): scrub before it becomes a rendered footnote.
+        const safe = scrub_mod.scrub(self.gpa, line) catch return;
+        defer self.gpa.free(safe);
+        self.log.appendLog(safe) catch {};
         self.dirty.set();
     }
 
@@ -362,11 +367,14 @@ pub const Model = struct {
                 const unwrapped = (try partialjson.extractStringField(arena, tr.output, "output")) orelse
                     (try partialjson.extractDisplayField(arena, tr.output)) orelse tr.output;
                 const shown: []const u8 = if (unwrapped.len > 0) unwrapped else tr.output;
-                const out_preview = shown[0..previewLen(shown)];
+                // Tool output is remote content (fetched pages, cat'd files):
+                // ESC/C0 never reach the terminal from a preview.
+                const out_preview = try scrub_mod.scrub(arena, shown[0..previewLen(shown)]);
+                const input_s = try scrub_mod.scrub(arena, input);
                 try self.log.appendFmt("{s}", .{try entries.collapsedTool(
                     arena,
                     tr.tool,
-                    input,
+                    input_s,
                     theme.tokens(&count, tr.bytes),
                     durFmt(&e_buf, self.now_fn() - started),
                     tr.is_error,

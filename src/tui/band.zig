@@ -10,6 +10,7 @@ const width = @import("width.zig");
 const partialjson = @import("partialjson.zig");
 const chatlog = @import("chatlog.zig");
 const entries = @import("entries.zig");
+const scrub = @import("scrub.zig");
 const tasks_mod = @import("tasks.zig");
 const appendTail = @import("fmt.zig").appendTail;
 const tailLines = @import("fmt.zig").tailLines;
@@ -132,11 +133,13 @@ pub fn build(
 
     // Approval ask — keys first: the summary can exceed the terminal
     // width and rows clip right, so a trailing hint would be the part
-    // that vanishes (a gated mission then looks hung).
+    // that vanishes (a gated mission then looks hung). The summary is
+    // model-authored (a bash command): no escape may restyle the gate.
     if (view.approval) |ask| {
+        const safe_ask = try scrub.scrub(arena, ask);
         try bottom.append(arena, try std.fmt.allocPrint(arena, "{s}{s}  [y/N] approve?{s} {s}{s}{s}", .{
             theme.bold, theme.fg(&color, theme.Color.err), theme.reset,
-            theme.dim,  ask,                               theme.reset,
+            theme.dim,  safe_ask,                          theme.reset,
         }));
     }
 
@@ -230,8 +233,11 @@ fn renderLiveToolEntry(
 
     const body = try partialjson.extractDisplayField(arena, view.live_tool_args) orelse
         view.live_tool_args;
+    // Model-authored arguments (partial JSON fragments): scrub before split
+    // so a poisoned fragment cannot ride a line into the terminal.
+    const safe_body = try scrub.scrub(arena, body);
     var lines: std.ArrayList([]const u8) = .empty;
-    var it = std.mem.splitScalar(u8, std.mem.trimEnd(u8, body, "\n"), '\n');
+    var it = std.mem.splitScalar(u8, std.mem.trimEnd(u8, safe_body, "\n"), '\n');
     while (it.next()) |line| try lines.append(arena, line);
     const start = lines.items.len -| tool_box_max_rows;
     var shown = lines.items[start..];
