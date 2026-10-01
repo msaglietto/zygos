@@ -1,6 +1,6 @@
 # Work ledger — harness benchmark
 
-Updated 2026-10-01. Phases 1–8 are done. The first Phase 9 campaign finished 24 attempts and failed qualification; results are `/tmp/zygos-phase9/campaign.json`. The operator approved Phases 10–12, then explicitly chose a schema fix and a fresh Phase 9 plus Phase 10 campaign on one new clean build. Fresh Phase 9 is running under `/tmp/zygos-phase9-schema`; Phase 10 has not started. No dollar cap was named.
+Updated 2026-10-01. Phases 1–8 are done. Both Phase 9 campaigns finished 24 attempts; the fresh schema-repaired campaign has 6 verifier successes and 4 accepted scorer records, with 20 scorer rejections. Its report is `/tmp/zygos-phase9-schema/campaign.json`; the original failed campaign remains `/tmp/zygos-phase9/campaign.json`. The operator explicitly approved the schema fix and fresh Phase 9 plus both Phase 10 arms on one new clean build. Phase 10 has not started. Phases 11–12 are also approved but not started. No dollar cap was named.
 
 The historical offline binary used in phases 1–7 is git `a2a9bf03fe8b808c2a6dfd9a059e3f358346f7c7`, target `aarch64-macos.26.7...26.7-none`, optimize `Debug`, adapter `0.1.0`. That binary was built from a dirty tree, so the stamped sha is the parent commit and does not contain this work. A later build stamps `unknown` when `git status --porcelain` is non-empty, and the task command refuses `unknown`.
 
@@ -203,7 +203,44 @@ The Harbor adapter now accepts `ZYGOS_TRIM=on|off` (default on) and rejects any 
 
 Repair commit: `b157dc1fa2048b3aa313e66ba1b275f5c708c4ab`. Built once from its clean tree with `zig build -Dtarget=x86_64-linux-gnu -Doptimize=ReleaseSafe --prefix zig-out/linux-x86_64`. Binary SHA-256: `2f22205e1a85af623f13fb6c2d6c9718f7e4dda7836ae28cadc9c7bc5eb4b468`; triple `x86_64-linux.5.10...6.19-gnu.2.31`, optimize ReleaseSafe, adapter 0.1.0. A keyless, network-disabled Docker check wrote `/tmp/zygos-schema-linux-check/trial.json`: the embedded sha matches, all three scripted tools executed, trim calls 3, reduction 60, scorer exit 0. Its scripted tokens are 25 input, 6 output, 5 cache read; no provider cost. Build manifest: `/tmp/zygos-phase9-schema/build.json`. The prior artifact is preserved at `/tmp/zygos-phase9-binary-324c45c`. Do not rebuild for ledger edits.
 
-The approved fresh Phase 9 uses the same eight observed task ids, three runs each, cap 24, glm-5.3-flash, terminal-bench/terminal-bench-2-1, trim on, no Hub upload. Jobs and the resumable campaign report are under `/tmp/zygos-phase9-schema`. Phase 10 will use the same new artifact for both arms; only trim will differ.
+The approved fresh Phase 9 used the same eight observed task ids, three runs each, cap 24, glm-5.3-flash, terminal-bench/terminal-bench-2-1, trim on, no Hub upload. It is finished, with results below. Phase 10 will use the same new artifact for both explicitly approved arms; only trim will differ. Scorer failures remain refusals and are not reclassified as valid trim measurements.
+
+## Phase 9 schema-repaired campaign — finished 2026-10-01
+
+Executed 24 task-runs. Build sha `b157dc1fa2048b3aa313e66ba1b275f5c708c4ab`, binary SHA-256 `2f22205e1a85af623f13fb6c2d6c9718f7e4dda7836ae28cadc9c7bc5eb4b468`; triple `x86_64-linux.5.10...6.19-gnu.2.31`, optimize ReleaseSafe, adapter 0.1.0, model glm-5.3-flash, dataset terminal-bench/terminal-bench-2-1, step cap 24. One task per Harbor invocation, no retries, no Hub upload; up to four independent host jobs. The same binary was used throughout; no rebuild for ledger edits.
+
+Recorded input tokens 212358, output tokens 45975, cache-read tokens 0 (field present on 0/24 records). Published rates as of 2026-09-18: input $0.15, cached input $0.03, output $0.50 per million. Three-rate cost from recorded usage: **$0.05484120**. The scorer's single cents-per-million row is a trim check, not this invoice. Missing usage or a killed/unrecorded provider reply cannot be inferred as free.
+
+Harbor exit counts: `{"0": 24}`; exception counts: `{}`; reward counts: `{"0.0": 18, "1.0": 6}`. Scorer exits: `{"2": 20, "0": 4}`. Tool calls 221, empty inputs 0, handler failures 0; structured tool errors `{"PathEscapesWorkspace": 11}` remain fail-closed. Positive-reduction records 4; total trim calls 221, command-filter count 3. Stop reasons: `{"failed": 6, "max_steps": 2, "max_tokens": 10, "end_turn": 6}`. Execution completion does not override rejected scorer results or failed verifiers.
+
+Full trial records and per-trial dollar cost: `/tmp/zygos-phase9-schema/campaign.json`; aggregate: `/tmp/zygos-phase9-schema/completion-summary.json`. Paths below are the actual Harbor trials; their agent/trial.json, agent/events.jsonl, result.json, verifier reward, and separate scorer logs remain under this jobs directory.
+
+| Run | Arm | Task / actual trial path | Input | Cache read | Output | Dollar cost | Reward | Scorer |
+|---|---|---|---:|---:|---:|---:|---:|---|
+| 1 | on | `/tmp/zygos-phase9-schema/phase9-r1-build-cython-ext/build-cython-ext__bfizXZi` | 22314 | absent | 3045 | 0.00486960 | 0.0 | 2: score: TrimOnZeroReduction |
+| 1 | on | `/tmp/zygos-phase9-schema/phase9-r1-cobol-modernization/cobol-modernization__Ht34hMz` | 4839 | absent | 1504 | 0.00147785 | 0.0 | 2: score: TrimOnZeroReduction |
+| 1 | on | `/tmp/zygos-phase9-schema/phase9-r1-filter-js-from-html/filter-js-from-html__cMtBX7c` | 414 | absent | 1024 | 0.00057410 | 0.0 | 2: score: TrimEvidenceMissing |
+| 1 | on | `/tmp/zygos-phase9-schema/phase9-r1-fix-code-vulnerability/fix-code-vulnerability__rto9sWf` | 16428 | absent | 3055 | 0.00399170 | 1.0 | 2: score: TrimOnZeroReduction |
+| 1 | on | `/tmp/zygos-phase9-schema/phase9-r1-fix-git/fix-git__TVT3Cpk` | 6491 | absent | 2155 | 0.00205115 | 0.0 | 2: score: TrimOnZeroReduction |
+| 1 | on | `/tmp/zygos-phase9-schema/phase9-r1-log-summary-date-ranges/log-summary-date-ranges__QuSzF7s` | 11821 | absent | 1255 | 0.00240065 | 1.0 | 0: cents=0 source_lines_read=0 reduction=98 |
+| 1 | on | `/tmp/zygos-phase9-schema/phase9-r1-modernize-scientific-stack/modernize-scientific-stack__p3Gyb27` | 1277 | absent | 173 | 0.00027805 | 0.0 | 2: score: TrimOnZeroReduction |
+| 1 | on | `/tmp/zygos-phase9-schema/phase9-r1-regex-log/regex-log__g7EGKvk` | 0 | absent | 0 | 0.00000000 | 0.0 | 2: score: TrimEvidenceMissing |
+| 2 | on | `/tmp/zygos-phase9-schema/phase9-r2-build-cython-ext/build-cython-ext__9yRKAJB` | 14709 | absent | 2976 | 0.00369435 | 0.0 | 2: score: TrimOnZeroReduction |
+| 2 | on | `/tmp/zygos-phase9-schema/phase9-r2-cobol-modernization/cobol-modernization__DszioDs` | 4691 | absent | 1268 | 0.00133765 | 0.0 | 2: score: TrimOnZeroReduction |
+| 2 | on | `/tmp/zygos-phase9-schema/phase9-r2-filter-js-from-html/filter-js-from-html__yDnhTpX` | 414 | absent | 1024 | 0.00057410 | 0.0 | 2: score: TrimEvidenceMissing |
+| 2 | on | `/tmp/zygos-phase9-schema/phase9-r2-fix-code-vulnerability/fix-code-vulnerability__HHoUUjf` | 9441 | absent | 2757 | 0.00279465 | 0.0 | 0: cents=0 source_lines_read=0 reduction=2 |
+| 2 | on | `/tmp/zygos-phase9-schema/phase9-r2-fix-git/fix-git__Wt5igsu` | 1941 | absent | 1239 | 0.00091065 | 0.0 | 2: score: TrimOnZeroReduction |
+| 2 | on | `/tmp/zygos-phase9-schema/phase9-r2-log-summary-date-ranges/log-summary-date-ranges__AjgZRK2` | 18688 | absent | 6566 | 0.00608620 | 1.0 | 0: cents=0 source_lines_read=0 reduction=38 |
+| 2 | on | `/tmp/zygos-phase9-schema/phase9-r2-modernize-scientific-stack/modernize-scientific-stack__FDikEWk` | 2855 | absent | 593 | 0.00072475 | 0.0 | 2: score: TrimOnZeroReduction |
+| 2 | on | `/tmp/zygos-phase9-schema/phase9-r2-regex-log/regex-log__TGP47bQ` | 0 | absent | 0 | 0.00000000 | 0.0 | 2: score: TrimEvidenceMissing |
+| 3 | on | `/tmp/zygos-phase9-schema/phase9-r3-build-cython-ext/build-cython-ext__wnqLx9J` | 42501 | absent | 4465 | 0.00860765 | 0.0 | 2: score: TrimOnZeroReduction |
+| 3 | on | `/tmp/zygos-phase9-schema/phase9-r3-cobol-modernization/cobol-modernization__UWuu3VA` | 4587 | absent | 1241 | 0.00130855 | 0.0 | 2: score: TrimOnZeroReduction |
+| 3 | on | `/tmp/zygos-phase9-schema/phase9-r3-filter-js-from-html/filter-js-from-html__vfMSxGb` | 1339 | absent | 1148 | 0.00077485 | 0.0 | 2: score: TrimOnZeroReduction |
+| 3 | on | `/tmp/zygos-phase9-schema/phase9-r3-fix-code-vulnerability/fix-code-vulnerability__RYyJVSf` | 15780 | absent | 4359 | 0.00454650 | 1.0 | 2: score: TrimOnZeroReduction |
+| 3 | on | `/tmp/zygos-phase9-schema/phase9-r3-fix-git/fix-git__g8Uug23` | 9869 | absent | 3257 | 0.00310885 | 1.0 | 2: score: TrimOnZeroReduction |
+| 3 | on | `/tmp/zygos-phase9-schema/phase9-r3-log-summary-date-ranges/log-summary-date-ranges__3r6wV2A` | 20676 | absent | 2616 | 0.00440940 | 1.0 | 0: cents=0 source_lines_read=0 reduction=53 |
+| 3 | on | `/tmp/zygos-phase9-schema/phase9-r3-modernize-scientific-stack/modernize-scientific-stack__VvcRGrV` | 1283 | absent | 255 | 0.00031995 | 0.0 | 2: score: TrimOnZeroReduction |
+| 3 | on | `/tmp/zygos-phase9-schema/phase9-r3-regex-log/regex-log__xDaCcQE` | 0 | absent | 0 | 0.00000000 | 0.0 | 2: score: TrimEvidenceMissing |
 
 ## Checks run on 2026-09-28
 
