@@ -1,6 +1,6 @@
 # Work ledger — harness benchmark
 
-Updated 2026-09-30. Phases 1–8 are done. Phase 8 below is the current live record: one approved task with `glm-5.3-flash`. Phases 9–12 are not started and need their own approvals. No dollar cap was named.
+Updated 2026-10-01. Phases 1–8 are done. Phase 9 was approved for 24 task-runs and stopped after its first trial because the live tool path and scorer failed. It is incomplete. Phases 10–12 are not started and need their own approvals. No dollar cap was named.
 
 The historical offline binary used in phases 1–7 is git `a2a9bf03fe8b808c2a6dfd9a059e3f358346f7c7`, target `aarch64-macos.26.7...26.7-none`, optimize `Debug`, adapter `0.1.0`. That binary was built from a dirty tree, so the stamped sha is the parent commit and does not contain this work. A later build stamps `unknown` when `git status --porcelain` is non-empty, and the task command refuses `unknown`.
 
@@ -73,7 +73,7 @@ Done. The only accepted pin is `terminal-bench/terminal-bench-2-1`. `./eval/run.
 
 ## Phase 8 — Pilot
 
-Inventory, the Linux binary, and one Harbor task are recorded on 2026-09-30. Spend for that single task was approved the same day for catalog model `glm-5.3-flash`. No dollar cap was named. Phases 9–12 stay unstarted.
+Inventory, the Linux binary, and one Harbor task are recorded on 2026-09-30. Spend for that single task was approved the same day for catalog model `glm-5.3-flash`. No dollar cap was named. At that date, phases 9–12 were unstarted.
 
 `eval/image-platforms.json` is `status: ready`. The source is the public task set at `https://github.com/harbor-framework/terminal-bench-2-1` (89 `task.toml` files under `tasks/`, each with `docker_image`). Registry manifests, read on 2026-09-30:
 
@@ -98,7 +98,7 @@ The published GLM-5.3-Flash rates (https://docs.z.ai/guides/overview/pricing, 20
 
 The verifier reward is 0 because `/app/analyze_climate_modern.py` was not created and neither `/app/requirements.txt` nor `/app/pyproject.toml` was created.
 
-Phases 9–12 are not started.
+Phases 9–12 were not started when the pilot was recorded on 2026-09-30.
 
 ## Offline tool-input repair — 2026-09-30
 
@@ -116,11 +116,27 @@ The fix is commit `324c45cb6a8a60b07f04d5c069e7522c3ad54d33` (`324c45c`). From t
 
 A network-disabled, `--pull=never` container using the already-installed `debian:bullseye-slim` amd64 image checked the Linux CLI with the scripted `--offline` fixture. It wrote `/tmp/zygos-tool-input-linux-check/trial.json` and `events.jsonl`; no Harbor or provider ran. The trial confirms sha `324c45c`, triple `x86_64-linux.5.10...6.19-gnu.2.31`, optimize `ReleaseSafe`, and adapter `0.1.0`. Tokens are synthetic: input 25, output 6, cache read 5, cache creation 3. Provider cost is $0; Harbor reward is not applicable. `zygos task score` with a free fixture price exited 0: `cents=0 source_lines_read=3 reduction=60`. Build identity and digest are saved at `/tmp/zygos-tool-input-build.json`.
 
-A proposed eight-task phase-9 set is in `/tmp/zygos-phase9-proposal.md`, drawn from the installed task files. It is a proposal, not a frozen canary or a completed run. Phase 9 remains unapproved and unstarted; phases 10–12 remain unstarted.
+A proposed eight-task phase-9 set was saved in `/tmp/zygos-phase9-proposal.md`, drawn from the installed task files. It was unapproved and unstarted on 2026-09-30. The approval and first live trial are recorded below; the proposal is not a frozen canary.
 
 ## Phase 9 — Freeze the canary
 
-Not started. Task ids will be frozen from actual task runs, with `modernize-scientific-stack` as one member. The shape, if approved separately, is 3 runs of 8–12 tasks (24–36 task-runs). At least one task must produce filterable output or the phase 6 guard fails a wired trim-on arm. No completed canary ids were invented here.
+Approved on 2026-10-01 for three runs of eight tasks (24 task-runs), with the proposal's stop condition: inspect each trial and stop on a broken tool path or failed scorer evidence before spending on the next task. Started and stopped after 1 of 24; 23 task-runs did not run. Phase 9 is incomplete and the canary is not frozen. `modernize-scientific-stack` remains a proposed member. Task ids will be frozen only from actual task runs.
+
+The first task was `fix-code-vulnerability`, selected from the installed Terminal-Bench 2.1 task files. Its instruction offers `pytest -rA`, which can produce filterable command output. The agent never executed a successful command, so this trial provides no live filter evidence for ADR 003. The verifier's own pytest output is not agent tool output.
+
+Harbor 0.23.0 ran one task, n=1, concurrency 1, max retries 0, model `glm-5.3-flash`, dataset `terminal-bench/terminal-bench-2-1`, step cap 24, trim on, and platform `linux/amd64`. `PYTHONPATH` was the repository and `PYTHONDONTWRITEBYTECODE=1` prevented an untracked adapter cache. The existing adapter passed the key only in the task exec environment; its providers.toml was keyless. No Hub upload or public publication occurred. Job: `/tmp/zygos-phase9/phase9-r1-fix-code-vulnerability`. Trial: `fix-code-vulnerability__WxoQzbD`, at `/tmp/zygos-phase9/phase9-r1-fix-code-vulnerability/fix-code-vulnerability__WxoQzbD`. Harbor exited 0 with 0 exceptions, reward 0.0, and wall time about 1m 22s.
+
+`agent/trial.json` records git sha `324c45cb6a8a60b07f04d5c069e7522c3ad54d33`, triple `x86_64-linux.5.10...6.19-gnu.2.31`, optimize `ReleaseSafe`, and adapter `0.1.0`. The uploaded `agent/zygos` matches the pinned Linux binary: sha256 `78e1a163748eff8b500d11797745b0d7ea67c7a227dfdb10daf0061f601b1795`. No rebuild was performed for this trial or this ledger edit.
+
+`agent/events.jsonl` has five provider steps. Step 1 dispatched two bash calls, step 2 one bash call, step 3 one read_file call, and step 4 a bash call and a read_file call. All six inputs are `{}` and all six results are `handler_failed`; there are no successful tool results or write_file calls. Step 5 stopped on `max_tokens` at output_tokens 1024, the request default because the catalog row sets no max_tokens. The trace has no tool ids and the raw provider stream was not saved. The offline regressions establish the repaired synthetic contract, but this live failure leaves the provider stream shape and paired calls unresolved.
+
+Token totals are input 2288 and output 1141. `cache_read_tokens` is absent. Using the same published 2026-09-18 rates ($0.15 input, $0.03 cached input, $0.50 output per 1M tokens), the cached rate is unused: 2288 × $0.15/M + 1141 × $0.50/M = $0.00091370. No dollar cap is assumed.
+
+The trim snapshot has calls 0, filtered 0, raw_bytes 0, sent_bytes 0, and reduction 0; source_lines_read is 0. The pinned Linux scorer ran offline in a network-disabled container and exited 2 with `TrimEvidenceMissing`. Its price fixture `/tmp/zygos-phase9/prices.txt` contains `glm-5.3-flash 15`; that single cents_per_mtok value is the scorer check, not the three-rate invoice above. Scorer output and exit status are `/tmp/zygos-phase9/phase9-r1-fix-code-vulnerability.score.txt` and `/tmp/zygos-phase9/phase9-r1-fix-code-vulnerability.score-exit.txt`.
+
+The verifier found no `/app/report.jsonl` and the Bottle header validation remained unfixed: its output checks had 4 failures and 2 passes. Harbor reward is 0. Further spend stopped under the approved condition. The remaining runs need the live tool-input failure resolved before continuing; phases 10–12 remain not started and separately gated.
+
+Offline checks on 2026-10-01: `zig build test --summary all` passed 878/878 tests and `zig fmt --check src/` was clean. Only this ledger changed. The Linux binary digest is unchanged, `eval/image-platforms.json` remains `status: ready`, and no `eval/harbor/**__pycache__` was created. A trial summary is saved at `/tmp/zygos-phase9/report.json`.
 
 ## Phase 10 — First ablation
 
