@@ -2,7 +2,7 @@
 
 Rules below are the ones whose failure crosses a trust, spend, or durability boundary. Status words are only: pinned by existing tests, proposed, guarded-live, unverified.
 
-`zig build test` is the merge gate this repo actually runs (848 tests, leak-checked, no network). It is not wired to a hosted required check. Adding that check is an operator decision.
+`zig build test` is the leak-checked, offline merge check. `.github/workflows/ci.yml` runs it plus formatting, build, and local integration checks on macOS and Linux. Requiring those checks in branch protection is a maintainer repository setting. Test counts come from `zig build test --summary all`, not a fixed documentation count.
 
 ## Existing coverage
 

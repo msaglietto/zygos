@@ -29,6 +29,11 @@ ride the same policy/trim/budget gates as native tools.
   content is preserved as JSON.
 - The worker owns its clients: teardown closes transports; a server dying
   mid-mission fails the *calls*, not the process.
+- The child transport caps a reply line at 1 MiB, rejects NUL, and times out
+  each line read after two minutes. Buffered later lines are preserved.
+  Teardown escalates TERM to KILL after 250 ms if the child does not exit.
+  A blocked write or endless unmatched notifications still need a whole-RPC
+  deadline; the read deadline does not provide that stronger guarantee.
 
 E2E leg 2 of `test/e2e/m4/run.sh` drives a real client against
 `zygos mcp-gateway` over stdio (zygos talking to zygos).

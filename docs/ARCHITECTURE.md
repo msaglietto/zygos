@@ -1,7 +1,8 @@
 # Zygos architecture (condensed)
 
-Full rationale lives in the vault (`poe.md/Projects/Zygos/DESIGN.md`). This is
-the working summary for agents in this repo.
+This is the repository-local layer sketch. Implemented behavior and trust
+boundaries live in [documentation/architecture.md](../documentation/architecture.md);
+milestone contracts live in [GOAL.md](../GOAL.md). No private vault is required.
 
 ## Layers
 

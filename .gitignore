@@ -13,3 +13,7 @@ wm
 CLAUDE.md
 .agents/
 skills-lock.json
+.gitnexus/
+.planning/
+.planning-*/
+providers.local.toml

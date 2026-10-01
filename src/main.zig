@@ -261,6 +261,7 @@ fn todayStamp(buf: *[10]u8) []const u8 {
 }
 
 test {
+    std.testing.refAllDecls(cli_mission);
     // The exe test binary's root is this file; nothing references cli/ in
     // test mode (main() is not a test-root), so pull the CLI's pure
     // submodules in explicitly for test discovery.

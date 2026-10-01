@@ -16,7 +16,7 @@ on that same bus.
 
 - **Languages:** Zig (kernel + workers), Markdown (specs), shell/JS (e2e harnesses), ZON (configs)
 - **Dependencies:** `websocket.zig` only — external deps are human-gated (`GOAL.md`)
-- **Status:** M4.6 (M0–M4.5 closed); `zig build test` runs 579 leak-checked tests, no network
+- **Status:** M4.6 (M0–M4.5 closed); `zig build test` runs the leak-checked suite, no network
 - **Process:** TDD is law (`AGENTS.md`); wire format is human-gated (`docs/PROTOCOL.md`)
 
 ## Architecture Layers

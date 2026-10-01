@@ -32,6 +32,8 @@ const BlockAcc = union(enum) {
 
 pub const Assembler = struct {
     gpa: std.mem.Allocator,
+    max_stream_bytes: usize = 16 * 1024 * 1024,
+    received_bytes: usize = 0,
     id: []const u8 = "",
     model: []const u8 = "",
     stop_reason: StopReason = .unknown,
@@ -71,6 +73,9 @@ pub const Assembler = struct {
         event_name: []const u8,
         data_json: []const u8,
     ) AssembleError!?[]const u8 {
+        if (self.received_bytes > self.max_stream_bytes or data_json.len > self.max_stream_bytes - self.received_bytes)
+            return error.TooLarge;
+        self.received_bytes += data_json.len;
         const Kind = enum {
             message_start,
             content_block_start,
@@ -231,6 +236,14 @@ pub const Assembler = struct {
         };
     }
 };
+
+test "anthropic assembler caps accumulated stream bytes across events" {
+    var a = Assembler.init(std.testing.allocator);
+    defer a.deinit();
+    a.max_stream_bytes = 2;
+    try std.testing.expectEqual(@as(?[]const u8, null), try a.onEvent("ping", "{}"));
+    try std.testing.expectError(error.TooLarge, a.onEvent("ping", "{}"));
+}
 
 const canonicalizeDuplicateKeys = core.canonicalizeDuplicateKeys;
 const parseStopReason = core.parseStopReason;

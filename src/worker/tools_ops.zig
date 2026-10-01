@@ -6,8 +6,8 @@
 //! Confinement contract (M1): lexical normalization of root-joined paths —
 //! "..", ".", and absolute-path escapes are rejected; symlink-based escapes
 //! are M2 hardening (realpath after the policy gate exists). bash runs with
-//! cwd = workspace root and no timeout of its own — the kernel's invocation
-//! timeout bounds the bus call.
+//! cwd = workspace root. A local deadline kills the shell process group;
+//! the kernel invocation timeout independently bounds the bus call.
 
 const std = @import("std");
 const c = std.c;
@@ -18,6 +18,7 @@ const c = std.c;
 // worker modules per Z-02).
 extern "c" fn pipe(fds: *[2]c.fd_t) c_int;
 extern "c" fn fork() c.pid_t;
+extern "c" fn setpgid(pid: c.pid_t, pgid: c.pid_t) c_int;
 extern "c" fn dup2(old: c.fd_t, new: c.fd_t) c_int;
 extern "c" fn close(fd: c.fd_t) c_int;
 extern "c" fn execve(path: [*:0]const u8, argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*:0]const u8) c_int;
@@ -63,6 +64,7 @@ pub const output_cap = 1024 * 1024; // bash output truncated (not an error)
 pub const Workspace = struct {
     /// Absolute, canonical workspace root, no trailing slash.
     root: []const u8,
+    shell_timeout_ms: u32 = 120_000,
 
     pub fn init(root: []const u8) Workspace {
         std.debug.assert(root.len > 1 and root[0] == '/');
@@ -162,6 +164,12 @@ pub fn writeFile(gpa: std.mem.Allocator, ws: Workspace, rel_path: []const u8, co
     }
 }
 
+fn monotonicMs() i64 {
+    var ts: c.timespec = undefined;
+    if (c.clock_gettime(.MONOTONIC, &ts) != 0) return 0;
+    return @as(i64, @intCast(ts.sec)) * 1000 + @divTrunc(@as(i64, @intCast(ts.nsec)), std.time.ns_per_ms);
+}
+
 pub const BashResult = struct {
     exit_code: i32,
     /// Combined stdout+stderr, truncated at `output_cap`. Owned.
@@ -192,6 +200,9 @@ pub fn bash(gpa: std.mem.Allocator, ws: Workspace, command: []const u8) OpsError
     }
     if (pid == 0) {
         // Child: only async-signal-safe calls before execve.
+        // Only the child sets its group; competing parent/child calls can
+        // fail in the child on macOS. Cleanup also kills pid before reap.
+        if (setpgid(0, 0) != 0) _exit(127);
         _ = dup2(fds[1], 1);
         _ = dup2(fds[1], 2);
         _ = close(fds[0]);
@@ -201,23 +212,54 @@ pub fn bash(gpa: std.mem.Allocator, ws: Workspace, command: []const u8) OpsError
         _exit(127);
     }
     _ = close(fds[1]);
+    defer _ = close(fds[0]);
+    // Every return, including allocation/read failure, kills descendants
+    // holding the pipe and reaps the shell before the handler exits.
+    var reaped = false;
+    defer {
+        _ = c.kill(-pid, c.SIG.KILL);
+        if (!reaped) {
+            // The deadline may fire before the child establishes its group.
+            // Kill the direct child as well so reap never waits on that race.
+            _ = c.kill(pid, c.SIG.KILL);
+            var ignored: c_int = 0;
+            while (waitpid(pid, &ignored, 0) < 0 and c._errno().* == @intFromEnum(c.E.INTR)) {}
+        }
+    }
+    const deadline = monotonicMs() + ws.shell_timeout_ms;
 
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(gpa);
     var chunk: [16 * 1024]u8 = undefined;
     while (true) {
+        const left = deadline - monotonicMs();
+        if (left <= 0) return error.ExecFailed;
+        var poll_fds = [_]c.pollfd{.{ .fd = fds[0], .events = c.POLL.IN, .revents = 0 }};
+        const ready = c.poll(&poll_fds, 1, @intCast(@min(left, std.math.maxInt(c_int))));
+        if (ready < 0 and c._errno().* == @intFromEnum(c.E.INTR)) continue;
+        if (ready <= 0) return error.ExecFailed;
         const n = read(fds[0], &chunk, chunk.len);
-        if (n <= 0) break;
+        if (n < 0 and c._errno().* == @intFromEnum(c.E.INTR)) continue;
+        if (n < 0) return error.ExecFailed;
+        if (n == 0) break;
         if (out.items.len < output_cap) {
             const take = @min(@as(usize, @intCast(n)), output_cap - out.items.len);
             out.appendSlice(gpa, chunk[0..take]) catch return error.OutOfMemory;
         }
         // Past the cap we keep draining so the child never blocks on a full pipe.
     }
-    _ = close(fds[0]);
-
     var status: c_int = 0;
-    if (waitpid(pid, &status, 0) < 0) return error.ExecFailed;
+    while (true) {
+        const got = waitpid(pid, &status, 1); // WNOHANG: EOF is not child exit
+        if (got == pid) {
+            reaped = true;
+            break;
+        }
+        if (got < 0 and c._errno().* != @intFromEnum(c.E.INTR)) return error.ExecFailed;
+        if (monotonicMs() >= deadline) return error.ExecFailed;
+        var no_fds: [0]c.pollfd = .{};
+        _ = c.poll(&no_fds, 0, 5);
+    }
     const exit_code: i32 = if ((status & 0x7f) == 0)
         (status >> 8) & 0xff // WIFEXITED → WEXITSTATUS
     else
@@ -352,6 +394,12 @@ test "bash: echo, exit codes, stderr capture" {
     const err = try bash(testing.allocator, ws, "echo oops 1>&2");
     defer testing.allocator.free(err.output);
     try testing.expectEqualStrings("oops\n", err.output);
+}
+
+test "bash: deadline stops a silent command and reaps it" {
+    var ws = Workspace.init("/tmp");
+    ws.shell_timeout_ms = 20;
+    try testing.expectError(error.ExecFailed, bash(testing.allocator, ws, "sleep 0.2"));
 }
 
 test "bash: child env is scrubbed — secrets dropped, PATH kept" {

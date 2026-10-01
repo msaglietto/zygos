@@ -13,12 +13,13 @@ There is no job queue, no internal HTTP trigger, and no `?source=cron` endpoint.
 ## Idempotency
 
 - `refuseStart`: a start against an existing substrate, without `resume` and without `--run-stamp`, exits 2 and does not clobber.
-- `--run-stamp` appends the stamp to the planning root, so each cron fire gets its own directory.
+- `--run-stamp` appends `YYYYMMDD-HHMMSS-P<pid>` to the planning root.
+- A process-held `flock` on `<planning>/claim` excludes overlapping CLI runs; errors refuse and exit 2. The file stays on disk; its contents are diagnostic, not lock ownership. Never unlink a live claim. The OS releases the lock on exit or crash.
 - An unanswered completion gate parks (`resolved:false`). It does not replan and does not mark `done`. The next weekly fire does not resume that park unless the operator points `mission resume` at it.
 
 ## Authentication of the internal call
 
-The crontab is the authentication. The process is the operator's uid. Closed stdin makes approval timeouts deny. There is no second credential for "this invocation is cron".
+The crontab selects the operator context. The executor shell can also append approval commands to `control.jsonl`; closed stdin is not an independent human authorization boundary. The process is the operator's uid. Closed stdin makes approval timeouts deny. There is no second credential for "this invocation is cron".
 
 ## Seeing the last run
 

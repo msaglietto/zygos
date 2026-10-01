@@ -40,6 +40,7 @@ const ToolView = chatlog.ToolView;
 
 pub const Model = struct {
     gpa: std.mem.Allocator,
+    max_preview_bytes: usize = 256 * 1024,
     mutex: sync.Mutex = .{},
     /// Set on every mutation; the render loop waits on it.
     dirty: sync.ResetEvent = .{},
@@ -152,7 +153,7 @@ pub const Model = struct {
         defer self.mutex.unlock();
         // The answer starting is the end of the thinking phase.
         self.flushThinking() catch {};
-        scrub_mod.appendScrubbed(self.gpa, &self.live, bytes) catch {};
+        self.appendPreview(&self.live, bytes) catch {};
         self.stream_bytes += bytes.len;
         self.touchPhase();
         self.dirty.set();
@@ -163,7 +164,7 @@ pub const Model = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         if (self.thinking_started_ms == null) self.thinking_started_ms = self.now_fn();
-        scrub_mod.appendScrubbed(self.gpa, &self.thinking, bytes) catch {};
+        self.appendPreview(&self.thinking, bytes) catch {};
         self.stream_bytes += bytes.len;
         self.touchPhase();
         self.dirty.set();
@@ -176,7 +177,7 @@ pub const Model = struct {
         defer self.mutex.unlock();
         self.flushThinking() catch {};
         self.flushLive(.narration) catch {};
-        const copy = self.gpa.dupe(u8, name) catch return;
+        const copy = scrub_mod.scrub(self.gpa, name[0..@min(name.len, self.max_preview_bytes)]) catch return;
         if (self.live_tool_name) |old| self.gpa.free(old);
         self.live_tool_name = copy;
         self.live_tool_args.clearRetainingCapacity();
@@ -189,8 +190,14 @@ pub const Model = struct {
     pub fn onToolArgs(self: *Model, fragment: []const u8) void {
         self.mutex.lock();
         defer self.mutex.unlock();
-        scrub_mod.appendScrubbed(self.gpa, &self.live_tool_args, fragment) catch {};
+        self.appendPreview(&self.live_tool_args, fragment) catch {};
         self.dirty.set();
+    }
+
+    fn appendPreview(self: *Model, out: *std.ArrayList(u8), bytes: []const u8) error{OutOfMemory}!void {
+        if (out.items.len >= self.max_preview_bytes) return;
+        const remaining = self.max_preview_bytes - out.items.len;
+        try scrub_mod.appendScrubbed(self.gpa, out, bytes[0..@min(bytes.len, remaining)]);
     }
 
     /// Captured std.log line — shown as a dim footnote so evidence is never
@@ -275,7 +282,22 @@ pub const Model = struct {
         self.dirty.set();
     }
 
-    fn applyEvent(self: *Model, arena: std.mem.Allocator, ev: trace_event.TraceEvent) error{OutOfMemory}!void {
+    fn applyEvent(self: *Model, arena: std.mem.Allocator, raw_ev: trace_event.TraceEvent) error{OutOfMemory}!void {
+        var ev = raw_ev;
+        // Trace fields are decoded strings: escaped controls in JSON become
+        // real terminal bytes here. Clean every text field before formatting.
+        switch (ev) {
+            inline else => |*payload| {
+                inline for (@typeInfo(@TypeOf(payload.*)).@"struct".fields) |field| {
+                    if (comptime field.type == []const u8) {
+                        @field(payload, field.name) = try scrub_mod.scrub(arena, @field(payload, field.name));
+                    } else if (comptime field.type == ?[]const u8) {
+                        if (@field(payload, field.name)) |value|
+                            @field(payload, field.name) = try scrub_mod.scrub(arena, value);
+                    }
+                }
+            },
+        }
         switch (ev) {
             .mission => |m| {
                 try self.replaceOwned(&self.mission_state, m.to);
@@ -664,6 +686,32 @@ test "deltas accumulate and render as the live tail" {
     const view = try renderJoined(&m, arena_state.allocator());
     const marker = std.mem.indexOf(u8, view, "---").?;
     try testing.expect(std.mem.indexOf(u8, view[marker..], "streaming now") != null);
+}
+
+test "live narration thinking and tool arguments have bounded previews" {
+    var m = Model.init(testing.allocator, 0);
+    defer m.deinit();
+    m.max_preview_bytes = 16;
+    m.onThinking("012345678901234567890123456789");
+    try testing.expect(m.thinking.items.len <= 16);
+    m.onDelta("012345678901234567890123456789");
+    try testing.expect(m.live.items.len <= 16);
+    m.onToolArgs("012345678901234567890123456789");
+    try testing.expect(m.live_tool_args.items.len <= 16);
+}
+
+test "model renders tool names and trace descriptions without terminal controls" {
+    var m = Model.init(testing.allocator, 0);
+    defer m.deinit();
+    m.onToolName("bash\x1b]52;c;ZXZpbA==\x07");
+    m.onEvent(
+        \\{"event":"task_start","index":0,"total":1,"desc":"safe\u001b]52;c;ZXZpbA==\u0007"}
+    );
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const view = try renderJoined(&m, arena.allocator());
+    try testing.expect(std.mem.indexOf(u8, view, "\x1b]") == null);
+    try testing.expect(std.mem.indexOf(u8, view, "ZXZpbA==") == null);
 }
 
 test "tool_call opens a running box and tool_result collapses it" {

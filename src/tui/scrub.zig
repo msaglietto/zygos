@@ -37,9 +37,18 @@ pub fn appendScrubbed(gpa: std.mem.Allocator, out: *std.ArrayList(u8), s: []cons
             i += 1;
             continue;
         }
-        // C1 controls arrive as 0xc2 0x80..0x9f; many terminals execute them.
-        if (b == 0xc2 and i + 1 < s.len and s[i + 1] >= 0x80 and s[i + 1] <= 0x9f) {
-            i += 2;
+        if (b >= 0x80) {
+            const len = std.unicode.utf8ByteSequenceLength(b) catch {
+                i += 1;
+                continue;
+            };
+            if (len > s.len - i) break;
+            const cp = std.unicode.utf8Decode(s[i..][0..len]) catch {
+                i += 1;
+                continue;
+            };
+            if (cp < 0x80 or cp > 0x9f) try out.appendSlice(gpa, s[i..][0..len]);
+            i += len;
             continue;
         }
         try out.append(gpa, b);
@@ -152,4 +161,13 @@ test "scrub leaves plain ASCII and JSON alone" {
         "{\"command\":\"echo hello > greeting.txt\",\"exit_code\":0}",
     );
     try check("", "");
+}
+
+test "scrub refuses raw C1 bytes and split UTF-8 control encodings" {
+    try check("a\x9bb", "ab");
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    try appendScrubbed(testing.allocator, &out, "a\xc2");
+    try appendScrubbed(testing.allocator, &out, "\x9bb");
+    try testing.expectEqualStrings("ab", out.items);
 }
