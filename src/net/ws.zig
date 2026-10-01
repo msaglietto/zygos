@@ -139,9 +139,12 @@ pub const Gateway = struct {
     /// One live connection: the socket plus its bounded writer queue (M7
     /// net hardening) — a stalled consumer fills its own queue and gets
     /// QueueFull; it never parks the kernel thread in a socket write.
+    /// The retire gate closes before teardown: an in-flight kernel-thread
+    /// push finishes first, so the entry is never freed under it.
     const ConnEntry = struct {
         conn: *websocket.Conn,
         queue: writer_queue.WriterQueue,
+        gate: sync.RetireGate = .{},
 
         fn sinkWrite(ctx: *anyopaque, frame: []const u8) error{Disconnected}!void {
             const self: *ConnEntry = @ptrCast(@alignCast(ctx));
@@ -163,20 +166,24 @@ pub const Gateway = struct {
             .writeFn = &ConnEntry.sinkWrite,
         });
         try entry.queue.start();
+        errdefer entry.queue.stop(); // OOM after start: never strand the writer
         self.conns.mutex.lock();
         defer self.conns.mutex.unlock();
         try self.conns.map.put(id, entry);
     }
 
     /// Returns false if already removed — the exactly-once disconnect guard.
-    /// The removed entry's queue joins its writer before freeing, so no
-    /// in-flight write outlives the connection.
+    /// The gate retires first: an in-flight sendFn push drains before the
+    /// queue joins its writer and the entry is freed, so no push ever
+    /// touches a freed ConnEntry.
     fn removeConn(self: *Gateway, id: WorkerId) bool {
         self.conns.mutex.lock();
         const removed = self.conns.map.fetchRemove(id);
         self.conns.mutex.unlock();
         const kv = removed orelse return false;
+        kv.value.gate.retire();
         kv.value.queue.deinit();
+        kv.value.gate.deinit();
         self.gpa.destroy(kv.value);
         return true;
     }
@@ -191,7 +198,14 @@ pub const Gateway = struct {
             self.conns.mutex.unlock();
             return error.Disconnected;
         };
+        // Acquire under the table lock: removeConn's fetchRemove serializes
+        // against this, so a held gate means the entry outlives our push.
+        if (!entry.gate.acquire()) {
+            self.conns.mutex.unlock();
+            return error.Disconnected;
+        }
         self.conns.mutex.unlock();
+        defer entry.gate.release();
         entry.queue.push(frame) catch |err| switch (err) {
             error.QueueFull => return error.QueueFull,
             error.Closed, error.OutOfMemory => return error.Disconnected,
