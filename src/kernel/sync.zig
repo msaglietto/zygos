@@ -127,6 +127,49 @@ pub const ResetEvent = struct {
     }
 };
 
+/// Lifetime gate for pointers handed out under a foreign lock (an outbound
+/// frame target, a registry entry): acquirers hold a counted reference;
+/// `retire()` closes the gate to new acquirers and blocks until every
+/// in-flight holder has released. The owner may free the guarded object only
+/// after `retire()` returns — the release side needs no lock of its own.
+pub const RetireGate = struct {
+    mutex: Mutex = .{},
+    done: Condition = .{},
+    count: usize = 0,
+    retired: bool = false,
+
+    /// True = counted hold (pair with `release`). False = gate is retired;
+    /// the caller must not touch the guarded object.
+    pub fn acquire(self: *RetireGate) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.retired) return false;
+        self.count += 1;
+        return true;
+    }
+
+    pub fn release(self: *RetireGate) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.count -= 1;
+        if (self.retired and self.count == 0) self.done.broadcast();
+    }
+
+    /// Close the gate and wait for all in-flight holders to release.
+    pub fn retire(self: *RetireGate) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.retired = true;
+        while (self.count > 0) self.done.wait(&self.mutex);
+    }
+
+    pub fn deinit(self: *RetireGate) void {
+        self.done.deinit();
+        self.mutex.deinit();
+        self.* = undefined;
+    }
+};
+
 // ===========================================================================
 // Tests — no sleep-based synchronization anywhere; joins bound every wait.
 // ===========================================================================
@@ -281,4 +324,90 @@ test "condition: broadcast wakes all waiters" {
 
     for (threads) |t| t.join();
     try testing.expectEqual(@as(usize, 4), ctx.woke);
+}
+
+test "retire gate: acquire succeeds until retire, fails after" {
+    var gate: RetireGate = .{};
+    defer gate.deinit();
+
+    try testing.expect(gate.acquire());
+    gate.release();
+    gate.retire();
+    try testing.expect(!gate.acquire());
+}
+
+test "retire gate: retire returns only via the holder's release, and the gate is closed after" {
+    var gate: RetireGate = .{};
+    defer gate.deinit();
+
+    try testing.expect(gate.acquire()); // in-flight holder, held by this thread
+
+    const Ctx = struct {
+        gate: *RetireGate,
+        done: ResetEvent = .{},
+
+        fn retirer(self: *@This()) void {
+            self.gate.retire();
+            self.done.set();
+        }
+    };
+    var ctx: Ctx = .{ .gate = &gate };
+    defer ctx.done.deinit();
+
+    const t = try std.Thread.spawn(.{}, Ctx.retirer, .{&ctx});
+    gate.release(); // last holder → retire unblocks, done sets
+    ctx.done.wait(); // bounded by the release; join below bounds the thread
+    t.join();
+    try testing.expect(ctx.done.isSet());
+    // After retire has run, the gate is closed to new holders.
+    try testing.expect(!gate.acquire());
+}
+
+test "retire gate: retire waits for every holder (two acquires, two releases)" {
+    const Ctx = struct {
+        gate: RetireGate = .{},
+        mutex: Mutex = .{},
+        cond: Condition = .{},
+        holder_ready: bool = false,
+        release_now: bool = false,
+        holder_acquired: bool = false,
+
+        fn holder(self: *@This()) void {
+            if (self.gate.acquire()) self.holder_acquired = true;
+            self.mutex.lock();
+            self.holder_ready = true;
+            self.cond.signal();
+            while (!self.release_now) self.cond.wait(&self.mutex);
+            self.mutex.unlock();
+            self.gate.release();
+        }
+
+        fn releaser(self: *@This()) void {
+            // Holder may or may not be waiting yet: broadcast covers both.
+            self.mutex.lock();
+            self.release_now = true;
+            self.cond.broadcast();
+            self.mutex.unlock();
+        }
+    };
+    var ctx: Ctx = .{};
+    defer {
+        ctx.cond.deinit();
+        ctx.mutex.deinit();
+        ctx.gate.deinit();
+    }
+
+    try testing.expect(ctx.gate.acquire()); // first holder: this thread
+    const holder = try std.Thread.spawn(.{}, Ctx.holder, .{&ctx}); // second holder
+    ctx.mutex.lock();
+    while (!ctx.holder_ready) ctx.cond.wait(&ctx.mutex);
+    ctx.mutex.unlock();
+    try testing.expect(ctx.holder_acquired);
+
+    const releaser = try std.Thread.spawn(.{}, Ctx.releaser, .{&ctx});
+    ctx.gate.release(); // this thread's hold
+    ctx.gate.retire(); // returns only once the holder thread released too
+    holder.join();
+    releaser.join();
+    try testing.expect(!ctx.gate.acquire());
 }
