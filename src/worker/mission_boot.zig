@@ -204,6 +204,14 @@ pub fn searchConfigFromEnv(env: []const EnvPair) ?web_tools.SearchConfig {
     return null;
 }
 
+/// SSRF screen escape hatch: ZYGOS_FETCH_ALLOW_PRIVATE=1|true lets web_fetch
+/// reach loopback/private hosts (localhost stubs, self-hosted mirrors).
+/// Malformed values keep the screen on (fail closed).
+pub fn fetchAllowPrivate(env: []const EnvPair) bool {
+    const raw = getEnv(env, "ZYGOS_FETCH_ALLOW_PRIVATE") orelse return false;
+    return std.mem.eql(u8, raw, "1") or std.ascii.eqlIgnoreCase(raw, "true");
+}
+
 // ---------------------------------------------------------------------------
 // run-stamp refusal + planning root
 // ---------------------------------------------------------------------------
@@ -532,6 +540,16 @@ test "claimDecision: live holder is busy; dead, empty, or garbage claims take ov
     // A claim we cannot parse identifies no live holder: take over.
     try t.expect(claimDecision("not-a-pid", true) == .claim);
     try t.expect(claimDecision("", true) == .claim);
+}
+
+test "fetchAllowPrivate: only 1/true opts out; unset and junk keep the screen" {
+    const on = [_]EnvPair{.{ .name = "ZYGOS_FETCH_ALLOW_PRIVATE", .value = "1" }};
+    try t.expect(fetchAllowPrivate(&on));
+    const on_word = [_]EnvPair{.{ .name = "ZYGOS_FETCH_ALLOW_PRIVATE", .value = "TRUE" }};
+    try t.expect(fetchAllowPrivate(&on_word));
+    const junk = [_]EnvPair{.{ .name = "ZYGOS_FETCH_ALLOW_PRIVATE", .value = "yes please" }};
+    try t.expect(!fetchAllowPrivate(&junk));
+    try t.expect(!fetchAllowPrivate(&.{}));
 }
 
 test "planningRoot: run-stamp suffixes the base; plain base unchanged" {

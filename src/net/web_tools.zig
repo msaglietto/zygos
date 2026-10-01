@@ -37,6 +37,9 @@ pub const Options = struct {
     /// get one polite retry; every other status still fails closed at once.
     search_retry_max: usize = 1,
     search_retry_delay_ms: u64 = 1100,
+    /// SSRF screen escape hatch (ZYGOS_FETCH_ALLOW_PRIVATE=1): allows
+    /// loopback/private hosts — localhost stubs, self-hosted mirrors.
+    allow_private_hosts: bool = false,
 };
 
 pub const html = @import("web/html.zig");
@@ -63,6 +66,102 @@ pub fn validateUrl(url: []const u8) ValidateError!void {
         return error.InvalidUrl;
     // A fetchable URL needs a host; bare "http:" / scheme-only garbage fails.
     if (uri.host == null) return error.InvalidUrl;
+}
+
+// ---------------------------------------------------------------------------
+// SSRF screen (fetch-time; validateUrl above is scheme admission only)
+// ---------------------------------------------------------------------------
+
+/// Default-refused host classes: loopback (name and literal), link-local,
+/// private ranges, unspecified, multicast, the RFC 6598 shared range, and
+/// their IPv6 forms (incl. v4-mapped). Prompt-injected content must not
+/// aim web_fetch at internal services or cloud metadata. DNS names other
+/// than localhost pass — resolve-then-rebind is documented out of scope.
+pub fn hostBlocked(host_text: []const u8) bool {
+    // IPv6 literals arrive bracketed in the authority: [::1], [fe80::1].
+    if (host_text.len >= 2 and host_text[0] == '[' and host_text[host_text.len - 1] == ']')
+        return v6Blocked(host_text[1 .. host_text.len - 1]);
+    if (parseIpv4(host_text)) |b| return isBlockedV4(b[0], b[1], b[2], b[3]);
+    return isLocalName(host_text);
+}
+
+fn isLocalName(name: []const u8) bool {
+    if (std.ascii.eqlIgnoreCase(name, "localhost")) return true;
+    return name.len > ".localhost".len and
+        std.ascii.endsWithIgnoreCase(name, ".localhost");
+}
+
+fn isBlockedV4(a: u8, b: u8, c: u8, d: u8) bool {
+    _ = c;
+    _ = d;
+    return switch (a) {
+        0, 10, 127 => true, // this-network, private, loopback
+        169 => b == 254, // link-local 169.254.0.0/16 (incl. metadata 169.254.169.254)
+        172 => b >= 16 and b <= 31, // private 172.16.0.0/12
+        192 => b == 168, // private 192.168.0.0/16
+        100 => b >= 64 and b <= 127, // RFC 6598 shared
+        224...255 => true, // multicast + reserved
+        else => false,
+    };
+}
+
+/// Strict dotted-quad parse (no ports — Uri separates the port).
+fn parseIpv4(s: []const u8) ?[4]u8 {
+    var out: [4]u8 = undefined;
+    var it = std.mem.splitScalar(u8, s, '.');
+    var i: usize = 0;
+    while (it.next()) |part| {
+        if (i >= 4) return null;
+        if (part.len == 0 or part.len > 3) return null;
+        var v: u16 = 0;
+        for (part) |ch| {
+            if (ch < '0' or ch > '9') return null;
+            v = v * 10 + (ch - '0');
+        }
+        if (v > 255) return null;
+        out[i] = @intCast(v);
+        i += 1;
+    }
+    if (i != 4) return null;
+    return out;
+}
+
+fn v6Blocked(s: []const u8) bool {
+    if (s.len == 0) return true;
+    if (std.mem.eql(u8, s, "::1") or std.mem.eql(u8, s, "::")) return true;
+    // v4-mapped ::ffff:a.b.c.d — screen the embedded v4.
+    if (std.mem.startsWith(u8, s, "::ffff:")) {
+        if (parseIpv4(s["::ffff:".len..])) |b| return isBlockedV4(b[0], b[1], b[2], b[3]);
+        return true; // unparseable mapped form: fail closed
+    }
+    // fe80::/10 (fe8x-febx), fc00::/7 (fc/fd), ff00::/8, and any other
+    // "::"-prefixed special form — conservative fail closed.
+    if (startsWithHex(s, "fe8") or startsWithHex(s, "fe9") or
+        startsWithHex(s, "fea") or startsWithHex(s, "feb")) return true;
+    if (startsWithHex(s, "fc") or startsWithHex(s, "fd")) return true;
+    if (startsWithHex(s, "ff")) return true;
+    if (std.mem.startsWith(u8, s, "::")) return true;
+    return false;
+}
+
+fn startsWithHex(s: []const u8, prefix: []const u8) bool {
+    if (s.len < prefix.len) return false;
+    for (s[0..prefix.len], prefix) |a, b| {
+        if (std.ascii.toLower(a) != std.ascii.toLower(b)) return false;
+    }
+    return true;
+}
+
+/// True when `url`'s host class is refused by the screen. Unparseable or
+/// host-less URLs are not this gate's problem (validateUrl answers those).
+pub fn fetchHostBlocked(url: []const u8) bool {
+    const uri = std.Uri.parse(url) catch return false;
+    const host = uri.host orelse return false;
+    const text = switch (host) {
+        .raw => |s| s,
+        .percent_encoded => |s| s,
+    };
+    return hostBlocked(text);
 }
 
 // ---------------------------------------------------------------------------
@@ -102,6 +201,9 @@ pub const WebToolsWorker = struct {
     search_retry_delay_ms: u64,
     transport: Transport = defaultTransport,
     transport_ctx: ?*anyopaque = null,
+    /// SSRF screen escape hatch (ZYGOS_FETCH_ALLOW_PRIVATE=1): localhost
+    /// stubs and self-hosted mirrors need it; default is screen-on.
+    allow_private_hosts: bool = false,
     /// Owned deep copy of search config, or null when search is unconfigured.
     search: ?OwnedSearch,
 
@@ -164,6 +266,12 @@ pub const WebToolsWorker = struct {
         const url = strField(obj, "url") orelse return error.Failed;
 
         validateUrl(url) catch return errorReply(arena, "InvalidUrl");
+
+        // SSRF screen: private/loopback/link-local hosts refuse (structured,
+        // fail closed) unless the operator allowed them (localhost stubs,
+        // self-hosted mirrors — ZYGOS_FETCH_ALLOW_PRIVATE=1).
+        if (!self.allow_private_hosts and fetchHostBlocked(url))
+            return errorReply(arena, "PrivateHost");
 
         const body = self.transport(self.transport_ctx, self.gpa, self.io, url, &.{}, self.max_fetch_bytes) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -431,6 +539,83 @@ test "validateUrl: https/http pass; file:, ftp:, garbage ⇒ error" {
     try testing.expectError(error.InvalidUrl, validateUrl(""));
 }
 
+test "SSRF screen: loopback/private/link-local hosts blocked; public pass" {
+    // Loopback and local names.
+    try testing.expect(fetchHostBlocked("http://localhost/x"));
+    try testing.expect(fetchHostBlocked("http://api.localhost/x"));
+    try testing.expect(fetchHostBlocked("http://LOCALHOST/x"));
+    // Private / link-local / metadata / shared v4.
+    try testing.expect(fetchHostBlocked("http://127.0.0.1/x"));
+    try testing.expect(fetchHostBlocked("http://10.1.2.3/x"));
+    try testing.expect(fetchHostBlocked("http://192.168.1.1/x"));
+    try testing.expect(fetchHostBlocked("http://172.16.0.9/x"));
+    try testing.expect(fetchHostBlocked("http://172.31.255.1/x"));
+    try testing.expect(fetchHostBlocked("http://169.254.169.254/latest/meta-data"));
+    try testing.expect(fetchHostBlocked("http://0.0.0.0/x"));
+    try testing.expect(fetchHostBlocked("http://100.64.0.1/x"));
+    // IPv6 loopback / link-local / unique-local / v4-mapped private.
+    try testing.expect(fetchHostBlocked("http://[::1]/x"));
+    try testing.expect(fetchHostBlocked("http://[::]/x"));
+    try testing.expect(fetchHostBlocked("http://[fe80::1]/x"));
+    try testing.expect(fetchHostBlocked("http://[fd12:3456::1]/x"));
+    try testing.expect(fetchHostBlocked("http://[::ffff:10.0.0.1]/x"));
+    // Public hosts fetch.
+    try testing.expect(!fetchHostBlocked("https://example.com/path"));
+    try testing.expect(!fetchHostBlocked("http://8.8.8.8/x"));
+    try testing.expect(!fetchHostBlocked("http://[2606:4700::6810:85e5]/x"));
+    try testing.expect(!fetchHostBlocked("http://172.32.0.1/x")); // just outside 172.16/12
+    // Not this gate's problem: garbage passes through to validateUrl.
+    try testing.expect(!fetchHostBlocked("not a url"));
+}
+
+test "web_fetch: private host refuses with PrivateHost before the transport; the allow flag overrides" {
+    var h = try Harness.init(testing.allocator, .{});
+    defer h.deinit();
+
+    const FetchFake = struct {
+        calls: usize = 0,
+
+        fn transport(
+            ctx: ?*anyopaque,
+            gpa: std.mem.Allocator,
+            io: std.Io,
+            url: []const u8,
+            headers: []const std.http.Header,
+            max_bytes: usize,
+        ) HttpGetError!HttpBody {
+            _ = io;
+            _ = url;
+            _ = headers;
+            _ = max_bytes;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.calls += 1;
+            return .{
+                .bytes = try gpa.dupe(u8, "<html><body><p>internal mirror</p></body></html>"),
+                .content_type = try gpa.dupe(u8, "text/html; charset=utf-8"),
+            };
+        }
+    };
+
+    var fake = FetchFake{};
+    h.worker.transport = FetchFake.transport;
+    h.worker.transport_ctx = &fake;
+
+    // Screen on: cloud-metadata and loopback refuse without a transport call.
+    const res = try h.caller.call("zygos::tools::web_fetch", "{\"url\":\"http://169.254.169.254/latest/meta-data\"}");
+    defer res.deinit(testing.allocator);
+    try testing.expect(res == .ok);
+    try testing.expect(std.mem.indexOf(u8, res.ok, "PrivateHost") != null);
+    try testing.expectEqual(@as(usize, 0), fake.calls);
+
+    // Escape hatch (ZYGOS_FETCH_ALLOW_PRIVATE wiring target): rides the seam.
+    h.worker.allow_private_hosts = true;
+    const res2 = try h.caller.call("zygos::tools::web_fetch", "{\"url\":\"http://169.254.169.254/latest/meta-data\"}");
+    defer res2.deinit(testing.allocator);
+    try testing.expect(res2 == .ok);
+    try testing.expect(std.mem.indexOf(u8, res2.ok, "internal mirror") != null);
+    try testing.expectEqual(@as(usize, 1), fake.calls);
+}
+
 const fixture_brave =
     \\{"web":{"results":[
     \\  {"title":"Zig Programming Language","url":"https://ziglang.org/","description":"Zig is a general-purpose programming language."},
@@ -627,7 +812,7 @@ test "fetch rides the transport seam" {
     h.worker.transport = FetchFake.transport;
     h.worker.transport_ctx = &fake;
 
-    const res = try h.caller.call("zygos::tools::web_fetch", "{\"url\":\"http://127.0.0.1:1/x\"}");
+    const res = try h.caller.call("zygos::tools::web_fetch", "{\"url\":\"https://example.com/x\"}");
     defer res.deinit(testing.allocator);
     try testing.expect(res == .ok);
     try testing.expectEqual(@as(usize, 1), fake.calls);

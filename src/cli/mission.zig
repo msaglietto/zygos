@@ -217,6 +217,7 @@ pub fn run(gpa: std.mem.Allocator, args: *std.process.Args.Iterator) u8 {
     _ = policy;
     const web = zygos.web_tools.WebToolsWorker.start(gpa, &actor, &registry, io_boot.io(), .{
         .search = zygos.mission_boot.searchConfigFromEnv(env),
+        .allow_private_hosts = zygos.mission_boot.fetchAllowPrivate(env),
     }) catch return boot_fail();
     _ = web;
     const approvals = zygos.approval.ApprovalWorker.start(gpa, &actor, &registry, .{
