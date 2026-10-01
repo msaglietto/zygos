@@ -1,6 +1,6 @@
 # Work ledger — harness benchmark
 
-Updated 2026-10-01. Phases 1–8 are done. The first Phase 9 campaign finished 24 attempts and failed qualification; results are `/tmp/zygos-phase9/campaign.json`. The operator approved Phases 10–12, then explicitly chose a schema fix and a fresh Phase 9 plus Phase 10 campaign on one new clean build. Those live campaigns are not started yet. No dollar cap was named.
+Updated 2026-10-01. Phases 1–8 are done. The first Phase 9 campaign finished 24 attempts and failed qualification; results are `/tmp/zygos-phase9/campaign.json`. The operator approved Phases 10–12, then explicitly chose a schema fix and a fresh Phase 9 plus Phase 10 campaign on one new clean build. Fresh Phase 9 is running under `/tmp/zygos-phase9-schema`; Phase 10 has not started. No dollar cap was named.
 
 The historical offline binary used in phases 1–7 is git `a2a9bf03fe8b808c2a6dfd9a059e3f358346f7c7`, target `aarch64-macos.26.7...26.7-none`, optimize `Debug`, adapter `0.1.0`. That binary was built from a dirty tree, so the stamped sha is the parent commit and does not contain this work. A later build stamps `unknown` when `git status --porcelain` is non-empty, and the task command refuses `unknown`.
 
@@ -175,7 +175,7 @@ Trial directories below are absolute. Scorer output for each row is `/tmp/zygos-
 | 3 | `/tmp/zygos-phase9/phase9-r3-modernize-scientific-stack/modernize-scientific-stack__PGpGFwF` | 1936 | 1400 | 0.00099040 | 0.0 | 0 |
 | 3 | `/tmp/zygos-phase9/phase9-r3-regex-log/regex-log__YvLwCqD` | 0 | 0 | 0.00000000 | 0.0 | 0 |
 
-Full results are saved at `/tmp/zygos-phase9/campaign.json`. Phase 9 execution is finished, but canary qualification failed. Phases 10–12 remain not started and require their own approvals; the Phase 9 continuation did not authorize them.
+Full results are saved at `/tmp/zygos-phase9/campaign.json`. This first Phase 9 execution is finished, but canary qualification failed. At its completion, Phases 10–12 had not started and required their own approvals; the later operator approval and schema-repair rerun are recorded below.
 
 Offline checks on 2026-10-01: `zig build test --summary all` passed 878/878 tests and `zig fmt --check src/` was clean. Only this ledger changed. The Linux binary digest is unchanged, `eval/image-platforms.json` remains `status: ready`, and no `eval/harbor/**__pycache__` was created. The initial trial summary is `/tmp/zygos-phase9/report.json`; the full 24-trial report is `/tmp/zygos-phase9/campaign.json`.
 
@@ -200,6 +200,10 @@ An offline regression observes the public task-to-provider request through a reg
 The operator explicitly approved replacing the prior Phase 9/10 artifact with one clean build after this fix is committed, and rerunning Phase 9 before Phase 10. Old results remain historical evidence. The new build identity and live trial paths will be recorded after they exist. No live provider request or Harbor trial ran during this repair.
 
 The Harbor adapter now accepts `ZYGOS_TRIM=on|off` (default on) and rejects any other value before container exec. Its offline tests first reproduced the hardcoded-on arm and missing invalid-value refusal, then passed all three checks. They verify that the two commands differ only in the trim value, keep the key in the exec environment, and preserve the timeout and other arguments. Adapter version remains 0.1.0.
+
+Repair commit: `b157dc1fa2048b3aa313e66ba1b275f5c708c4ab`. Built once from its clean tree with `zig build -Dtarget=x86_64-linux-gnu -Doptimize=ReleaseSafe --prefix zig-out/linux-x86_64`. Binary SHA-256: `2f22205e1a85af623f13fb6c2d6c9718f7e4dda7836ae28cadc9c7bc5eb4b468`; triple `x86_64-linux.5.10...6.19-gnu.2.31`, optimize ReleaseSafe, adapter 0.1.0. A keyless, network-disabled Docker check wrote `/tmp/zygos-schema-linux-check/trial.json`: the embedded sha matches, all three scripted tools executed, trim calls 3, reduction 60, scorer exit 0. Its scripted tokens are 25 input, 6 output, 5 cache read; no provider cost. Build manifest: `/tmp/zygos-phase9-schema/build.json`. The prior artifact is preserved at `/tmp/zygos-phase9-binary-324c45c`. Do not rebuild for ledger edits.
+
+The approved fresh Phase 9 uses the same eight observed task ids, three runs each, cap 24, glm-5.3-flash, terminal-bench/terminal-bench-2-1, trim on, no Hub upload. Jobs and the resumable campaign report are under `/tmp/zygos-phase9-schema`. Phase 10 will use the same new artifact for both arms; only trim will differ.
 
 ## Checks run on 2026-09-28
 
