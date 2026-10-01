@@ -27,6 +27,6 @@ jobs:
           # Matches minimum_zig_version in build.zig.zon.
           version: 0.16.0
       - name: fmt
-        run: zig fmt --check src/
+        run: zig fmt --check build.zig src/ test/
       - name: test
         run: zig build test

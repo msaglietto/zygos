@@ -154,4 +154,4 @@ Approach these with the spec open and run `zig build test` often:
 1. Read `GOAL.md` (decision authority) and `AGENTS.md` (TDD law, commands, conventions).
 2. Walk the tour above — or open the interactive dashboard: `/understand-dashboard`.
 3. Pick the spec in `docs/specs/` for the module you're touching; write the RED test first.
-4. Gate: `zig build test` green and `zig fmt --check src/` clean before any commit.
+4. Gate: `zig build test` green and `zig fmt --check build.zig src/ test/` clean before any commit.

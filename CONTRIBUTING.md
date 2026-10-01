@@ -14,7 +14,7 @@ and must never read a real provider catalog, real vault, or remote service.
 zig build --fetch
 zig build test --system zig-pkg
 zig build --system zig-pkg
-zig fmt --check src/
+zig fmt --check build.zig src/ test/
 ```
 
 Write a named regression test in the affected module, run `zig build test`

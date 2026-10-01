@@ -31,7 +31,7 @@ Rules below are the ones whose failure crosses a trust, spend, or durability bou
 | Session read | Orient and `session_open` read only through the sessions they use | Bytes after the next header are absent | `src/worker/tessera/vault.zig` test `readThroughSessions stops before the next session header` | unit | pinned by existing tests |
 | Mission tool list | The start body offers bash, web_search, and web_fetch | `read_file` and `write_file` are not in the list | `src/worker/mission/start.zig` test `mission start offers bash, web_search, and web_fetch only` | unit | pinned by existing tests |
 | Output filters | Real git output is compressed; deleting a guard fails the suite | `raw: true` bypasses the seam | `test/e2e/m8/run.sh`, `test/mutation/guards.sh`, `test/probe/filter/run.sh` | integration | pinned by existing tests |
-| PR verify | Each pull request runs `zig fmt --check src/` and `zig build test` | A format or test failure fails the job. The merge button stays available on this GitHub plan | `.github/workflows/verify.yml` | integration | pinned by existing tests |
+| PR verify | Each pull request runs `zig fmt --check build.zig src/ test/` and `zig build test` | A format or test failure fails the job. The merge button stays available on this GitHub plan | `.github/workflows/verify.yml` | integration | pinned by existing tests |
 
 ## Proposed tests
 

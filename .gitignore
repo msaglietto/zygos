@@ -6,6 +6,7 @@ zig-out/
 test/e2e/node-sdk/node_modules/
 test/e2e/node-sdk/package-lock.json
 zig-pkg/
+.zig-global-cache/
 .tokensave/
 .claude
 .ua

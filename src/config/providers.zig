@@ -747,3 +747,29 @@ test "no leaks across parse/deinit loops incl. error paths" {
         try t.expectError(error.InvalidCatalog, Catalog.parse(t.allocator, "[[providers]]\nname = \"a\"", null));
     }
 }
+
+test "public example catalog parses and stores no inline key" {
+    // Build wiring embeds examples/providers.toml. A relative @embedFile
+    // from this file is outside the module root.
+    const example_providers = @import("example_providers");
+    var diag: Diag = .{};
+    var cat = Catalog.parse(t.allocator, example_providers.text, &diag) catch |err| {
+        std.debug.print("examples/providers.toml:{d}: {s}\n", .{ diag.line, diag.message });
+        return err;
+    };
+    defer cat.deinit();
+
+    try t.expectEqual(@as(usize, 1), cat.providers.len);
+    const p = cat.providers[0];
+    try t.expectEqualStrings("Example OpenAI", p.name);
+    try t.expectEqual(ProviderKind.openai_compatible, p.kind);
+    try t.expectEqualStrings("https://api.openai.com/v1", p.endpoint.?);
+    try t.expectEqualStrings("your-model-id", p.model);
+    try t.expectEqualStrings("OPENAI_API_KEY", p.key_env.?);
+    try t.expectEqual(@as(?[]const u8, null), p.key);
+    try t.expectEqual(@as(u32, 4096), p.max_tokens.?);
+    try t.expectEqual(@as(f64, 0.2), p.temperature.?);
+    const s = try slug(t.allocator, p.name);
+    defer t.allocator.free(s);
+    try t.expectEqualStrings("example-openai", s);
+}
