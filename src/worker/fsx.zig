@@ -68,20 +68,31 @@ pub fn mkdirP(gpa: std.mem.Allocator, abs: []const u8) error{OutOfMemory}!void {
 }
 
 /// Atomic tmp+rename write (mission_store idiom). Creates parent
-/// directories. rename(2) is the atomicity boundary: readers see the old
-/// file or the new one, never a torn write.
+/// directories. Each writer owns a unique O_EXCL tmp file (pid + counter):
+/// concurrent writers never interleave into one tmp, and rename(2) remains
+/// the atomicity boundary — readers see the old file or the new one, never a
+/// torn write. fsync before rename keeps the final name from ever pointing
+/// at an empty file across a power loss.
+var tmp_seq = std.atomic.Value(u64).init(0);
+
 pub fn writeAtomic(gpa: std.mem.Allocator, path: []const u8, bytes: []const u8) error{ Failed, OutOfMemory }!void {
     if (std.mem.lastIndexOfScalar(u8, path, '/')) |slash| {
         try mkdirP(gpa, path[0..slash]);
     }
 
-    const tmp_z = std.fmt.allocPrintSentinel(gpa, "{s}.tmp", .{path}, 0) catch return error.OutOfMemory;
+    const tmp_z = std.fmt.allocPrintSentinel(gpa, "{s}.tmp.{d}.{d}", .{
+        path,
+        std.c.getpid(),
+        tmp_seq.fetchAdd(1, .monotonic),
+    }, 0) catch return error.OutOfMemory;
     defer gpa.free(tmp_z);
     const final_z = gpa.dupeZ(u8, path) catch return error.OutOfMemory;
     defer gpa.free(final_z);
 
-    const fd = c.open(tmp_z, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(c.mode_t, 0o644));
+    const fd = c.open(tmp_z, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true }, @as(c.mode_t, 0o644));
     if (fd < 0) return error.Failed;
+    // Whatever happens after a successful create, no tmp residue survives.
+    defer _ = c.unlink(tmp_z); // no-op after a successful rename
     var off: usize = 0;
     while (off < bytes.len) {
         const n = c.write(fd, bytes.ptr + off, bytes.len - off);
@@ -90,6 +101,10 @@ pub fn writeAtomic(gpa: std.mem.Allocator, path: []const u8, bytes: []const u8) 
             return error.Failed;
         }
         off += @intCast(n);
+    }
+    if (c.fsync(fd) != 0) {
+        _ = c.close(fd);
+        return error.Failed;
     }
     if (c.close(fd) != 0) return error.Failed;
     if (c.rename(tmp_z, final_z) != 0) return error.Failed;
@@ -143,4 +158,44 @@ test "writeAtomic overwrites atomically (old content fully replaced)" {
     const back = readWholeFile(testing.allocator, path).?;
     defer testing.allocator.free(back);
     try testing.expectEqualStrings("second", back);
+}
+
+test "writeAtomic concurrent writers publish exactly one writer's bytes, no tmp residue" {
+    var buf: [128]u8 = undefined;
+    const path = tmpPath(&buf, "concurrent.txt");
+
+    const filler = struct {
+        fn run(p: []const u8, ch: u8) void {
+            var payload: [64 * 1024]u8 = undefined;
+            @memset(&payload, ch);
+            var i: usize = 0;
+            while (i < 40) : (i += 1) {
+                writeAtomic(testing.allocator, p, &payload) catch unreachable;
+            }
+        }
+    };
+
+    var a = try std.Thread.spawn(.{}, filler.run, .{ path, 'a' });
+    var b = try std.Thread.spawn(.{}, filler.run, .{ path, 'b' });
+    a.join();
+    b.join();
+
+    // The published file is exactly one writer's pattern — never a mix of
+    // 'a' and 'b' bytes from two writers sharing one tmp file.
+    const back = readWholeFile(testing.allocator, path).?;
+    defer testing.allocator.free(back);
+    try testing.expectEqual(@as(usize, 64 * 1024), back.len);
+    const first = back[0];
+    for (back) |ch| try testing.expectEqual(first, ch);
+
+    // Success paths leave no .tmp siblings behind (libc readdir — std.fs
+    // iteration lives behind std.Io, out of worker modules per Z-02).
+    var dbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_z = try std.fmt.bufPrintZ(&dbuf, "{s}", .{std.fs.path.dirname(path).?});
+    const dir = std.c.opendir(dir_z.ptr) orelse return error.TestUnexpectedResult;
+    defer _ = std.c.closedir(dir);
+    while (std.c.readdir(dir)) |e| {
+        const name = std.mem.sliceTo(&e.name, 0);
+        try testing.expect(!std.mem.startsWith(u8, name, "concurrent.txt.tmp"));
+    }
 }
