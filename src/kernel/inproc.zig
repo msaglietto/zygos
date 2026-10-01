@@ -73,12 +73,21 @@ pub const Registry = struct {
 
     fn sendFn(ctx: *anyopaque, to: WorkerId, frame: []const u8) actor_mod.SendError!void {
         const self: *Registry = @ptrCast(@alignCast(ctx));
+        // Acquire the retire gate under the registry lock: once `stop()` has
+        // removed the worker (same lock), the map lookup fails instead; once
+        // we hold the gate, `stop()`'s retire blocks until our release, so
+        // `deliver` can never touch a freed Worker.
         const worker = blk: {
             self.mutex.lock();
             defer self.mutex.unlock();
-            break :blk self.map.get(to);
+            const w = self.map.get(to) orelse break :blk null;
+            if (!w.gate.acquire()) break :blk null;
+            break :blk w;
         };
-        if (worker) |w| return w.deliver(frame);
+        if (worker) |w| {
+            defer w.gate.release();
+            return w.deliver(frame);
+        }
         if (self.fallback) |fb| return fb.sendFn(fb.ctx, to, frame);
         return error.Disconnected;
     }
@@ -138,6 +147,10 @@ pub const Worker = struct {
     hb_done: sync.Condition = .{},
     handlers_live: usize = 0,
 
+    /// Lifetime gate for kernel-thread delivers (see Registry.sendFn):
+    /// `stop()` retires it and may free the Worker only once it drains.
+    gate: sync.RetireGate = .{},
+
     router: std.Thread = undefined,
 
     pub fn spawn(
@@ -171,6 +184,9 @@ pub const Worker = struct {
     pub fn stop(self: *Worker) void {
         // No new deliveries...
         self.registry.remove(self.id);
+        // ...and wait out any in-flight kernel-thread deliver before any of
+        // this Worker's memory goes away (RetireGate; UAF otherwise).
+        self.gate.retire();
         // ...bus-level GC (CAS-gated; a peer's re-registration survives)...
         self.actor.post(.{ .worker_disconnected = self.id });
         // ...wake anyone blocked on our calls...
@@ -207,6 +223,7 @@ pub const Worker = struct {
         self.handlers.deinit();
         self.pending.deinit();
         self.gpa.free(self.name);
+        self.gate.deinit();
         self.hb_done.deinit();
         self.hb_mutex.deinit();
         self.pending_mutex.deinit();
@@ -679,6 +696,63 @@ test "worker stop posts worker_disconnected; its functions are reaped" {
     defer after.deinit(testing.allocator);
     try testing.expect(after == .err);
     try testing.expectEqualStrings("function_not_found", after.err);
+}
+
+test "stop waits out an in-flight kernel deliver before freeing (RetireGate wiring)" {
+    var h = try Harness.init(testing.allocator);
+    defer h.deinit();
+
+    const w = try Worker.spawn(testing.allocator, &h.actor, &h.registry, "stopping");
+    const out = h.registry.outbound();
+
+    // Stand in for a kernel-thread deliver that is in flight: the same
+    // acquire Registry.sendFn performs under the registry lock.
+    try testing.expect(w.gate.acquire());
+
+    // Once the worker is out of the map (stop()'s first step), a send goes
+    // to the fallback — never delivered to the half-stopped worker.
+    h.registry.remove(w.id);
+    try out.sendFn(out.ctx, w.id, "{}");
+    try testing.expectEqual(@as(usize, 1), h.fallback.frames);
+
+    const Stopper = struct {
+        fn run(target: *Worker) void {
+            target.stop();
+        }
+    };
+    const t = try std.Thread.spawn(.{}, Stopper.run, .{w});
+    // stop() is inside gate.retire() waiting on the hold above; releasing
+    // lets it finish. Under the old no-gate code this release (and stop's
+    // destroy) raced the deliver — the use-after-free this test pins.
+    w.gate.release();
+    t.join();
+}
+
+test "stop during a concurrent send storm never delivers to freed memory" {
+    var h = try Harness.init(testing.allocator);
+    defer h.deinit();
+
+    // Soak, not a flake: every iteration joins; the assertions are exact.
+    var round: usize = 0;
+    while (round < 25) : (round += 1) {
+        const w = try Worker.spawn(testing.allocator, &h.actor, &h.registry, "churn");
+        const out = h.registry.outbound();
+
+        const Sender = struct {
+            fn run(ob: actor_mod.Outbound, to: WorkerId) void {
+                var i: usize = 0;
+                while (i < 50) : (i += 1) {
+                    // QueueFull (cap 64) or Disconnected are both fine.
+                    ob.sendFn(ob.ctx, to, "{\"type\":\"ping\"}") catch {};
+                }
+            }
+        };
+        var s1 = try std.Thread.spawn(.{}, Sender.run, .{ out, w.id });
+        var s2 = try std.Thread.spawn(.{}, Sender.run, .{ out, w.id });
+        w.stop();
+        s1.join();
+        s2.join();
+    }
 }
 
 test "mux falls back to the fallback outbound for non-inproc ids" {
