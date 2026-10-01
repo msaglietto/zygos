@@ -112,7 +112,11 @@ Green evidence: `zig build test --summary all` 878/878 passed, leak-checked and 
 
 The phase-8 raw stream was not saved, and its trace has no tool ids. The tests prove the argument-loss mechanism for the synthetic stream shape and that the harness does not double a single block. They cannot establish the pilot's exact stream shape or whether its paired calls were duplicates. No deduplication by tool name was introduced.
 
-The Linux binary for phases 9 and 10 must be built once from the clean committed fix, with target `x86_64-linux.5.10...6.19-gnu.2.31`, optimize `ReleaseSafe`, and adapter `0.1.0`. A later ledger-only commit does not rebuild that artifact. Phase 9 remains unapproved and unstarted.
+The fix is commit `324c45cb6a8a60b07f04d5c069e7522c3ad54d33` (`324c45c`). From that clean tree, the Linux binary was rebuilt once with `zig build -Dtarget=x86_64-linux-gnu -Doptimize=ReleaseSafe --prefix zig-out/linux-x86_64`. Its sha256 is `78e1a163748eff8b500d11797745b0d7ea67c7a227dfdb10daf0061f601b1795`. Use this artifact and sha for every phase-9 and phase-10 trial. This ledger-only note does not rebuild it. The original pilot binary is preserved at `/tmp/zygos-phase8-binary-f3a3bdc`.
+
+A network-disabled, `--pull=never` container using the already-installed `debian:bullseye-slim` amd64 image checked the Linux CLI with the scripted `--offline` fixture. It wrote `/tmp/zygos-tool-input-linux-check/trial.json` and `events.jsonl`; no Harbor or provider ran. The trial confirms sha `324c45c`, triple `x86_64-linux.5.10...6.19-gnu.2.31`, optimize `ReleaseSafe`, and adapter `0.1.0`. Tokens are synthetic: input 25, output 6, cache read 5, cache creation 3. Provider cost is $0; Harbor reward is not applicable. `zygos task score` with a free fixture price exited 0: `cents=0 source_lines_read=3 reduction=60`. Build identity and digest are saved at `/tmp/zygos-tool-input-build.json`.
+
+A proposed eight-task phase-9 set is in `/tmp/zygos-phase9-proposal.md`, drawn from the installed task files. It is a proposal, not a frozen canary or a completed run. Phase 9 remains unapproved and unstarted; phases 10–12 remain unstarted.
 
 ## Phase 9 — Freeze the canary
 
