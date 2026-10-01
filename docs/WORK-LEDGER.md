@@ -1,6 +1,6 @@
 # Work ledger — harness benchmark
 
-Updated 2026-10-01. Phases 1–8 are done. Phase 9 was approved for 24 task-runs and stopped after its first trial because the live tool path and scorer failed. It is incomplete. Phases 10–12 are not started and need their own approvals. No dollar cap was named.
+Updated 2026-10-01. Phases 1–8 are done. Phase 9 finished all 24 approved task-run attempts after an explicit operator instruction to continue; canary qualification failed because all scorer checks reject missing trim evidence. Results are `/tmp/zygos-phase9/campaign.json`. Phases 10–12 are not started and need their own approvals. No dollar cap was named.
 
 The historical offline binary used in phases 1–7 is git `a2a9bf03fe8b808c2a6dfd9a059e3f358346f7c7`, target `aarch64-macos.26.7...26.7-none`, optimize `Debug`, adapter `0.1.0`. That binary was built from a dirty tree, so the stamped sha is the parent commit and does not contain this work. A later build stamps `unknown` when `git status --porcelain` is non-empty, and the task command refuses `unknown`.
 
@@ -120,7 +120,7 @@ A proposed eight-task phase-9 set was saved in `/tmp/zygos-phase9-proposal.md`, 
 
 ## Phase 9 — Freeze the canary
 
-Approved on 2026-10-01 for three runs of eight tasks (24 task-runs), with the proposal's stop condition: inspect each trial and stop on a broken tool path or failed scorer evidence before spending on the next task. Started and stopped after 1 of 24; 23 task-runs did not run. Phase 9 is incomplete and the canary is not frozen. `modernize-scientific-stack` remains a proposed member. Task ids will be frozen only from actual task runs.
+Approved on 2026-10-01 for three runs of eight tasks (24 task-runs), with the proposal's initial stop condition: inspect each trial and stop on a broken tool path or failed scorer evidence before spending on the next task. The first trial failed and spend stopped. The operator then explicitly instructed continuation of all 23 remaining Phase 9 runs before the model allocation reset. That instruction supersedes the campaign stop condition; tool policy, task budgets, model allowlist, and scorer rejection stay unchanged. The remaining runs finished sequentially with the same pinned binary and settings. Actual task ids, trials, and failed qualification are recorded below.
 
 The first task was `fix-code-vulnerability`, selected from the installed Terminal-Bench 2.1 task files. Its instruction offers `pytest -rA`, which can produce filterable command output. The agent never executed a successful command, so this trial provides no live filter evidence for ADR 003. The verifier's own pytest output is not agent tool output.
 
@@ -130,13 +130,54 @@ Harbor 0.23.0 ran one task, n=1, concurrency 1, max retries 0, model `glm-5.3-fl
 
 `agent/events.jsonl` has five provider steps. Step 1 dispatched two bash calls, step 2 one bash call, step 3 one read_file call, and step 4 a bash call and a read_file call. All six inputs are `{}` and all six results are `handler_failed`; there are no successful tool results or write_file calls. Step 5 stopped on `max_tokens` at output_tokens 1024, the request default because the catalog row sets no max_tokens. The trace has no tool ids and the raw provider stream was not saved. The offline regressions establish the repaired synthetic contract, but this live failure leaves the provider stream shape and paired calls unresolved.
 
-Token totals are input 2288 and output 1141. `cache_read_tokens` is absent. Using the same published 2026-09-18 rates ($0.15 input, $0.03 cached input, $0.50 output per 1M tokens), the cached rate is unused: 2288 × $0.15/M + 1141 × $0.50/M = $0.00091370. No dollar cap is assumed.
+The first trial's token totals are input 2288 and output 1141. `cache_read_tokens` is absent. Using the same published 2026-09-18 rates ($0.15 input, $0.03 cached input, $0.50 output per 1M tokens), the cached rate is unused: 2288 × $0.15/M + 1141 × $0.50/M = $0.00091370. No dollar cap is assumed.
 
 The trim snapshot has calls 0, filtered 0, raw_bytes 0, sent_bytes 0, and reduction 0; source_lines_read is 0. The pinned Linux scorer ran offline in a network-disabled container and exited 2 with `TrimEvidenceMissing`. Its price fixture `/tmp/zygos-phase9/prices.txt` contains `glm-5.3-flash 15`; that single cents_per_mtok value is the scorer check, not the three-rate invoice above. Scorer output and exit status are `/tmp/zygos-phase9/phase9-r1-fix-code-vulnerability.score.txt` and `/tmp/zygos-phase9/phase9-r1-fix-code-vulnerability.score-exit.txt`.
 
-The verifier found no `/app/report.jsonl` and the Bottle header validation remained unfixed: its output checks had 4 failures and 2 passes. Harbor reward is 0. Further spend stopped under the approved condition. The remaining runs need the live tool-input failure resolved before continuing; phases 10–12 remain not started and separately gated.
+The verifier found no `/app/report.jsonl` and the Bottle header validation remained unfixed: its output checks had 4 failures and 2 passes. Harbor reward is 0. Spend initially stopped under the proposal's condition; the operator's subsequent instruction resumed the remaining runs with failures preserved. Phases 10–12 remain not started and separately gated.
 
-Offline checks on 2026-10-01: `zig build test --summary all` passed 878/878 tests and `zig fmt --check src/` was clean. Only this ledger changed. The Linux binary digest is unchanged, `eval/image-platforms.json` remains `status: ready`, and no `eval/harbor/**__pycache__` was created. A trial summary is saved at `/tmp/zygos-phase9/report.json`.
+Campaign execution finished on 2026-10-01: 24 task-runs, three attempts for each of eight task ids observed in the actual trials. The executed set is `build-cython-ext`, `cobol-modernization`, `filter-js-from-html`, `fix-code-vulnerability`, `fix-git`, `log-summary-date-ranges`, `modernize-scientific-stack`, `regex-log`. `modernize-scientific-stack` is one member. This is an observed task set, not a qualified frozen canary: all 24 trim-on trials fail ADR 003 and no task emitted successful agent command output.
+
+All 24 uploaded binaries and trial identities match the pinned sha, triple, ReleaseSafe build, adapter 0.1.0, model, dataset, step cap 24, and trim-on settings recorded above. No Linux rebuild or Hub upload occurred. Each Harbor invocation remained n=1, concurrency 1, and max retries 0.
+
+Totals: input_tokens 49949, output_tokens 26650. Cache read and cache creation fields are absent in all 24 trials. The published 2026-09-18 rates remain $0.15 input, $0.03 cached input, and $0.50 output per 1M tokens; cached input is unreported and that rate is unused. The recorded-usage cost is 49949 × $0.15/M + 26650 × $0.50/M = $0.02081735. No dollar cap was invented.
+
+There were 162 tool dispatches, all with input `{}`, and 162 `handler_failed` results; successful tools and source_lines_read are zero throughout. Every trim snapshot has zero calls and zero reduction. Turn stops: 18 max_tokens, 3 failed, 2 end_turn, and 1 max_steps. All 24 final scorer checks exited 2 with `TrimEvidenceMissing`; the single `glm-5.3-flash 15` cents_per_mtok fixture remains a trim check, not this three-rate cost calculation. The provider raw streams were not saved, so the live argument-loss cause and paired calls are unresolved.
+
+Harbor reward is 0.0 in 23 trials. The first `regex-log` attempt has no reward and one `RewardFileNotFoundError`: Docker stopped during the run and verification produced no reward file. Docker Desktop was restarted. The next Harbor invocation was refused before a trial launched; its log is `/tmp/zygos-phase9/phase9-r2-modernize-scientific-stack.daemon-down.harbor.log`. The 16 unstarted task-runs then resumed, and existing trials were not repeated. The interrupted regex trial reports no token usage; its initial scorer invocation failed with Docker unavailable (exit 1), preserved in `/tmp/zygos-phase9/phase9-r1-regex-log.docker-unavailable.score.txt`. Its final offline scorer after recovery exited 2 with `TrimEvidenceMissing`. The other two regex turns also failed before reporting usage, without a Harbor exception.
+
+Trial directories below are absolute. Scorer output for each row is `/tmp/zygos-phase9/<job-name>.score.txt`; each final scorer result is exit 2, `TrimEvidenceMissing`. Harbor exit is 0 for every actual trial. The table preserves the missing reward rather than treating it as zero.
+
+| Repeat | Trial directory | Input | Output | USD | Harbor reward | Exceptions |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| 1 | `/tmp/zygos-phase9/phase9-r1-build-cython-ext/build-cython-ext__rHAxgqh` | 1960 | 1369 | 0.00097850 | 0.0 | 0 |
+| 1 | `/tmp/zygos-phase9/phase9-r1-cobol-modernization/cobol-modernization__Poh4LoZ` | 4833 | 2108 | 0.00177895 | 0.0 | 0 |
+| 1 | `/tmp/zygos-phase9/phase9-r1-filter-js-from-html/filter-js-from-html__7a8thu5` | 291 | 1024 | 0.00055565 | 0.0 | 0 |
+| 1 | `/tmp/zygos-phase9/phase9-r1-fix-code-vulnerability/fix-code-vulnerability__WxoQzbD` | 2288 | 1141 | 0.00091370 | 0.0 | 0 |
+| 1 | `/tmp/zygos-phase9/phase9-r1-fix-git/fix-git__sJGjVBN` | 708 | 1199 | 0.00070570 | 0.0 | 0 |
+| 1 | `/tmp/zygos-phase9/phase9-r1-log-summary-date-ranges/log-summary-date-ranges__w4g467u` | 2652 | 1133 | 0.00096430 | 0.0 | 0 |
+| 1 | `/tmp/zygos-phase9/phase9-r1-modernize-scientific-stack/modernize-scientific-stack__eYHjD8h` | 2438 | 1280 | 0.00100570 | 0.0 | 0 |
+| 1 | `/tmp/zygos-phase9/phase9-r1-regex-log/regex-log__FSFyAum` | 0 | 0 | 0.00000000 | missing | 1 (RewardFileNotFoundError) |
+| 2 | `/tmp/zygos-phase9/phase9-r2-build-cython-ext/build-cython-ext__RBAxixL` | 3915 | 1321 | 0.00124775 | 0.0 | 0 |
+| 2 | `/tmp/zygos-phase9/phase9-r2-cobol-modernization/cobol-modernization__J76iuUw` | 6865 | 1575 | 0.00181725 | 0.0 | 0 |
+| 2 | `/tmp/zygos-phase9/phase9-r2-filter-js-from-html/filter-js-from-html__MQr9FwH` | 291 | 1024 | 0.00055565 | 0.0 | 0 |
+| 2 | `/tmp/zygos-phase9/phase9-r2-fix-code-vulnerability/fix-code-vulnerability__UQLwRTV` | 4514 | 492 | 0.00092310 | 0.0 | 0 |
+| 2 | `/tmp/zygos-phase9/phase9-r2-fix-git/fix-git__EvTJNv3` | 983 | 1384 | 0.00083945 | 0.0 | 0 |
+| 2 | `/tmp/zygos-phase9/phase9-r2-log-summary-date-ranges/log-summary-date-ranges__2BH4zN9` | 5098 | 1651 | 0.00159020 | 0.0 | 0 |
+| 2 | `/tmp/zygos-phase9/phase9-r2-modernize-scientific-stack/modernize-scientific-stack__gC3DFQa` | 1478 | 1152 | 0.00079770 | 0.0 | 0 |
+| 2 | `/tmp/zygos-phase9/phase9-r2-regex-log/regex-log__cY79UtB` | 0 | 0 | 0.00000000 | 0.0 | 0 |
+| 3 | `/tmp/zygos-phase9/phase9-r3-build-cython-ext/build-cython-ext__VcXhBsp` | 1801 | 1224 | 0.00088215 | 0.0 | 0 |
+| 3 | `/tmp/zygos-phase9/phase9-r3-cobol-modernization/cobol-modernization__wrozoN8` | 2110 | 1188 | 0.00091050 | 0.0 | 0 |
+| 3 | `/tmp/zygos-phase9/phase9-r3-filter-js-from-html/filter-js-from-html__kA38REx` | 291 | 1024 | 0.00055565 | 0.0 | 0 |
+| 3 | `/tmp/zygos-phase9/phase9-r3-fix-code-vulnerability/fix-code-vulnerability__j4J7Top` | 2897 | 1285 | 0.00107705 | 0.0 | 0 |
+| 3 | `/tmp/zygos-phase9/phase9-r3-fix-git/fix-git__J4qH8BC` | 1013 | 1488 | 0.00089595 | 0.0 | 0 |
+| 3 | `/tmp/zygos-phase9/phase9-r3-log-summary-date-ranges/log-summary-date-ranges__ZJHi5nH` | 1587 | 1188 | 0.00083205 | 0.0 | 0 |
+| 3 | `/tmp/zygos-phase9/phase9-r3-modernize-scientific-stack/modernize-scientific-stack__PGpGFwF` | 1936 | 1400 | 0.00099040 | 0.0 | 0 |
+| 3 | `/tmp/zygos-phase9/phase9-r3-regex-log/regex-log__YvLwCqD` | 0 | 0 | 0.00000000 | 0.0 | 0 |
+
+Full results are saved at `/tmp/zygos-phase9/campaign.json`. Phase 9 execution is finished, but canary qualification failed. Phases 10–12 remain not started and require their own approvals; the Phase 9 continuation did not authorize them.
+
+Offline checks on 2026-10-01: `zig build test --summary all` passed 878/878 tests and `zig fmt --check src/` was clean. Only this ledger changed. The Linux binary digest is unchanged, `eval/image-platforms.json` remains `status: ready`, and no `eval/harbor/**__pycache__` was created. The initial trial summary is `/tmp/zygos-phase9/report.json`; the full 24-trial report is `/tmp/zygos-phase9/campaign.json`.
 
 ## Phase 10 — First ablation
 
