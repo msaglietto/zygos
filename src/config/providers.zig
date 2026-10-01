@@ -331,8 +331,12 @@ fn validateProviders(arena: std.mem.Allocator, builds: []const ProviderBuild, di
             return fail(diag, b.line, "unknown provider 'type'", error.InvalidCatalog);
         if ((kind == .openai_compatible or kind == .anthropic_compatible or kind == .ollama) and b.endpoint == null)
             return fail(diag, b.line, "provider missing 'endpoint'", error.InvalidCatalog);
-        if (b.max_tokens) |mt| if (mt < 1)
-            return fail(diag, b.line, "'max_tokens' must be >= 1", error.InvalidCatalog);
+        if (b.max_tokens) |mt| {
+            if (mt < 1) return fail(diag, b.line, "'max_tokens' must be >= 1", error.InvalidCatalog);
+            // Provider.max_tokens is u32; @intCast must stay in range.
+            if (mt > std.math.maxInt(u32))
+                return fail(diag, b.line, "'max_tokens' must be <= 4294967295", error.InvalidCatalog);
+        }
         if (b.temperature) |temp| if (temp < 0 or temp > 2)
             return fail(diag, b.line, "'temperature' must be in [0, 2]", error.InvalidCatalog);
         providers[i] = .{
@@ -642,6 +646,12 @@ test "validate: temperature out of [0,2] or max_tokens < 1 is InvalidCatalog" {
     const zero = "[[providers]]\nname = \"a\"\ntype = \"google\"\nmodel = \"m\"\nmax_tokens = 0";
     try t.expectError(error.InvalidCatalog, Catalog.parse(t.allocator, zero, &diag));
     try t.expectEqualStrings("'max_tokens' must be >= 1", diag.message);
+
+    // > u32 max would panic in the @intCast below validate; it must be a
+    // line-numbered catalog error instead.
+    const huge = "[[providers]]\nname = \"a\"\ntype = \"google\"\nmodel = \"m\"\nmax_tokens = 5000000000";
+    try t.expectError(error.InvalidCatalog, Catalog.parse(t.allocator, huge, &diag));
+    try t.expectEqualStrings("'max_tokens' must be <= 4294967295", diag.message);
 }
 
 test "validate: duplicate provider name and slug-colliding names are InvalidCatalog" {
