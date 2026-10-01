@@ -423,8 +423,17 @@ pub const Actor = struct {
                         .{ .connection = from },
                         now_ms + self.invokeTimeoutFor(m.function_id),
                     ) catch |err| {
-                        log.warn("invoke {s}: {t}, frame dropped", .{ m.function_id, err });
-                        return;
+                        switch (err) {
+                            // A squatted/colliding uuid must answer its caller:
+                            // the pending under this id belongs to someone else,
+                            // so no timeout or result would ever arrive here.
+                            error.DuplicateId => {
+                                log.warn("invoke {s}: duplicate invocation_id, answered with error", .{m.function_id});
+                                self.sendErrorResult(from, m.invocation_id.?, m, "duplicate_invocation_id", "invocation_id is already pending");
+                            },
+                            error.OutOfMemory => log.warn("invoke {s}: out of memory, frame dropped", .{m.function_id}),
+                        }
+                        return; // never forward: the pending is not ours
                     };
                 }
                 self.sendMsg(callee, .{ .invokefunction = m });
@@ -753,6 +762,32 @@ test "invoke unknown function without invocation_id is dropped silently" {
 
     try h.frame(widOf(2), "{\"type\":\"invokefunction\",\"function_id\":\"missing::f\",\"data\":{}}", 0);
     try testing.expectEqual(@as(usize, 0), h.fake.sent.items.len);
+}
+
+test "duplicate invocation_id invoke answers an error result, not silence" {
+    var h = try Harness.init(testing.allocator);
+    defer h.deinit();
+    const worker_a = widOf(1);
+
+    try h.frame(worker_a, "{\"type\":\"registerfunction\",\"id\":\"echo::f\",\"description\":\"echo\"}", 0);
+    // First invoke parks the pending...
+    try h.frame(widOf(2),
+        \\{"type":"invokefunction","invocation_id":"11111111-2222-3333-4444-555555555555",
+        \\ "function_id":"echo::f","data":{}}
+    , 1_000);
+    // ...a second invoke with the same uuid must not strand its caller in
+    // a wait that no timeout and no result will ever answer.
+    try h.frame(widOf(3),
+        \\{"type":"invokefunction","invocation_id":"11111111-2222-3333-4444-555555555555",
+        \\ "function_id":"echo::f","data":{}}
+    , 1_050);
+
+    try testing.expectEqual(@as(usize, 2), h.fake.sent.items.len);
+    try testing.expect(std.mem.eql(u8, &h.fake.sent.items[1].to, &widOf(3)));
+    var p = try h.fake.parseAt(1);
+    defer p.deinit();
+    try testing.expectEqualStrings("duplicate_invocation_id", p.value.invocationresult.err.?.code);
+    try testing.expectEqualStrings(caller_uuid_text, p.value.invocationresult.invocation_id);
 }
 
 test "fire-and-forget invoke forwards without parking a pending" {
