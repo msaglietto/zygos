@@ -61,6 +61,37 @@ pub fn run(gpa: std.mem.Allocator, args: *std.process.Args.Iterator) u8 {
     }
     const brief_text = brief_texts.items[0];
 
+    // ---- planning root + exclusive claim (before anything boots) ------------
+    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+    _ = std.c.getcwd(&cwd_buf, cwd_buf.len) orelse {
+        eprint("mission: cannot resolve cwd\n", .{});
+        return 2;
+    };
+    const cwd = std.mem.sliceTo(&cwd_buf, 0);
+
+    const mission_id = stem(bp);
+    const planning_base = absPath(gpa, cwd, parsed.planning orelse "./.planning") catch return oom();
+    // Unattended-rerun semantics (Y3): --run-stamp gives every scheduled
+    // invocation its own planning root; without it, starting over an
+    // existing mission substrate refuses instead of clobbering it.
+    const planning = zygos.mission_boot.planningRoot(gpa, planning_base, run_stamp, runStamp()) catch return oom();
+    if (!queue_mode and zygos.mission_boot.refuseStart(resume_flag, run_stamp, fileExists(gpa, planning, "mission.json"))) {
+        eprint(
+            "mission: {s} already holds a mission; resume it, pick a fresh --planning, or pass --run-stamp\n",
+            .{planning},
+        );
+        return 2;
+    }
+    // Exclusive-run claim: the refuse check above races a slow-booting
+    // second starter; the O_EXCL claim does not. Live holder → refuse.
+    if (!queue_mode) {
+        var busy_buf: [32]u8 = undefined;
+        if (!claimPlanningRoot(planning, &busy_buf)) {
+            eprint("mission: pid {s} is already running a mission in {s}\n", .{ std.mem.sliceTo(&busy_buf, 0), planning });
+            return 2;
+        }
+    }
+
     // ---- provider catalog ---------------------------------------------------
     const env = envPairs(gpa) catch return oom();
     const cat_path = zygos.providers_catalog.configPath(gpa, env) catch |err| switch (err) {
@@ -140,27 +171,6 @@ pub fn run(gpa: std.mem.Allocator, args: *std.process.Args.Iterator) u8 {
         return 2;
     };
     _ = &boot;
-
-    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
-    _ = std.c.getcwd(&cwd_buf, cwd_buf.len) orelse {
-        eprint("mission: cannot resolve cwd\n", .{});
-        return 2;
-    };
-    const cwd = std.mem.sliceTo(&cwd_buf, 0);
-
-    const mission_id = stem(bp);
-    const planning_base = absPath(gpa, cwd, parsed.planning orelse "./.planning") catch return oom();
-    // Unattended-rerun semantics (Y3): --run-stamp gives every scheduled
-    // invocation its own planning root; without it, starting over an
-    // existing mission substrate refuses instead of clobbering it.
-    const planning = zygos.mission_boot.planningRoot(gpa, planning_base, run_stamp, runStamp()) catch return oom();
-    if (!queue_mode and zygos.mission_boot.refuseStart(resume_flag, run_stamp, fileExists(gpa, planning, "mission.json"))) {
-        eprint(
-            "mission: {s} already holds a mission; resume it, pick a fresh --planning, or pass --run-stamp\n",
-            .{planning},
-        );
-        return 2;
-    }
 
     // M7 executor worktree isolation: ZYGOS_WORKTREE=1 gives the executor a
     // detached git worktree under the planning root — the main tree stays
@@ -363,6 +373,13 @@ pub fn run(gpa: std.mem.Allocator, args: *std.process.Args.Iterator) u8 {
             if (run_stamp)
                 root = std.fmt.allocPrint(gpa, "{s}-{s}", .{ root, runStamp() }) catch return oom();
             const resume_q = fileExists(gpa, root, "mission.json");
+            {
+                var busy_buf: [32]u8 = undefined;
+                if (!claimPlanningRoot(root, &busy_buf)) {
+                    eprint("mission: pid {s} is already running a mission in {s}; skipping {s}\n", .{ std.mem.sliceTo(&busy_buf, 0), root, qpath });
+                    continue;
+                }
+            }
 
             const bconf = std.fmt.allocPrint(gpa, "{{\"scope\":{f},\"max_tokens\":{d}}}", .{
                 json.fmt(mid, .{}), zygos.mission_boot.budgetMaxTokens(env, qtext),
@@ -705,9 +722,11 @@ fn boot_fail() u8 {
     return 2;
 }
 
-var stamp_buf: [15]u8 = undefined;
+var stamp_buf: [32]u8 = undefined;
 
-/// Wall-clock "YYYYMMDD-HHMMSS" (UTC) for --run-stamp planning roots.
+/// Wall-clock "YYYYMMDD-HHMMSS-P<pid>" (UTC) for --run-stamp planning roots.
+/// The pid suffix keeps two invocations inside the same second from sharing
+/// a root — second-granularity stamps collided and refused nothing.
 fn runStamp() []const u8 {
     var ts: std.c.timespec = undefined;
     _ = std.c.clock_gettime(.REALTIME, &ts);
@@ -715,9 +734,10 @@ fn runStamp() []const u8 {
     const yd = ep.getEpochDay().calculateYearDay();
     const md = yd.calculateMonthDay();
     const ds = ep.getDaySeconds();
-    _ = std.fmt.bufPrint(&stamp_buf, "{d:0>4}{d:0>2}{d:0>2}-{d:0>2}{d:0>2}{d:0>2}", .{
+    _ = std.fmt.bufPrint(&stamp_buf, "{d:0>4}{d:0>2}{d:0>2}-{d:0>2}{d:0>2}{d:0>2}-P{d}", .{
         yd.year,              md.month.numeric(),      md.day_index + 1,
         ds.getHoursIntoDay(), ds.getMinutesIntoHour(), ds.getSecondsIntoMinute(),
+        std.c.getpid(),
     }) catch unreachable;
     return &stamp_buf;
 }
@@ -728,6 +748,72 @@ fn fileExists(gpa: std.mem.Allocator, dir: []const u8, name: []const u8) bool {
     const f = std.c.fopen(path_z.ptr, "r") orelse return false;
     _ = std.c.fclose(f);
     return true;
+}
+
+/// Exclusive-run claim on the planning root. The mission.json refuse check
+/// races any second starter whose first persist lands late (kernel boot,
+/// MCP handshakes, budget configure all precede it); an O_EXCL claim file
+/// closes that window. Returns true when this run holds the root; false
+/// when a live holder does (`busy_buf` carries its pid for the message).
+fn claimPlanningRoot(planning: []const u8, busy_buf: *[32]u8) bool {
+    var root_z_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_z = std.fmt.bufPrintZ(&root_z_buf, "{s}", .{planning}) catch return true; // unprintable path: proceed
+    _ = std.c.mkdir(root_z.ptr, @as(std.c.mode_t, 0o755)); // EEXIST is fine
+
+    var claim_z_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const claim_z = std.fmt.bufPrintZ(&claim_z_buf, "{s}/claim", .{planning}) catch return true;
+
+    var attempt: usize = 0;
+    while (attempt < 3) : (attempt += 1) {
+        const fd = std.c.open(claim_z, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true }, @as(std.c.mode_t, 0o644));
+        if (fd >= 0) {
+            var pid_buf: [16]u8 = undefined;
+            const pid_text = std.fmt.bufPrint(&pid_buf, "{d}\n", .{std.c.getpid()}) catch {
+                _ = std.c.close(fd);
+                return true;
+            };
+            _ = std.c.write(fd, pid_text.ptr, pid_text.len);
+            _ = std.c.close(fd);
+            return true; // ours
+        }
+
+        // Held: read the holder's pid and ask the OS whether it lives.
+        const rfd = std.c.open(claim_z, .{ .ACCMODE = .RDONLY });
+        if (rfd < 0) continue; // vanished between create and read — retry
+        var text_buf: [32]u8 = undefined;
+        const n = std.c.read(rfd, &text_buf, text_buf.len);
+        _ = std.c.close(rfd);
+        if (n <= 0) continue;
+
+        const text = text_buf[0..@intCast(n)];
+        const pid = std.fmt.parseInt(std.c.pid_t, std.mem.trim(u8, text, " \t\r\n"), 10) catch {
+            _ = std.c.unlink(claim_z); // garbage claim identifies no holder
+            continue;
+        };
+        // Signal 0 = existence probe. == 0 alive; ESRCH dead; EPERM alive
+        // (exists, not ours to signal). errno is only meaningful on -1.
+        const alive = blk: {
+            const rc = std.c.kill(pid, @enumFromInt(0));
+            if (rc == 0) break :blk true;
+            break :blk rc == -1 and std.c._errno().* != @intFromEnum(std.c.E.SRCH);
+        };
+        switch (zygos.mission_boot.claimDecision(text, alive)) {
+            .claim => {
+                _ = std.c.unlink(claim_z); // crashed holder — take over
+                continue;
+            },
+            .busy => |holder| {
+                const copied = @min(holder.len, busy_buf.len - 1);
+                @memcpy(busy_buf[0..copied], holder[0..copied]);
+                busy_buf[copied] = 0;
+                return false;
+            },
+        }
+    }
+    // Three failed attempts: refuse — a concurrent racer keeps winning.
+    @memcpy(busy_buf[0..1], "0");
+    busy_buf[1] = 0;
+    return false;
 }
 
 // ---- console approvals ------------------------------------------------------

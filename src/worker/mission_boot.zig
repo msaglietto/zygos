@@ -226,6 +226,32 @@ pub fn planningRoot(
 }
 
 // ---------------------------------------------------------------------------
+// planning-root claim (exclusive run)
+// ---------------------------------------------------------------------------
+
+pub const ClaimDecision = union(enum) {
+    /// No holder, or the holder crashed: the run may claim the root.
+    claim,
+    /// A live process holds the root; its pid text (trimmed) names it.
+    busy: []const u8,
+};
+
+/// Verdict from a claim file's contents plus the liveness fact the caller
+/// supplies (kill(pid, 0) == 0 or EPERM). The refuseStart check above races
+/// any second starter whose mission.json lands late; the claim file is the
+/// close-the-window companion. Unparseable claims identify no live holder —
+/// takeover, never a wedged root.
+pub fn claimDecision(claim_text: []const u8, holder_alive: bool) ClaimDecision {
+    const trimmed = std.mem.trim(u8, claim_text, " \t\r\n");
+    // A claim we cannot parse (not digits) identifies no holder: takeover,
+    // never a wedged root — callers only get here past a valid pid.
+    if (trimmed.len == 0 or trimmed.len > 10) return .claim;
+    for (trimmed) |ch| if (!std.ascii.isDigit(ch)) return .claim;
+    if (holder_alive) return .{ .busy = trimmed };
+    return .claim;
+}
+
+// ---------------------------------------------------------------------------
 // executor worktree isolation (M7)
 // ---------------------------------------------------------------------------
 
@@ -495,6 +521,17 @@ test "refuseStart: fresh start over existing substrate refuses; resume/run-stamp
     try t.expect(!refuseStart(true, false, true));
     try t.expect(!refuseStart(false, true, true));
     try t.expect(!refuseStart(false, false, false));
+}
+
+test "claimDecision: live holder is busy; dead, empty, or garbage claims take over" {
+    // Live holder: refuse and name it.
+    try t.expect(claimDecision("4242\n", true) == .busy);
+    try t.expectEqualStrings("4242", claimDecision("4242\n", true).busy);
+    // Crashed holder (kill(pid,0) says gone): take over.
+    try t.expect(claimDecision("4242", false) == .claim);
+    // A claim we cannot parse identifies no live holder: take over.
+    try t.expect(claimDecision("not-a-pid", true) == .claim);
+    try t.expect(claimDecision("", true) == .claim);
 }
 
 test "planningRoot: run-stamp suffixes the base; plain base unchanged" {
