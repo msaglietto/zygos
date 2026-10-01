@@ -313,6 +313,90 @@ test "processSse renders tool_use with accumulated input and works without a sen
     try testing.expectEqualStrings("pwd", block.get("input").?.object.get("command").?.string);
 }
 
+test "start-event tool inputs reach the task bash read and write handlers once each" {
+    const task = @import("../worker/task.zig");
+    const ops = @import("../worker/tools_ops.zig");
+    const trial = @import("../worker/trial.zig");
+    const C = struct {
+        extern "c" fn realpath(path: [*:0]const u8, resolved: [*]u8) ?[*:0]u8;
+    };
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var rel_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const rel = try std.fmt.bufPrintZ(&rel_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const root = std.mem.span(C.realpath(rel, &root_buf) orelse return error.RealpathFailed);
+
+    // Synthetic compatibility fixtures, not a recording of the Phase 8 stream.
+    const starts = [_][]const u8{
+        \\{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t-bash","name":"bash","input":{"command":"seq 1 500"}}}
+        ,
+        \\{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t-read","name":"read_file","input":{"path":"fixture.txt"}}}
+        ,
+        \\{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t-write","name":"write_file","input":{"path":"note.txt","content":"non-empty start input\n"}}}
+        ,
+    };
+    var script: [4][]const u8 = undefined;
+    var made: usize = 0;
+    defer for (script[0..made]) |msg| testing.allocator.free(msg);
+    for (starts) |start| {
+        const fixture = try std.fmt.allocPrint(
+            testing.allocator,
+            "event: message_start\ndata: {{\"type\":\"message_start\",\"message\":{{\"id\":\"m\",\"model\":\"fixture\"}}}}\n\n" ++
+                "event: content_block_start\ndata: {s}\n\n" ++
+                "event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n" ++
+                "event: message_delta\ndata: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"tool_use\"}}}}\n\n" ++
+                "event: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n",
+            .{start},
+        );
+        defer testing.allocator.free(fixture);
+        var reader: std.Io.Reader = .fixed(fixture);
+        script[made] = try processSse(testing.allocator, &reader, null, null);
+        made += 1;
+    }
+    var end_reader: std.Io.Reader = .fixed(fixture_text_stream);
+    script[made] = try processSse(testing.allocator, &end_reader, null, null);
+    made += 1;
+
+    const result = try task.run(testing.allocator, .{
+        .workspace = root,
+        .instruction = "Exercise the SSE tool inputs.",
+        .task_id = "offline-sse-input",
+        .dataset = "offline-fixture",
+        .model_id = "fixture",
+        .variable = "trim-on",
+        .step_cap = 4,
+        .identity = .{
+            .git_sha = "0123456789abcdef0123456789abcdef01234567",
+            .target_triple = "fixture",
+            .optimize = "Debug",
+            .adapter_version = trial.adapter_version,
+        },
+        .script = &script,
+        .seed_fixture = true,
+    });
+    defer result.deinit(testing.allocator);
+    try testing.expect(std.mem.indexOf(u8, result.turn_json, "handler_failed") == null);
+    const written = try ops.readFile(testing.allocator, ops.Workspace.init(root), "note.txt");
+    defer testing.allocator.free(written);
+    try testing.expectEqualStrings("non-empty start input\n", written);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const record = try trial.parse(arena.allocator(), result.trial_json);
+    try testing.expectEqual(@as(u64, 3), record.source_lines_read);
+    try testing.expectEqual(@as(u64, 3), record.trim.?.calls);
+    try testing.expect(record.trim.?.reduction > 0);
+    const turn = try json.parseFromSliceLeaky(json.Value, arena.allocator(), result.turn_json, .{});
+    try testing.expectEqualStrings("end_turn", turn.object.get("stop").?.string);
+    const transcript = turn.object.get("transcript").?.array.items;
+    for ([_]usize{ 2, 4, 6 }) |index| {
+        const replies = transcript[index].object.get("content").?.array.items;
+        try testing.expectEqual(@as(usize, 1), replies.len);
+        try testing.expect(!replies[0].object.get("is_error").?.bool);
+    }
+}
+
 test "processSse surfaces API error events" {
     const fixture =
         "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"later\"}}\n\n";

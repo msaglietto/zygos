@@ -1,7 +1,7 @@
 //! Anthropic Messages-API stream assembler (T3b). Consumes already-decoded
 //! SSE events (name + data JSON) and produces user-visible text deltas plus
 //! the assembled terminal message — stop_reason, usage, and tool_use blocks
-//! with their `input_json` accumulated from partial fragments. Pure std;
+//! with `input_json` from the start object or accumulated partial fragments. Pure std;
 //! SSE line decoding is sse.zig's job, sockets are the net layer's.
 //!
 //! Robustness contract: unknown event names are ignored (forward compat);
@@ -27,6 +27,7 @@ const BlockAcc = union(enum) {
         id: []const u8, // owned
         name: []const u8, // owned
         input: std.ArrayList(u8),
+        has_input_deltas: bool = false,
     },
 };
 
@@ -138,9 +139,15 @@ pub const Assembler = struct {
                     errdefer self.gpa.free(id);
                     const name = try self.gpa.dupe(u8, strField(cb, "name") orelse return error.MalformedEvent);
                     errdefer self.gpa.free(name);
-                    // The start's "input" value is ignored by contract; the
-                    // real input is the concatenated partial_json fragments.
-                    try self.blocks.append(self.gpa, .{ .tool_use = .{ .id = id, .name = name, .input = .empty } });
+                    var input: std.ArrayList(u8) = .empty;
+                    errdefer input.deinit(self.gpa);
+                    // Compatible endpoints can supply complete input in the
+                    // start event. An empty object remains a delta placeholder.
+                    if (cb.get("input")) |value| {
+                        if (value == .object and value.object.count() > 0)
+                            try input.appendSlice(self.gpa, try core.rawJson(arena.allocator(), value));
+                    }
+                    try self.blocks.append(self.gpa, .{ .tool_use = .{ .id = id, .name = name, .input = input } });
                     stream_tap.emit(.tool_name, name);
                 } else {
                     // Unknown block kind: keep indexes aligned with a text acc.
@@ -165,7 +172,13 @@ pub const Assembler = struct {
                 } else if (std.mem.eql(u8, dtype, "input_json_delta")) {
                     const fragment = strField(delta, "partial_json") orelse return error.MalformedEvent;
                     switch (self.blocks.items[@intCast(index)]) {
-                        .tool_use => |*tu| try tu.input.appendSlice(self.gpa, fragment),
+                        .tool_use => |*tu| if (fragment.len > 0) {
+                            // Deltas encode a whole object, not a suffix to the
+                            // start input. Empty fragments carry no replacement.
+                            if (!tu.has_input_deltas) tu.input.clearRetainingCapacity();
+                            try tu.input.appendSlice(self.gpa, fragment);
+                            tu.has_input_deltas = true;
+                        },
                         .text => return error.MalformedEvent,
                     }
                     stream_tap.emit(.tool_args, fragment);
@@ -324,6 +337,41 @@ test "tool_use stream accumulates partial_json fragments into input_json" {
     try testing.expectEqualStrings("toolu_1", msg.content[0].tool_use.id);
     try testing.expectEqualStrings("bash", msg.content[0].tool_use.name);
     try testing.expectEqualStrings("{\"command\":\"ls\"}", msg.content[0].tool_use.input_json);
+}
+
+test "tool input deltas replace a start object while empty deltas preserve it" {
+    var a = Assembler.init(testing.allocator);
+    defer a.deinit();
+    _ = try a.onEvent("message_start", start_ev);
+    _ = try a.onEvent("content_block_start",
+        \\{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t1","name":"bash","input":{"command":"seed"}}}
+    );
+    _ = try a.onEvent("content_block_delta",
+        \\{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":""}}
+    );
+    _ = try a.onEvent("content_block_delta",
+        \\{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"command\":"}}
+    );
+    _ = try a.onEvent("content_block_delta",
+        \\{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"\"printf delta\"}"}}
+    );
+    _ = try a.onEvent("content_block_stop", "{\"type\":\"content_block_stop\",\"index\":0}");
+    _ = try a.onEvent("content_block_start",
+        \\{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"t2","name":"bash","input":{"command":"printf start"}}}
+    );
+    _ = try a.onEvent("content_block_delta",
+        \\{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":""}}
+    );
+    _ = try a.onEvent("content_block_stop", "{\"type\":\"content_block_stop\",\"index\":1}");
+    _ = try a.onEvent("message_delta", "{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}");
+    _ = try a.onEvent("message_stop", "{\"type\":\"message_stop\"}");
+
+    const msg = try a.message();
+    try testing.expectEqual(@as(usize, 2), msg.content.len);
+    try testing.expectEqualStrings("t1", msg.content[0].tool_use.id);
+    try testing.expectEqualStrings("{\"command\":\"printf delta\"}", msg.content[0].tool_use.input_json);
+    try testing.expectEqualStrings("t2", msg.content[1].tool_use.id);
+    try testing.expectEqualStrings("{\"command\":\"printf start\"}", msg.content[1].tool_use.input_json);
 }
 
 test "duplicate keys in streamed tool input canonicalize last-wins" {

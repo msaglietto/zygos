@@ -1,8 +1,8 @@
-# Work ledger — harness benchmark, phases that spend nothing
+# Work ledger — harness benchmark
 
-Recorded 2026-09-28. This is the human follow-up for the revised Harbor / Terminal-Bench plan. Phases 1–7 are done. Phases 8–12 are not started. No dated model id was named, and no dollar cap was chosen, so nothing here spends.
+Updated 2026-09-30. Phases 1–8 are done. Phase 8 below is the current live record: one approved task with `glm-5.3-flash`. Phases 9–12 are not started and need their own approvals. No dollar cap was named.
 
-The offline binary that produced the trial below is git `a2a9bf03fe8b808c2a6dfd9a059e3f358346f7c7`, target `aarch64-macos.26.7...26.7-none`, optimize `Debug`, adapter `0.1.0`. That binary was built from a dirty tree, so the stamped sha is the parent commit and does not contain this work. A later build stamps `unknown` when `git status --porcelain` is non-empty, and the task command refuses `unknown`.
+The historical offline binary used in phases 1–7 is git `a2a9bf03fe8b808c2a6dfd9a059e3f358346f7c7`, target `aarch64-macos.26.7...26.7-none`, optimize `Debug`, adapter `0.1.0`. That binary was built from a dirty tree, so the stamped sha is the parent commit and does not contain this work. A later build stamps `unknown` when `git status --porcelain` is non-empty, and the task command refuses `unknown`.
 
 ## Where the decisions live
 
@@ -100,9 +100,23 @@ The verifier reward is 0 because `/app/analyze_climate_modern.py` was not create
 
 Phases 9–12 are not started.
 
+## Offline tool-input repair — 2026-09-30
+
+No Harbor task ran during this repair and no provider spend occurred. This is an offline prerequisite for phase 9, not another phase-8 pilot.
+
+`src/worker/anthropic.zig` discarded `content_block_start.input`. With a populated start object and no later input deltas, `src/net/anthropic.zig` rendered `{}`, and the real tool handlers returned `handler_failed`. A synthetic SSE regression in `src/net/anthropic.zig` reproduced that path through the shipped decoder, assembler, renderer, task turn loop, bench policy, and bash/read/write handlers. Its first `zig build test` was red at the assertion rejecting `handler_failed` (876/877 passed).
+
+The assembler now owns a copy of a populated start object. The first non-empty `input_json_delta` replaces that object; subsequent fragments concatenate. An empty fragment preserves the start input, and the ordinary `{}` placeholder still takes its arguments from deltas. A second red test caught invalid concatenation of a start object and a streamed object (877/878 passed) before replacement was implemented.
+
+Green evidence: `zig build test --summary all` 878/878 passed, leak-checked and offline; `zig fmt --check src/` clean. The SSE-to-task regression runs `seq 1 500`, reads three fixture lines, writes `non-empty start input\n` to `note.txt`, and observes one successful reply per tool, three trim calls, and positive reduction. The assembler regression preserves two distinct tool ids. Existing partial-JSON and duplicate-key tests stay green. The bench allowlist, mission policy, and trim/scorer rules are unchanged; `eval/image-platforms.json` remains exactly `status: ready`.
+
+The phase-8 raw stream was not saved, and its trace has no tool ids. The tests prove the argument-loss mechanism for the synthetic stream shape and that the harness does not double a single block. They cannot establish the pilot's exact stream shape or whether its paired calls were duplicates. No deduplication by tool name was introduced.
+
+The Linux binary for phases 9 and 10 must be built once from the clean committed fix, with target `x86_64-linux.5.10...6.19-gnu.2.31`, optimize `ReleaseSafe`, and adapter `0.1.0`. A later ledger-only commit does not rebuild that artifact. Phase 9 remains unapproved and unstarted.
+
 ## Phase 9 — Freeze the canary
 
-Not started. Task ids come from the pilot. The shape, if approved separately, is 3 runs of 8–12 tasks (24–36 task-runs). At least one task must produce filterable output or the phase 6 guard fails a wired trim-on arm. No ids were invented here.
+Not started. Task ids will be frozen from actual task runs, with `modernize-scientific-stack` as one member. The shape, if approved separately, is 3 runs of 8–12 tasks (24–36 task-runs). At least one task must produce filterable output or the phase 6 guard fails a wired trim-on arm. No completed canary ids were invented here.
 
 ## Phase 10 — First ablation
 
