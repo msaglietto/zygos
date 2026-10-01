@@ -423,3 +423,10 @@ back the same day: provider warnings now name the failing instance
 (rate-limit attribution), and the CLI requests real-mission
 `role_max_steps`/`max_role_turns` instead of the scripted-test defaults that
 starved the first executor run.
+
+## License
+
+MIT — see [LICENSE](LICENSE). The one dependency
+([karlseguin/websocket.zig](https://github.com/karlseguin/websocket.zig),
+pinned in `build.zig.zon`) is MIT-licensed upstream; record its license text
+from the pinned commit when you vendor or re-pin it.
