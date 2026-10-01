@@ -385,7 +385,11 @@ fn buildRequest(arena: std.mem.Allocator, cfg: Config) TaskError![]u8 {
 
 fn toolsJson(arena: std.mem.Allocator, extras: []const ExtraTool) TaskError![]u8 {
     var out: std.ArrayList(u8) = .empty;
-    try out.appendSlice(arena, "[{\"name\":\"bash\",\"function_id\":\"zygos::tools::bash\"},{\"name\":\"read_file\",\"function_id\":\"zygos::tools::read_file\"},{\"name\":\"write_file\",\"function_id\":\"zygos::tools::write_file\"}");
+    try out.appendSlice(arena,
+        \\[{"name":"bash","function_id":"zygos::tools::bash","description":"Run a shell command with the workspace as cwd.","input_schema":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}},
+        \\{"name":"read_file","function_id":"zygos::tools::read_file","description":"Read a file inside the workspace.","input_schema":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}},
+        \\{"name":"write_file","function_id":"zygos::tools::write_file","description":"Write file content inside the workspace.","input_schema":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}
+    );
     for (extras) |extra| {
         try out.print(arena, ",{{\"name\":{f},\"function_id\":{f}}}", .{
             json.fmt(extra.name, .{}),
@@ -830,6 +834,95 @@ test "bench rules allow bash, read_file, and write_file and deny everything else
 }
 
 const stub_end_turn = "{\"stop_reason\":\"end_turn\",\"usage\":{\"input_tokens\":4,\"output_tokens\":2,\"cache_read_input_tokens\":9},\"content\":[{\"type\":\"text\",\"text\":\"done\"}]}";
+
+const SchemaProvider = struct {
+    worker: ?*inproc.Worker = null,
+    schemas_valid: bool = true,
+    calls: usize = 0,
+
+    fn boot(ctx: *anyopaque, gpa: std.mem.Allocator, actor: *actor_mod.Actor, registry: *inproc.Registry) anyerror!void {
+        const self: *SchemaProvider = @ptrCast(@alignCast(ctx));
+        const worker = try inproc.Worker.spawn(gpa, actor, registry, "schema-provider");
+        errdefer worker.stop();
+        try worker.registerFunction("zygos::providers::schema-test", self, &handler);
+        self.worker = worker;
+    }
+
+    fn stop(ctx: *anyopaque) void {
+        const self: *SchemaProvider = @ptrCast(@alignCast(ctx));
+        if (self.worker) |w| {
+            self.worker = null;
+            w.stop();
+        }
+    }
+
+    fn handler(ctx: ?*anyopaque, arena: std.mem.Allocator, request: []const u8) error{ Failed, OutOfMemory }![]const u8 {
+        const self: *SchemaProvider = @ptrCast(@alignCast(ctx.?));
+        const root = json.parseFromSliceLeaky(json.Value, arena, request, .{}) catch return error.Failed;
+        if (root != .object) return error.Failed;
+        const tools = root.object.get("tools") orelse return error.Failed;
+        if (tools != .array or tools.array.items.len != 3) return error.Failed;
+        const names = [_][]const u8{ "bash", "read_file", "write_file" };
+        const fields = [_][]const []const u8{ &.{"command"}, &.{"path"}, &.{ "path", "content" } };
+        for (tools.array.items, 0..) |tool, i| {
+            if (tool != .object) return error.Failed;
+            if (!std.mem.eql(u8, jsonx.strField(tool.object, "name") orelse "", names[i])) return error.Failed;
+            const schema = tool.object.get("input_schema") orelse {
+                self.schemas_valid = false;
+                return arena.dupe(u8, stub_end_turn);
+            };
+            if (schema != .object) return error.Failed;
+            if (!std.mem.eql(u8, jsonx.strField(schema.object, "type") orelse "", "object")) return error.Failed;
+            const props = schema.object.get("properties") orelse return error.Failed;
+            const required = schema.object.get("required") orelse return error.Failed;
+            if (props != .object or required != .array or required.array.items.len != fields[i].len) return error.Failed;
+            for (fields[i], 0..) |field, n| {
+                const property = props.object.get(field) orelse return error.Failed;
+                if (property != .object) return error.Failed;
+                if (!std.mem.eql(u8, jsonx.strField(property.object, "type") orelse "", "string")) return error.Failed;
+                const key = required.array.items[n];
+                if (key != .string or !std.mem.eql(u8, key.string, field)) return error.Failed;
+            }
+        }
+        const replies = [_][]const u8{
+            \\{"stop_reason":"tool_use","usage":{"input_tokens":1,"output_tokens":1},"content":[{"type":"tool_use","id":"schema-bash","name":"bash","input":{"command":"seq 1 500"}}]}
+            ,
+            \\{"stop_reason":"tool_use","usage":{"input_tokens":1,"output_tokens":1},"content":[{"type":"tool_use","id":"schema-read","name":"read_file","input":{"path":"fixture.txt"}}]}
+            ,
+            \\{"stop_reason":"tool_use","usage":{"input_tokens":1,"output_tokens":1},"content":[{"type":"tool_use","id":"schema-write","name":"write_file","input":{"path":"schema-note.txt","content":"schema forwarded\n"}}]}
+            ,
+            stub_end_turn,
+        };
+        const index = @min(self.calls, replies.len - 1);
+        self.calls += 1;
+        return arena.dupe(u8, replies[index]);
+    }
+};
+
+test "task forwards required argument schemas to the provider and tools execute" {
+    var dir = try TestDir.init();
+    defer dir.deinit();
+    const root = try dir.root();
+    var provider = SchemaProvider{};
+    var cfg = offlineConfig(root, null, &.{});
+    cfg.upstream = "zygos::providers::schema-test";
+    cfg.live = .{ .ctx = @ptrCast(&provider), .boot = SchemaProvider.boot, .stop = SchemaProvider.stop };
+    const result = try run(testing.allocator, cfg);
+    defer result.deinit(testing.allocator);
+    try testing.expect(provider.schemas_valid);
+    try testing.expectEqual(@as(usize, 4), provider.calls);
+    try testing.expect(std.mem.indexOf(u8, result.turn_json, "handler_failed") == null);
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const trial = try trial_mod.parse(arena_state.allocator(), result.trial_json);
+    try testing.expectEqual(@as(u64, 3), trial.source_lines_read);
+    try testing.expect(trial.trim.?.calls == 3 and trial.trim.?.reduction > 0);
+    const path = try std.fmt.allocPrint(testing.allocator, "{s}/schema-note.txt", .{root});
+    defer testing.allocator.free(path);
+    const note = fsx_mod.readWholeFile(testing.allocator, path) orelse return error.WriteMissing;
+    defer testing.allocator.free(note);
+    try testing.expectEqualStrings("schema forwarded\n", note);
+}
 
 const StubProvider = struct {
     worker: ?*inproc.Worker = null,

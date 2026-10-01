@@ -1,6 +1,6 @@
 # Work ledger — harness benchmark
 
-Updated 2026-10-01. Phases 1–8 are done. Phase 9 finished all 24 approved task-run attempts after an explicit operator instruction to continue; canary qualification failed because all scorer checks reject missing trim evidence. Results are `/tmp/zygos-phase9/campaign.json`. Phases 10–12 are not started and need their own approvals. No dollar cap was named.
+Updated 2026-10-01. Phases 1–8 are done. The first Phase 9 campaign finished 24 attempts and failed qualification; results are `/tmp/zygos-phase9/campaign.json`. The operator approved Phases 10–12, then explicitly chose a schema fix and a fresh Phase 9 plus Phase 10 campaign on one new clean build. Those live campaigns are not started yet. No dollar cap was named.
 
 The historical offline binary used in phases 1–7 is git `a2a9bf03fe8b808c2a6dfd9a059e3f358346f7c7`, target `aarch64-macos.26.7...26.7-none`, optimize `Debug`, adapter `0.1.0`. That binary was built from a dirty tree, so the stamped sha is the parent commit and does not contain this work. A later build stamps `unknown` when `git status --porcelain` is non-empty, and the task command refuses `unknown`.
 
@@ -181,15 +181,25 @@ Offline checks on 2026-10-01: `zig build test --summary all` passed 878/878 test
 
 ## Phase 10 — First ablation
 
-Not started. Trim on versus trim off, same sha, triple, optimize level, adapter version, model, dataset, and step cap. The shape is another 48–72 task-runs and needs its own approval. No campaign cap was set before phase 8, so an earlier yes would not cover this.
+Approved on 2026-10-01, not started. The operator explicitly chose to fix the missing tool schemas, rerun Phase 9, and run both Phase 10 arms on one new clean Linux build. Trim on versus trim off must match on sha, triple, optimize level, adapter version, model, dataset, and step cap. The approved eight-task set gives 48 Phase 10 task-runs. No dollar cap was named.
 
 ## Phase 11 — Milestone job
 
-Not started. Full 89, then SWE-bench Lite after its slug is confirmed. Manual. Not a PR gate.
+Approved on 2026-10-01, not started. Full 89, then SWE-bench Lite after its slug is confirmed. Manual. Not a PR gate. The installed Harbor 0.23.0 registry lists SWE-bench Verified, not a confirmed Lite slug; Verified is not a substitute.
 
 ## Phase 12 — Mission bench
 
-Not started. One brief, kill and resume once. That number stays on the mission FSM, separate from `zygos task`. RADAR, BrowseComp-Plus, and Y5 stay behind their own gates. No new Z-12 number was assigned. Code Z-12 remains the stream-idle watchdog.
+Approved on 2026-10-01, not started. One brief, kill and resume once. That number stays on the mission FSM, separate from `zygos task`. Mission policy and manual completion gates remain fail-closed. RADAR, BrowseComp-Plus, and Y5 stay behind their own gates. No new Z-12 number was assigned. Code Z-12 remains the stream-idle watchdog.
+
+## Offline task-schema repair — 2026-10-01
+
+`src/worker/task.zig` advertised bash, read_file, and write_file with only name and function_id. It supplied no argument schema, and the turn forwarded that incomplete tools array unchanged to the provider. This is a second concrete request-contract defect; the missing raw provider streams still prevent attribution of every earlier empty input or paired call to a particular stream event.
+
+An offline regression observes the public task-to-provider request through a registered stub provider, checks required string arguments (command; path; path and content), and then exercises all three real handlers. Before the fix, `zig build test` failed at the missing-schema assertion: 878/879 tests passed. The minimum fix adds those three input_schema definitions and tool descriptions. The regression now executes `seq 1 500`, reads three fixture lines, writes `schema forwarded\n` to `schema-note.txt`, and records three trim calls with positive reduction. `zig build test --summary all` passes 879/879 tests, and `zig fmt --check src/` is clean. No catalog, vault, or network is used by the test.
+
+The operator explicitly approved replacing the prior Phase 9/10 artifact with one clean build after this fix is committed, and rerunning Phase 9 before Phase 10. Old results remain historical evidence. The new build identity and live trial paths will be recorded after they exist. No live provider request or Harbor trial ran during this repair.
+
+The Harbor adapter now accepts `ZYGOS_TRIM=on|off` (default on) and rejects any other value before container exec. Its offline tests first reproduced the hardcoded-on arm and missing invalid-value refusal, then passed all three checks. They verify that the two commands differ only in the trim value, keep the key in the exec environment, and preserve the timeout and other arguments. Adapter version remains 0.1.0.
 
 ## Checks run on 2026-09-28
 

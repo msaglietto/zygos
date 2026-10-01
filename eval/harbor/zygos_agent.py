@@ -107,6 +107,9 @@ class ZygosAgent(BaseAgent):
         step_cap = int(os.environ.get("ZYGOS_STEP_CAP", "24"))
         if step_cap < 1 or step_cap > 32:
             raise RuntimeError("step cap is outside 1..32")
+        trim = os.environ.get("ZYGOS_TRIM", "on")
+        if trim not in ("on", "off"):
+            raise RuntimeError("trim must be on or off")
         workspace = os.environ.get("ZYGOS_WORKSPACE", "/app")
         if not workspace.startswith("/"):
             raise RuntimeError("ZYGOS_WORKSPACE is not absolute")
@@ -146,7 +149,7 @@ class ZygosAgent(BaseAgent):
                 "--instruction-file",
                 str(instruction_path),
                 "--trim",
-                "on",
+                trim,
             )
         )
         timeout = 570
