@@ -260,8 +260,8 @@ pub const Actor = struct {
             .registertriggertype => |m| self.onRegisterTriggerType(from, m),
             .registertrigger => |m| self.onRegisterTrigger(from, m),
             .unregistertrigger => |m| {
-                if (!self.triggers.unregisterBinding(m.id, m.trigger_type))
-                    log.warn("unregistertrigger {s}: unknown or type mismatch", .{m.id});
+                if (!self.triggers.unregisterBinding(m.id, m.trigger_type, from))
+                    log.warn("unregistertrigger {s}: unknown, type mismatch, or not owner", .{m.id});
             },
             .triggerregistrationresult => |m| self.onTriggerRegistrationResult(m),
             .invokefunction => |m| self.onInvoke(from, m, now_ms),
@@ -1012,6 +1012,37 @@ test "registertrigger with unknown type answers unknown_trigger_type" {
     var p = try h.fake.parseAt(0);
     defer p.deinit();
     try testing.expectEqualStrings("unknown_trigger_type", p.value.triggerregistrationresult.err.?.code);
+}
+
+test "unregistertrigger from a non-owner is refused; the owner's succeeds" {
+    var h = try Harness.init(testing.allocator);
+    defer h.deinit();
+    const provider = widOf(1);
+    const registrant = widOf(2);
+    const rogue = widOf(3);
+
+    try h.frame(provider, "{\"type\":\"registertriggertype\",\"id\":\"cron\",\"description\":\"cron\"}", 0);
+    try h.frame(registrant,
+        \\{"type":"registertrigger","id":"t-1","trigger_type":"cron",
+        \\ "function_id":"jobs::nightly","config":{"schedule":"0 3 * * *"}}
+    , 0);
+    try testing.expectEqual(@as(usize, 1), h.fake.sent.items.len); // forwarded to provider
+
+    // A different worker tries to evict the registrant's binding: refused.
+    try h.frame(rogue, "{\"type\":\"unregistertrigger\",\"id\":\"t-1\"}", 0);
+
+    // The binding survived: re-registering the type replays it.
+    try h.frame(provider, "{\"type\":\"registertriggertype\",\"id\":\"cron\",\"description\":\"cron2\"}", 0);
+    try testing.expectEqual(@as(usize, 2), h.fake.sent.items.len);
+    var p = try h.fake.parseAt(1);
+    defer p.deinit();
+    try testing.expectEqualStrings("t-1", p.value.registertrigger.id);
+
+    // The owner's unregister removes it.
+    try h.frame(registrant, "{\"type\":\"unregistertrigger\",\"id\":\"t-1\"}", 0);
+    try h.frame(provider, "{\"type\":\"registertriggertype\",\"id\":\"cron\",\"description\":\"cron3\"}", 0);
+    // No replay frame: nothing left to replay.
+    try testing.expectEqual(@as(usize, 2), h.fake.sent.items.len);
 }
 
 test "ping answers pong" {
