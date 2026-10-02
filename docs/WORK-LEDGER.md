@@ -1,6 +1,6 @@
 # Work ledger — harness benchmark
 
-Updated 2026-10-02. Phases 1–8 are done. The fresh schema-repaired Phase 9 finished 24 trials with 6 verifier successes and 4 accepted scorer records. Phase 10 finished 48 matched trials with all verifier rewards 0 and 47 failed provider turns; its report is `/tmp/zygos-phase10-schema/campaign.json`. Both phases used the one clean `b157dc1` Linux artifact. Phases 11–12 are approved but not started; later spend is stopped while the provider failure is investigated. No dollar cap was named.
+Updated 2026-10-02. Phases 1–8 are done. The fresh schema-repaired Phase 9 finished 24 trials with 6 verifier successes and 4 accepted scorer records. Phase 10 finished 48 matched trials with all verifier rewards 0 and 47 failed provider turns; its report is `/tmp/zygos-phase10-schema/campaign.json`. Both phases used the one clean `b157dc1` Linux artifact. Phase 11 stopped after its first trial captured provider transport `HttpFailed`; the other 88 tasks have not started. Phase 12 is approved but not started. No dollar cap was named.
 
 The historical offline binary used in phases 1–7 is git `a2a9bf03fe8b808c2a6dfd9a059e3f358346f7c7`, target `aarch64-macos.26.7...26.7-none`, optimize `Debug`, adapter `0.1.0`. That binary was built from a dirty tree, so the stamped sha is the parent commit and does not contain this work. A later build stamps `unknown` when `git status --porcelain` is non-empty, and the task command refuses `unknown`.
 
@@ -185,11 +185,11 @@ Approved on 2026-10-01, execution finished under `/tmp/zygos-phase10-schema`. Th
 
 ## Phase 11 — Milestone job
 
-Approved on 2026-10-01, not started. Full 89, then SWE-bench Lite after its slug is confirmed. Manual. Not a PR gate. Later spend is stopped while the Phase 10 provider failure is investigated. The installed Harbor 0.23.0 legacy registry and current Hub package queries list SWE-bench Verified, not a confirmed Lite slug; Verified is not a substitute. Query snapshots: `/tmp/zygos-swe-lite-registry-query.json` and `/tmp/zygos-lite-named-package-check.json`. A text clarification is pending; no Lite trial has run.
+Approved on 2026-10-01, stopped after the first of 89 tasks under `/tmp/zygos-phase11-schema` with redacted diagnostics. Full 89, then SWE-bench Lite after its slug is confirmed. Manual. Not a PR gate. The other 88 tasks have not started while the reproduced provider transport failure is investigated. The installed Harbor 0.23.0 legacy registry and current Hub package queries list SWE-bench Verified, not a confirmed Lite slug; Verified is not a substitute. Query snapshots: `/tmp/zygos-swe-lite-registry-query.json` and `/tmp/zygos-lite-named-package-check.json`. A text clarification is pending; no Lite trial has run.
 
 ## Phase 12 — Mission bench
 
-Approved on 2026-10-01, not started. One brief, kill and resume once. That number stays on the mission FSM, separate from `zygos task`. Mission policy and manual completion gates remain fail-closed. RADAR, BrowseComp-Plus, and Y5 stay behind their own gates. No new Z-12 number was assigned. Code Z-12 remains the stream-idle watchdog.
+Approved on 2026-10-01, not started because the provider transport failure was reproduced by the first Phase 11 task. One isolated brief is prepared at `/tmp/zygos-phase12-schema/brief.md`; no mission was launched, killed, or resumed. The required run remains one brief, killed and resumed once, on the mission FSM, separate from `zygos task`. Mission policy and manual completion gates remain fail-closed. RADAR, BrowseComp-Plus, and Y5 stay behind their own gates. No new Z-12 number was assigned. Code Z-12 remains the stream-idle watchdog.
 
 ## Offline task-schema repair — 2026-10-01
 
@@ -308,6 +308,14 @@ Full trial records and per-trial dollar cost: `/tmp/zygos-phase10-schema/campaig
 ## Phase 10 diagnostic follow-up — 2026-10-02
 
 The adapter had discarded task stdout/stderr on process exit 0, although that exit can contain a provider-failed turn. A new offline adapter test first failed with missing diagnostic files. It now verifies output preservation on exit 0 and redaction of the exec-environment key. All four adapter tests pass. The change only writes diagnostic files; it does not change task arguments, catalog, allowlist, model, timeout, adapter version, or the pinned Linux artifact. Phase 9 and Phase 10 were already finished before this logging change, and their reports remain unchanged. A keyless TLS-only check now succeeds from the modernize image (`/tmp/zygos-phase10-schema/keyless-tls-probe.txt`); that does not establish the earlier provider failure cause or current model quota. The first approved Phase 11 task will preserve diagnostics before launching any further members of the full set. `zig build test --summary all` passes 879/879 offline tests and `zig fmt --check src/` is clean.
+
+## Phase 11 first trial — stopped 2026-10-02
+
+Actual trial: `/tmp/zygos-phase11-schema/phase11-on-r1-modernize-scientific-stack/modernize-scientific-stack__J57q67E`. Same pinned binary: build sha `b157dc1fa2048b3aa313e66ba1b275f5c708c4ab`, SHA-256 `2f22205e1a85af623f13fb6c2d6c9718f7e4dda7836ae28cadc9c7bc5eb4b468`, triple `x86_64-linux.5.10...6.19-gnu.2.31`, ReleaseSafe, adapter 0.1.0, glm-5.3-flash, terminal-bench/terminal-bench-2-1, cap 24, trim on. Diagnostic-only adapter logging was committed as `bed2838` after Phase 10; the Linux artifact was not rebuilt. One task per invocation, no retry or Hub upload.
+
+Harbor exit 0, no exception, verifier reward 0. Trial tokens: 571 input, 74 output; cache read and creation fields absent. At $0.15 input / $0.03 cached input / $0.50 output per million, recorded-usage cost is `571 × $0.15/M + 74 × $0.50/M = $0.00012265`. Scorer exit 2, `TrimOnZeroReduction`; trim calls 2, raw/sent bytes 218/218, reduction 0. Both tool inputs were non-empty, and neither result was handler_failed. The turn ended failed at its second provider step.
+
+The redacted `agent/stdout.txt` contains `warning(provider_anthropic): glm-flash (model glm-5.3-flash): stream failed: HttpFailed`. That identifies a provider transport failure, not an empty-input handler failure; it does not establish a quota error, underlying send/receive error, or the cause of every older failed turn. No raw provider stream was captured. Campaign and first-trial report: `/tmp/zygos-phase11-schema/campaign.json` and `/tmp/zygos-phase11-schema/phase11-on-r1-modernize-scientific-stack.summary.json`. The remaining 88 tasks, SWE-bench Lite, and the Phase 12 mission have not run. Existing phase approvals remain recorded; no policy, budget, or completion gate was bypassed.
 
 ## Checks run on 2026-09-28
 
