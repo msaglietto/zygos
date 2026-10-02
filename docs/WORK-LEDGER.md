@@ -1,6 +1,6 @@
 # Work ledger — harness benchmark
 
-Updated 2026-10-01. Phases 1–8 are done. Both Phase 9 campaigns finished 24 attempts; the fresh schema-repaired campaign has 6 verifier successes and 4 accepted scorer records, with 20 scorer rejections. Its report is `/tmp/zygos-phase9-schema/campaign.json`; the original failed campaign remains `/tmp/zygos-phase9/campaign.json`. The operator explicitly approved the schema fix and fresh Phase 9 plus both Phase 10 arms on one new clean build. Phase 10 has not started. Phases 11–12 are also approved but not started. No dollar cap was named.
+Updated 2026-10-02. Phases 1–8 are done. The fresh schema-repaired Phase 9 finished 24 trials with 6 verifier successes and 4 accepted scorer records. Phase 10 finished 48 matched trials with all verifier rewards 0 and 47 failed provider turns; its report is `/tmp/zygos-phase10-schema/campaign.json`. Both phases used the one clean `b157dc1` Linux artifact. Phases 11–12 are approved but not started; later spend is stopped while the provider failure is investigated. No dollar cap was named.
 
 The historical offline binary used in phases 1–7 is git `a2a9bf03fe8b808c2a6dfd9a059e3f358346f7c7`, target `aarch64-macos.26.7...26.7-none`, optimize `Debug`, adapter `0.1.0`. That binary was built from a dirty tree, so the stamped sha is the parent commit and does not contain this work. A later build stamps `unknown` when `git status --porcelain` is non-empty, and the task command refuses `unknown`.
 
@@ -181,11 +181,11 @@ Offline checks on 2026-10-01: `zig build test --summary all` passed 878/878 test
 
 ## Phase 10 — First ablation
 
-Approved on 2026-10-01, not started. The operator explicitly chose to fix the missing tool schemas, rerun Phase 9, and run both Phase 10 arms on one new clean Linux build. Trim on versus trim off must match on sha, triple, optimize level, adapter version, model, dataset, and step cap. The approved eight-task set gives 48 Phase 10 task-runs. No dollar cap was named.
+Approved on 2026-10-01, execution finished under `/tmp/zygos-phase10-schema`. The operator explicitly chose to fix the missing tool schemas, rerun Phase 9, and run both Phase 10 arms on one new clean Linux build. Trim on versus trim off matches on sha, triple, optimize level, adapter version, model, dataset, and step cap. All 48 task-runs on the eight-task set are recorded below. Each invocation ran one task, with up to four independent host jobs and no retries. All verifier rewards were 0; 47 turns failed at the provider boundary. This does not qualify a useful trim comparison. No dollar cap was named.
 
 ## Phase 11 — Milestone job
 
-Approved on 2026-10-01, not started. Full 89, then SWE-bench Lite after its slug is confirmed. Manual. Not a PR gate. The installed Harbor 0.23.0 registry lists SWE-bench Verified, not a confirmed Lite slug; Verified is not a substitute.
+Approved on 2026-10-01, not started. Full 89, then SWE-bench Lite after its slug is confirmed. Manual. Not a PR gate. Later spend is stopped while the Phase 10 provider failure is investigated. The installed Harbor 0.23.0 legacy registry and current Hub package queries list SWE-bench Verified, not a confirmed Lite slug; Verified is not a substitute. Query snapshots: `/tmp/zygos-swe-lite-registry-query.json` and `/tmp/zygos-lite-named-package-check.json`. A text clarification is pending; no Lite trial has run.
 
 ## Phase 12 — Mission bench
 
@@ -241,6 +241,69 @@ Full trial records and per-trial dollar cost: `/tmp/zygos-phase9-schema/campaign
 | 3 | on | `/tmp/zygos-phase9-schema/phase9-r3-log-summary-date-ranges/log-summary-date-ranges__3r6wV2A` | 20676 | absent | 2616 | 0.00440940 | 1.0 | 0: cents=0 source_lines_read=0 reduction=53 |
 | 3 | on | `/tmp/zygos-phase9-schema/phase9-r3-modernize-scientific-stack/modernize-scientific-stack__VvcRGrV` | 1283 | absent | 255 | 0.00031995 | 0.0 | 2: score: TrimOnZeroReduction |
 | 3 | on | `/tmp/zygos-phase9-schema/phase9-r3-regex-log/regex-log__xDaCcQE` | 0 | absent | 0 | 0.00000000 | 0.0 | 2: score: TrimEvidenceMissing |
+
+## Phase 10 schema-repaired campaign — finished 2026-10-02
+
+Arm subtotals: trim on 37,382 input / 6,808 output tokens, $0.00901130, 2 scorer accepted and 22 rejected; trim off 68,139 input / 9,477 output tokens, $0.01495935, all 24 scorer accepted with the expected zero trim snapshot. All 48 rewards were 0. Seventeen records contain zero reported usage; the traces do not establish the upstream failure cause or the invoice for unreported work. All 24 task/repeat pairs match on the required build and request settings. Only the trim argument changes. The observed cost difference is descriptive, not evidence of a causal saving. Arm report: `/tmp/zygos-phase10-schema/arms.json`.
+
+Executed 48 task-runs. Build sha `b157dc1fa2048b3aa313e66ba1b275f5c708c4ab`, binary SHA-256 `2f22205e1a85af623f13fb6c2d6c9718f7e4dda7836ae28cadc9c7bc5eb4b468`; triple `x86_64-linux.5.10...6.19-gnu.2.31`, optimize ReleaseSafe, adapter 0.1.0, model glm-5.3-flash, dataset terminal-bench/terminal-bench-2-1, step cap 24. One task per Harbor invocation, no retries, no Hub upload; up to four independent host jobs. The same binary was used throughout; no rebuild for ledger edits.
+
+Recorded input tokens 105521, output tokens 16285, cache-read tokens 0 (field present on 0/48 records). Published rates as of 2026-09-18: input $0.15, cached input $0.03, output $0.50 per million. Three-rate cost from recorded usage: **$0.02397065**. The scorer's single cents-per-million row is a trim check, not this invoice. Missing usage or a killed/unrecorded provider reply cannot be inferred as free.
+
+Harbor exit counts: `{"0": 48}`; exception counts: `{}`; reward counts: `{"0.0": 48}`. Scorer exits: `{"0": 26, "2": 22}`. Tool calls 153, empty inputs 0, handler failures 0; structured tool errors `{"PathEscapesWorkspace": 13}` remain fail-closed. Positive-reduction records 2; total trim calls 68, command-filter count 2. Stop reasons: `{"failed": 47, "max_tokens": 1}`. Execution completion does not override rejected scorer results or failed verifiers.
+
+Full trial records and per-trial dollar cost: `/tmp/zygos-phase10-schema/campaign.json`; aggregate: `/tmp/zygos-phase10-schema/completion-summary.json`. Paths below are the actual Harbor trials; their agent/trial.json, agent/events.jsonl, result.json, verifier reward, and separate scorer logs remain under this jobs directory.
+
+| Run | Arm | Task / actual trial path | Input | Cache read | Output | Dollar cost | Reward | Scorer |
+|---|---|---|---:|---:|---:|---:|---:|---|
+| 1 | off | `/tmp/zygos-phase10-schema/phase10-off-r1-build-cython-ext/build-cython-ext__jQmQ7bn` | 10038 | absent | 1231 | 0.00212120 | 0.0 | 0: cents=0 source_lines_read=0 reduction=0 |
+| 1 | on | `/tmp/zygos-phase10-schema/phase10-on-r1-build-cython-ext/build-cython-ext__7wepxjw` | 10195 | absent | 1234 | 0.00214625 | 0.0 | 2: score: TrimOnZeroReduction |
+| 1 | off | `/tmp/zygos-phase10-schema/phase10-off-r1-cobol-modernization/cobol-modernization__5PUMGnj` | 0 | absent | 0 | 0.00000000 | 0.0 | 0: cents=0 source_lines_read=0 reduction=0 |
+| 1 | on | `/tmp/zygos-phase10-schema/phase10-on-r1-cobol-modernization/cobol-modernization__ApR8VQk` | 0 | absent | 0 | 0.00000000 | 0.0 | 2: score: TrimEvidenceMissing |
+| 1 | off | `/tmp/zygos-phase10-schema/phase10-off-r1-filter-js-from-html/filter-js-from-html__BWrq7vL` | 0 | absent | 0 | 0.00000000 | 0.0 | 0: cents=0 source_lines_read=0 reduction=0 |
+| 1 | on | `/tmp/zygos-phase10-schema/phase10-on-r1-filter-js-from-html/filter-js-from-html__LE8bVDH` | 414 | absent | 111 | 0.00011760 | 0.0 | 2: score: TrimOnZeroReduction |
+| 1 | off | `/tmp/zygos-phase10-schema/phase10-off-r1-fix-code-vulnerability/fix-code-vulnerability__GUcUQot` | 5062 | absent | 170 | 0.00084430 | 0.0 | 0: cents=0 source_lines_read=0 reduction=0 |
+| 1 | on | `/tmp/zygos-phase10-schema/phase10-on-r1-fix-code-vulnerability/fix-code-vulnerability__MUeczmm` | 3218 | absent | 178 | 0.00057170 | 0.0 | 0: cents=0 source_lines_read=0 reduction=10 |
+| 1 | off | `/tmp/zygos-phase10-schema/phase10-off-r1-fix-git/fix-git__tTRGhk6` | 836 | absent | 245 | 0.00024790 | 0.0 | 0: cents=0 source_lines_read=0 reduction=0 |
+| 1 | on | `/tmp/zygos-phase10-schema/phase10-on-r1-fix-git/fix-git__5hLmRRJ` | 1751 | absent | 368 | 0.00044665 | 0.0 | 2: score: TrimOnZeroReduction |
+| 1 | off | `/tmp/zygos-phase10-schema/phase10-off-r1-log-summary-date-ranges/log-summary-date-ranges__35Lwhde` | 48 | absent | 64 | 0.00003920 | 0.0 | 0: cents=0 source_lines_read=0 reduction=0 |
+| 1 | on | `/tmp/zygos-phase10-schema/phase10-on-r1-log-summary-date-ranges/log-summary-date-ranges__FuhdJei` | 1579 | absent | 283 | 0.00037835 | 0.0 | 2: score: TrimOnZeroReduction |
+| 1 | off | `/tmp/zygos-phase10-schema/phase10-off-r1-modernize-scientific-stack/modernize-scientific-stack__7uW9DX5` | 2851 | absent | 675 | 0.00076515 | 0.0 | 0: cents=0 source_lines_read=0 reduction=0 |
+| 1 | on | `/tmp/zygos-phase10-schema/phase10-on-r1-modernize-scientific-stack/modernize-scientific-stack__js5RrXg` | 3718 | absent | 1260 | 0.00118770 | 0.0 | 2: score: TrimOnZeroReduction |
+| 1 | off | `/tmp/zygos-phase10-schema/phase10-off-r1-regex-log/regex-log__G2oV8U8` | 0 | absent | 0 | 0.00000000 | 0.0 | 0: cents=0 source_lines_read=0 reduction=0 |
+| 1 | on | `/tmp/zygos-phase10-schema/phase10-on-r1-regex-log/regex-log__k9cmRfD` | 0 | absent | 0 | 0.00000000 | 0.0 | 2: score: TrimEvidenceMissing |
+| 2 | off | `/tmp/zygos-phase10-schema/phase10-off-r2-build-cython-ext/build-cython-ext__Zn5DrS3` | 21750 | absent | 2045 | 0.00428500 | 0.0 | 0: cents=0 source_lines_read=0 reduction=0 |
+| 2 | on | `/tmp/zygos-phase10-schema/phase10-on-r2-build-cython-ext/build-cython-ext__NdBFcuM` | 0 | absent | 0 | 0.00000000 | 0.0 | 2: score: TrimEvidenceMissing |
+| 2 | off | `/tmp/zygos-phase10-schema/phase10-off-r2-cobol-modernization/cobol-modernization__HWJ8GW6` | 0 | absent | 0 | 0.00000000 | 0.0 | 0: cents=0 source_lines_read=0 reduction=0 |
+| 2 | on | `/tmp/zygos-phase10-schema/phase10-on-r2-cobol-modernization/cobol-modernization__bipsjmq` | 1636 | absent | 119 | 0.00030490 | 0.0 | 2: score: TrimOnZeroReduction |
+| 2 | off | `/tmp/zygos-phase10-schema/phase10-off-r2-filter-js-from-html/filter-js-from-html__YrZMXRp` | 0 | absent | 0 | 0.00000000 | 0.0 | 0: cents=0 source_lines_read=0 reduction=0 |
+| 2 | on | `/tmp/zygos-phase10-schema/phase10-on-r2-filter-js-from-html/filter-js-from-html__gpzXd9n` | 414 | absent | 1024 | 0.00057410 | 0.0 | 2: score: TrimEvidenceMissing |
+| 2 | off | `/tmp/zygos-phase10-schema/phase10-off-r2-fix-code-vulnerability/fix-code-vulnerability__MYvRZbj` | 6222 | absent | 569 | 0.00121780 | 0.0 | 0: cents=0 source_lines_read=0 reduction=0 |
+| 2 | on | `/tmp/zygos-phase10-schema/phase10-on-r2-fix-code-vulnerability/fix-code-vulnerability__f8vRVhR` | 2870 | absent | 218 | 0.00053950 | 0.0 | 2: score: TrimOnZeroReduction |
+| 2 | off | `/tmp/zygos-phase10-schema/phase10-off-r2-fix-git/fix-git__AqKss2M` | 4786 | absent | 1165 | 0.00130040 | 0.0 | 0: cents=0 source_lines_read=0 reduction=0 |
+| 2 | on | `/tmp/zygos-phase10-schema/phase10-on-r2-fix-git/fix-git__g7GeJi7` | 5554 | absent | 1161 | 0.00141360 | 0.0 | 2: score: TrimOnZeroReduction |
+| 2 | off | `/tmp/zygos-phase10-schema/phase10-off-r2-log-summary-date-ranges/log-summary-date-ranges__TKXcWsY` | 2686 | absent | 298 | 0.00055190 | 0.0 | 0: cents=0 source_lines_read=0 reduction=0 |
+| 2 | on | `/tmp/zygos-phase10-schema/phase10-on-r2-log-summary-date-ranges/log-summary-date-ranges__ZZWs5ae` | 624 | absent | 87 | 0.00013710 | 0.0 | 2: score: TrimOnZeroReduction |
+| 2 | off | `/tmp/zygos-phase10-schema/phase10-off-r2-modernize-scientific-stack/modernize-scientific-stack__Qa5ZNE5` | 2589 | absent | 542 | 0.00065935 | 0.0 | 0: cents=0 source_lines_read=0 reduction=0 |
+| 2 | on | `/tmp/zygos-phase10-schema/phase10-on-r2-modernize-scientific-stack/modernize-scientific-stack__BS8q8tA` | 1265 | absent | 184 | 0.00028175 | 0.0 | 2: score: TrimOnZeroReduction |
+| 2 | off | `/tmp/zygos-phase10-schema/phase10-off-r2-regex-log/regex-log__6jdMTWc` | 0 | absent | 0 | 0.00000000 | 0.0 | 0: cents=0 source_lines_read=0 reduction=0 |
+| 2 | on | `/tmp/zygos-phase10-schema/phase10-on-r2-regex-log/regex-log__eTfZ9Ee` | 0 | absent | 0 | 0.00000000 | 0.0 | 2: score: TrimEvidenceMissing |
+| 3 | off | `/tmp/zygos-phase10-schema/phase10-off-r3-build-cython-ext/build-cython-ext__Yk4Jv5A` | 35 | absent | 122 | 0.00006625 | 0.0 | 0: cents=0 source_lines_read=0 reduction=0 |
+| 3 | on | `/tmp/zygos-phase10-schema/phase10-on-r3-build-cython-ext/build-cython-ext__kGcpAEd` | 1565 | absent | 249 | 0.00035925 | 0.0 | 2: score: TrimOnZeroReduction |
+| 3 | off | `/tmp/zygos-phase10-schema/phase10-off-r3-cobol-modernization/cobol-modernization__k3eVXs6` | 1776 | absent | 260 | 0.00039640 | 0.0 | 0: cents=0 source_lines_read=0 reduction=0 |
+| 3 | on | `/tmp/zygos-phase10-schema/phase10-on-r3-cobol-modernization/cobol-modernization__ZVzcU6n` | 600 | absent | 74 | 0.00012700 | 0.0 | 2: score: TrimOnZeroReduction |
+| 3 | off | `/tmp/zygos-phase10-schema/phase10-off-r3-filter-js-from-html/filter-js-from-html__mc7yz2j` | 0 | absent | 0 | 0.00000000 | 0.0 | 0: cents=0 source_lines_read=0 reduction=0 |
+| 3 | on | `/tmp/zygos-phase10-schema/phase10-on-r3-filter-js-from-html/filter-js-from-html__6LDZHro` | 0 | absent | 0 | 0.00000000 | 0.0 | 2: score: TrimEvidenceMissing |
+| 3 | off | `/tmp/zygos-phase10-schema/phase10-off-r3-fix-code-vulnerability/fix-code-vulnerability__brzRJVW` | 0 | absent | 0 | 0.00000000 | 0.0 | 0: cents=0 source_lines_read=0 reduction=0 |
+| 3 | on | `/tmp/zygos-phase10-schema/phase10-on-r3-fix-code-vulnerability/fix-code-vulnerability__Ua5M46j` | 1165 | absent | 54 | 0.00020175 | 0.0 | 0: cents=0 source_lines_read=0 reduction=19 |
+| 3 | off | `/tmp/zygos-phase10-schema/phase10-off-r3-fix-git/fix-git__2erU29P` | 807 | absent | 188 | 0.00021505 | 0.0 | 0: cents=0 source_lines_read=0 reduction=0 |
+| 3 | on | `/tmp/zygos-phase10-schema/phase10-on-r3-fix-git/fix-git__G84SwQj` | 814 | absent | 204 | 0.00022410 | 0.0 | 2: score: TrimOnZeroReduction |
+| 3 | off | `/tmp/zygos-phase10-schema/phase10-off-r3-log-summary-date-ranges/log-summary-date-ranges__2PkymCz` | 5132 | absent | 1073 | 0.00130630 | 0.0 | 0: cents=0 source_lines_read=0 reduction=0 |
+| 3 | on | `/tmp/zygos-phase10-schema/phase10-on-r3-log-summary-date-ranges/log-summary-date-ranges__ZfmsiV8` | 0 | absent | 0 | 0.00000000 | 0.0 | 2: score: TrimEvidenceMissing |
+| 3 | off | `/tmp/zygos-phase10-schema/phase10-off-r3-modernize-scientific-stack/modernize-scientific-stack__TXgTNXK` | 3521 | absent | 830 | 0.00094315 | 0.0 | 0: cents=0 source_lines_read=0 reduction=0 |
+| 3 | on | `/tmp/zygos-phase10-schema/phase10-on-r3-modernize-scientific-stack/modernize-scientific-stack__Pmd2hFS` | 0 | absent | 0 | 0.00000000 | 0.0 | 2: score: TrimEvidenceMissing |
+| 3 | off | `/tmp/zygos-phase10-schema/phase10-off-r3-regex-log/regex-log__pjhm9Fk` | 0 | absent | 0 | 0.00000000 | 0.0 | 0: cents=0 source_lines_read=0 reduction=0 |
+| 3 | on | `/tmp/zygos-phase10-schema/phase10-on-r3-regex-log/regex-log__N9zR8wP` | 0 | absent | 0 | 0.00000000 | 0.0 | 2: score: TrimEvidenceMissing |
 
 ## Checks run on 2026-09-28
 
