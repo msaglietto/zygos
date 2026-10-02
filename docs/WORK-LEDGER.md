@@ -305,6 +305,10 @@ Full trial records and per-trial dollar cost: `/tmp/zygos-phase10-schema/campaig
 | 3 | off | `/tmp/zygos-phase10-schema/phase10-off-r3-regex-log/regex-log__pjhm9Fk` | 0 | absent | 0 | 0.00000000 | 0.0 | 0: cents=0 source_lines_read=0 reduction=0 |
 | 3 | on | `/tmp/zygos-phase10-schema/phase10-on-r3-regex-log/regex-log__N9zR8wP` | 0 | absent | 0 | 0.00000000 | 0.0 | 2: score: TrimEvidenceMissing |
 
+## Phase 10 diagnostic follow-up — 2026-10-02
+
+The adapter had discarded task stdout/stderr on process exit 0, although that exit can contain a provider-failed turn. A new offline adapter test first failed with missing diagnostic files. It now verifies output preservation on exit 0 and redaction of the exec-environment key. All four adapter tests pass. The change only writes diagnostic files; it does not change task arguments, catalog, allowlist, model, timeout, adapter version, or the pinned Linux artifact. Phase 9 and Phase 10 were already finished before this logging change, and their reports remain unchanged. A keyless TLS-only check now succeeds from the modernize image (`/tmp/zygos-phase10-schema/keyless-tls-probe.txt`); that does not establish the earlier provider failure cause or current model quota. The first approved Phase 11 task will preserve diagnostics before launching any further members of the full set. `zig build test --summary all` passes 879/879 offline tests and `zig fmt --check src/` is clean.
+
 ## Checks run on 2026-09-28
 
 ```bash

@@ -58,6 +58,28 @@ class TrimContract(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(RuntimeError, "trim"):
             await self.invoke("maybe")
 
+    async def test_successful_process_preserves_diagnostics_without_key(self):
+        class DiagnosticEnvironment(Environment):
+            async def exec(self, **kwargs):
+                self.calls.append(kwargs)
+                return SimpleNamespace(
+                    return_code=0,
+                    stdout="task: healthy exit=0\noffline-fixture\n",
+                    stderr="anthropic answered 429\noffline-fixture\n",
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            logs = Path(directory)
+            environment = DiagnosticEnvironment()
+            with patch.dict(os.environ, {"Z_AI_API_KEY": "offline-fixture", "ZYGOS_TASK_ID": "fixture"}, clear=True):
+                agent = ZygosAgent(logs_dir=logs, model_name="glm-5.3-flash")
+                await agent.run("fixture instruction", environment, None)
+            stdout = (logs / "stdout.txt").read_text()
+            stderr = (logs / "stderr.txt").read_text()
+            self.assertIn("healthy exit=0", stdout)
+            self.assertIn("anthropic answered 429", stderr)
+            self.assertNotIn("offline-fixture", stdout + stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

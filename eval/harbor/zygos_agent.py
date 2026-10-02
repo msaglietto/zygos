@@ -164,6 +164,12 @@ class ZygosAgent(BaseAgent):
             },
             timeout_sec=timeout,
         )
+        for stream in ("stdout", "stderr"):
+            text = getattr(result, stream, "") or ""
+            (Path(self.logs_dir) / f"{stream}.txt").write_text(
+                text.replace(os.environ["Z_AI_API_KEY"], "[REDACTED]"),
+                encoding="utf-8",
+            )
         if not environment.capabilities.mounted:
             try:
                 await environment.download_file(
