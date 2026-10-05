@@ -70,8 +70,9 @@ pub fn slug(gpa: std.mem.Allocator, name: []const u8) error{OutOfMemory}![]u8 {
 pub const ModelLookupError = error{ OutOfMemory, ModelNotFound, ModelAmbiguous, ModelKind };
 
 /// Bus function for the one catalog row whose `model` equals `model`.
-/// Only an anthropic-compatible row is returned. Two rows, an unknown
-/// model, or any other backend is a refusal. Caller owns the result.
+/// The approved DeepSeek task model uses the OpenAI dialect; historical
+/// task rows use Anthropic. Duplicate rows or a wrong dialect refuse.
+/// Caller owns the result.
 pub fn functionForModel(gpa: std.mem.Allocator, catalog: *const Catalog, model: []const u8) ModelLookupError![]u8 {
     var found: ?Provider = null;
     for (catalog.providers) |entry| {
@@ -80,7 +81,11 @@ pub fn functionForModel(gpa: std.mem.Allocator, catalog: *const Catalog, model: 
         found = entry;
     }
     const entry = found orelse return error.ModelNotFound;
-    if (entry.kind != .anthropic_compatible) return error.ModelKind;
+    const kind: ProviderKind = if (std.mem.eql(u8, model, "deepseek/deepseek-v4.1-flash"))
+        .openai_compatible
+    else
+        .anthropic_compatible;
+    if (entry.kind != kind) return error.ModelKind;
     const s = try slug(gpa, entry.name);
     defer gpa.free(s);
     return std.fmt.allocPrint(gpa, "zygos::providers::{s}", .{s}) catch |err| switch (err) {
@@ -782,6 +787,31 @@ test "functionForModel maps the approved pilot model and refuses the rest" {
     var openai = try Catalog.parse(t.allocator, wrong_kind, null);
     defer openai.deinit();
     try t.expectError(error.ModelKind, functionForModel(t.allocator, &openai, "glm-5.3-flash"));
+}
+
+test "functionForModel selects approved DeepSeek Flash with its OpenAI catalog defaults" {
+    const toml =
+        \\[[providers]]
+        \\name = "Deepseek Flash"
+        \\type = "openai_compatible"
+        \\model = "deepseek/deepseek-v4.1-flash"
+        \\endpoint = "https://openrouter.ai/api/v1"
+        \\max_tokens = 8192
+        \\temperature = 0.7
+    ;
+    var cat = try Catalog.parse(t.allocator, toml, null);
+    defer cat.deinit();
+    const function = try functionForModel(t.allocator, &cat, "deepseek/deepseek-v4.1-flash");
+    defer t.allocator.free(function);
+    try t.expectEqualStrings("zygos::providers::deepseek-flash", function);
+    try t.expectEqual(@as(?u32, 8192), cat.providers[0].max_tokens);
+    try t.expectEqual(@as(?f64, 0.7), cat.providers[0].temperature);
+    var wrong = cat.providers[0];
+    wrong.kind = .anthropic_compatible;
+    const wrong_rows = [_]Provider{wrong};
+    var wrong_cat = cat;
+    wrong_cat.providers = &wrong_rows;
+    try t.expectError(error.ModelKind, functionForModel(t.allocator, &wrong_cat, "deepseek/deepseek-v4.1-flash"));
 }
 
 test "configPath: AI_PROVIDERS_CONFIG override, else HOME fallback" {
