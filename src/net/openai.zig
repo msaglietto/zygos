@@ -36,7 +36,7 @@ pub const StreamOptions = struct {
     idle_timeout_ms: u64 = stream_guard.default_idle_ms,
 };
 
-pub const StreamError = error{ OutOfMemory, HttpFailed, ApiError, BadStream, BadRequest };
+pub const StreamError = error{ OutOfMemory, HttpInvalidUrl, HttpRequestFailed, HttpSendFailed, HttpReceiveFailed, ApiError, BadStream, BadRequest };
 
 /// Join a version-carrying base URL with the chat completions path.
 /// Caller owns the result.
@@ -123,7 +123,10 @@ pub fn streamChat(
 
     const url = chatUrl(gpa, opts.base_url) catch return error.OutOfMemory;
     defer gpa.free(url);
-    const uri = std.Uri.parse(url) catch return error.HttpFailed;
+    const uri = std.Uri.parse(url) catch |err| {
+        log.warn("URL parse failed: {t}", .{err});
+        return error.HttpInvalidUrl;
+    };
 
     const auth = std.fmt.allocPrint(gpa, "Bearer {s}", .{opts.api_key}) catch
         return error.OutOfMemory;
@@ -139,8 +142,8 @@ pub fn streamChat(
             .{ .name = "accept", .value = "text/event-stream" },
         },
     }) catch |err| {
-        log.warn("{s} model {s}: request setup failed: {t}", .{ opts.base_url, opts.model, err });
-        return error.HttpFailed;
+        log.warn("request setup failed: {t}", .{err});
+        return error.HttpRequestFailed;
     };
     defer req.deinit();
 
@@ -167,10 +170,16 @@ pub fn streamChat(
     }
 
     req.transfer_encoding = .{ .content_length = body.len };
-    req.sendBodyComplete(body) catch return error.HttpFailed;
+    req.sendBodyComplete(body) catch |err| {
+        log.warn("request send failed: {t}", .{err});
+        return error.HttpSendFailed;
+    };
 
     var redirect_buf: [1024]u8 = undefined;
-    var response = req.receiveHead(&redirect_buf) catch return error.HttpFailed;
+    var response = req.receiveHead(&redirect_buf) catch |err| {
+        log.warn("response head failed: {t}", .{err});
+        return error.HttpReceiveFailed;
+    };
     if (guard) |*g| g.poke();
     if (response.head.status != .ok) {
         log.warn("{s} model {s}: endpoint answered {d}", .{
@@ -267,13 +276,12 @@ fn renderMessage(gpa: std.mem.Allocator, msg: assembler_mod.Message) error{OutOf
     }
 
     return std.fmt.allocPrint(gpa,
-        \\{{"id":{f},"model":{f},"stop_reason":"{t}","usage":{{"input_tokens":{d},"output_tokens":{d}}},"content":[{s}]}}
+        \\{{"id":{f},"model":{f},"stop_reason":"{t}","usage":{f},"content":[{s}]}}
     , .{
         json.fmt(msg.id, .{}),
         json.fmt(msg.model, .{}),
         msg.stop_reason,
-        msg.usage.input_tokens,
-        msg.usage.output_tokens,
+        json.fmt(msg.usage, .{ .emit_null_optional_fields = false }),
         blocks.items,
     });
 }
@@ -283,6 +291,46 @@ fn renderMessage(gpa: std.mem.Allocator, msg: assembler_mod.Message) error{OutOf
 // ===========================================================================
 
 const testing = std.testing;
+
+test "processSse omits unreported cache counts" {
+    var reader: std.Io.Reader = .fixed(fixture_text_stream);
+    const out = try processSse(testing.allocator, &reader, null, null);
+    defer testing.allocator.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "cache") == null);
+}
+
+test "processSse preserves OpenRouter cache counts without subtracting prompt usage" {
+    const fixture =
+        "data: {\"id\":\"cache\",\"model\":\"fixture\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\n" ++
+        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":7,\"prompt_tokens_details\":{\"cached_tokens\":80,\"cache_write_tokens\":0}}}\n\n" ++
+        "data: [DONE]\n\n";
+    var reader: std.Io.Reader = .fixed(fixture);
+    const out = try processSse(testing.allocator, &reader, null, null);
+    defer testing.allocator.free(out);
+    var p = try json.parseFromSlice(json.Value, testing.allocator, out, .{});
+    defer p.deinit();
+    const usage = p.value.object.get("usage").?.object;
+    try testing.expect(usage.contains("cache_read_tokens"));
+    try testing.expectEqual(@as(i64, 80), usage.get("cache_read_tokens").?.integer);
+    try testing.expectEqual(@as(i64, 0), usage.get("cache_creation_tokens").?.integer);
+    try testing.expectEqual(@as(i64, 100), usage.get("input_tokens").?.integer);
+    try testing.expectEqual(@as(i64, 7), usage.get("output_tokens").?.integer);
+}
+
+test "streamChat distinguishes URL and request setup failures without network" {
+    try testing.expectError(error.HttpInvalidUrl, streamChat(testing.allocator, .failing, .{
+        .api_key = "offline-fixture",
+        .model = "fixture",
+        .messages_json = "[]",
+        .base_url = "invalid url",
+    }, null));
+    try testing.expectError(error.HttpRequestFailed, streamChat(testing.allocator, .failing, .{
+        .api_key = "offline-fixture",
+        .model = "fixture",
+        .messages_json = "[]",
+        .base_url = "ftp://fixture.invalid",
+    }, null));
+}
 
 const fixture_text_stream =
     "data: {\"id\":\"cc-1\",\"model\":\"gpt-x\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hi \"},\"finish_reason\":null}]}\n\n" ++

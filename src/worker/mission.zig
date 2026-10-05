@@ -412,6 +412,12 @@ fn runMission(self: *MissionOrchestrator, arena: std.mem.Allocator, request_json
     const ctl = try self.track(p.mission_id);
     defer self.untrack(p.mission_id);
 
+    // Preserve intake criteria independently of model-authored MISSION.md.
+    // Resume uses the original artifact, never a replacement request brief.
+    if (!p.resume_flag) {
+        if (p.brief) |brief_text| try putArtifact(self, cfg, "BRIEF.md", brief_text);
+    }
+
     // The pre-first-turn state hits the disk too: a mission killed before
     // its first role turn still resumes.
     try self.persist(cfg.store, ctl, &m);
@@ -1834,6 +1840,31 @@ test "a well-formed brief starts the mission normally" {
     try expectTerminal(res.ok, "done", "completed");
 }
 
+test "original operator brief survives generated acceptance drift in every role" {
+    var h = try Harness.init(testing.allocator, &.{ po_ok, plan1, exec_ok, verify_pass });
+    defer h.deinit();
+    const gate_worker = try FakeGate.start(testing.allocator, &h.actor, &h.registry, &.{"{\"approved\":true}"});
+    defer gate_worker.stop();
+    const brief = good_brief ++ "\nOriginal acceptance: 2 -3 8 must print 7; invalid input exits 2.\n";
+    const req = try briefStartReq(h, testing.allocator, brief);
+    defer testing.allocator.free(req);
+    const res = try h.caller.call("zygos::missions::start", req);
+    defer res.deinit(testing.allocator);
+    try testing.expect(res == .ok);
+    try expectTerminal(res.ok, "done", "completed");
+
+    try testing.expectEqual(@as(usize, 4), h.provider.requests.items.len);
+    for (h.provider.requests.items) |request| {
+        var parsed = try json.parseFromSlice(json.Value, testing.allocator, request, .{});
+        defer parsed.deinit();
+        const content = parsed.value.object.get("messages").?.array.items[0].object.get("content").?.string;
+        try testing.expect(std.mem.indexOf(u8, content, brief) != null);
+    }
+    const saved = try h.store().readArtifact(testing.allocator, "BRIEF.md");
+    defer testing.allocator.free(saved);
+    try testing.expectEqualStrings(brief, saved);
+}
+
 const StartCtx = struct {
     h: *Harness,
     req: []const u8,
@@ -1843,6 +1874,29 @@ const StartCtx = struct {
         self.res = self.h.caller.call("zygos::missions::start", self.req) catch unreachable;
     }
 };
+
+test "resumed roles keep the persisted operator brief instead of replacement intake" {
+    var h = try Harness.init(testing.allocator, &.{ plan1, exec_ok, verify_pass });
+    defer h.deinit();
+    const gate_worker = try FakeGate.start(testing.allocator, &h.actor, &h.registry, &.{"{\"approved\":true}"});
+    defer gate_worker.stop();
+    const original = good_brief ++ "\nOriginal acceptance: 2 -3 8 must print 7.\n";
+    try h.store().writeArtifact(testing.allocator, "BRIEF.md", original);
+    try h.store().writeArtifact(testing.allocator, "MISSION.md", "Generated acceptance: ship the gizmo.\n");
+    try h.store().save(testing.allocator, &.{ .mission_id = "m-1", .state = .planning, .objective = "gizmo", .acceptance = "generated" });
+    const req = try h.startReq(testing.allocator, ",\"resume\":true,\"gate_function\":\"test::gate::request\"");
+    defer testing.allocator.free(req);
+    const res = try h.caller.call("zygos::missions::start", req);
+    defer res.deinit(testing.allocator);
+    try testing.expect(res == .ok);
+    try expectTerminal(res.ok, "done", "completed");
+    for (h.provider.requests.items) |request| {
+        var parsed = try json.parseFromSlice(json.Value, testing.allocator, request, .{});
+        defer parsed.deinit();
+        const content = parsed.value.object.get("messages").?.array.items[0].object.get("content").?.string;
+        try testing.expect(std.mem.indexOf(u8, content, original) != null);
+    }
+}
 
 test "abort mid-mission stops durably with aborted" {
     var h = try Harness.init(testing.allocator, &.{ po_ok, plan2, exec_ok, exec_ok, verify_pass });

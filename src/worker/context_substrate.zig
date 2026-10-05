@@ -45,7 +45,7 @@ pub fn assembleContent(
     const m = step.mission;
 
     if (std.mem.eql(u8, step.role, "product-owner")) {
-        return .{ .content = m.objective };
+        return .{ .content = try withOperatorBrief(arena, step, m.objective) };
     }
     if (std.mem.eql(u8, step.role, "planner")) {
         // The substrate is the context: the planner reads the persisted
@@ -54,12 +54,12 @@ pub fn assembleContent(
             diag.message = mission_artifact ++ " missing from the planning root";
             return error.Failed;
         };
-        if (m.feedback.len == 0) return .{ .content = brief };
-        return .{ .content = try std.fmt.allocPrint(
+        if (m.feedback.len == 0) return .{ .content = try withOperatorBrief(arena, step, brief) };
+        return .{ .content = try withOperatorBrief(arena, step, try std.fmt.allocPrint(
             arena,
             "{s}\n\nFeedback on the previous attempt:\n{s}\n",
             .{ brief, m.feedback },
-        ) };
+        )) };
     }
     if (std.mem.eql(u8, step.role, "executor")) {
         // The executor is stateless across turns; the prompt is its only
@@ -88,7 +88,7 @@ pub fn assembleContent(
         ) catch return error.OutOfMemory;
         if (m.feedback.len > 0)
             w.print("\nFeedback on the previous attempt:\n{s}\n", .{m.feedback}) catch return error.OutOfMemory;
-        return .{ .content = content.written() };
+        return .{ .content = try withOperatorBrief(arena, step, content.written()) };
     }
     if (std.mem.eql(u8, step.role, "verifier")) {
         const brief = step.substrate.read(arena, mission_artifact) orelse {
@@ -99,14 +99,25 @@ pub fn assembleContent(
             diag.message = plan_artifact ++ " missing from the planning root";
             return error.Failed;
         };
-        return .{ .content = try std.fmt.allocPrint(
+        return .{ .content = try withOperatorBrief(arena, step, try std.fmt.allocPrint(
             arena,
             "{s}\n{s}\nEvery task above has been executed. Verify the objective is met.\n",
             .{ brief, plan },
-        ) };
+        )) };
     }
     diag.message = "unknown role";
     return error.Failed;
+}
+
+fn withOperatorBrief(arena: std.mem.Allocator, step: context.StepRef, content: []const u8) error{OutOfMemory}![]const u8 {
+    const original = step.substrate.read(arena, "BRIEF.md") orelse return content;
+    return std.fmt.allocPrint(
+        arena,
+        "{s}\n\nOriginal operator brief (authoritative):\n{s}\n" ++
+            "Preserve its success criteria, examples, constraints, and non-goals. " ++
+            "If generated acceptance or tasks conflict, follow this original brief.\n",
+        .{ content, original },
+    );
 }
 
 /// Stateless: one shared instance serves every mission.

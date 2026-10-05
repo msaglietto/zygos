@@ -1,9 +1,8 @@
 """Harbor agent for one Zygos task command.
 
 The adapter version is the `adapter_version` const in src/worker/trial.zig.
-Harbor loads this class as `eval.harbor.zygos_agent:ZygosAgent`. The live
-command is the phase-8 pilot: model glm-5.3-flash, the Linux binary in
-ZYGOS_LINUX_BIN, and Z_AI_API_KEY passed only in the container exec env.
+Harbor loads this class as `eval.harbor.zygos_agent:ZygosAgent`. Approved
+model catalogs are keyless; credentials enter only the container exec env.
 """
 
 from __future__ import annotations
@@ -45,6 +44,26 @@ endpoint = "https://api.z.ai/api/anthropic"
 key_env = "Z_AI_API_KEY"
 """
 
+DEEPSEEK_MODEL = "deepseek/deepseek-v4.1-flash"
+DEEPSEEK_CATALOG = """[[providers]]
+name = "Deepseek Flash"
+type = "openai_compatible"
+model = "deepseek/deepseek-v4.1-flash"
+endpoint = "https://openrouter.ai/api/v1"
+key_env = "DEEPSEEK_API_KEY"
+max_tokens = 8192
+temperature = 0.7
+"""
+
+
+def approved_config(model_name: str | None) -> tuple[str, str, str]:
+    model = model_name or APPROVED_MODEL
+    if model == APPROVED_MODEL:
+        return model, PILOT_CATALOG, "Z_AI_API_KEY"
+    if model == DEEPSEEK_MODEL:
+        return model, DEEPSEEK_CATALOG, "DEEPSEEK_API_KEY"
+    raise RuntimeError("refusing an unapproved live model")
+
 
 class ZygosAgent(BaseAgent):
     def __init__(
@@ -72,6 +91,7 @@ class ZygosAgent(BaseAgent):
         )
 
     async def setup(self, environment: BaseEnvironment) -> None:
+        _, catalog_text, _ = approved_config(self.model_name)
         binary = os.environ.get("ZYGOS_LINUX_BIN", "")
         path = Path(binary)
         if not path.is_file():
@@ -84,7 +104,7 @@ class ZygosAgent(BaseAgent):
             user="root",
         )
         catalog = Path(self.logs_dir) / "providers.toml"
-        catalog.write_text(PILOT_CATALOG, encoding="utf-8")
+        catalog.write_text(catalog_text, encoding="utf-8")
         await environment.upload_file(
             source_path=catalog,
             target_path=str(env_paths.agent_dir / "providers.toml"),
@@ -97,10 +117,10 @@ class ZygosAgent(BaseAgent):
         context: AgentContext,
     ) -> None:
         del context
-        if self.model_name not in (None, APPROVED_MODEL):
-            raise RuntimeError("refusing a live model other than glm-5.3-flash")
-        if not os.environ.get("Z_AI_API_KEY"):
-            raise RuntimeError("Z_AI_API_KEY is not set")
+        model, _, key_env = approved_config(self.model_name)
+        key = os.environ.get(key_env)
+        if not key:
+            raise RuntimeError(f"{key_env} is not set")
         task_id = os.environ.get("ZYGOS_TASK_ID", "")
         if not task_id or "/" in task_id or ".." in task_id:
             raise RuntimeError("ZYGOS_TASK_ID is missing")
@@ -133,7 +153,7 @@ class ZygosAgent(BaseAgent):
                 "task",
                 "run",
                 "--model",
-                APPROVED_MODEL,
+                model,
                 "--workspace",
                 workspace,
                 "--out",
@@ -159,7 +179,7 @@ class ZygosAgent(BaseAgent):
         result = await environment.exec(
             command=command,
             env={
-                "Z_AI_API_KEY": os.environ["Z_AI_API_KEY"],
+                key_env: key,
                 "AI_PROVIDERS_CONFIG": str(env_paths.agent_dir / "providers.toml"),
             },
             timeout_sec=timeout,
@@ -167,7 +187,7 @@ class ZygosAgent(BaseAgent):
         for stream in ("stdout", "stderr"):
             text = getattr(result, stream, "") or ""
             (Path(self.logs_dir) / f"{stream}.txt").write_text(
-                text.replace(os.environ["Z_AI_API_KEY"], "[REDACTED]"),
+                text.replace(key, "[REDACTED]"),
                 encoding="utf-8",
             )
         if not environment.capabilities.mounted:

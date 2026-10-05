@@ -20,7 +20,12 @@ pub const Block = union(enum) {
     tool_use: struct { id: []const u8, name: []const u8, input_json: []const u8 },
 };
 
-pub const Usage = struct { input_tokens: u64 = 0, output_tokens: u64 = 0 };
+pub const Usage = struct {
+    input_tokens: u64 = 0,
+    output_tokens: u64 = 0,
+    cache_read_tokens: ?u64 = null,
+    cache_creation_tokens: ?u64 = null,
+};
 
 /// The provider-neutral terminal message the turn driver consumes —
 /// identical across the anthropic path, the chat path, and the fakes.
@@ -58,6 +63,14 @@ pub fn captureUsage(usage: *Usage, u: json.ObjectMap) void {
         usage.input_tokens = n;
     if (intField(u, "output_tokens") orelse intField(u, "completion_tokens")) |n|
         usage.output_tokens = n;
+    if (intField(u, "cache_read_input_tokens") orelse intField(u, "cache_read_tokens")) |n|
+        usage.cache_read_tokens = n;
+    if (intField(u, "cache_creation_input_tokens") orelse intField(u, "cache_creation_tokens")) |n|
+        usage.cache_creation_tokens = n;
+    if (objField(u, "prompt_tokens_details")) |details| {
+        if (intField(details, "cached_tokens")) |n| usage.cache_read_tokens = n;
+        if (intField(details, "cache_write_tokens")) |n| usage.cache_creation_tokens = n;
+    }
 }
 
 /// Some providers stream tool-args fragments that concatenate into an object
@@ -97,6 +110,18 @@ pub const rawJson = jsonx.rawJson;
 // ===========================================================================
 
 const testing = std.testing;
+
+test "captureUsage preserves cache counts across partial and malformed updates" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var u: Usage = .{};
+    captureUsage(&u, try usageFrom(arena.allocator(), "{\"input_tokens\":11,\"cache_read_input_tokens\":33,\"cache_creation_input_tokens\":4}"));
+    captureUsage(&u, try usageFrom(arena.allocator(), "{\"output_tokens\":5,\"prompt_tokens_details\":{\"cached_tokens\":-1,\"cache_write_tokens\":\"wrong\"}}"));
+    try testing.expectEqual(@as(u64, 11), u.input_tokens);
+    try testing.expectEqual(@as(u64, 5), u.output_tokens);
+    try testing.expectEqual(@as(?u64, 33), u.cache_read_tokens);
+    try testing.expectEqual(@as(?u64, 4), u.cache_creation_tokens);
+}
 
 fn usageFrom(arena: std.mem.Allocator, text: []const u8) !json.ObjectMap {
     const root = try json.parseFromSliceLeaky(json.Value, arena, text, .{});

@@ -1,6 +1,6 @@
 # Spec: `zygos task` — headless trial
 
-The Harbor-facing entry. One instruction, the existing turn loop, a step cap, and a `trial.json`. This is not a mission: there is no product-owner and no completion gate. Exit 0 means the process finished and wrote a trial, including when a tool was denied. Exit 2 is a refusal (bad args, missing `--offline`, unknown git sha, workspace missing). Exit 1 is out of memory.
+The Harbor-facing entry. One instruction, the existing turn loop, a step cap, and a `trial.json`. This is not a mission: there is no product-owner and no completion gate. Exit 0 means the process finished and wrote a trial, including when a tool was denied. Exit 2 is a refusal (bad args, unapproved live model, unknown git sha, workspace missing). Exit 1 is out of memory.
 
 The mission FSM is a different number and is not what this command measures.
 
@@ -11,9 +11,11 @@ zygos task run --offline --workspace DIR --out trial.json [--events events.jsonl
 zygos task score --trial trial.json --prices prices.txt
 ```
 
-`--offline` is required. Without it the process prints a refusal and exits 2. The offline path uses the scripted provider. It does not read the provider catalog, the vault, or the network. The script is bash `seq 1 500` (over the trim line cap), a read of `fixture.txt` (three lines, the only `source_lines_read`), a write of `note.txt`, then end of turn.
+`--offline` selects the scripted provider. Without it, a complete operator-approved live invocation as described below is required; incomplete or unapproved invocations exit 2. The offline path does not read the provider catalog, the vault, or the network. Its script is bash `seq 1 500` (over the trim line cap), a read of `fixture.txt` (three lines, the only `source_lines_read`), a write of `note.txt`, then end of turn.
 
 `--trim off` does not register `TrimWorker`. The trial still carries a zero snapshot. `--trim on` (the default) starts the worker with the mission CLI limits: 65536 bytes, 400 lines, head 120, tail 80.
+
+Operator-approved live runs may use `glm-5.3-flash` or `deepseek/deepseek-v4.1-flash`, with the pinned dataset, an instruction file, a task id, and step cap 1–32. Other models remain refused. The DeepSeek Harbor catalog uses OpenRouter's OpenAI-compatible endpoint, `DEEPSEEK_API_KEY` only in the exec environment, `max_tokens = 8192`, and `temperature = 0.7`. `ZYGOS_JOBS_DIR` gives `eval/run.sh` a separate jobs directory; every invocation still launches one task with no retries or Hub upload. A model allowlist does not authorize an additional campaign phase.
 
 `prices.txt` is one `<model_id> <cents_per_mtok>` row per line. `#` comments are ignored. A zero price is a free model. A missing row for the trial's model is `MissingPrice`.
 
@@ -31,6 +33,8 @@ Fixed key order so two offline runs match byte for byte. Cache keys are omitted 
 `reduction` is `(raw - sent) * 100 / raw` when `raw > 0` and `sent < raw`, else 0. The git sha is the Zygos build, not the task workspace. A dirty worktree, a missing git checkout, or a hash that is not 40 or 64 hex characters embeds `unknown`, and the task command then refuses to write a trial. `optimize` is the build mode name (`Debug`, `ReleaseSafe`, `ReleaseFast`, `ReleaseSmall`).
 
 The trace file given to `--events` stays the usage line from `trace_event.zig`: `input_tokens` and `output_tokens`. Cache counts are not added there.
+
+The SSE clients preserve reported cache counts in their terminal usage payload for copying to the trial, including OpenRouter's `prompt_tokens_details.cached_tokens` and `cache_write_tokens`. Unreported counts remain absent. OpenAI-compatible `input_tokens` retains the provider's total prompt count, including cached input; its three-rate cost calculation charges `(input_tokens - cache_read_tokens)` at the ordinary input rate and cache reads at their separate rate. The scorer formula below is unchanged and is not a provider invoice.
 
 ## Bench policy
 

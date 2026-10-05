@@ -27,16 +27,79 @@ class Environment:
 
 
 class TrimContract(unittest.IsolatedAsyncioTestCase):
-    async def invoke(self, trim):
+    async def test_deepseek_setup_and_run_use_keyless_catalog_and_exec_environment(self):
+        class UploadEnvironment(Environment):
+            def __init__(self):
+                super().__init__()
+                self.uploads = {}
+
+            async def upload_file(self, **kwargs):
+                self.uploads[kwargs["target_path"]] = Path(kwargs["source_path"]).read_bytes()
+
+            async def exec(self, **kwargs):
+                self.calls.append(kwargs)
+                return SimpleNamespace(return_code=0, stdout="deepseek-fixture", stderr="")
+
+        with tempfile.TemporaryDirectory() as directory:
+            logs = Path(directory)
+            binary = logs / "binary"
+            binary.write_bytes(b"offline-binary")
+            values = {
+                "DEEPSEEK_API_KEY": "deepseek-fixture",
+                "ZYGOS_TASK_ID": "fixture",
+                "ZYGOS_LINUX_BIN": str(binary),
+            }
+            with patch.dict(os.environ, values, clear=True):
+                environment = UploadEnvironment()
+                agent = ZygosAgent(logs_dir=logs, model_name="deepseek/deepseek-v4.1-flash")
+                await agent.setup(environment)
+                await agent.run("fixture instruction", environment, None)
+            import tomllib
+            catalog = tomllib.loads((logs / "providers.toml").read_text())
+            provider = catalog["providers"][0]
+            self.assertEqual(provider["model"], "deepseek/deepseek-v4.1-flash")
+            self.assertEqual(provider["type"], "openai_compatible")
+            self.assertEqual(provider["endpoint"], "https://openrouter.ai/api/v1")
+            self.assertEqual(provider["max_tokens"], 8192)
+            self.assertEqual(provider["temperature"], 0.7)
+            self.assertEqual(provider["key_env"], "DEEPSEEK_API_KEY")
+            self.assertNotIn("key", provider)
+            call = environment.calls[-1]
+            command = shlex.split(call["command"])
+            self.assertEqual(command[command.index("--model") + 1], provider["model"])
+            self.assertEqual(call["env"]["DEEPSEEK_API_KEY"], "deepseek-fixture")
+            self.assertNotIn("Z_AI_API_KEY", call["env"])
+            self.assertNotIn("deepseek-fixture", call["command"])
+            for path in (logs / "providers.toml", logs / "stdout.txt", logs / "stderr.txt"):
+                self.assertNotIn("deepseek-fixture", path.read_text())
+
+    async def invoke(self, trim, model="glm-5.3-flash"):
         with tempfile.TemporaryDirectory() as directory:
             environment = Environment()
-            values = {"Z_AI_API_KEY": "offline-fixture", "ZYGOS_TASK_ID": "fixture"}
+            key_env = "DEEPSEEK_API_KEY" if model == "deepseek/deepseek-v4.1-flash" else "Z_AI_API_KEY"
+            values = {key_env: "offline-fixture", "ZYGOS_TASK_ID": "fixture"}
             if trim is not None:
                 values["ZYGOS_TRIM"] = trim
             with patch.dict(os.environ, values, clear=True):
-                agent = ZygosAgent(logs_dir=Path(directory), model_name="glm-5.3-flash")
+                agent = ZygosAgent(logs_dir=Path(directory), model_name=model)
                 await agent.run("fixture instruction", environment, None)
             return environment.calls
+
+    async def test_deepseek_arms_differ_only_in_trim(self):
+        model = "deepseek/deepseek-v4.1-flash"
+        on, off = (await self.invoke("on", model))[0], (await self.invoke("off", model))[0]
+        a, b = shlex.split(on["command"]), shlex.split(off["command"])
+        position = a.index("--trim") + 1
+        self.assertEqual(a[position], "on")
+        self.assertEqual(b[position], "off")
+        b[position] = "on"
+        self.assertEqual(a, b)
+        self.assertEqual(on["env"], off["env"])
+        self.assertEqual(on["timeout_sec"], off["timeout_sec"])
+
+    async def test_unknown_model_is_refused(self):
+        with self.assertRaisesRegex(RuntimeError, "unapproved"):
+            await self.invoke("on", "deepseek/unknown")
 
     async def test_arms_differ_only_in_trim_argument(self):
         on, off = (await self.invoke("on"))[0], (await self.invoke("off"))[0]

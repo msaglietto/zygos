@@ -57,7 +57,7 @@ while [ $# -gt 0 ]; do
       ;;
     --help|-h)
       echo "usage: eval/run.sh [--dry-run] [--dataset terminal-bench/terminal-bench-2-1]"
-      echo "       eval/run.sh --task NAME --model glm-5.3-flash --task-dir DIR"
+      echo "       eval/run.sh --task NAME --model MODEL --task-dir DIR"
       exit 0
       ;;
     *)
@@ -99,10 +99,17 @@ if [ "$dry" -eq 1 ]; then
   exit 0
 fi
 
-# Phase 8 only: one task, n=1, model glm-5.3-flash, linux/amd64.
+# Approved models only: one task per invocation, n=1, linux/amd64.
 # Any other shape falls through to the refusal below.
 if [ -n "$pilot_task" ] || [ -n "$pilot_model" ] || [ -n "$pilot_dir" ]; then
-  if [ "$pilot_model" != "glm-5.3-flash" ] || [ -z "$pilot_task" ] || [ -z "$pilot_dir" ]; then
+  case "$pilot_model" in
+    glm-5.3-flash|deepseek/deepseek-v4.1-flash) ;;
+    *)
+      echo "eval: refusing an unapproved live model" >&2
+      exit 2
+      ;;
+  esac
+  if [ -z "$pilot_task" ] || [ -z "$pilot_dir" ]; then
     echo "eval: refusing a live Harbor run until a dated model id and a spend approval exist" >&2
     exit 2
   fi
@@ -135,13 +142,13 @@ if [ -n "$pilot_task" ] || [ -n "$pilot_model" ] || [ -n "$pilot_dir" ]; then
   PYTHONPATH="$repo" exec harbor run \
     -p "$pilot_dir" \
     -a eval.harbor.zygos_agent:ZygosAgent \
-    -m glm-5.3-flash \
+    -m "$pilot_model" \
     -k 1 \
     --n-concurrent 1 \
     --n-concurrent-agents 1 \
     --max-retries 0 \
     --yes \
-    -o /tmp/zygos-phase8
+    -o "${ZYGOS_JOBS_DIR:-/tmp/zygos-phase8}"
 fi
 
 echo "eval: refusing a live Harbor run until a dated model id and a spend approval exist" >&2

@@ -3,7 +3,7 @@
 //! `run` is the headless Harbor entry. It is not a mission: no product-owner
 //! gate, and exit 0 means the process finished and wrote a trial, including
 //! when a tool was denied. Exit 2 is a refusal. `--offline` is the scripted
-//! provider. The only live model is `glm-5.3-flash`, for one phase-8 pilot.
+//! provider. Live models are explicitly approved campaign entries.
 //! Any other model, dataset, or step cap above the pilot bound is refused.
 //!
 //! The git sha, target triple, optimize level, and adapter version are pinned
@@ -23,6 +23,7 @@ extern "c" fn realpath(path: [*:0]const u8, resolved: [*]u8) ?[*:0]u8;
 pub const ArgError = error{ Usage, Help, LiveRefused };
 
 pub const approved_pilot_model = "glm-5.3-flash";
+pub const approved_rerun_model = "deepseek/deepseek-v4.1-flash";
 pub const approved_pilot_dataset = "terminal-bench/terminal-bench-2-1";
 /// Under the Harbor agent timeout so a trial can still be written.
 const pilot_timeout_ms: i64 = 540_000;
@@ -147,7 +148,8 @@ pub fn parseRun(argv: []const []const u8) ArgError!RunArgs {
         };
     }
     const m = model orelse return error.LiveRefused;
-    if (!std.mem.eql(u8, m, approved_pilot_model)) return error.LiveRefused;
+    if (!std.mem.eql(u8, m, approved_pilot_model) and
+        !std.mem.eql(u8, m, approved_rerun_model)) return error.LiveRefused;
     const cap = step_cap orelse return error.Usage;
     if (cap == 0 or cap > zygos.task.pilot_step_cap_max) return error.LiveRefused;
     const tid = task_id orelse return error.Usage;
@@ -496,10 +498,10 @@ fn parseUsize(text: []const u8) ?usize {
 fn printUsage() void {
     eprint(
         \\usage: zygos task run --offline --workspace DIR --out trial.json [--events events.jsonl] [--trim on|off]
-        \\       zygos task run --model glm-5.3-flash --workspace DIR --out trial.json --step-cap N --task-id ID --dataset terminal-bench/terminal-bench-2-1 --instruction-file PATH [--events events.jsonl] [--trim on|off]
+        \\       zygos task run --model MODEL --workspace DIR --out trial.json --step-cap N --task-id ID --dataset terminal-bench/terminal-bench-2-1 --instruction-file PATH [--events events.jsonl] [--trim on|off]
         \\       zygos task score --trial trial.json --prices prices.txt
         \\
-        \\--offline is the scripted provider. The only live model is glm-5.3-flash.
+        \\--offline is the scripted provider. Live MODEL: glm-5.3-flash or deepseek/deepseek-v4.1-flash.
         \\N is 1..32. Exit 0 means the process finished.
         \\
     , .{});
@@ -527,6 +529,24 @@ fn resolvePath(gpa: std.mem.Allocator, path: []const u8) ?[]u8 {
 }
 
 const testing = std.testing;
+
+test "task run accepts explicitly approved DeepSeek Flash on both trim arms" {
+    for ([_][]const u8{ "on", "off" }) |arm| {
+        const args = try parseRun(&.{
+            "--model",            "deepseek/deepseek-v4.1-flash",
+            "--workspace",        "w",
+            "--out",              "o",
+            "--step-cap",         "24",
+            "--task-id",          "t",
+            "--dataset",          "terminal-bench/terminal-bench-2-1",
+            "--instruction-file", "i",
+            "--trim",             arm,
+        });
+        try testing.expectEqualStrings("deepseek/deepseek-v4.1-flash", args.model.?);
+        try testing.expectEqual(@as(usize, 24), args.step_cap.?);
+        try testing.expectEqual(std.mem.eql(u8, arm, "on"), args.trim);
+    }
+}
 
 test "task run without --offline is refused" {
     try testing.expectError(error.LiveRefused, parseRun(&.{ "--workspace", "w", "--out", "o" }));

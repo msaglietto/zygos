@@ -31,7 +31,7 @@ pub const StreamOptions = struct {
     idle_timeout_ms: u64 = stream_guard.default_idle_ms,
 };
 
-pub const StreamError = error{ OutOfMemory, HttpFailed, ApiError, BadStream };
+pub const StreamError = error{ OutOfMemory, HttpInvalidUrl, HttpRequestFailed, HttpSendFailed, HttpReceiveFailed, ApiError, BadStream };
 
 /// Blocking call: POST /v1/messages with stream:true, push text deltas into
 /// `sender` (closed on return), return the assembled terminal message as
@@ -67,7 +67,10 @@ pub fn streamMessages(
     const url = std.fmt.allocPrint(gpa, "{s}/v1/messages", .{opts.base_url}) catch
         return error.OutOfMemory;
     defer gpa.free(url);
-    const uri = std.Uri.parse(url) catch return error.HttpFailed;
+    const uri = std.Uri.parse(url) catch |err| {
+        log.warn("URL parse failed: {t}", .{err});
+        return error.HttpInvalidUrl;
+    };
 
     var client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer client.deinit();
@@ -81,7 +84,7 @@ pub fn streamMessages(
         },
     }) catch |err| {
         log.warn("request setup failed: {t}", .{err});
-        return error.HttpFailed;
+        return error.HttpRequestFailed;
     };
     defer req.deinit();
 
@@ -108,10 +111,16 @@ pub fn streamMessages(
     }
 
     req.transfer_encoding = .{ .content_length = body.len };
-    req.sendBodyComplete(body) catch return error.HttpFailed;
+    req.sendBodyComplete(body) catch |err| {
+        log.warn("request send failed: {t}", .{err});
+        return error.HttpSendFailed;
+    };
 
     var redirect_buf: [1024]u8 = undefined;
-    var response = req.receiveHead(&redirect_buf) catch return error.HttpFailed;
+    var response = req.receiveHead(&redirect_buf) catch |err| {
+        log.warn("response head failed: {t}", .{err});
+        return error.HttpReceiveFailed;
+    };
     if (guard) |*g| g.poke();
     if (response.head.status != .ok) {
         log.warn("anthropic answered {d}", .{@intFromEnum(response.head.status)});
@@ -209,13 +218,12 @@ fn renderMessage(gpa: std.mem.Allocator, msg: assembler_mod.Message) error{OutOf
     }
 
     return std.fmt.allocPrint(gpa,
-        \\{{"id":{f},"model":{f},"stop_reason":"{t}","usage":{{"input_tokens":{d},"output_tokens":{d}}},"content":[{s}]}}
+        \\{{"id":{f},"model":{f},"stop_reason":"{t}","usage":{f},"content":[{s}]}}
     , .{
         json.fmt(msg.id, .{}),
         json.fmt(msg.model, .{}),
         msg.stop_reason,
-        msg.usage.input_tokens,
-        msg.usage.output_tokens,
+        json.fmt(msg.usage, .{ .emit_null_optional_fields = false }),
         blocks.items,
     });
 }
@@ -225,6 +233,21 @@ fn renderMessage(gpa: std.mem.Allocator, msg: assembler_mod.Message) error{OutOf
 // ===========================================================================
 
 const testing = std.testing;
+
+test "streamMessages distinguishes URL and request setup failures without network" {
+    try testing.expectError(error.HttpInvalidUrl, streamMessages(testing.allocator, .failing, .{
+        .api_key = "offline-fixture",
+        .model = "fixture",
+        .messages_json = "[]",
+        .base_url = "invalid url",
+    }, null));
+    try testing.expectError(error.HttpRequestFailed, streamMessages(testing.allocator, .failing, .{
+        .api_key = "offline-fixture",
+        .model = "fixture",
+        .messages_json = "[]",
+        .base_url = "ftp://fixture.invalid",
+    }, null));
+}
 
 const fixture_text_stream =
     "event: message_start\n" ++
