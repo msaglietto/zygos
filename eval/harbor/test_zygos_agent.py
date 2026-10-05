@@ -27,6 +27,62 @@ class Environment:
 
 
 class TrimContract(unittest.IsolatedAsyncioTestCase):
+    async def setup_with_certificates(self, probe_code, bundle=None, mkdir_code=0):
+        class CertificateEnvironment(Environment):
+            def __init__(self):
+                super().__init__()
+                self.uploads = {}
+
+            async def upload_file(self, **kwargs):
+                self.uploads[kwargs["target_path"]] = Path(kwargs["source_path"]).read_bytes()
+
+            async def exec(self, **kwargs):
+                self.calls.append(kwargs)
+                command = kwargs["command"]
+                code = probe_code if command.startswith("for bundle in ") else 0
+                if command == "mkdir -p /etc/ssl/certs":
+                    code = mkdir_code
+                return SimpleNamespace(return_code=code)
+
+        with tempfile.TemporaryDirectory() as directory:
+            logs = Path(directory)
+            binary = logs / "binary"
+            binary.write_bytes(b"offline-binary")
+            values = {"ZYGOS_LINUX_BIN": str(binary)}
+            if bundle is not None:
+                path = logs / "roots.pem"
+                path.write_bytes(bundle)
+                values["ZYGOS_CA_BUNDLE"] = str(path)
+            with patch.dict(os.environ, values, clear=True):
+                environment = CertificateEnvironment()
+                agent = ZygosAgent(logs_dir=logs, model_name="deepseek/deepseek-v4.1-flash")
+                await agent.setup(environment)
+            return environment
+
+    async def test_missing_certificate_bundle_is_provisioned_from_explicit_fixture(self):
+        bundle = b"-----BEGIN CERTIFICATE-----\nfixture\n-----END CERTIFICATE-----\n"
+        environment = await self.setup_with_certificates(1, bundle)
+        self.assertEqual(environment.uploads["/etc/ssl/certs/ca-certificates.crt"], bundle)
+        self.assertTrue(any(call["command"] == "mkdir -p /etc/ssl/certs" and call["user"] == "root" for call in environment.calls))
+
+    async def test_existing_certificate_bundle_is_preserved_without_host_lookup(self):
+        environment = await self.setup_with_certificates(0)
+        self.assertTrue(any(call["command"].startswith("for bundle in ") for call in environment.calls))
+        self.assertNotIn("/etc/ssl/certs/ca-certificates.crt", environment.uploads)
+
+    async def test_missing_or_invalid_host_bundle_stops_setup(self):
+        for bundle in (None, b"", b"not a certificate"):
+            with self.subTest(bundle=bundle):
+                with self.assertRaisesRegex(RuntimeError, "CA bundle"):
+                    await self.setup_with_certificates(1, bundle)
+
+    async def test_certificate_probe_and_directory_errors_stop_setup(self):
+        bundle = b"-----BEGIN CERTIFICATE-----\nfixture\n-----END CERTIFICATE-----\n"
+        with self.assertRaisesRegex(RuntimeError, "certificate probe"):
+            await self.setup_with_certificates(2, bundle)
+        with self.assertRaisesRegex(RuntimeError, "certificate directory"):
+            await self.setup_with_certificates(1, bundle, mkdir_code=1)
+
     async def test_deepseek_setup_and_run_use_keyless_catalog_and_exec_environment(self):
         class UploadEnvironment(Environment):
             def __init__(self):

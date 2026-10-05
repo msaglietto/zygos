@@ -109,6 +109,36 @@ class ZygosAgent(BaseAgent):
             source_path=catalog,
             target_path=str(env_paths.agent_dir / "providers.toml"),
         )
+        if environment.os == "linux":
+            # Zig scans these system bundles; minimal task images may omit them.
+            probe = await environment.exec(
+                command=(
+                    "for bundle in /etc/ssl/certs/ca-certificates.crt "
+                    "/etc/pki/tls/certs/ca-bundle.crt /etc/ssl/ca-bundle.pem "
+                    "/etc/pki/tls/cacert.pem "
+                    "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem "
+                    '/etc/ssl/cert.pem; do if [ -s "$bundle" ]; then exit 0; fi; done; exit 1'
+                ),
+                user="root",
+            )
+            if probe.return_code not in (0, 1):
+                raise RuntimeError("certificate probe failed")
+            if probe.return_code == 1:
+                source = Path(os.environ.get("ZYGOS_CA_BUNDLE", ""))
+                if not source.is_file():
+                    raise RuntimeError("ZYGOS_CA_BUNDLE must name a CA bundle")
+                bundle = source.read_bytes()
+                if b"-----BEGIN CERTIFICATE-----" not in bundle or b"-----END CERTIFICATE-----" not in bundle:
+                    raise RuntimeError("ZYGOS_CA_BUNDLE is not a PEM CA bundle")
+                directory = await environment.exec(
+                    command="mkdir -p /etc/ssl/certs", user="root",
+                )
+                if directory.return_code != 0:
+                    raise RuntimeError("certificate directory creation failed")
+                await environment.upload_file(
+                    source_path=source,
+                    target_path="/etc/ssl/certs/ca-certificates.crt",
+                )
 
     async def run(
         self,

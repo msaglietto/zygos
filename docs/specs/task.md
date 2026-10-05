@@ -17,6 +17,10 @@ zygos task score --trial trial.json --prices prices.txt
 
 Operator-approved live runs may use `glm-5.3-flash` or `deepseek/deepseek-v4.1-flash`, with the pinned dataset, an instruction file, a task id, and step cap 1–32. Other models remain refused. The DeepSeek Harbor catalog uses OpenRouter's OpenAI-compatible endpoint, `DEEPSEEK_API_KEY` only in the exec environment, `max_tokens = 8192`, and `temperature = 0.7`. `ZYGOS_JOBS_DIR` gives `eval/run.sh` a separate jobs directory; every invocation still launches one task with no retries or Hub upload. A model allowlist does not authorize an additional campaign phase.
 
+The Flash route requires an OpenRouter credential. A key for DeepSeek's direct API does not authenticate at OpenRouter. When the host stores the matching credential as `OPENROUTER_API_KEY`, bind that value to `DEEPSEEK_API_KEY` in the launch process environment. Keep credentials out of the container catalog, command arguments, and diagnostic output.
+
+Adapter setup preserves any existing Linux certificate bundle. A minimal image with none requires `ZYGOS_CA_BUNDLE` to name the operator-selected host PEM bundle; setup copies it to the standard container trust-store path before inference. An absent or malformed source, a failed probe, or a failed directory creation stops setup. TLS verification remains enabled, and this setup is identical in both trim arms.
+
 `prices.txt` is one `<model_id> <cents_per_mtok>` row per line. `#` comments are ignored. A zero price is a free model. A missing row for the trial's model is `MissingPrice`.
 
 ## Trial fields
