@@ -19,7 +19,7 @@ Operator-approved live runs may use `glm-5.3-flash` or `deepseek/deepseek-v4.1-f
 
 The Flash route requires an OpenRouter credential. A key for DeepSeek's direct API does not authenticate at OpenRouter. When the host stores the matching credential as `OPENROUTER_API_KEY`, bind that value to `DEEPSEEK_API_KEY` in the launch process environment. Keep credentials out of the container catalog, command arguments, and diagnostic output.
 
-Adapter setup preserves any existing Linux certificate bundle. A minimal image with none requires `ZYGOS_CA_BUNDLE` to name the operator-selected host PEM bundle; setup copies it to the standard container trust-store path before inference. An absent or malformed source, a failed probe, or a failed directory creation stops setup. TLS verification remains enabled, and this setup is identical in both trim arms.
+Adapter setup preserves any existing Linux certificate bundle. A minimal image with none requires `ZYGOS_CA_BUNDLE` to name the operator-selected host PEM bundle; setup copies it to the standard container trust-store path before inference. An absent or malformed source, a failed probe, or a failed directory creation stops setup. TLS verification remains enabled, and this setup is identical in both trim arms. The OpenAI-compatible client allows at most three request-setup attempts for transient `NameServerFailure`, separated by one-second cancellable delays. This happens before sending an HTTP body; other errors and later request stages stop normally. Harbor task retries remain zero.
 
 `prices.txt` is one `<model_id> <cents_per_mtok>` row per line. `#` comments are ignored. A zero price is a free model. A missing row for the trial's model is `MissingPrice`.
 

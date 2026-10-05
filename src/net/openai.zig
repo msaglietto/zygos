@@ -135,15 +135,29 @@ pub fn streamChat(
     var client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer client.deinit();
 
-    var req = client.request(.POST, uri, .{
-        .extra_headers = &.{
-            .{ .name = "authorization", .value = auth },
-            .{ .name = "content-type", .value = "application/json" },
-            .{ .name = "accept", .value = "text/event-stream" },
-        },
-    }) catch |err| {
-        log.warn("request setup failed: {t}", .{err});
-        return error.HttpRequestFailed;
+    var dns_retries: u8 = 0;
+    var req = setup: while (true) {
+        const request = client.request(.POST, uri, .{
+            .extra_headers = &.{
+                .{ .name = "authorization", .value = auth },
+                .{ .name = "content-type", .value = "application/json" },
+                .{ .name = "accept", .value = "text/event-stream" },
+            },
+        }) catch |err| {
+            // DNS fails before any HTTP body can be sent. Never replay a POST.
+            if (err == error.NameServerFailure and dns_retries < 2) {
+                dns_retries += 1;
+                log.warn("DNS lookup failed; retrying request setup ({d}/2)", .{dns_retries});
+                io.sleep(.fromSeconds(1), .awake) catch {
+                    log.warn("DNS backoff canceled", .{});
+                    return error.HttpRequestFailed;
+                };
+                continue :setup;
+            }
+            log.warn("request setup failed: {t}", .{err});
+            return error.HttpRequestFailed;
+        };
+        break :setup request;
     };
     defer req.deinit();
 
@@ -330,6 +344,66 @@ test "streamChat distinguishes URL and request setup failures without network" {
         .messages_json = "[]",
         .base_url = "ftp://fixture.invalid",
     }, null));
+}
+
+const DnsFailureFixture = struct {
+    io: std.Io = undefined,
+    lookup_calls: usize = 0,
+    sleeps: usize = 0,
+    transient_failures: usize,
+    cancel_sleep: bool = false,
+
+    fn lookup(ctx: ?*anyopaque, _: std.Io.net.HostName, results: *std.Io.Queue(std.Io.net.HostName.LookupResult), _: std.Io.net.HostName.LookupOptions) std.Io.net.HostName.LookupError!void {
+        const self: *DnsFailureFixture = @ptrCast(@alignCast(ctx.?));
+        defer results.close(self.io);
+        self.lookup_calls += 1;
+        if (self.lookup_calls <= self.transient_failures) return error.NameServerFailure;
+        return error.NetworkDown;
+    }
+
+    fn sleep(ctx: ?*anyopaque, _: std.Io.Timeout) std.Io.Cancelable!void {
+        const self: *DnsFailureFixture = @ptrCast(@alignCast(ctx.?));
+        self.sleeps += 1;
+        if (self.cancel_sleep) return error.Canceled;
+    }
+
+    fn run(self: *DnsFailureFixture) StreamError![]u8 {
+        var vtable = std.Io.failing.vtable.*;
+        vtable.netLookup = lookup;
+        vtable.sleep = sleep;
+        self.io = .{ .userdata = self, .vtable = &vtable };
+        return streamChat(testing.allocator, self.io, .{
+            .api_key = "offline-fixture",
+            .model = "fixture",
+            .messages_json = "[]",
+            .base_url = "http://fixture.invalid",
+        }, null);
+    }
+};
+
+test "streamChat retries transient DNS setup errors before any HTTP body" {
+    var fixture: DnsFailureFixture = .{ .transient_failures = 2 };
+    try testing.expectError(error.HttpRequestFailed, fixture.run());
+    try testing.expectEqual(@as(usize, 3), fixture.lookup_calls);
+    try testing.expectEqual(@as(usize, 2), fixture.sleeps);
+}
+
+test "streamChat stops after bounded DNS attempts and does not retry permanent errors" {
+    var persistent: DnsFailureFixture = .{ .transient_failures = 10 };
+    try testing.expectError(error.HttpRequestFailed, persistent.run());
+    try testing.expectEqual(@as(usize, 3), persistent.lookup_calls);
+    try testing.expectEqual(@as(usize, 2), persistent.sleeps);
+    var permanent: DnsFailureFixture = .{ .transient_failures = 0 };
+    try testing.expectError(error.HttpRequestFailed, permanent.run());
+    try testing.expectEqual(@as(usize, 1), permanent.lookup_calls);
+    try testing.expectEqual(@as(usize, 0), permanent.sleeps);
+}
+
+test "streamChat cancels during DNS backoff without another request" {
+    var fixture: DnsFailureFixture = .{ .transient_failures = 10, .cancel_sleep = true };
+    try testing.expectError(error.HttpRequestFailed, fixture.run());
+    try testing.expectEqual(@as(usize, 1), fixture.lookup_calls);
+    try testing.expectEqual(@as(usize, 1), fixture.sleeps);
 }
 
 const fixture_text_stream =
