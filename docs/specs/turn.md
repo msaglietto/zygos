@@ -184,3 +184,5 @@ Driver (fake provider + fake tool, both inproc):
 ## Out of scope
 
 - Context compaction, session persistence — M5.
+
+Unsupported provider stop reasons fail the turn after usage accounting and before any tool dispatch; only end_turn, max_tokens, and stop_sequence are normal terminal reasons.

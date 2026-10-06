@@ -621,3 +621,64 @@ test "processSse drains buffered terminal events without another socket read" {
         try testing.expectEqual(@as(u64, 1), guard.pokes);
     }
 }
+
+test "incomplete tool completion stops on the task bus and preserves usage" {
+    const ops = @import("../worker/tools_ops.zig");
+    const task = @import("../worker/task.zig");
+    const trial = @import("../worker/trial.zig");
+    const C = struct {
+        extern "c" fn realpath(path: [*:0]const u8, resolved: [*]u8) ?[*:0]u8;
+    };
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var rel_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const rel = try std.fmt.bufPrintZ(&rel_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const root = std.mem.span(C.realpath(rel, &root_buf) orelse return error.RealpathFailed);
+    for ([_][]const u8{ "length", "tool_calls" }) |finish| {
+        const payload = try json.Stringify.valueAlloc(testing.allocator, .{
+            .id = "truncated",
+            .model = "fixture",
+            .usage = .{ .prompt_tokens = 8124, .completion_tokens = 8192, .prompt_tokens_details = .{ .cached_tokens = 7296 } },
+            .choices = .{.{
+                .index = 0,
+                .finish_reason = finish,
+                .delta = .{ .tool_calls = .{.{ .index = 0, .id = "partial", .function = .{ .name = "bash", .arguments = "{\"command\":\"touch should-not-exist" } }} },
+            }},
+        }, .{});
+        defer testing.allocator.free(payload);
+        const fixture = try std.fmt.allocPrint(testing.allocator, "data: {s}\n\ndata: [DONE]\n\n", .{payload});
+        defer testing.allocator.free(fixture);
+        var reader: std.Io.Reader = .fixed(fixture);
+        const terminal = try processSse(testing.allocator, &reader, null, null);
+        defer testing.allocator.free(terminal);
+        var parsed = try json.parseFromSlice(json.Value, testing.allocator, terminal, .{});
+        defer parsed.deinit();
+        const limited = std.mem.eql(u8, finish, "length");
+        try testing.expectEqualStrings(if (limited) "max_tokens" else "unknown", parsed.value.object.get("stop_reason").?.string);
+        try testing.expectEqual(@as(usize, 0), parsed.value.object.get("content").?.array.items.len);
+        const script = [_][]const u8{terminal};
+        const result = try task.run(testing.allocator, .{
+            .workspace = root,
+            .instruction = "Never dispatch the partial command.",
+            .task_id = "offline-truncated-tool",
+            .dataset = "offline-fixture",
+            .model_id = "fixture",
+            .variable = "trim-on",
+            .step_cap = 1,
+            .identity = .{ .git_sha = "0123456789abcdef0123456789abcdef01234567", .target_triple = "fixture", .optimize = "Debug", .adapter_version = trial.adapter_version },
+            .script = &script,
+        });
+        defer result.deinit(testing.allocator);
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const record = try trial.parse(arena.allocator(), result.trial_json);
+        try testing.expectEqual(@as(u64, 8124), record.input_tokens);
+        try testing.expectEqual(@as(u64, 8192), record.output_tokens);
+        try testing.expectEqual(@as(?u64, 7296), record.cache_read_tokens);
+        try testing.expectEqual(@as(u64, 0), record.trim.?.calls);
+        const turn = try json.parseFromSliceLeaky(json.Value, arena.allocator(), result.turn_json, .{});
+        try testing.expectEqualStrings(if (limited) "max_tokens" else "failed", turn.object.get("stop").?.string);
+        try testing.expectError(error.NotFound, ops.readFile(testing.allocator, ops.Workspace.init(root), "should-not-exist"));
+    }
+}

@@ -570,6 +570,23 @@ fn runTurn(self: *TurnOrchestrator, arena: std.mem.Allocator, request_json: []co
                     .{try rawJson(arena, content)},
                 ));
 
+                const terminal_stop = std.mem.eql(u8, stop_reason, "end_turn") or
+                    std.mem.eql(u8, stop_reason, "max_tokens") or
+                    std.mem.eql(u8, stop_reason, "stop_sequence");
+                if (!terminal_stop and !std.mem.eql(u8, stop_reason, "tool_use")) {
+                    state = try Fsm.apply(state, .provider_error);
+                    try trace_mod.emit(arena, trace_path, .{ .turn_end = .{
+                        .turn_id = turn_id orelse "",
+                        .stop = "failed",
+                        .steps = @intCast(steps),
+                        .err = "unknown_provider_stop",
+                    } });
+                    return try std.fmt.allocPrint(
+                        arena,
+                        "{{\"stop\":\"failed\",\"steps\":{d},\"error\":\"unknown_provider_stop\"}}",
+                        .{steps},
+                    );
+                }
                 if (!std.mem.eql(u8, stop_reason, "tool_use")) {
                     state = try Fsm.apply(state, .provider_end_turn); // → stopped
                     stop = stop_reason;
