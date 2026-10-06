@@ -236,12 +236,25 @@ pub fn processSse(
 
     var chunk: [4096]u8 = undefined;
     stream: while (true) {
-        // readSliceShort fills the entire chunk, hiding short reads from the
-        // watchdog and SSE decoder. Process each available read immediately.
-        var buffers = [_][]u8{&chunk};
-        const n = reader.readVec(&buffers) catch |err| switch (err) {
-            error.EndOfStream => break :stream,
-            error.ReadFailed => return error.BadStream,
+        // Consume buffered bytes before any blocking read. readSliceShort
+        // fills the chunk, and readVec can read again behind a short buffer.
+        const n = if (reader.bufferedLen() > 0) buffered: {
+            const bytes = reader.buffered();
+            const count = @min(chunk.len, bytes.len);
+            @memcpy(chunk[0..count], bytes[0..count]);
+            reader.toss(count);
+            break :buffered count;
+        } else read: {
+            var buffers = [_][]u8{&chunk};
+            break :read reader.readVec(&buffers) catch |err| switch (err) {
+                error.EndOfStream => break :stream,
+                error.ReadFailed => {
+                    log.warn("stream read failed: buffered={d}, activity_updates={d}", .{
+                        reader.bufferedLen(), if (guard) |g| g.pokes else 0,
+                    });
+                    return error.BadStream;
+                },
+            };
         };
         if (n == 0) continue;
         if (guard) |g| g.poke();
@@ -564,4 +577,47 @@ test "processSse processes each short read before requesting more bytes" {
     try testing.expectEqualStrings("end_turn", parsed.value.object.get("stop_reason").?.string);
     try testing.expect(input.reads > 1);
     try testing.expectEqual(input.reads, guard.pokes);
+}
+
+test "processSse drains buffered terminal events without another socket read" {
+    const Buffered = struct {
+        reader: std.Io.Reader,
+        loaded: bool,
+
+        fn unreachableStream(_: *std.Io.Reader, _: *std.Io.Writer, _: std.Io.Limit) std.Io.Reader.StreamError!usize {
+            unreachable;
+        }
+
+        fn read(r: *std.Io.Reader, _: [][]u8) std.Io.Reader.Error!usize {
+            const self: *@This() = @fieldParentPtr("reader", r);
+            if (self.loaded) return error.ReadFailed;
+            @memcpy(r.buffer[0..fixture_text_stream.len], fixture_text_stream);
+            r.end = fixture_text_stream.len;
+            self.loaded = true;
+            // TLS and indirect readers can buffer bytes while returning zero.
+            return 0;
+        }
+    };
+    for ([_]bool{ true, false }) |seeded| {
+        var buffer: [fixture_text_stream.len]u8 = undefined;
+        if (seeded) @memcpy(&buffer, fixture_text_stream);
+        var input: Buffered = .{
+            .reader = .{
+                .vtable = &.{ .stream = Buffered.unreachableStream, .readVec = Buffered.read },
+                .buffer = &buffer,
+                .seek = 0,
+                .end = if (seeded) buffer.len else 0,
+            },
+            .loaded = seeded,
+        };
+        var dummy: u8 = 0;
+        var guard = stream_guard.StreamGuard.init(120_000, @ptrCast(&dummy), &noopFire);
+        defer guard.deinit();
+        const out = try processSse(testing.allocator, &input.reader, null, &guard);
+        defer testing.allocator.free(out);
+        var parsed = try json.parseFromSlice(json.Value, testing.allocator, out, .{});
+        defer parsed.deinit();
+        try testing.expectEqualStrings("end_turn", parsed.value.object.get("stop_reason").?.string);
+        try testing.expectEqual(@as(u64, 1), guard.pokes);
+    }
 }
