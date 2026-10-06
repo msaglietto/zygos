@@ -1,6 +1,6 @@
 # Work ledger — harness benchmark
 
-Updated 2026-10-06. DeepSeek blocker repairs and interrupted reruns are recorded at the end; no DeepSeek phase is yet complete. Phases 1–8 are done. The fresh schema-repaired Phase 9 finished 24 trials with 6 verifier successes and 4 accepted scorer records. Phase 10 finished 48 matched trials with all verifier rewards 0 and 47 failed provider turns; its report is `/tmp/zygos-phase10-schema/campaign.json`. Both phases used the one clean `b157dc1` Linux artifact. Phase 11 stopped after its first trial captured provider transport `HttpFailed`; the other 88 tasks have not started. Phase 12 executed one mission, genuinely killed and resumed once, then failed on executor `max_tokens`; it did not reach verification or the manual completion gate. No dollar cap was named.
+Updated 2026-10-06. DeepSeek Phase 9 completed 24 trials on the clean `a147d52` Linux artifact: 11 verifier successes, one accepted scorer record with 28% reduction, no transport/RPC failures, no handler failures, and no empty tool inputs. Its campaign is `/tmp/zygos-phase9-deepseek-completions/campaign.json`; all six DeepSeek attempts and their known costs are recorded below. DeepSeek phases 10–12 remain not started; Phase 10 requires separate approval. Phases 1–8 are done. Historical GLM results remain preserved: schema-repaired Phase 9 completed 24 trials with six verifier successes and four accepted scorer records; Phase 10 completed 48 matched trials with all verifier rewards 0 and 47 failed provider turns, using the clean `b157dc1` artifact. Its report is `/tmp/zygos-phase10-schema/campaign.json`. Historical Phase 11 stopped after one provider transport failure, with 88 tasks pending. Historical Phase 12 was killed and resumed once, then failed on executor `max_tokens` without reaching verification or the manual completion gate. No dollar cap was named.
 
 The historical offline binary used in phases 1–7 is git `a2a9bf03fe8b808c2a6dfd9a059e3f358346f7c7`, target `aarch64-macos.26.7...26.7-none`, optimize `Debug`, adapter `0.1.0`. That binary was built from a dirty tree, so the stamped sha is the parent commit and does not contain this work. A later build stamps `unknown` when `git status --porcelain` is non-empty, and the task command refuses `unknown`.
 
@@ -529,3 +529,67 @@ Recorded trial totals: input 2143710 (cache read 1879680), output 195498; snapsh
 A new offline SSE→terminal→real task-bus regression first failed because the terminal renderer produced invalid JSON (895/896 passed). It covers length-limited and malformed tool_calls completions, asserts no dispatch/file creation, and requires input/output/cache usage to reach trial accounting. The assembler now omits partial tool blocks on max_tokens; other malformed argument JSON stops as unknown without materializing any tool block. The turn driver now treats unsupported stop reasons as provider_error after accounting rather than treating them as a normal completion. No malformed call is repaired into empty arguments or dispatched. The regression's failed assertion exposed that driver boundary; the test was not weakened. Final result: 896/896 offline Zig tests, 12 Python tests, format and diff checks clean.
 
 GitNexus reports HIGH assembler impact (24 upstream symbols, 11 direct references, three processes). The warning was reported before implementation. Impact queries did not resolve the private runTurn function; manual source review found its entry handler and task/mission callers. No protocol file, dependency, policy, budget, or approval gate was weakened. Later DeepSeek phases remain not started. A replacement full campaign uses one clean artifact; malformed model completions are explicit benchmark failures with preserved usage, distinct from transport failures.
+
+## DeepSeek Phase 9 — completed 2026-10-06
+
+Executed 24 task-runs: the same eight observed tasks, three repeats each. Build sha `a147d52286e9b2e63ff4991800e98af57d792de1`, binary SHA-256 `09008d658265bb6f4e06e61386f1a2b1c284905d91e61a087366a1a73d812926`, triple `x86_64-linux.5.10...6.19-gnu.2.31`, ReleaseSafe, adapter 0.1.0, model `deepseek/deepseek-v4.1-flash`, dataset `terminal-bench/terminal-bench-2-1`, cap 24, trim on, output allowance 8192, temperature 0.7. All uploaded binary hashes and trial identities match. Certificate provisioning uses the explicit bundle recorded above and is unchanged across trials; existing bundles are preserved. One task per Harbor invocation, zero retries, no Hub upload, at most two concurrent jobs in this campaign. No rebuild occurred for ledger edits.
+
+Verifier successes: 11/24. Scorer accepted: 1/24. Provider transport/RPC failures: 0; failed turns from malformed/unsupported model completions: 0; handler_failed results: 0; empty tool inputs: 0. Terminal stops: `{"end_turn": 12, "max_steps": 8, "max_tokens": 4}`. Scorer refusals remain errors, including zero reduction or missing trim evidence, and are not counted as valid measurements. The canary contains recorded command output with positive reduction. Tool-result success counts mean handler delivery; bash can still report a nonzero command exit.
+
+Aggregate tokens: 2451344 input (including 2108160 cached reads), 229662 output. At $0.003 ordinary input / $0.003 cached input / $2.40 output per million, recorded-usage estimate is `$0.558542832`. Formula: `(input - cache_read) × $0.003/M + cache_read × $0.003/M + output × $2.40/M`. Source snapshot is `/tmp/zygos-deepseek-blockers/model-snapshot-2026-10-06.json`; incomplete responses may omit usage; this estimate is separate from the scorer's integer cents check and is not a provider invoice.
+
+Campaign: `/tmp/zygos-phase9-deepseek-completions/campaign.json`; verified aggregate: `/tmp/zygos-phase9-deepseek-completions/completion-summary.json`. Actual trial paths, Harbor rewards, tokens, costs, and scorer results follow.
+
+| Run | Actual trial path | Input | Cache read | Output | Dollar cost | Reward | Stop | Scorer |
+|---|---|---:|---:|---:|---:|---:|---|---|
+| 1 | `/tmp/zygos-phase9-deepseek-completions/phase9-r1-build-cython-ext/build-cython-ext__i56ymm8` | 226058 | 198272 | 4448 | 0.011353374 | 0.0 | max_steps | 2: score: TrimOnZeroReduction |
+| 1 | `/tmp/zygos-phase9-deepseek-completions/phase9-r1-cobol-modernization/cobol-modernization__LDfz8QY` | 178392 | 141056 | 18956 | 0.046029576 | 0.0 | max_steps | 2: score: TrimOnZeroReduction |
+| 1 | `/tmp/zygos-phase9-deepseek-completions/phase9-r1-filter-js-from-html/filter-js-from-html__5d4Vgt6` | 13189 | 4864 | 10023 | 0.024094767 | 0.0 | max_tokens | 2: score: TrimOnZeroReduction |
+| 1 | `/tmp/zygos-phase9-deepseek-completions/phase9-r1-fix-code-vulnerability/fix-code-vulnerability__ojNjrTs` | 202993 | 190080 | 4108 | 0.010468179 | 0.0 | max_steps | 2: score: TrimOnZeroReduction |
+| 1 | `/tmp/zygos-phase9-deepseek-completions/phase9-r1-fix-git/fix-git__Qq6onjP` | 33273 | 12672 | 2464 | 0.006013419 | 1.0 | end_turn | 2: score: TrimOnZeroReduction |
+| 1 | `/tmp/zygos-phase9-deepseek-completions/phase9-r1-log-summary-date-ranges/log-summary-date-ranges__juwdZbk` | 68347 | 50944 | 2307 | 0.005741841 | 1.0 | end_turn | 2: score: TrimOnZeroReduction |
+| 1 | `/tmp/zygos-phase9-deepseek-completions/phase9-r1-modernize-scientific-stack/modernize-scientific-stack__DaDjZyw` | 35202 | 29312 | 3760 | 0.009129606 | 1.0 | end_turn | 2: score: TrimOnZeroReduction |
+| 1 | `/tmp/zygos-phase9-deepseek-completions/phase9-r1-regex-log/regex-log__rLWuwv8` | 653 | 0 | 8192 | 0.019662759 | 0.0 | max_tokens | 2: score: TrimEvidenceMissing |
+| 2 | `/tmp/zygos-phase9-deepseek-completions/phase9-r2-build-cython-ext/build-cython-ext__HAcUjp7` | 188757 | 173952 | 3781 | 0.009640671 | 0.0 | max_steps | 2: score: TrimOnZeroReduction |
+| 2 | `/tmp/zygos-phase9-deepseek-completions/phase9-r2-cobol-modernization/cobol-modernization__JDUBJXL` | 165858 | 142720 | 26747 | 0.064690374 | 0.0 | max_steps | 2: score: TrimOnZeroReduction |
+| 2 | `/tmp/zygos-phase9-deepseek-completions/phase9-r2-filter-js-from-html/filter-js-from-html__gJoL6nP` | 25491 | 19968 | 24759 | 0.059498073 | 0.0 | end_turn | 2: score: TrimOnZeroReduction |
+| 2 | `/tmp/zygos-phase9-deepseek-completions/phase9-r2-fix-code-vulnerability/fix-code-vulnerability__Zy88Q62` | 308495 | 283392 | 17200 | 0.042205485 | 0.0 | max_steps | 0: cents=9 source_lines_read=0 reduction=28 |
+| 2 | `/tmp/zygos-phase9-deepseek-completions/phase9-r2-fix-git/fix-git__LjULdEm` | 40663 | 25856 | 3108 | 0.007581189 | 1.0 | end_turn | 2: score: TrimOnZeroReduction |
+| 2 | `/tmp/zygos-phase9-deepseek-completions/phase9-r2-log-summary-date-ranges/log-summary-date-ranges__HevdS8K` | 22877 | 14080 | 1139 | 0.002802231 | 1.0 | end_turn | 2: score: TrimOnZeroReduction |
+| 2 | `/tmp/zygos-phase9-deepseek-completions/phase9-r2-modernize-scientific-stack/modernize-scientific-stack__tFPGWV3` | 30414 | 24320 | 3730 | 0.009043242 | 1.0 | end_turn | 2: score: TrimOnZeroReduction |
+| 2 | `/tmp/zygos-phase9-deepseek-completions/phase9-r2-regex-log/regex-log__7Cxjvha` | 19786 | 16128 | 13773 | 0.033114558 | 1.0 | end_turn | 2: score: TrimOnZeroReduction |
+| 3 | `/tmp/zygos-phase9-deepseek-completions/phase9-r3-build-cython-ext/build-cython-ext__NLttx9q` | 396684 | 370432 | 5992 | 0.015570852 | 0.0 | max_steps | 2: score: TrimOnZeroReduction |
+| 3 | `/tmp/zygos-phase9-deepseek-completions/phase9-r3-cobol-modernization/cobol-modernization__rwSd6w8` | 203894 | 184576 | 29380 | 0.071123682 | 0.0 | max_steps | 2: score: TrimOnZeroReduction |
+| 3 | `/tmp/zygos-phase9-deepseek-completions/phase9-r3-filter-js-from-html/filter-js-from-html__9FVumge` | 61221 | 54272 | 26350 | 0.063423663 | 0.0 | max_tokens | 2: score: TrimOnZeroReduction |
+| 3 | `/tmp/zygos-phase9-deepseek-completions/phase9-r3-fix-code-vulnerability/fix-code-vulnerability__9ZSNJJu` | 136248 | 115072 | 4673 | 0.011623944 | 1.0 | end_turn | 2: score: TrimOnZeroReduction |
+| 3 | `/tmp/zygos-phase9-deepseek-completions/phase9-r3-fix-git/fix-git__ygPtdaN` | 39607 | 23424 | 2316 | 0.005677221 | 1.0 | end_turn | 2: score: TrimOnZeroReduction |
+| 3 | `/tmp/zygos-phase9-deepseek-completions/phase9-r3-log-summary-date-ranges/log-summary-date-ranges__mugD8N2` | 31286 | 15104 | 1917 | 0.004694658 | 1.0 | end_turn | 2: score: TrimOnZeroReduction |
+| 3 | `/tmp/zygos-phase9-deepseek-completions/phase9-r3-modernize-scientific-stack/modernize-scientific-stack__LcAFZ9K` | 21303 | 17024 | 2347 | 0.005696709 | 1.0 | end_turn | 2: score: TrimOnZeroReduction |
+| 3 | `/tmp/zygos-phase9-deepseek-completions/phase9-r3-regex-log/regex-log__HqxnTKY` | 653 | 640 | 8192 | 0.019662759 | 0.0 | max_tokens | 2: score: TrimEvidenceMissing |
+
+Recorded argument failures (distinct from provider transport failures): `[]`.
+
+Unsupported or malformed model completions remain failed benchmark outcomes, never transport successes or repaired tool calls. Their usage is recorded before stopping; they are not retried. The separate scorer rate remains 30 cents per million and is not an invoice rate.
+
+Stopped after Phase 9. DeepSeek Phase 10 (48 matched on/off trials on this exact artifact), Phase 11 (full 89, then Lite only with a confirmed Harbor pin), and Phase 12 (one mission with genuine kill/resume and a manual completion gate) remain not started. Original-brief preservation and resume coverage are proven offline; no new live mission success is claimed. The Lite Harbor package remains unconfirmed. RADAR, BrowseComp-Plus, and Y5 remain behind their separate gates.
+
+## DeepSeek session cost and handoff — 2026-10-06
+
+This session executed 104 Harbor task-runs across six repair attempts, plus the separate synthetic tool-path preflight. Interrupted attempts are preserved; only the final 24-run campaign is the completed replacement Phase 9. No DeepSeek Phase 10, 11, or 12 run occurred.
+
+| Attempt directory under `/tmp/` | Task-runs | Recorded-usage estimate |
+|---|---:|---:|
+| `zygos-phase9-deepseek` | 8 | $0.120794100 |
+| `zygos-phase9-deepseek-ready` | 8 | $0.112065816 |
+| `zygos-phase9-deepseek-dns` | 20 | $0.403644528 |
+| `zygos-phase9-deepseek-stream` | 24 | $0.387731028 |
+| `zygos-phase9-deepseek-buffered` | 20 | $0.475626330 |
+| `zygos-phase9-deepseek-completions` | 24 | $0.558542832 |
+
+Synthetic tool-path preflight: $0.001102380. Additional known usage from the rejected buffered-attempt reply: $0.019685172, kept outside its unchanged trial. Combined known-usage estimate: **$2.079192186**. Earlier estimates retain their $0.30 ordinary input / $0.006 cached input / $1.20 output snapshot; the last two campaigns use the $0.003 / $0.003 / $2.40 snapshot. The pricing change effective time and provider invoice are unavailable; incomplete responses can have unreported usage. This total is neither an invoice nor an upper bound.
+
+The final accepted record is vulnerability repeat 2: 88,748 raw bytes → 63,362 sent bytes, integer reduction 28%, scorer exit 0. Every final snapshot reports `filtered=0` and `deduped=0`: this establishes generic truncation wiring, not command-specific filtering. The other 23 scorer records remain invalid measurements (21 `TrimOnZeroReduction`, two `TrimEvidenceMissing`). The 401 recorded tool calls reached handlers successfully. Four turns stopped at `max_tokens`, eight at `max_steps`, and 12 at `end_turn`; verifier rewards remain the benchmark outcomes.
+
+Final offline checks: Zig 0.16.0, `zig build test --summary all` 896/896, 12 Python adapter/runner tests, `zig fmt --check src/`, and `git diff --check`. Tests use mocks/fixtures and no real catalog, vault, or network. Linux SHA-256 stays `09008d658265bb6f4e06e61386f1a2b1c284905d91e61a087366a1a73d812926`; retain the artifact built from clean source `a147d52286e9b2e63ff4991800e98af57d792de1` for every Phase 10 arm. A ledger-only commit changes checkout HEAD but does not rebuild that artifact.
+
+The reviewable Phase 10 proposal is `/tmp/zygos-deepseek-blockers/phase10-proposal.json`: 48 task-runs, eight identical tasks × three repeats × trim on/off. Its source, binary, model, dataset, cap, CA bundle, and provider settings match the final Phase 9; trim is the only harness variable. It has not launched. Separate approval is required by ADR 004 and the original phase gates. The runnable SWE-bench Lite Harbor package remains unconfirmed; Verified is not substituted. Master remains untouched and nothing is pushed.
