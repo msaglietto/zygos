@@ -236,8 +236,14 @@ pub fn processSse(
 
     var chunk: [4096]u8 = undefined;
     stream: while (true) {
-        const n = reader.readSliceShort(&chunk) catch return error.BadStream;
-        if (n == 0) break :stream;
+        // readSliceShort fills the entire chunk, hiding short reads from the
+        // watchdog and SSE decoder. Process each available read immediately.
+        var buffers = [_][]u8{&chunk};
+        const n = reader.readVec(&buffers) catch |err| switch (err) {
+            error.EndOfStream => break :stream,
+            error.ReadFailed => return error.BadStream,
+        };
+        if (n == 0) continue;
         if (guard) |g| g.poke();
         decoder.feed(chunk[0..n]) catch return error.OutOfMemory;
 
@@ -516,4 +522,46 @@ test "buildChatBody: temperature emitted only when set" {
     defer testing.allocator.free(with_temp);
     try testing.expect(std.mem.indexOf(u8, with_temp, "\"temperature\":") != null);
     try testing.expect(std.mem.indexOf(u8, with_temp, "0.7") != null);
+}
+
+test "processSse processes each short read before requesting more bytes" {
+    const Fragmented = struct {
+        reader: std.Io.Reader = .{
+            .vtable = &.{ .stream = unreachableStream, .readVec = read },
+            .buffer = &.{},
+            .seek = 0,
+            .end = 0,
+        },
+        guard: *stream_guard.StreamGuard,
+        offset: usize = 0,
+        reads: u64 = 0,
+
+        fn unreachableStream(_: *std.Io.Reader, _: *std.Io.Writer, _: std.Io.Limit) std.Io.Reader.StreamError!usize {
+            unreachable;
+        }
+
+        fn read(r: *std.Io.Reader, data: [][]u8) std.Io.Reader.Error!usize {
+            const self: *@This() = @fieldParentPtr("reader", r);
+            // A socket may deliver tiny chunks and stay open after the terminal
+            // event. No second blocking read is safe until activity is poked.
+            if (self.guard.pokes != self.reads or self.offset == fixture_text_stream.len)
+                return error.ReadFailed;
+            const n = @min(17, @min(data[0].len, fixture_text_stream.len - self.offset));
+            @memcpy(data[0][0..n], fixture_text_stream[self.offset..][0..n]);
+            self.offset += n;
+            self.reads += 1;
+            return n;
+        }
+    };
+    var dummy: u8 = 0;
+    var guard = stream_guard.StreamGuard.init(120_000, @ptrCast(&dummy), &noopFire);
+    defer guard.deinit();
+    var input: Fragmented = .{ .guard = &guard };
+    const out = try processSse(testing.allocator, &input.reader, null, &guard);
+    defer testing.allocator.free(out);
+    var parsed = try json.parseFromSlice(json.Value, testing.allocator, out, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("end_turn", parsed.value.object.get("stop_reason").?.string);
+    try testing.expect(input.reads > 1);
+    try testing.expectEqual(input.reads, guard.pokes);
 }
