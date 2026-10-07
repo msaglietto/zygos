@@ -6,6 +6,12 @@ Reconstructed from git history on 2026-09-30. A commit that only added a library
 
 The agent that next changes operator-visible behavior adds the new heading in that same commit.
 
+## [4.0.2] - 2026-10-07
+
+### Fixed
+
+- `zygos task score` refuses a trim-off trial whose present trim snapshot has any nonzero counter as `MalformedTrial`, instead of reporting its recorded reduction. A trim-off trial with no snapshot still scores reduction 0.
+
 ## [4.0.1] - 2026-10-07
 
 ### Fixed

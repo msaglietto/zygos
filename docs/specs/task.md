@@ -48,7 +48,7 @@ Deny by default. Allowed tool names: `bash`, `read_file`, `write_file`, inside t
 
 `zygos task score` exits 0 and prints `cents`, `source_lines_read`, and `reduction`, or exits 2 and prints the error name.
 
-Refused: trim-on with no snapshot, trim-on with `calls == 0`, trim-on with `reduction == 0`, empty build identity, missing price, any variable other than `trim-on` or `trim-off`. Accepted: trim-off with reduction 0.
+Refused: trim-on with no snapshot, trim-on with `calls == 0`, trim-on with `reduction == 0`, empty build identity, missing price, any variable other than `trim-on` or `trim-off`. Accepted: trim-off with no snapshot or the all-zero snapshot the command writes; it scores reduction 0. A present trim-off snapshot with any nonzero counter is `MalformedTrial`, because trim ran or the record was altered.
 
 A trim-on snapshot whose `sent_bytes` exceeds `raw_bytes`, or whose recorded `reduction` is not the value computed from those two fields, is `MalformedTrial`. Token addition or the price multiplication that does not fit in a `u64` is the same error. A consistent zero on trim-on stays `TrimOnZeroReduction`.
 

@@ -8,7 +8,8 @@
 //! A trim-on arm with no snapshot, zero compress calls, or a recorded
 //! reduction of zero is a scorer error. That is the M8 failure mode (the
 //! seam shipped and never ran) and a flat pass rate must not hide it.
-//! A trim-off arm is allowed to record zero.
+//! A trim-off arm is allowed to record zero, and only zero: a present
+//! trim-off snapshot with any nonzero counter is a malformed trial.
 
 const std = @import("std");
 const json = std.json;
@@ -207,7 +208,12 @@ pub fn score(trial: Trial, prices: []const Price) ScoreError!Scored {
             if (snap.reduction == 0) return error.TrimOnZeroReduction;
             break :trim_reduction snap.reduction;
         } else if (std.mem.eql(u8, trial.variable, "trim-off")) {
-            break :trim_reduction if (trial.trim) |s| s.reduction else 0;
+            // The control arm never registers the trim worker. Any nonzero
+            // counter means trim ran or the record was edited.
+            if (trial.trim) |s| {
+                if (!std.meta.eql(s, std.mem.zeroes(TrimSnap))) return error.MalformedTrial;
+            }
+            break :trim_reduction 0;
         } else return error.UnknownVariable;
     };
     // ReleaseFast wraps; a wrapped cost can exit 0. Overflow is a bad trial.
@@ -357,6 +363,8 @@ test "score: trim-on zero reduction fails; missing evidence fails; trim-off zero
     off.variable = "trim-off";
     off.trim.?.reduction = 0;
     off.trim.?.calls = 0;
+    off.trim.?.raw_bytes = 0;
+    off.trim.?.sent_bytes = 0;
     const off_scored = try score(off, &fixture_prices);
     try testing.expectEqual(@as(u64, 0), off_scored.reduction);
 }
@@ -372,6 +380,38 @@ test "score: a trim-on reduction that disagrees with raw and sent is malformed" 
     over.trim.?.sent_bytes = 200;
     over.trim.?.reduction = 0;
     try testing.expectError(error.MalformedTrial, score(over, &fixture_prices));
+}
+
+fn zeroOff() Trial {
+    var off = baseTrial();
+    off.variable = "trim-off";
+    off.trim = .{ .calls = 0, .filtered = 0, .deduped = 0, .raw_bytes = 0, .sent_bytes = 0, .reduction = 0 };
+    return off;
+}
+
+test "score: a present trim-off snapshot must be the all-zero control" {
+    try testing.expectEqual(@as(u64, 0), (try score(zeroOff(), &fixture_prices)).reduction);
+
+    // An absent snapshot on the control arm still scores as zero.
+    var absent = zeroOff();
+    absent.trim = null;
+    try testing.expectEqual(@as(u64, 0), (try score(absent, &fixture_prices)).reduction);
+
+    // Consistent counters that show trim ran are not a control arm.
+    var ran = zeroOff();
+    ran.trim = .{ .calls = 1, .filtered = 0, .deduped = 0, .raw_bytes = 100, .sent_bytes = 100, .reduction = 0 };
+    try testing.expectError(error.MalformedTrial, score(ran, &fixture_prices));
+
+    // The reported contaminated arm: reduction 500 used to score as 500.
+    var inflated = ran;
+    inflated.trim.?.reduction = 500;
+    try testing.expectError(error.MalformedTrial, score(inflated, &fixture_prices));
+
+    inline for (.{ "calls", "filtered", "deduped", "raw_bytes", "sent_bytes", "reduction" }) |field| {
+        var one = zeroOff();
+        @field(one.trim.?, field) = 1;
+        try testing.expectError(error.MalformedTrial, score(one, &fixture_prices));
+    }
 }
 
 test "score: trim reduction is exact across the parseable counter range" {
