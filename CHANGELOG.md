@@ -6,6 +6,12 @@ Reconstructed from git history on 2026-09-30. A commit that only added a library
 
 The agent that next changes operator-visible behavior adds the new heading in that same commit.
 
+## [4.0.1] - 2026-10-07
+
+### Fixed
+
+- `zygos task score` computes the trim reduction percentage in 128-bit arithmetic, so a parseable raw byte count near the integer limit no longer panics or wraps.
+
 ## [4.0.0] - 2026-10-01
 
 ### Breaking

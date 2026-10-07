@@ -85,7 +85,8 @@ pub fn sourceLinesRead(tool_name: []const u8, content: []const u8) u64 {
 
 pub fn reductionOf(raw_bytes: u64, sent_bytes: u64) u64 {
     if (raw_bytes == 0 or sent_bytes >= raw_bytes) return 0;
-    return (raw_bytes - sent_bytes) * 100 / raw_bytes;
+    // u128: the saved bytes times 100 can exceed u64; the quotient is <= 100.
+    return @intCast(@as(u128, raw_bytes - sent_bytes) * 100 / raw_bytes);
 }
 
 pub fn identityComplete(id: Identity) bool {
@@ -371,6 +372,27 @@ test "score: a trim-on reduction that disagrees with raw and sent is malformed" 
     over.trim.?.sent_bytes = 200;
     over.trim.?.reduction = 0;
     try testing.expectError(error.MalformedTrial, score(over, &fixture_prices));
+}
+
+test "score: trim reduction is exact across the parseable counter range" {
+    // i64 max is the largest count the JSON parser accepts; times 100 it
+    // does not fit a u64.
+    var wide = baseTrial();
+    wide.trim.?.raw_bytes = std.math.maxInt(i64);
+    wide.trim.?.sent_bytes = 0;
+    wide.trim.?.reduction = 100;
+    try testing.expectEqual(@as(u64, 100), (try score(wide, &fixture_prices)).reduction);
+
+    // Floor rounding holds at the top of the range: 2/3 of the bytes saved.
+    var floor = baseTrial();
+    floor.trim.?.raw_bytes = std.math.maxInt(u64);
+    floor.trim.?.sent_bytes = std.math.maxInt(u64) / 3;
+    floor.trim.?.reduction = 66;
+    try testing.expectEqual(@as(u64, 66), (try score(floor, &fixture_prices)).reduction);
+
+    var lie = wide;
+    lie.trim.?.reduction = 99;
+    try testing.expectError(error.MalformedTrial, score(lie, &fixture_prices));
 }
 
 test "score: token addition or price multiplication that overflows is malformed" {
