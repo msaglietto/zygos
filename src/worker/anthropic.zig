@@ -223,12 +223,31 @@ pub const Assembler = struct {
     pub fn message(self: *Assembler) AssembleError!Message {
         if (!self.done) return error.Incomplete;
         if (self.materialized == null) {
-            for (self.blocks.items) |*b| switch (b.*) {
-                .tool_use => |*tu| canonicalizeDuplicateKeys(self.gpa, &tu.input),
-                else => {},
+            // A cut-off reply cannot dispatch partial tool input. The net
+            // renderer embeds input_json raw, so validate before the bus.
+            var keep_tools = self.stop_reason != .max_tokens;
+            if (keep_tools) validate: for (self.blocks.items) |*b| switch (b.*) {
+                .tool_use => |*tu| {
+                    canonicalizeDuplicateKeys(self.gpa, &tu.input);
+                    // Empty input renders as {}.
+                    if (tu.input.items.len == 0) continue;
+                    if (!try isJsonObject(self.gpa, tu.input.items)) {
+                        std.log.scoped(.anthropic_assembler).warn("invalid tool input; stopped without dispatch", .{});
+                        self.stop_reason = .unknown;
+                        keep_tools = false;
+                        break :validate;
+                    }
+                },
+                .text => {},
             };
-            const out = try self.gpa.alloc(Block, self.blocks.items.len);
-            for (self.blocks.items, 0..) |b, i| {
+            var count: usize = 0;
+            for (self.blocks.items) |b| {
+                if (keep_tools or b == .text) count += 1;
+            }
+            const out = try self.gpa.alloc(Block, count);
+            var i: usize = 0;
+            for (self.blocks.items) |b| {
+                if (!keep_tools and b == .tool_use) continue;
                 out[i] = switch (b) {
                     .text => |t| .{ .text = t.items },
                     .tool_use => |tu| .{ .tool_use = .{
@@ -237,6 +256,7 @@ pub const Assembler = struct {
                         .input_json = tu.input.items,
                     } },
                 };
+                i += 1;
             }
             self.materialized = out;
         }
@@ -256,6 +276,15 @@ test "anthropic assembler caps accumulated stream bytes across events" {
     a.max_stream_bytes = 2;
     try std.testing.expectEqual(@as(?[]const u8, null), try a.onEvent("ping", "{}"));
     try std.testing.expectError(error.TooLarge, a.onEvent("ping", "{}"));
+}
+
+fn isJsonObject(gpa: std.mem.Allocator, bytes: []const u8) error{OutOfMemory}!bool {
+    var value = json.parseFromSlice(json.Value, gpa, bytes, .{}) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        return false;
+    };
+    defer value.deinit();
+    return value.value == .object;
 }
 
 const canonicalizeDuplicateKeys = core.canonicalizeDuplicateKeys;
@@ -385,6 +414,88 @@ test "tool input deltas replace a start object while empty deltas preserve it" {
     try testing.expectEqualStrings("{\"command\":\"printf delta\"}", msg.content[0].tool_use.input_json);
     try testing.expectEqualStrings("t2", msg.content[1].tool_use.id);
     try testing.expectEqualStrings("{\"command\":\"printf start\"}", msg.content[1].tool_use.input_json);
+}
+
+/// Text block, then one bash tool_use with `start_input` and the given
+/// `partial_json` fragments, ending with `stop`.
+fn feedToolStream(a: *Assembler, start_input: []const u8, fragments: []const []const u8, stop: []const u8) !void {
+    var buf: [512]u8 = undefined;
+    _ = try a.onEvent("message_start", start_ev);
+    _ = try a.onEvent("content_block_start",
+        \\{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+    );
+    _ = try a.onEvent("content_block_delta",
+        \\{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"running"}}
+    );
+    _ = try a.onEvent("content_block_start", try std.fmt.bufPrint(&buf,
+        \\{{"type":"content_block_start","index":1,"content_block":{{"type":"tool_use","id":"t1","name":"bash","input":{s}}}}}
+    , .{start_input}));
+    for (fragments) |fragment| {
+        var esc: [256]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&esc);
+        try json.Stringify.value(fragment, .{}, &w);
+        _ = try a.onEvent("content_block_delta", try std.fmt.bufPrint(&buf,
+            \\{{"type":"content_block_delta","index":1,"delta":{{"type":"input_json_delta","partial_json":{s}}}}}
+        , .{w.buffered()}));
+    }
+    _ = try a.onEvent("message_delta", try std.fmt.bufPrint(&buf,
+        \\{{"type":"message_delta","delta":{{"stop_reason":"{s}"}},"usage":{{"output_tokens":8192}}}}
+    , .{stop}));
+    _ = try a.onEvent("message_stop", "{\"type\":\"message_stop\"}");
+}
+
+fn expectNoToolBlocks(msg: Message) !void {
+    try testing.expectEqual(@as(usize, 1), msg.content.len);
+    try testing.expectEqualStrings("running", msg.content[0].text);
+    try testing.expectEqual(@as(u64, 11), msg.usage.input_tokens);
+    try testing.expectEqual(@as(u64, 8192), msg.usage.output_tokens);
+}
+
+test "max_tokens cutoff omits partial tool input and keeps usage" {
+    var a = Assembler.init(testing.allocator);
+    defer a.deinit();
+    try feedToolStream(&a, "{}", &.{ "{\"command\":", "\"touch should-not-exist" }, "max_tokens");
+    const msg = try a.message();
+    try testing.expectEqual(StopReason.max_tokens, msg.stop_reason);
+    try expectNoToolBlocks(msg);
+}
+
+test "max_tokens drops even a complete tool block: the reply was cut off" {
+    var a = Assembler.init(testing.allocator);
+    defer a.deinit();
+    try feedToolStream(&a, "{\"command\":\"seed\"}", &.{}, "max_tokens");
+    const msg = try a.message();
+    try testing.expectEqual(StopReason.max_tokens, msg.stop_reason);
+    try expectNoToolBlocks(msg);
+}
+
+test "truncated tool input under tool_use stops unknown without a tool block" {
+    var a = Assembler.init(testing.allocator);
+    defer a.deinit();
+    try feedToolStream(&a, "{}", &.{"{\"command\":\"touch should-not-exist"}, "tool_use");
+    const msg = try a.message();
+    try testing.expectEqual(StopReason.unknown, msg.stop_reason);
+    try expectNoToolBlocks(msg);
+}
+
+test "a whitespace-only replacement delta cannot dispatch the replaced start input" {
+    var a = Assembler.init(testing.allocator);
+    defer a.deinit();
+    try feedToolStream(&a, "{\"command\":\"seed\"}", &.{ " ", "\n\t" }, "tool_use");
+    const msg = try a.message();
+    try testing.expectEqual(StopReason.unknown, msg.stop_reason);
+    try expectNoToolBlocks(msg);
+}
+
+test "valid non-object tool input stops unknown without a tool block" {
+    for ([_][]const u8{ "[]", "\"x\"", "42", "null", "true" }) |value| {
+        var a = Assembler.init(testing.allocator);
+        defer a.deinit();
+        try feedToolStream(&a, "{}", &.{value}, "tool_use");
+        const msg = try a.message();
+        try testing.expectEqual(StopReason.unknown, msg.stop_reason);
+        try expectNoToolBlocks(msg);
+    }
 }
 
 test "duplicate keys in streamed tool input canonicalize last-wins" {

@@ -20,3 +20,12 @@ events pop via `next`.
 Consumers: `net/anthropic.zig` and `net/openai.zig` feed decoded events to
 the `worker/{anthropic,openai}.zig` assemblers (shared core:
 `worker/assembler.zig`).
+
+Both assemblers validate terminal tool input before materialization, because
+the net renderers embed it raw in the terminal payload. A `max_tokens` reply
+omits its tool blocks and keeps that reason and its usage. Any other non-empty
+tool input that is not a JSON object (truncated, whitespace-only, or a
+different JSON type) stops as `unknown` with no tool blocks; the turn driver
+then fails the turn after usage accounting and without dispatch. In the
+anthropic dialect, a start-event input survives empty deltas, and a non-empty
+delta sequence replaces it as a whole.

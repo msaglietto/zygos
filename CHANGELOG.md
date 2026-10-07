@@ -6,6 +6,12 @@ Reconstructed from git history on 2026-09-30. A commit that only added a library
 
 The agent that next changes operator-visible behavior adds the new heading in that same commit.
 
+## [4.0.4] - 2026-10-07
+
+### Fixed
+
+- Anthropic-dialect replies no longer dispatch or embed invalid tool input. A `max_tokens` cutoff omits partial tool blocks and stops the turn as `max_tokens`. Truncated, whitespace-only, or non-object tool input stops as `unknown`, which fails the turn without dispatch. In both cases the terminal payload stays valid JSON, so usage is recorded and `turn_end` is traced.
+
 ## [4.0.3] - 2026-10-07
 
 ### Fixed

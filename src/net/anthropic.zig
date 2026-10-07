@@ -542,3 +542,91 @@ test "processSse drains buffered terminal events without another socket read" {
         try testing.expectEqual(@as(u64, 1), guard.pokes);
     }
 }
+
+test "cut-off and malformed tool input stop on the task bus with usage and trace" {
+    const fsx = @import("../worker/fsx.zig");
+    const ops = @import("../worker/tools_ops.zig");
+    const task = @import("../worker/task.zig");
+    const trial = @import("../worker/trial.zig");
+    const C = struct {
+        extern "c" fn realpath(path: [*:0]const u8, resolved: [*]u8) ?[*:0]u8;
+    };
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var rel_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const rel = try std.fmt.bufPrintZ(&rel_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const root = std.mem.span(C.realpath(rel, &root_buf) orelse return error.RealpathFailed);
+
+    const Case = struct { stop: []const u8, start: []const u8, fragments: []const []const u8, want: []const u8, turn: []const u8 };
+    const cases = [_]Case{
+        // Output limit inside the arguments.
+        .{ .stop = "max_tokens", .start = "{}", .fragments = &.{ "{\"command\":", "\"touch should-not-exist" }, .want = "max_tokens", .turn = "max_tokens" },
+        // The same partial input reported as a tool call.
+        .{ .stop = "tool_use", .start = "{}", .fragments = &.{"{\"command\":\"touch should-not-exist"}, .want = "unknown", .turn = "failed" },
+        // Whitespace replaces a dispatchable start input.
+        .{ .stop = "tool_use", .start = "{\"command\":\"touch should-not-exist\"}", .fragments = &.{" "}, .want = "unknown", .turn = "failed" },
+        // Valid JSON that is not an argument object.
+        .{ .stop = "tool_use", .start = "{}", .fragments = &.{"[\"touch should-not-exist\"]"}, .want = "unknown", .turn = "failed" },
+    };
+    for (cases, 0..) |case, n| {
+        var stream: std.ArrayList(u8) = .empty;
+        defer stream.deinit(testing.allocator);
+        try stream.print(testing.allocator, "event: message_start\ndata: {s}\n\n", .{
+            \\{"type":"message_start","message":{"id":"m","model":"fixture","usage":{"input_tokens":8124,"cache_read_input_tokens":7296,"output_tokens":1}}}
+        });
+        try stream.print(testing.allocator, "event: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"tool_use\",\"id\":\"partial\",\"name\":\"bash\",\"input\":{s}}}}}\n\n", .{case.start});
+        for (case.fragments) |fragment| {
+            const data = try json.Stringify.valueAlloc(testing.allocator, .{
+                .type = "content_block_delta",
+                .index = 0,
+                .delta = .{ .type = "input_json_delta", .partial_json = fragment },
+            }, .{});
+            defer testing.allocator.free(data);
+            try stream.print(testing.allocator, "event: content_block_delta\ndata: {s}\n\n", .{data});
+        }
+        try stream.print(testing.allocator, "event: message_delta\ndata: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"{s}\"}},\"usage\":{{\"output_tokens\":8192}}}}\n\n", .{case.stop});
+        try stream.appendSlice(testing.allocator, "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
+
+        var reader: std.Io.Reader = .fixed(stream.items);
+        const terminal = try processSse(testing.allocator, &reader, null, null);
+        defer testing.allocator.free(terminal);
+        var parsed = try json.parseFromSlice(json.Value, testing.allocator, terminal, .{});
+        defer parsed.deinit();
+        try testing.expectEqualStrings(case.want, parsed.value.object.get("stop_reason").?.string);
+        try testing.expectEqual(@as(usize, 0), parsed.value.object.get("content").?.array.items.len);
+
+        const events = try std.fmt.allocPrint(testing.allocator, "{s}/events-{d}.jsonl", .{ root, n });
+        defer testing.allocator.free(events);
+        const script = [_][]const u8{terminal};
+        const result = try task.run(testing.allocator, .{
+            .workspace = root,
+            .instruction = "Never dispatch the partial command.",
+            .task_id = "offline-anthropic-tool-input",
+            .dataset = "offline-fixture",
+            .model_id = "fixture",
+            .variable = "trim-on",
+            .step_cap = 1,
+            .identity = .{ .git_sha = "0123456789abcdef0123456789abcdef01234567", .target_triple = "fixture", .optimize = "Debug", .adapter_version = trial.adapter_version },
+            .script = &script,
+            .trace_path = events,
+        });
+        defer result.deinit(testing.allocator);
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const record = try trial.parse(arena.allocator(), result.trial_json);
+        try testing.expectEqual(@as(u64, 8124), record.input_tokens);
+        try testing.expectEqual(@as(u64, 8192), record.output_tokens);
+        try testing.expectEqual(@as(?u64, 7296), record.cache_read_tokens);
+        const turn = try json.parseFromSliceLeaky(json.Value, arena.allocator(), result.turn_json, .{});
+        try testing.expectEqualStrings(case.turn, turn.object.get("stop").?.string);
+        try testing.expectError(error.NotFound, ops.readFile(testing.allocator, ops.Workspace.init(root), "should-not-exist"));
+
+        const log_bytes = fsx.readWholeFile(testing.allocator, events) orelse return error.NoTrace;
+        defer testing.allocator.free(log_bytes);
+        try testing.expect(std.mem.indexOf(u8, log_bytes, "\"event\":\"usage\"") != null);
+        try testing.expect(std.mem.indexOf(u8, log_bytes, "\"output_tokens\":8192") != null);
+        try testing.expect(std.mem.indexOf(u8, log_bytes, "\"event\":\"turn_end\"") != null);
+        try testing.expect(std.mem.indexOf(u8, log_bytes, "\"event\":\"tool_call\"") == null);
+    }
+}
