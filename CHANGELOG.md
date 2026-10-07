@@ -6,6 +6,12 @@ Reconstructed from git history on 2026-09-30. A commit that only added a library
 
 The agent that next changes operator-visible behavior adds the new heading in that same commit.
 
+## [4.0.3] - 2026-10-07
+
+### Fixed
+
+- A fresh `zygos::missions::start` without a `brief` removes a `BRIEF.md` left by an earlier mission instead of handing it to every role as the authoritative brief. If the stale file cannot be removed, the start fails before any role runs. Resume still keeps the original brief, and a fresh start with a `brief` replaces it.
+
 ## [4.0.2] - 2026-10-07
 
 ### Fixed

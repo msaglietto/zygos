@@ -67,6 +67,16 @@ pub const Store = struct {
         }
     }
 
+    /// Remove an artifact. Already absent is success; any other unlink
+    /// failure is Io, so callers can refuse rather than read stale bytes.
+    pub fn removeArtifact(self: Store, gpa: std.mem.Allocator, name: []const u8) StoreError!void {
+        try checkName(name);
+        const path_z = std.fmt.allocPrintSentinel(gpa, "{s}/{s}", .{ self.root, name }, 0) catch
+            return error.OutOfMemory;
+        defer gpa.free(path_z);
+        if (c.unlink(path_z) != 0 and c._errno().* != @intFromEnum(c.E.NOENT)) return error.Io;
+    }
+
     /// Returns owned bytes; missing artifact is NotFound.
     pub fn readArtifact(self: Store, gpa: std.mem.Allocator, name: []const u8) StoreError![]u8 {
         try checkName(name);
@@ -450,6 +460,24 @@ test "appendArtifact grows a file append-only; name rules apply" {
     try testing.expectEqualStrings("- one\n- two\n", got);
 
     try testing.expectError(error.BadName, store.appendArtifact(testing.allocator, "a/b.md", "x"));
+}
+
+test "removeArtifact deletes, treats absent as success, and reports other failures" {
+    var t = TestRoot.init();
+    defer t.deinit();
+    const root = try t.path();
+    const store = Store.init(root);
+
+    try store.writeArtifact(testing.allocator, "BRIEF.md", "old\n");
+    try store.removeArtifact(testing.allocator, "BRIEF.md");
+    try testing.expectError(error.NotFound, store.readArtifact(testing.allocator, "BRIEF.md"));
+    try store.removeArtifact(testing.allocator, "BRIEF.md");
+
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_z = try std.fmt.bufPrintZ(&buf, "{s}/PLAN.md", .{root});
+    try testing.expectEqual(@as(c_int, 0), c.mkdir(dir_z, 0o755));
+    try testing.expectError(error.Io, store.removeArtifact(testing.allocator, "PLAN.md"));
+    try testing.expectError(error.BadName, store.removeArtifact(testing.allocator, "../BRIEF.md"));
 }
 
 test "load without a state file is NotFound; garbage is Corrupt" {

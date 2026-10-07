@@ -414,8 +414,17 @@ fn runMission(self: *MissionOrchestrator, arena: std.mem.Allocator, request_json
 
     // Preserve intake criteria independently of model-authored MISSION.md.
     // Resume uses the original artifact, never a replacement request brief.
+    // A fresh start owns BRIEF.md: roles treat it as authoritative, so a
+    // brief-less start must not inherit one left by an earlier mission.
     if (!p.resume_flag) {
-        if (p.brief) |brief_text| try putArtifact(self, cfg, "BRIEF.md", brief_text);
+        if (p.brief) |brief_text| {
+            try putArtifact(self, cfg, "BRIEF.md", brief_text);
+        } else {
+            cfg.store.removeArtifact(self.gpa, "BRIEF.md") catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.Failed,
+            };
+        }
     }
 
     // The pre-first-turn state hits the disk too: a mission killed before
@@ -1896,6 +1905,77 @@ test "resumed roles keep the persisted operator brief instead of replacement int
         const content = parsed.value.object.get("messages").?.array.items[0].object.get("content").?.string;
         try testing.expect(std.mem.indexOf(u8, content, original) != null);
     }
+}
+
+const stale_brief = good_brief ++ "\nStale acceptance: drop the production database.\n";
+
+fn expectNoStaleBrief(h: *Harness) !void {
+    for (h.provider.requests.items) |request| {
+        var parsed = try json.parseFromSlice(json.Value, testing.allocator, request, .{});
+        defer parsed.deinit();
+        const content = parsed.value.object.get("messages").?.array.items[0].object.get("content").?.string;
+        try testing.expect(std.mem.indexOf(u8, content, "Stale acceptance") == null);
+    }
+}
+
+test "a fresh brief-less bus start does not inherit an earlier mission's brief" {
+    var h = try Harness.init(testing.allocator, &.{ po_ok, plan1, exec_ok, verify_pass });
+    defer h.deinit();
+    const gate_worker = try FakeGate.start(testing.allocator, &h.actor, &h.registry, &.{"{\"approved\":true}"});
+    defer gate_worker.stop();
+    try h.store().writeArtifact(testing.allocator, "BRIEF.md", stale_brief);
+
+    const req = try h.startReq(testing.allocator, ",\"objective\":\"seed\",\"gate_function\":\"test::gate::request\"");
+    defer testing.allocator.free(req);
+    const res = try h.caller.call("zygos::missions::start", req);
+    defer res.deinit(testing.allocator);
+    try testing.expect(res == .ok);
+    try expectTerminal(res.ok, "done", "completed");
+
+    try testing.expectEqual(@as(usize, 4), h.provider.requests.items.len);
+    for (h.provider.requests.items) |request| {
+        try testing.expect(std.mem.indexOf(u8, request, "Original operator brief") == null);
+    }
+    try expectNoStaleBrief(h);
+    try testing.expectError(error.NotFound, h.store().readArtifact(testing.allocator, "BRIEF.md"));
+}
+
+test "a fresh start with a brief replaces an earlier mission's brief" {
+    var h = try Harness.init(testing.allocator, &.{ po_ok, plan1, exec_ok, verify_pass });
+    defer h.deinit();
+    const gate_worker = try FakeGate.start(testing.allocator, &h.actor, &h.registry, &.{"{\"approved\":true}"});
+    defer gate_worker.stop();
+    try h.store().writeArtifact(testing.allocator, "BRIEF.md", stale_brief);
+
+    const req = try briefStartReq(h, testing.allocator, good_brief);
+    defer testing.allocator.free(req);
+    const res = try h.caller.call("zygos::missions::start", req);
+    defer res.deinit(testing.allocator);
+    try testing.expect(res == .ok);
+    try expectTerminal(res.ok, "done", "completed");
+
+    try expectNoStaleBrief(h);
+    const saved = try h.store().readArtifact(testing.allocator, "BRIEF.md");
+    defer testing.allocator.free(saved);
+    try testing.expectEqualStrings(good_brief, saved);
+}
+
+test "a stale brief that cannot be cleared refuses the fresh start before any role runs" {
+    var h = try Harness.init(testing.allocator, &.{ po_ok, plan1, exec_ok, verify_pass });
+    defer h.deinit();
+    // A directory named BRIEF.md: unlink(2) fails with something other
+    // than ENOENT, so the stale state cannot be proven gone.
+    const dir_z = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/BRIEF.md", .{h.root}, 0);
+    defer testing.allocator.free(dir_z);
+    try testing.expectEqual(@as(c_int, 0), std.c.mkdir(dir_z, 0o755));
+
+    const req = try h.startReq(testing.allocator, ",\"objective\":\"seed\",\"gate_function\":\"test::gate::request\"");
+    defer testing.allocator.free(req);
+    const res = try h.caller.call("zygos::missions::start", req);
+    defer res.deinit(testing.allocator);
+    try testing.expect(res == .err);
+    try testing.expectEqual(@as(usize, 0), h.provider.callCount());
+    try testing.expectError(error.NotFound, h.store().load(testing.allocator));
 }
 
 test "abort mid-mission stops durably with aborted" {
