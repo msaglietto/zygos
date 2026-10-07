@@ -76,7 +76,7 @@ zygos task run --offline --workspace DIR --out trial.json --events events.jsonl
 zygos task score --trial trial.json --prices prices.txt
 ```
 
-`--offline` is required. A live provider run is refused until a dated model id and a spend approval exist. The trial pins the git sha, target triple, optimize level, and adapter version. Bench policy allows only bash, read, and write inside the workspace. Mission policy is unchanged.
+`--offline` selects the scripted provider. Live runs require an allowlisted model and a complete invocation; the current Deepseek Flash campaign has standing authorization under [Benchmark operating policy](docs/benchmark-policy.md). Agents review and record evidence at phase boundaries and advance without asking for permission each time. The trial pins the git sha, target triple, optimize level, and adapter version. Bench policy allows only bash, read, and write inside the workspace. Mission policy is unchanged.
 
 `eval/run.sh --dry-run` prints the pinned dataset `terminal-bench/terminal-bench-2-1` and the task command. It is not part of `zig build test`. The contract is `docs/specs/task.md`.
 
