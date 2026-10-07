@@ -7,6 +7,27 @@ capabilities as replaceable workers. Wire-compatible with the unmodified iii
 SDKs. See `GOAL.md` for the mission, `docs/ARCHITECTURE.md` and
 `docs/PROTOCOL.md` for the design, `docs/specs/` for per-module contracts.
 
+## Before running missions
+
+Zygos is experimental software for a trusted local operator. Mission policy
+allows bash and web tools by default. Bash runs as your OS user with workspace
+cwd, an environment allowlist, and a two-minute process-group deadline; it is
+not a sandbox. Fetched content can influence commands. The executor can also
+write the attach control file and approve its completion gate. Closed stdin
+does not make that gate independent of the executor. See
+[SECURITY.md](SECURITY.md) and [permissions](documentation/permissions.md).
+
+Bare kernel mode binds loopback and rejects browser Origins by default.
+`ZYGOS_TOKEN` optionally requires `?token=<secret>` on worker connections;
+`ZYGOS_ALLOW_ORIGIN` is an exact comma-separated browser Origin allowlist.
+Admitted peers can register and invoke bus functions. Mission mode uses an
+in-process bus and does not expose its tools through the WebSocket listener.
+
+For a fixture-only demonstration, run `./test/e2e/m45/run.sh` (Node.js + git).
+For your own provider catalog and a small mission, see
+[examples](examples/README.md). Contribution rules are in
+[CONTRIBUTING.md](CONTRIBUTING.md).
+
 ## Status: M4.6 — zahir-radar workload (M0–M4.5 closed)
 
 | Milestone | Criterion | State |
@@ -54,10 +75,12 @@ SDKs. See `GOAL.md` for the mission, `docs/ARCHITECTURE.md` and
 
 ## Build & test
 
-Requires Zig 0.16.0 (and libc — pthread + CSPRNG; macOS or Linux).
+Requires Zig 0.16.0 and libc (pthread + CSPRNG): macOS or Linux with glibc.
+The benchmark artifact targets glibc 2.31; Linux uses `getrandom` and macOS
+uses `arc4random_buf`. CI uses Ubuntu 24.04 and macOS 14.
 
 ```bash
-zig build test   # full suite (872 tests, leak-checked, no network)
+zig build test   # full suite (leak-checked, no network; CI checks macOS + Linux)
 zig build        # produces zig-out/bin/zygos
 ```
 
@@ -413,10 +436,11 @@ zig build smoke-providers -- <slug-a> <slug-b>
 
 The weekly-trigger decision (M4.6/Y3): scheduling lives **outside** the
 binary — cron/launchd invoke the CLI; the kernel stays schedule-free. The
-CLI's guarantees make this safe unattended: approvals fail closed on a
-closed stdin, a non-resume start over an existing substrate refuses (exit 2)
+CLI refuses overlapping runs on one planning root using a process-held
+file lock. Console approvals fail closed on a closed stdin; a non-resume start over an existing substrate refuses (exit 2)
 instead of clobbering it, and `--run-stamp` gives every invocation its own
-planning root (`<root>-YYYYMMDD-HHMMSS`).
+planning root (`<root>-YYYYMMDD-HHMMSS-P<pid>`). This is rerun isolation,
+not a sandbox: an executor shell can still write the approval control file.
 
 ```cron
 # weekly zahir-radar refresh, Mondays 07:00 — each run gets its own .planning
@@ -436,3 +460,12 @@ back the same day: provider warnings now name the failing instance
 (rate-limit attribution), and the CLI requests real-mission
 `role_max_steps`/`max_role_turns` instead of the scripted-test defaults that
 starved the first executor run.
+
+## License
+
+MIT — see [LICENSE](LICENSE). The one dependency
+([karlseguin/websocket.zig](https://github.com/karlseguin/websocket.zig),
+pinned in `build.zig.zon`) is MIT-licensed. Its pinned license and provenance
+are recorded in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Include both
+notices when distributing binaries. CI and maintainer publication tasks are
+documented in [open-source readiness](documentation/open-source-readiness.md).

@@ -1,0 +1,5 @@
+.{
+    .default = .{
+        .{ .provider_function = "zygos::providers::example-openai", .model = "your-model-id" },
+    },
+}

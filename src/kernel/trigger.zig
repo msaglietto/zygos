@@ -378,8 +378,15 @@ pub const Triggers = struct {
     /// Remove a binding by id. `trigger_type` is an optional consistency
     /// check: if provided and it doesn't match the stored type, the call is
     /// a no-op returning false (PROTOCOL.md optional field semantics).
-    pub fn unregisterBinding(self: *Triggers, id: []const u8, trigger_type: ?[]const u8) bool {
+    /// Connection-owned bindings are removable only by their registrant
+    /// (the function-path CAS rule, applied to triggers): a peer must not
+    /// evict another peer's binding. Durable bindings (owner == null) have
+    /// no registrant on the wire; any peer may remove them explicitly.
+    pub fn unregisterBinding(self: *Triggers, id: []const u8, trigger_type: ?[]const u8, requester: WorkerId) bool {
         const b = self.bindings.getPtr(id) orelse return false;
+        if (b.owner) |owner| {
+            if (!std.mem.eql(u8, &owner, &requester)) return false;
+        }
         if (trigger_type) |tt| {
             if (!std.mem.eql(u8, b.trigger_type, tt)) return false;
         }
@@ -850,11 +857,14 @@ test "unregisterBinding with mismatched trigger_type is a no-op returning false"
         .owner = worker_a,
     }, null);
 
-    // Mismatch → no-op.
-    try testing.expect(!tr.unregisterBinding("b1", "http"));
+    // A different worker's request → refused (owner CAS).
+    try testing.expect(!tr.unregisterBinding("b1", "cron", worker_b));
 
-    // Match → removes.
-    try testing.expect(tr.unregisterBinding("b1", "cron"));
+    // Mismatch → no-op.
+    try testing.expect(!tr.unregisterBinding("b1", "http", worker_a));
+
+    // Match + owner → removes.
+    try testing.expect(tr.unregisterBinding("b1", "cron", worker_a));
     try testing.expect(tr.binding("b1") == null);
 
     // null trigger_type → skip check, remove by id.
@@ -864,8 +874,19 @@ test "unregisterBinding with mismatched trigger_type is a no-op returning false"
         .config = "{}",
         .owner = worker_a,
     }, null);
-    try testing.expect(tr.unregisterBinding("b2", null));
+    try testing.expect(tr.unregisterBinding("b2", null, worker_a));
     try testing.expect(tr.binding("b2") == null);
+
+    // Durable (owner == null) binding: no registrant on the wire, any
+    // explicit unregister may remove it.
+    _ = try tr.registerBinding("b3", .{
+        .trigger_type = "cron",
+        .function_id = "fn",
+        .config = "{}",
+        .owner = null,
+    }, null);
+    try testing.expect(tr.unregisterBinding("b3", null, worker_b));
+    try testing.expect(tr.binding("b3") == null);
 }
 
 // 14 ----------------------------------------------------------------------

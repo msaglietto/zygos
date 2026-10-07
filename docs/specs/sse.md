@@ -11,6 +11,11 @@ events pop via `next`.
 - Comment lines (`:`) and unknown fields are skipped.
 - Input bytes never crash the decoder; garbage between events is discarded
   at line granularity.
+- Decoder storage is capped at 4 MiB across raw input and the accumulated
+  event fields, including complete data lines in an unterminated event.
+  Exceeding the cap returns `TooLarge`; provider pumps map it to `BadStream`.
+- Assemblers cap total payload input at 16 MiB per response. Oversized
+  responses fail rather than returning a truncated terminal message.
 
 Consumers: `net/anthropic.zig` and `net/openai.zig` feed decoded events to
 the `worker/{anthropic,openai}.zig` assemblers (shared core:

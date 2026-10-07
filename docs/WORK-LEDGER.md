@@ -602,3 +602,13 @@ The operator questioned why an approval policy was filed as an architectural dec
 Agents have standing authority to execute and assess the planned DeepSeek phases 10–12 and advance when their evidence prerequisites are met, including resolving the isolated benchmark mission's completion approval as delegated operator after independent acceptance checks through the real approval path. Source fixes still require offline red-first evidence and a clean artifact; policy, budget, and gate failures still stop. Trial/scorer failures remain recorded outcomes. No success criterion or runtime guard was changed.
 
 This policy update executed no paid trial and did not rebuild the frozen Linux artifact. Phase 10's 48-run proposal is authorized under the standing policy, not waiting on an operator answer. The full 89-task Phase 11, verified Lite package investigation, and isolated Phase 12 follow the planned scope. The Lite package remains unconfirmed; agents investigate it without asking the operator to supply an identifier. Historical approvals, interrupted attempts, and cost estimates above remain unchanged.
+
+## PR preparation — 2026-10-07
+
+Integrated upstream `master` at `9ff488d` into `harness-bench` for a reviewable PR. The only textual conflict was README's test command; resolution keeps current CI wording and documents the existing Linux getrandom/glibc 2.31 entropy path. Upstream hardening and this branch's harness/provider repairs are retained. No dependency or wire-protocol change is introduced relative to the current PR base; GOAL success criteria are unchanged.
+
+The combined tree passes 940/940 offline Zig tests, 12 mocked Python adapter/runner tests, native build, formatting of build.zig/src/test, scripted mission/MCP integration, WebSocket admission/delivery churn, the real filter probe (93% saved against its 45% floor), and M8 integration (1013 → 378 bytes, 63%, filtered=2, deduped=1). Probe ratios include this working tree and git history; they are separate from the DeepSeek campaign's recorded zero command-specific filter counts.
+
+GitNexus comparison reports critical scope across the shared kernel/provider paths. Complete change reports were checked for partial/truncated results; the underlying process index warns that it does not enumerate every flow. Graph scope is supporting evidence rather than proof of exhaustive coverage.
+
+PR preparation ran no paid benchmark. The clean-source a147d52 Linux artifact and its digest remain unchanged, and historical trial identities are not rewritten. Phase 10–12 remain not started under standing benchmark authority.

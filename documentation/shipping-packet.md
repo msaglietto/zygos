@@ -1,3 +1,5 @@
+> Historical shipping review. For current remediation and remaining publication tasks, see [open-source readiness](open-source-readiness.md) and the dated review in [the repository audit](../reports/repo_audit_2026-09-30.md). Older test counts and the missing-CI statement below describe that snapshot.
+
 ## Shipping Packet: zygos
 
 ### Documentation Inventory

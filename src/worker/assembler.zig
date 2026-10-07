@@ -9,7 +9,7 @@ const std = @import("std");
 const jsonx = @import("jsonx.zig");
 const json = std.json;
 
-pub const AssembleError = error{ OutOfMemory, MalformedEvent, ApiError, Incomplete };
+pub const AssembleError = error{ OutOfMemory, MalformedEvent, ApiError, Incomplete, TooLarge };
 
 /// Superset of both dialects' terminal reasons; chat-completions never
 /// produces `.stop_sequence`.

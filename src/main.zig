@@ -82,6 +82,19 @@ fn initLogFilter() void {
     log_filter = std.meta.stringToEnum(std.log.Level, s) orelse log_filter;
 }
 
+/// Comma-separated ZYGOS_ALLOW_ORIGIN → slices. Process-lifetime config:
+/// the allocation rides until exit (freed never, like the env it mirrors).
+fn splitOrigins(gpa: std.mem.Allocator, raw: []const u8) []const []const u8 {
+    var count: usize = 0;
+    var it = std.mem.splitScalar(u8, raw, ',');
+    while (it.next()) |_| count += 1;
+    const out = gpa.alloc([]const u8, count) catch return &.{};
+    it = std.mem.splitScalar(u8, raw, ',');
+    var i: usize = 0;
+    while (it.next()) |o| : (i += 1) out[i] = std.mem.trim(u8, o, " ");
+    return out;
+}
+
 pub fn main(proc: std.process.Init) !void {
     const gpa = std.heap.c_allocator;
 
@@ -99,6 +112,14 @@ pub fn main(proc: std.process.Init) !void {
     var config: zygos.net.Config = .{};
     if (std.c.getenv("ZYGOS_PORT")) |raw| {
         config.port = std.fmt.parseInt(u16, std.mem.span(raw), 10) catch config.port;
+    }
+    // Bus admission (see net/ws.zig admitHandshake): a page in the
+    // operator's browser must not join the loopback bus. Browsers always
+    // send Origin (refused unless allowlisted via ZYGOS_ALLOW_ORIGIN);
+    // ZYGOS_TOKEN, when set, must ride ?token= on every peer's open.
+    if (std.c.getenv("ZYGOS_TOKEN")) |raw| config.token = std.mem.span(raw);
+    if (std.c.getenv("ZYGOS_ALLOW_ORIGIN")) |raw| {
+        config.allowed_origins = splitOrigins(gpa, std.mem.span(raw));
     }
 
     const gateway = try zygos.net.Gateway.create(gpa, config);
@@ -242,6 +263,7 @@ fn todayStamp(buf: *[10]u8) []const u8 {
 }
 
 test {
+    std.testing.refAllDecls(cli_mission);
     // The exe test binary's root is this file; nothing references cli/ in
     // test mode (main() is not a test-root), so pull the CLI's pure
     // submodules in explicitly for test discovery.

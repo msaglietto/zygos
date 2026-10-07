@@ -9,6 +9,10 @@ const sync = @import("../../kernel/sync.zig");
 
 pub const TransportError = error{ Io, OutOfMemory };
 
+/// Line budget for stdio reads: a runaway server streaming unterminated
+/// bytes must OOM nobody. 1 MiB is far past any real JSON-RPC line.
+pub const max_line_bytes = 1024 * 1024;
+
 /// Line-oriented duplex channel to one MCP server. `readLine` returns null
 /// on EOF; returned slices are gpa-owned by the caller.
 pub const Transport = struct {
@@ -34,9 +38,15 @@ extern "c" fn fdopen(fd: c_int, mode: [*:0]const u8) ?*c.FILE;
 extern "c" fn close(fd: c_int) c_int;
 extern "c" fn _exit(status: c_int) noreturn;
 extern "c" fn fflush(stream: *c.FILE) c_int;
-extern "c" fn fgets(buf: [*]u8, size: c_int, stream: *c.FILE) ?[*:0]u8;
+extern "c" fn fileno(stream: *c.FILE) c_int;
 
 const SIGTERM: c_int = @intFromEnum(c.SIG.TERM);
+
+fn monotonicMs() i64 {
+    var ts: c.timespec = undefined;
+    if (c.clock_gettime(.MONOTONIC, &ts) != 0) return 0;
+    return @as(i64, @intCast(ts.sec)) * 1000 + @divTrunc(@as(i64, @intCast(ts.nsec)), std.time.ns_per_ms);
+}
 
 pub const ChildProcess = struct {
     gpa: std.mem.Allocator,
@@ -44,6 +54,10 @@ pub const ChildProcess = struct {
     to_child: *c.FILE, // requests out
     from_child: *c.FILE, // replies in
     write_mutex: sync.Mutex = .{},
+    read_timeout_ms: u32 = 120_000,
+    read_buf: [4096]u8 = undefined,
+    read_pos: usize = 0,
+    read_end: usize = 0,
 
     /// Spawn `argv` with its stdin/stdout piped here; stderr passes through
     /// to ours (server logs stay visible).
@@ -116,7 +130,18 @@ pub const ChildProcess = struct {
         _ = c.fclose(self.to_child);
         _ = c.fclose(self.from_child);
         _ = kill(self.pid, SIGTERM);
-        _ = waitpid(self.pid, null, 0);
+        const deadline = monotonicMs() + 250;
+        while (true) {
+            const reaped = waitpid(self.pid, null, 1); // WNOHANG
+            if (reaped == self.pid or (reaped < 0 and c._errno().* == @intFromEnum(c.E.CHILD))) break;
+            if (monotonicMs() >= deadline) {
+                _ = kill(self.pid, @intFromEnum(c.SIG.KILL));
+                while (waitpid(self.pid, null, 0) < 0 and c._errno().* == @intFromEnum(c.E.INTR)) {}
+                break;
+            }
+            var no_fds: [0]c.pollfd = .{};
+            _ = c.poll(&no_fds, 0, 5);
+        }
         self.write_mutex.deinit();
         const gpa = self.gpa;
         gpa.destroy(self);
@@ -139,19 +164,38 @@ pub const ChildProcess = struct {
         const self: *ChildProcess = @ptrCast(@alignCast(ctx));
         var buf: std.ArrayList(u8) = .empty;
         errdefer buf.deinit(gpa);
-        var chunk: [1024]u8 = undefined;
+        const deadline = monotonicMs() + self.read_timeout_ms;
         while (true) {
-            if (fgets(&chunk, chunk.len, self.from_child) == null) {
-                if (buf.items.len == 0) {
-                    buf.deinit(gpa);
-                    return null; // clean EOF
+            if (self.read_pos == self.read_end) {
+                const left = deadline - monotonicMs();
+                if (left <= 0) return error.Io;
+                var fds = [_]c.pollfd{.{ .fd = fileno(self.from_child), .events = c.POLL.IN, .revents = 0 }};
+                const ready = c.poll(&fds, 1, @intCast(@min(left, std.math.maxInt(c_int))));
+                if (ready < 0 and c._errno().* == @intFromEnum(c.E.INTR)) continue;
+                if (ready <= 0) return error.Io;
+                const n = c.read(fds[0].fd, &self.read_buf, self.read_buf.len);
+                if (n < 0 and c._errno().* == @intFromEnum(c.E.INTR)) continue;
+                if (n < 0) return error.Io;
+                if (n == 0) {
+                    if (buf.items.len == 0) {
+                        buf.deinit(gpa);
+                        return null;
+                    }
+                    break;
                 }
-                break; // EOF mid-line: hand over what we have
+                self.read_pos = 0;
+                self.read_end = @intCast(n);
             }
-            const got = std.mem.sliceTo(&chunk, 0);
-            try buf.appendSlice(gpa, got);
-            if (got.len > 0 and got[got.len - 1] == '\n') {
-                _ = buf.pop();
+            const pending = self.read_buf[self.read_pos..self.read_end];
+            const newline = std.mem.indexOfScalar(u8, pending, '\n');
+            const take = if (newline) |i| i else pending.len;
+            const part = pending[0..take];
+            // JSON-RPC is text: embedded NUL must not hide bytes from the cap.
+            if (std.mem.indexOfScalar(u8, part, 0) != null or part.len > max_line_bytes - buf.items.len) return error.Io;
+            try buf.appendSlice(gpa, part);
+            self.read_pos += take;
+            if (newline != null) {
+                self.read_pos += 1;
                 break;
             }
         }
@@ -180,4 +224,39 @@ test "child-process transport: EOF from an exiting child reads as null" {
     defer child.stop();
     const t = child.transport();
     try testing.expectEqual(@as(?[]u8, null), try t.readLine(testing.allocator));
+}
+
+test "child-process transport: a silent server reaches a read deadline" {
+    const child = try ChildProcess.spawn(testing.allocator, &.{ "/bin/sh", "-c", "exec sleep 0.2" });
+    defer child.stop();
+    child.read_timeout_ms = 20;
+    try testing.expectError(error.Io, child.transport().readLine(testing.allocator));
+}
+
+test "child-process transport: line cap refuses oversized input" {
+    const command = try std.fmt.allocPrint(testing.allocator, "head -c {d} /dev/zero | tr '\\000' x", .{max_line_bytes + 1});
+    defer testing.allocator.free(command);
+    const child = try ChildProcess.spawn(testing.allocator, &.{ "/bin/sh", "-c", command });
+    defer child.stop();
+    try testing.expectError(error.Io, child.transport().readLine(testing.allocator));
+}
+
+test "child-process transport: exact-cap line and read-ahead preserve the next line" {
+    const command = try std.fmt.allocPrint(testing.allocator, "head -c {d} /dev/zero | tr '\\000' x; printf '\\nnext\\n'", .{max_line_bytes});
+    defer testing.allocator.free(command);
+    const child = try ChildProcess.spawn(testing.allocator, &.{ "/bin/sh", "-c", command });
+    defer child.stop();
+    const t = child.transport();
+    const first = (try t.readLine(testing.allocator)).?;
+    defer testing.allocator.free(first);
+    try testing.expectEqual(max_line_bytes, first.len);
+    const second = (try t.readLine(testing.allocator)).?;
+    defer testing.allocator.free(second);
+    try testing.expectEqualStrings("next", second);
+}
+
+test "child-process transport: NUL cannot evade the line cap" {
+    const child = try ChildProcess.spawn(testing.allocator, &.{ "/bin/sh", "-c", "printf '\\000hidden\\n'" });
+    defer child.stop();
+    try testing.expectError(error.Io, child.transport().readLine(testing.allocator));
 }

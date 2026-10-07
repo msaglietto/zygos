@@ -183,13 +183,17 @@ pub fn processSse(
         };
         if (n == 0) continue;
         if (guard) |g| g.poke();
-        decoder.feed(chunk[0..n]) catch return error.OutOfMemory;
+        decoder.feed(chunk[0..n]) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.TooLarge => return error.BadStream,
+        };
 
         while (decoder.next() catch return error.OutOfMemory) |event| {
             const name = event.event orelse continue;
             const delta = assembler.onEvent(name, event.data) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.ApiError => return error.ApiError,
+                error.TooLarge => return error.BadStream,
                 error.MalformedEvent => {
                     log.warn("malformed stream event '{s}' skipped", .{name});
                     continue;

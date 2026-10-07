@@ -1,0 +1,11 @@
+# Copy to an untracked providers.local.toml, then set endpoint/model for your
+# provider. Catalog names become bus slugs: "Example OpenAI" → example-openai.
+# Do not put keys here. Export the variable named by key_env in your shell.
+[[providers]]
+name = "Example OpenAI"
+type = "openai_compatible"
+endpoint = "https://api.openai.com/v1"
+model = "your-model-id"
+key_env = "OPENAI_API_KEY"
+max_tokens = 4096
+temperature = 0.2

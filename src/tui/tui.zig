@@ -21,6 +21,7 @@ pub const highlight = @import("highlight.zig");
 pub const steerinput = @import("steerinput.zig");
 pub const model = @import("model.zig");
 pub const partialjson = @import("partialjson.zig");
+pub const scrub = @import("scrub.zig");
 pub const loop = @import("loop.zig");
 pub const logbridge = @import("logbridge.zig");
 

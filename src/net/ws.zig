@@ -32,7 +32,50 @@ pub const Config = struct {
     port: u16 = 49134, // iii Node SDK default (measured, docs/specs/net.md)
     tick_interval_ms: u64 = 250,
     max_frame_bytes: usize = 16 * 1024 * 1024,
+    /// Shared-secret gate: when set, peers must carry it as ?token=<value>
+    /// on the handshake request target. From ZYGOS_TOKEN.
+    token: ?[]const u8 = null,
+    /// Origins allowed to connect (browser pages always send Origin; SDK
+    /// and script clients never do). Empty default = every Origin refused.
+    /// From comma-separated ZYGOS_ALLOW_ORIGIN.
+    allowed_origins: []const []const u8 = &.{},
 };
+
+/// Handshake admission (pure; the socket-free suite pins it):
+/// - A browser page's WebSocket open always carries an `Origin` header;
+///   SDK/script clients never send one. Origin present but not on the
+///   allowlist ⇒ refuse — a page in the operator's browser must not join
+///   the loopback bus.
+/// - A configured token must ride the request target as ?token=<value>
+///   (compared constant-time; missing or wrong ⇒ refuse). Absent token
+///   config leaves the loopback-trust default unchanged.
+pub fn admitHandshake(origin: ?[]const u8, target: []const u8, token: ?[]const u8, allowed_origins: []const []const u8) bool {
+    if (origin) |o| {
+        var ok = false;
+        for (allowed_origins) |a| {
+            if (std.mem.eql(u8, a, o)) ok = true;
+        }
+        if (!ok) return false;
+    }
+    const want = token orelse return true;
+    const got = tokenParam(target) orelse return false;
+    if (got.len != want.len) return false;
+    // Constant-time compare (channel keyEql idiom): the token is a secret.
+    var acc: u8 = 0;
+    for (want, got) |a, b| acc |= a ^ b;
+    return acc == 0;
+}
+
+/// `?token=<value>` (or `&token=`) from the handshake request target.
+pub fn tokenParam(target: []const u8) ?[]const u8 {
+    const q = std.mem.indexOfScalar(u8, target, '?') orelse return null;
+    var it = std.mem.splitScalar(u8, target[q + 1 ..], '&');
+    while (it.next()) |pair| {
+        if (!std.mem.startsWith(u8, pair, "token=")) continue;
+        return pair["token=".len..];
+    }
+    return null;
+}
 
 /// Wall-clock milliseconds. The gateway stamps commands so the kernel never
 /// reads a clock (actor spec boundary contract 3). Shared with the headless
@@ -140,9 +183,12 @@ pub const Gateway = struct {
     /// One live connection: the socket plus its bounded writer queue (M7
     /// net hardening) — a stalled consumer fills its own queue and gets
     /// QueueFull; it never parks the kernel thread in a socket write.
+    /// The retire gate closes before teardown: an in-flight kernel-thread
+    /// push finishes first, so the entry is never freed under it.
     const ConnEntry = struct {
         conn: *websocket.Conn,
         queue: writer_queue.WriterQueue,
+        gate: sync.RetireGate = .{},
 
         fn sinkWrite(ctx: *anyopaque, frame: []const u8) error{Disconnected}!void {
             const self: *ConnEntry = @ptrCast(@alignCast(ctx));
@@ -164,20 +210,24 @@ pub const Gateway = struct {
             .writeFn = &ConnEntry.sinkWrite,
         });
         try entry.queue.start();
+        errdefer entry.queue.stop(); // OOM after start: never strand the writer
         self.conns.mutex.lock();
         defer self.conns.mutex.unlock();
         try self.conns.map.put(id, entry);
     }
 
     /// Returns false if already removed — the exactly-once disconnect guard.
-    /// The removed entry's queue joins its writer before freeing, so no
-    /// in-flight write outlives the connection.
+    /// The gate retires first: an in-flight sendFn push drains before the
+    /// queue joins its writer and the entry is freed, so no push ever
+    /// touches a freed ConnEntry.
     fn removeConn(self: *Gateway, id: WorkerId) bool {
         self.conns.mutex.lock();
         const removed = self.conns.map.fetchRemove(id);
         self.conns.mutex.unlock();
         const kv = removed orelse return false;
+        kv.value.gate.retire();
         kv.value.queue.deinit();
+        kv.value.gate.deinit();
         self.gpa.destroy(kv.value);
         return true;
     }
@@ -192,7 +242,14 @@ pub const Gateway = struct {
             self.conns.mutex.unlock();
             return error.Disconnected;
         };
+        // Acquire under the table lock: removeConn's fetchRemove serializes
+        // against this, so a held gate means the entry outlives our push.
+        if (!entry.gate.acquire()) {
+            self.conns.mutex.unlock();
+            return error.Disconnected;
+        }
         self.conns.mutex.unlock();
+        defer entry.gate.release();
         entry.queue.push(frame) catch |err| switch (err) {
             error.QueueFull => return error.QueueFull,
             error.Closed, error.OutOfMemory => return error.Disconnected,
@@ -205,7 +262,13 @@ pub const Handler = struct {
     gw: *Gateway,
     worker_id: WorkerId,
 
-    pub fn init(_: *const websocket.Handshake, conn: *websocket.Conn, gw: *Gateway) !Handler {
+    pub fn init(hs: *const websocket.Handshake, conn: *websocket.Conn, gw: *Gateway) !Handler {
+        // Admission: browsers always send Origin (never allowlisted by
+        // default); a configured token must ride ?token=. Refusal fails the
+        // handshake — the connection is dropped before any bus identity is
+        // handed out.
+        if (!admitHandshake(hs.headers.get("origin"), hs.url, gw.config.token, gw.config.allowed_origins))
+            return error.NotAuthorized;
         const id = newWorkerId();
         try gw.addConn(id, conn);
         gw.actor.post(.{ .worker_connected = id });
@@ -271,4 +334,37 @@ test "nowMs is sane and monotonic-ish" {
     try testing.expect(t1 > 1_700_000_000_000); // after Nov 2023 — clock is real
     const t2 = nowMs();
     try testing.expect(t2 >= t1);
+}
+
+test "handshake admission: no Origin (SDK/script clients) admits; any unknown Origin refuses" {
+    // The default posture: nothing on the allowlist.
+    try testing.expect(admitHandshake(null, "/", null, &.{}));
+    // A browser page always sends Origin — refused unless allowlisted.
+    try testing.expect(!admitHandshake("https://evil.example", "/", null, &.{}));
+    try testing.expect(!admitHandshake("http://localhost:49134", "/", null, &.{}));
+    // Operator-allowlisted Origin admits.
+    try testing.expect(admitHandshake("https://console.local", "/", null, &.{"https://console.local"}));
+}
+
+test "handshake admission: configured token must ride ?token= (right value only)" {
+    const tok = "s3cr3t-bus-token";
+    // No token configured → token check skipped (loopback default).
+    try testing.expect(admitHandshake(null, "/", null, &.{}));
+    // Token configured: absent, wrong, or prefix-fooled values refuse.
+    try testing.expect(!admitHandshake(null, "/", tok, &.{}));
+    try testing.expect(!admitHandshake(null, "/?token=wrong", tok, &.{}));
+    try testing.expect(!admitHandshake(null, "/?mytoken=" ++ "s3cr3t-bus-token", tok, &.{}));
+    // Exact value admits, alone or among other params.
+    try testing.expect(admitHandshake(null, "/?token=s3cr3t-bus-token", tok, &.{}));
+    try testing.expect(admitHandshake(null, "/ws?a=1&token=s3cr3t-bus-token&b=2", tok, &.{}));
+    // Origin and token stack: both must pass.
+    try testing.expect(admitHandshake("https://console.local", "/?token=s3cr3t-bus-token", tok, &.{"https://console.local"}));
+    try testing.expect(!admitHandshake("https://console.local", "/", tok, &.{"https://console.local"}));
+}
+
+test "tokenParam: extracts only the token param, to & or end" {
+    try testing.expectEqualStrings("abc", tokenParam("/?token=abc").?);
+    try testing.expectEqualStrings("abc", tokenParam("/x?y=1&token=abc&z=2").?);
+    try testing.expect(tokenParam("/") == null);
+    try testing.expect(tokenParam("/?atok=abc") == null);
 }

@@ -260,8 +260,8 @@ pub const Actor = struct {
             .registertriggertype => |m| self.onRegisterTriggerType(from, m),
             .registertrigger => |m| self.onRegisterTrigger(from, m),
             .unregistertrigger => |m| {
-                if (!self.triggers.unregisterBinding(m.id, m.trigger_type))
-                    log.warn("unregistertrigger {s}: unknown or type mismatch", .{m.id});
+                if (!self.triggers.unregisterBinding(m.id, m.trigger_type, from))
+                    log.warn("unregistertrigger {s}: unknown, type mismatch, or not owner", .{m.id});
             },
             .triggerregistrationresult => |m| self.onTriggerRegistrationResult(m),
             .invokefunction => |m| self.onInvoke(from, m, now_ms),
@@ -423,8 +423,17 @@ pub const Actor = struct {
                         .{ .connection = from },
                         now_ms + self.invokeTimeoutFor(m.function_id),
                     ) catch |err| {
-                        log.warn("invoke {s}: {t}, frame dropped", .{ m.function_id, err });
-                        return;
+                        switch (err) {
+                            // A squatted/colliding uuid must answer its caller:
+                            // the pending under this id belongs to someone else,
+                            // so no timeout or result would ever arrive here.
+                            error.DuplicateId => {
+                                log.warn("invoke {s}: duplicate invocation_id, answered with error", .{m.function_id});
+                                self.sendErrorResult(from, m.invocation_id.?, m, "duplicate_invocation_id", "invocation_id is already pending");
+                            },
+                            error.OutOfMemory => log.warn("invoke {s}: out of memory, frame dropped", .{m.function_id}),
+                        }
+                        return; // never forward: the pending is not ours
                     };
                 }
                 self.sendMsg(callee, .{ .invokefunction = m });
@@ -755,6 +764,32 @@ test "invoke unknown function without invocation_id is dropped silently" {
     try testing.expectEqual(@as(usize, 0), h.fake.sent.items.len);
 }
 
+test "duplicate invocation_id invoke answers an error result, not silence" {
+    var h = try Harness.init(testing.allocator);
+    defer h.deinit();
+    const worker_a = widOf(1);
+
+    try h.frame(worker_a, "{\"type\":\"registerfunction\",\"id\":\"echo::f\",\"description\":\"echo\"}", 0);
+    // First invoke parks the pending...
+    try h.frame(widOf(2),
+        \\{"type":"invokefunction","invocation_id":"11111111-2222-3333-4444-555555555555",
+        \\ "function_id":"echo::f","data":{}}
+    , 1_000);
+    // ...a second invoke with the same uuid must not strand its caller in
+    // a wait that no timeout and no result will ever answer.
+    try h.frame(widOf(3),
+        \\{"type":"invokefunction","invocation_id":"11111111-2222-3333-4444-555555555555",
+        \\ "function_id":"echo::f","data":{}}
+    , 1_050);
+
+    try testing.expectEqual(@as(usize, 2), h.fake.sent.items.len);
+    try testing.expect(std.mem.eql(u8, &h.fake.sent.items[1].to, &widOf(3)));
+    var p = try h.fake.parseAt(1);
+    defer p.deinit();
+    try testing.expectEqualStrings("duplicate_invocation_id", p.value.invocationresult.err.?.code);
+    try testing.expectEqualStrings(caller_uuid_text, p.value.invocationresult.invocation_id);
+}
+
 test "fire-and-forget invoke forwards without parking a pending" {
     var h = try Harness.init(testing.allocator);
     defer h.deinit();
@@ -977,6 +1012,37 @@ test "registertrigger with unknown type answers unknown_trigger_type" {
     var p = try h.fake.parseAt(0);
     defer p.deinit();
     try testing.expectEqualStrings("unknown_trigger_type", p.value.triggerregistrationresult.err.?.code);
+}
+
+test "unregistertrigger from a non-owner is refused; the owner's succeeds" {
+    var h = try Harness.init(testing.allocator);
+    defer h.deinit();
+    const provider = widOf(1);
+    const registrant = widOf(2);
+    const rogue = widOf(3);
+
+    try h.frame(provider, "{\"type\":\"registertriggertype\",\"id\":\"cron\",\"description\":\"cron\"}", 0);
+    try h.frame(registrant,
+        \\{"type":"registertrigger","id":"t-1","trigger_type":"cron",
+        \\ "function_id":"jobs::nightly","config":{"schedule":"0 3 * * *"}}
+    , 0);
+    try testing.expectEqual(@as(usize, 1), h.fake.sent.items.len); // forwarded to provider
+
+    // A different worker tries to evict the registrant's binding: refused.
+    try h.frame(rogue, "{\"type\":\"unregistertrigger\",\"id\":\"t-1\"}", 0);
+
+    // The binding survived: re-registering the type replays it.
+    try h.frame(provider, "{\"type\":\"registertriggertype\",\"id\":\"cron\",\"description\":\"cron2\"}", 0);
+    try testing.expectEqual(@as(usize, 2), h.fake.sent.items.len);
+    var p = try h.fake.parseAt(1);
+    defer p.deinit();
+    try testing.expectEqualStrings("t-1", p.value.registertrigger.id);
+
+    // The owner's unregister removes it.
+    try h.frame(registrant, "{\"type\":\"unregistertrigger\",\"id\":\"t-1\"}", 0);
+    try h.frame(provider, "{\"type\":\"registertriggertype\",\"id\":\"cron\",\"description\":\"cron3\"}", 0);
+    // No replay frame: nothing left to replay.
+    try testing.expectEqual(@as(usize, 2), h.fake.sent.items.len);
 }
 
 test "ping answers pong" {

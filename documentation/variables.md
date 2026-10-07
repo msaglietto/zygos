@@ -28,6 +28,9 @@ Integer knobs go through `mission_boot.envInt`. A missing variable uses the defa
 | `ZYGOS_TUI_CAPTURE` | TUI debug tee | server | env path | n/a | Raw frames on disk. Treat as sensitive as the transcript. |
 | `COLORTERM` | TUI color | server | env | n/a | Display only. |
 | `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `ANTHROPIC_API_KEY`, `ZYGOS_SMOKE_MODEL` | `test/e2e/*/`, `test/smoke/` | smoke process | env | rotate at the provider | Not read by `zig build test`. |
+| `ZYGOS_TOKEN` | bare kernel handshake | server | optional env secret | rotate locally | Requires `?token=` on worker URLs. Treat connection URLs as secret-bearing. |
+| `ZYGOS_ALLOW_ORIGIN` | bare kernel browser admission | server | comma-separated exact Origin values; empty denies browsers | n/a | Does not authenticate local script clients. |
+| `ZYGOS_FETCH_ALLOW_PRIVATE` | mission web fetch | server | `1` or `true`; default screen enabled | n/a | Allows literal private hosts. Screening does not cover DNS or redirect targets. |
 | `HOME` | default catalog path | server | env | n/a | Absence with no `AI_PROVIDERS_CONFIG` refuses mission boot. |
 
 ## Files that hold secrets or transcripts
@@ -46,8 +49,18 @@ Integer knobs go through `mission_boot.envInt`. A missing variable uses the defa
 - `ZYGOS_BUDGET_MAX_TOKENS` or the brief `budget.max_tokens` is the ceiling you mean. Confirm the env var is an integer; a typo silently keeps the default.
 - Search, if used: `ZYGOS_SEARCH_ENGINE=brave` and the named key exported, or searxng with an endpoint.
 - Cron line uses `--run-stamp` and stdin from `/dev/null` (`cron.md`).
-- Bare `zygos` is not published off localhost. There is no auth to add without a protocol change (human gate).
+- Bare `zygos` is not published off localhost. Set `ZYGOS_TOKEN` to restrict local peers; it does not make the bus safe to expose publicly.
 - `ZYGOS_VAULT_ROOT` is set only when the vault should receive writes, and the checkpoint succeeds.
 - `events.jsonl` and any `ZYGOS_TUI_CAPTURE` path are not world-readable if transcripts are sensitive.
 
 No secret is compiled into the binary. `zig build test` does not read the real catalog or the network.
+
+Shell children receive only PATH, HOME, TZ, LANG, TERM, and LC_* variables.
+Provider and search keys are not inherited. HOME and PATH are preserved, so
+credentials on disk and executable lookup remain within the operator trust
+boundary. MCP children are operator-configured processes and inherit the
+parent environment. SSE decode storage is capped at 4 MiB per incomplete
+event, provider assemblers at 16 MiB of stream payload, MCP reply lines at
+1 MiB with a two-minute read deadline, and each live TUI preview at 256 KiB.
+Tool previews can omit later bytes; the provider and tool results are separate
+from presentation. Trace files still have no secret redaction.

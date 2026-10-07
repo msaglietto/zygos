@@ -77,6 +77,21 @@ pub fn build(b: *std.Build) void {
     const websocket = b.dependency("websocket", .{ .target = target, .optimize = optimize });
     mod.addImport("websocket", websocket.module("websocket"));
 
+    // The public example lives outside this module's root, so `@embedFile`
+    // from `src/` cannot see it. Copy it next to a generated root and let
+    // the catalog test import that. The real file is the input; the copy
+    // is the build step that makes the package path legal.
+    const example_files = b.addWriteFiles();
+    _ = example_files.addCopyFile(b.path("examples/providers.toml"), "providers.toml");
+    const example_providers = b.createModule(.{
+        .root_source_file = example_files.add("providers_example.zig",
+            \\pub const text: []const u8 = @embedFile("providers.toml");
+        ),
+        .target = target,
+        .optimize = optimize,
+    });
+    mod.addImport("example_providers", example_providers);
+
     // Here we define an executable. An executable needs to have a root module
     // which needs to expose a `main` function. While we could add a main function
     // to the module defined above, it's sometimes preferable to split business
@@ -325,6 +340,17 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
+
+    // Probe wait-status decoding. Kept off the zygos module: the probe
+    // executable links the kernel, and these tests must not.
+    const probe_status_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/probe/filter/status.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(probe_status_tests).step);
 
     // Just like flags, top level steps are also listed in the `--help` menu.
     //
