@@ -6,6 +6,12 @@ Reconstructed from git history on 2026-09-30. A commit that only added a library
 
 The agent that next changes operator-visible behavior adds the new heading in that same commit.
 
+## [4.2.0] - 2026-10-08
+
+### Added
+
+- Turn wall clock: a `wall_clock_ms` request field stops a turn as `timeout` before the next step and passes the remaining budget to every bash call as `timeout_ms`, which the bash tool may only shorten its deadline with. `zygos task run --timeout-ms` (default 540000) sets it; the Harbor adapter passes the exec ceiling minus 30 s. A late `sleep` inside a task no longer loses the trial to Harbor's agent timeout.
+
 ## [4.1.0] - 2026-10-08
 
 ### Added

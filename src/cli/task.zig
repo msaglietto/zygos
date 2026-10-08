@@ -30,8 +30,12 @@ pub const ArgError = error{ Usage, Help, LiveRefused };
 pub const approved_pilot_model = "glm-5.3-flash";
 pub const approved_rerun_model = "deepseek/deepseek-v4.1-flash";
 pub const approved_pilot_dataset = "terminal-bench/terminal-bench-2-1";
-/// Under the Harbor agent timeout so a trial can still be written.
-const pilot_timeout_ms: i64 = 540_000;
+/// Default turn wall clock, under Harbor's default agent ceiling so a trial
+/// is still written. The adapter passes the actual value as --timeout-ms.
+pub const default_timeout_ms: u64 = 540_000;
+pub const timeout_ms_max: u64 = 3_600_000;
+/// Kernel backstop for `zygos::turns::run`, past the wall clock.
+const invoke_slack_ms: i64 = 120_000;
 
 pub const RunArgs = struct {
     workspace: []const u8,
@@ -44,6 +48,7 @@ pub const RunArgs = struct {
     dataset: ?[]const u8 = null,
     instruction_file: ?[]const u8 = null,
     config: ?[]const u8 = null,
+    timeout_ms: u64 = default_timeout_ms,
 };
 
 pub const ConfigError = error{
@@ -108,6 +113,7 @@ pub fn parseRun(argv: []const []const u8) ArgError!RunArgs {
     var dataset: ?[]const u8 = null;
     var instruction_file: ?[]const u8 = null;
     var config: ?[]const u8 = null;
+    var timeout_ms: ?u64 = null;
     var i: usize = 0;
     while (i < argv.len) : (i += 1) {
         const a = argv[i];
@@ -155,6 +161,12 @@ pub fn parseRun(argv: []const []const u8) ArgError!RunArgs {
             i += 1;
             if (i >= argv.len or argv[i].len == 0) return error.Usage;
             config = argv[i];
+        } else if (std.mem.eql(u8, a, "--timeout-ms")) {
+            i += 1;
+            if (i >= argv.len) return error.Usage;
+            const t = parseUsize(argv[i]) orelse return error.Usage;
+            if (t < 1000 or t > timeout_ms_max) return error.Usage;
+            timeout_ms = t;
         } else return error.Usage;
     }
     if (help) return error.Help;
@@ -163,7 +175,7 @@ pub fn parseRun(argv: []const []const u8) ArgError!RunArgs {
     if (ws.len == 0 or out.len == 0) return error.Usage;
     if (offline) {
         // The offline fixture is byte-stable; a config would change its provider.
-        if (model != null or step_cap != null or task_id != null or dataset != null or instruction_file != null or config != null) return error.Usage;
+        if (model != null or step_cap != null or task_id != null or dataset != null or instruction_file != null or config != null or timeout_ms != null) return error.Usage;
         return .{
             .workspace = ws,
             .out_path = out,
@@ -191,6 +203,7 @@ pub fn parseRun(argv: []const []const u8) ArgError!RunArgs {
         .dataset = ds,
         .instruction_file = instr,
         .config = config,
+        .timeout_ms = timeout_ms orelse default_timeout_ms,
     };
 }
 
@@ -563,7 +576,8 @@ fn runLive(gpa: std.mem.Allocator, parsed: RunArgs) u8 {
         .trace_path = events,
         .trim = parsed.trim,
         .upstream = upstream,
-        .invoke_timeout_ms = pilot_timeout_ms,
+        .invoke_timeout_ms = @as(i64, @intCast(parsed.timeout_ms)) + invoke_slack_ms,
+        .wall_clock_ms = parsed.timeout_ms,
         .routes = if (routes) |*r| r else null,
         .live = .{
             .ctx = @ptrCast(&live),
@@ -617,11 +631,12 @@ fn parseUsize(text: []const u8) ?usize {
 fn printUsage() void {
     eprint(
         \\usage: zygos task run --offline --workspace DIR --out trial.json [--events events.jsonl] [--trim on|off]
-        \\       zygos task run --model MODEL --workspace DIR --out trial.json --step-cap N --task-id ID --dataset terminal-bench/terminal-bench-2-1 --instruction-file PATH [--events events.jsonl] [--trim on|off] [--config zygos.zon]
+        \\       zygos task run --model MODEL --workspace DIR --out trial.json --step-cap N --task-id ID --dataset terminal-bench/terminal-bench-2-1 --instruction-file PATH [--events events.jsonl] [--trim on|off] [--config zygos.zon] [--timeout-ms MS]
         \\       zygos task score --trial trial.json --prices prices.txt
         \\
         \\--offline is the scripted provider. Live MODEL: glm-5.3-flash or deepseek/deepseek-v4.1-flash.
         \\--config routes the task step over the file's .default/.routes ladder (approved models, catalog slugs only); other settings refuse.
+        \\--timeout-ms is the turn wall clock (1000..3600000, default 540000): no step starts past it and bash calls are bounded by the remainder.
         \\N is 1..32. Exit 0 means the process finished.
         \\
     , .{});
@@ -741,6 +756,24 @@ test "validateConfig: approved models on catalog slugs with keys pass; everythin
     try expectConfig(
         \\.{ .default = .{ .{ .provider_function = "zygos::provider::fake::messages", .model = "deepseek/deepseek-v4.1-flash" } } }
     , &both, "deepseek/deepseek-v4.1-flash", error.UnknownProviderSlug);
+}
+
+test "task run --timeout-ms is a bounded live-only wall clock with a default" {
+    const live = [_][]const u8{
+        "--model",            "deepseek/deepseek-v4.1-flash",
+        "--workspace",        "w",
+        "--out",              "o",
+        "--step-cap",         "24",
+        "--task-id",          "t",
+        "--dataset",          "terminal-bench/terminal-bench-2-1",
+        "--instruction-file", "i",
+    };
+    try testing.expectEqual(default_timeout_ms, (try parseRun(&live)).timeout_ms);
+    try testing.expectEqual(@as(u64, 300_000), (try parseRun(&(live ++ [_][]const u8{ "--timeout-ms", "300000" }))).timeout_ms);
+    try testing.expectError(error.Usage, parseRun(&(live ++ [_][]const u8{ "--timeout-ms", "999" })));
+    try testing.expectError(error.Usage, parseRun(&(live ++ [_][]const u8{ "--timeout-ms", "3600001" })));
+    try testing.expectError(error.Usage, parseRun(&(live ++ [_][]const u8{ "--timeout-ms", "soon" })));
+    try testing.expectError(error.Usage, parseRun(&.{ "--offline", "--workspace", "w", "--out", "o", "--timeout-ms", "5000" }));
 }
 
 test "task run without --offline is refused" {

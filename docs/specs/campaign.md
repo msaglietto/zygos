@@ -129,7 +129,9 @@ sha or absent), `agent/events.jsonl` (usage sums equal the trial, no cache
 field on the usage line, steps, tool calls, empty inputs, handler failures,
 terminal stop and error), and the scorer files. Every deviation lands in the
 record's `problems` list. A failed turn whose error is not
-`unknown_provider_stop` is a transport failure.
+`unknown_provider_stop` is a transport failure; a trace with no `turn_end`
+is a lost turn (the harness overran an outer ceiling) and also a problem.
+`end_turn`, `max_steps`, `max_tokens`, and `timeout` are recorded stops.
 
 ## report
 

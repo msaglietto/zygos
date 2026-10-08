@@ -169,9 +169,10 @@ class TrimContract(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((Path(directory) / "zygos.zon").read_text(), zon)
             with_config = shlex.split(environment.calls[-1]["command"])
         without = shlex.split((await self.invoke("on", model))[0]["command"])
-        self.assertEqual(with_config[with_config.index("--config") + 1], "/logs/agent/zygos.zon")
+        position = with_config.index("--config")
+        self.assertEqual(with_config[position + 1], "/logs/agent/zygos.zon")
         self.assertNotIn("--config", without)
-        self.assertEqual(with_config[: with_config.index("--config")], without)
+        self.assertEqual(with_config[:position] + with_config[position + 2 :], without)
 
     async def test_missing_config_file_stops_before_exec(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -210,6 +211,21 @@ class TrimContract(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(on["env"], off["env"])
         self.assertNotIn("offline-fixture", on["command"])
         self.assertEqual(on["timeout_sec"], off["timeout_sec"])
+
+    async def test_turn_wall_clock_sits_under_the_exec_ceiling(self):
+        call = (await self.invoke("on"))[0]
+        command = shlex.split(call["command"])
+        self.assertEqual(call["timeout_sec"], 570)
+        self.assertEqual(command[command.index("--timeout-ms") + 1], "540000")
+        with tempfile.TemporaryDirectory() as directory:
+            environment = Environment()
+            with patch.dict(os.environ, {"Z_AI_API_KEY": "offline-fixture", "ZYGOS_TASK_ID": "fixture"}, clear=True):
+                agent = ZygosAgent(logs_dir=Path(directory), model_name="glm-5.3-flash", agent_timeout_sec=900)
+                await agent.run("fixture instruction", environment, None)
+            call = environment.calls[0]
+            command = shlex.split(call["command"])
+            self.assertEqual(call["timeout_sec"], 870)
+            self.assertEqual(command[command.index("--timeout-ms") + 1], "840000")
 
     async def test_default_is_on(self):
         command = shlex.split((await self.invoke(None))[0]["command"])

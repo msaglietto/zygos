@@ -331,6 +331,13 @@ class ReportContract(unittest.TestCase):
             pair = report["matched"][0]["candidate"]
             self.assertTrue(any("git_sha" in p for p in pair["problems"]), pair["problems"])
 
+            # A trace without turn_end means the harness lost the turn; that is a problem, not a stop.
+            events = jobs / "baseline-r1-beta" / "beta__stub" / "agent" / "events.jsonl"
+            events.write_text("".join(l + "\n" for l in events.read_text().splitlines() if '"turn_end"' not in l))
+            result, out = fx.report(jobs)
+            report = json.loads((out / "report.json").read_text())
+            self.assertIn("turn never ended (no turn_end event)", report["matched"][1]["baseline"]["problems"])
+
 
 class BuildContract(unittest.TestCase):
     def test_build_from_a_clean_worktree_records_the_identity(self):

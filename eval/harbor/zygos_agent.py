@@ -218,10 +218,13 @@ class ZygosAgent(BaseAgent):
                 target_path=str(config_path),
             )
             parts += ["--config", str(config_path)]
-        command = " ".join(shlex.quote(part) for part in parts)
         timeout = 570
         if self._agent_timeout_sec:
             timeout = max(1, int(self._agent_timeout_sec) - 30)
+        # The turn's wall clock sits under the exec ceiling so the trial is
+        # written before Harbor kills the command.
+        parts += ["--timeout-ms", str(max(1000, (timeout - 30) * 1000))]
+        command = " ".join(shlex.quote(part) for part in parts)
         # The key stays in the exec env. It is not part of the command.
         result = await environment.exec(
             command=command,

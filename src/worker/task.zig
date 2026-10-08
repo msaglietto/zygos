@@ -97,6 +97,10 @@ pub const Config = struct {
     live: ?LiveHooks = null,
     /// Deadline for `zygos::turns::run`, which spans every step.
     invoke_timeout_ms: i64 = 30_000,
+    /// Turn wall clock (ms): no step starts past it and each bash call is
+    /// bounded by the remainder, so the trial is written before an outer
+    /// ceiling (Harbor's agent timeout) kills the process. Null: unbounded.
+    wall_clock_ms: ?u64 = null,
     /// `--config zygos.zon`: the task step is routed through
     /// `zygos::models::resolve` over this ladder, each attempt behind its
     /// own task bridge. The trial records the file's SHA-256. Null keeps
@@ -394,8 +398,12 @@ fn buildRequest(arena: std.mem.Allocator, cfg: Config) TaskError![]u8 {
         ",\"router_function\":\"zygos::models::resolve\",\"step_id\":\"" ++ task_config.step_id ++ "\""
     else
         "";
+    const wall = if (cfg.wall_clock_ms) |ms|
+        try std.fmt.allocPrint(arena, ",\"wall_clock_ms\":{d}", .{ms})
+    else
+        "";
     return std.fmt.allocPrint(arena,
-        \\{{"model":{f},"system":"Headless Zygos task. Tool denials are results, not a crashed process.","messages":[{{"role":"user","content":{f}}}],"max_steps":{d},"provider_function":"zygos::provider::task::messages","policy_function":{f},"turn_id":"task","tools":{s}{s}{s}}}
+        \\{{"model":{f},"system":"Headless Zygos task. Tool denials are results, not a crashed process.","messages":[{{"role":"user","content":{f}}}],"max_steps":{d},"provider_function":"zygos::provider::task::messages","policy_function":{f},"turn_id":"task","tools":{s}{s}{s}{s}}}
     , .{
         json.fmt(cfg.model_id, .{}),
         json.fmt(cfg.instruction, .{}),
@@ -404,6 +412,7 @@ fn buildRequest(arena: std.mem.Allocator, cfg: Config) TaskError![]u8 {
         tools_json,
         trace,
         routing,
+        wall,
     }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
     };
@@ -1114,6 +1123,18 @@ test "a routed config fails over through the task bridges and pins the config sh
     defer testing.allocator.free(log_bytes);
     try testing.expect(std.mem.indexOf(u8, log_bytes, "\"provider\":\"zygos::provider::task::via::zygos::providers::broken\",\"model\":\"ghost\",\"attempt\":0") != null);
     try testing.expect(std.mem.indexOf(u8, log_bytes, "\"provider\":\"zygos::provider::task::via::zygos::providers::stub\",\"model\":\"glm-5.3-flash\",\"attempt\":1") != null);
+}
+
+test "the turn request carries the wall clock only when the task sets one" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var cfg = offlineConfig("/w", null, &.{});
+    const unbounded = try buildRequest(arena, cfg);
+    try testing.expect(std.mem.indexOf(u8, unbounded, "wall_clock_ms") == null);
+    cfg.wall_clock_ms = 540_000;
+    const bounded = try buildRequest(arena, cfg);
+    try testing.expect(std.mem.indexOf(u8, bounded, ",\"wall_clock_ms\":540000}") != null);
 }
 
 test "a live hook is forwarded and an empty script without one is refused" {

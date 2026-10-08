@@ -69,8 +69,13 @@ pub const ToolsWorker = struct {
         const self: *ToolsWorker = @ptrCast(@alignCast(ctx.?));
         const obj = try parseObject(arena, request_json);
         const command = strField(obj, "command") orelse return error.Failed;
+        // A caller-supplied bound only ever shortens the workspace deadline.
+        var ws = self.ws;
+        if (jsonx.uintField(obj, "timeout_ms")) |bound| {
+            if (bound > 0 and bound < ws.shell_timeout_ms) ws.shell_timeout_ms = @intCast(bound);
+        }
 
-        const result = ops.bash(self.gpa, self.ws, command) catch |err| return opError(arena, err);
+        const result = ops.bash(self.gpa, ws, command) catch |err| return opError(arena, err);
         defer self.gpa.free(result.output);
         return std.fmt.allocPrint(arena, "{{\"exit_code\":{d},\"output\":{f}}}", .{
             result.exit_code,
@@ -159,6 +164,29 @@ const Harness = struct {
         gpa.destroy(self);
     }
 };
+
+fn testClockMs() i64 {
+    var ts: std.c.timespec = undefined;
+    if (std.c.clock_gettime(.MONOTONIC, &ts) != 0) return 0;
+    return @as(i64, @intCast(ts.sec)) * 1000 + @divTrunc(@as(i64, @intCast(ts.nsec)), std.time.ns_per_ms);
+}
+
+test "bash tool: a timeout_ms input shortens the deadline and never lengthens it" {
+    var h = try Harness.init(testing.allocator);
+    defer h.deinit();
+    const started = testClockMs();
+    const res = try h.caller.call("zygos::tools::bash", "{\"command\":\"sleep 2\",\"timeout_ms\":30}");
+    defer res.deinit(testing.allocator);
+    try testing.expect(testClockMs() - started < 1500);
+    try testing.expect(res == .ok);
+    try testing.expect(std.mem.indexOf(u8, res.ok, "ExecFailed") != null);
+
+    // Longer than the workspace limit: the limit stands.
+    try testing.expectEqual(@as(u32, 120_000), h.tools.ws.shell_timeout_ms);
+    const quick = try h.caller.call("zygos::tools::bash", "{\"command\":\"echo bounded\",\"timeout_ms\":999999999}");
+    defer quick.deinit(testing.allocator);
+    try testing.expect(std.mem.indexOf(u8, quick.ok, "bounded") != null);
+}
 
 test "bash tool runs over the bus and reports exit code and output" {
     var h = try Harness.init(testing.allocator);

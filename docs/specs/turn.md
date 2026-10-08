@@ -110,8 +110,18 @@ New optional request fields — every one absent ⇒ exact M1 behavior:
  "step_id":"execute",                            // U3, routing key
  "budget_function":"zygos::budget::check",       // U5 (record goes to ::record)
  "budget_scope":"turn-1",                        // U5 counter scope
+ "wall_clock_ms":540000,                         // turn wall clock (headless task)
  "turn_id":"t-1"}                                 // U2 abort/steer handle
 ```
+
+- **Wall clock.** With `wall_clock_ms`, no step starts once that much time
+  has elapsed since the turn began: the turn stops cleanly with
+  `stop:"timeout"` (the `step_budget_exhausted` FSM event, like
+  `max_steps`) and `turn_end` is traced. Every dispatch to
+  `zygos::tools::bash` carries the remaining budget as `timeout_ms`, which
+  the bash tool uses to shorten (never lengthen) its own deadline, so one
+  long command cannot carry the turn past an outer ceiling. Absent ⇒
+  unbounded, exactly as before.
 
 - **Policy (fail-closed).** With `policy_function` set, each tool_use block is
   checked before dispatch: `deny` ⇒ is_error tool_result `policy_denied:

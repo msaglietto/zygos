@@ -462,7 +462,9 @@ def inspect_job(exp: Experiment, jobs_dir: Path, arm: Arm, repeat: int, task_id:
         )
         if tool_calls and record["empty_tool_inputs"] == len(tool_calls):
             record["problems"].append("every tool call had empty input")
-        if record["turn_stop"] == "failed" and record["turn_error"] != "unknown_provider_stop":
+        if record["turn_stop"] is None:
+            record["problems"].append("turn never ended (no turn_end event)")
+        elif record["turn_stop"] == "failed" and record["turn_error"] != "unknown_provider_stop":
             record["problems"].append(f"turn failed: {record['turn_error']}")
             record["transport_failure"] = True
     else:
