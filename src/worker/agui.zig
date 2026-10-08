@@ -439,10 +439,38 @@ fn isValueEnd(c: u8) bool {
     return std.ascii.isWhitespace(c) or std.mem.indexOfScalar(u8, "\"'\\,;&})]<>", c) != null;
 }
 
+/// The quote opening at `j`: `\"` inside a serialized payload, else `"`
+/// or `'`. Empty when there is none.
+fn quoteAt(s: []const u8, j: usize) []const u8 {
+    if (std.mem.startsWith(u8, s[j..], "\\\"")) return "\\\"";
+    if (j < s.len and (s[j] == '"' or s[j] == '\'')) return s[j .. j + 1];
+    return "";
+}
+
 fn skipQuote(s: []const u8, j: usize) usize {
-    if (std.mem.startsWith(u8, s[j..], "\\\"")) return j + 2;
-    if (j < s.len and (s[j] == '"' or s[j] == '\'')) return j + 1;
-    return j;
+    return j + quoteAt(s, j).len;
+}
+
+/// The first `quote` at or after `from` that is not itself escaped.
+fn closingQuote(s: []const u8, from: usize, quote: []const u8) ?usize {
+    var k = from;
+    while (std.mem.indexOfPos(u8, s, k, quote)) |at| : (k = at + 1) {
+        if (at == 0 or s[at - 1] != '\\') return at;
+    }
+    return null;
+}
+
+/// No word byte before `i`. The serialized tool payloads spell whitespace
+/// and control bytes as JSON escapes (`\n`, `\u001b`), whose last byte is
+/// a letter or digit, so an escape also counts as a boundary.
+fn atBoundary(s: []const u8, i: usize) bool {
+    if (i == 0 or !isWord(s[i - 1])) return true;
+    if (i >= 2 and s[i - 2] == '\\' and std.mem.indexOfScalar(u8, "bfnrt", s[i - 1]) != null) return true;
+    if (i >= 6 and s[i - 6] == '\\' and s[i - 5] == 'u') {
+        for (s[i - 4 .. i]) |c| if (!std.ascii.isHex(c)) return false;
+        return true;
+    }
+    return false;
 }
 
 fn skipSpaces(s: []const u8, j: usize) usize {
@@ -453,7 +481,8 @@ fn skipSpaces(s: []const u8, j: usize) usize {
 
 /// The value span of `NAME<sep>value` when an identifier starts at `i`,
 /// its name looks secret, and the value is long enough to be one. All-digit
-/// values (`max_tokens=4096`) are counts, not secrets.
+/// values (`max_tokens=4096`) are counts, not secrets. A quoted value runs
+/// to its closing quote, spaces included.
 fn namedValue(s: []const u8, i: usize) ?Span {
     if (!isIdent(s[i]) or (i > 0 and isIdent(s[i - 1]))) return null;
     var name_end = i;
@@ -465,12 +494,19 @@ fn namedValue(s: []const u8, i: usize) ?Span {
 
     var j = skipSpaces(s, skipQuote(s, name_end));
     if (j >= s.len or (s[j] != '=' and s[j] != ':')) return null;
-    j = skipQuote(s, skipSpaces(s, j + 1));
+    j = skipSpaces(s, j + 1);
+    const quote = quoteAt(s, j);
+    j += quote.len;
+    const closed = if (quote.len != 0) closingQuote(s, j, quote) else null;
     var end = j;
-    var all_digits = true;
-    while (end < s.len and !isValueEnd(s[end])) : (end += 1) {
-        if (!std.ascii.isDigit(s[end])) all_digits = false;
+    if (closed) |close| {
+        end = close;
+    } else {
+        while (end < s.len and !isValueEnd(s[end])) end += 1;
     }
+    const all_digits = for (s[j..end]) |c| {
+        if (!std.ascii.isDigit(c)) break false;
+    } else true;
     if (end - j < 8 or all_digits) return null;
     return .{ .start = j, .end = end };
 }
@@ -491,13 +527,13 @@ fn runLen(s: []const u8, from: usize, comptime pred: fn (u8) bool) usize {
     return k - from;
 }
 
-/// A token whose shape gives it away, at a word boundary. `Bearer ` stays
-/// so the reader still sees the header's scheme.
+/// A token whose shape gives it away, at a word boundary. The bearer
+/// scheme stays so the reader still sees it; HTTP matches it in any case.
 fn shapedSecret(s: []const u8, i: usize) ?Span {
-    if (i > 0 and isWord(s[i - 1])) return null;
+    if (!atBoundary(s, i)) return null;
     const rest = s[i..];
-    if (std.mem.startsWith(u8, rest, "Bearer ")) {
-        const from = i + "Bearer ".len;
+    if (std.ascii.startsWithIgnoreCase(rest, "bearer ")) {
+        const from = skipSpaces(s, i + "bearer".len);
         const n = runLen(s, from, isBearerChar);
         return if (n >= 8) .{ .start = from, .end = from + n } else null;
     }
@@ -706,6 +742,55 @@ test "redact: secret shapes are scrubbed without a name" {
         "push with ghp_abcdefghijklmnopqrstuvwxyz0123456789 now",
     );
     try expectRedacted("aws [REDACTED] done", "aws AKIAABCDEFGHIJKLMNOP done");
+}
+
+test "redact: a key after a JSON escape in a serialized tool payload is scrubbed" {
+    try expectRedacted(
+        \\{"exit_code":0,"output":"header\n[REDACTED]\n"}
+    ,
+        \\{"exit_code":0,"output":"header\nsk-abcdefghijklmnop\n"}
+    );
+    try expectRedacted(
+        \\{"output":"a\tBearer [REDACTED] \u001b[REDACTED]"}
+    ,
+        \\{"output":"a\tBearer abcdefgh12345678 \u001bghp_abcdefghijklmnopqrstuvwxyz0123456789"}
+    );
+}
+
+test "redact: a quoted value is scrubbed through its closing quote" {
+    try expectRedacted(
+        \\PASSWORD="[REDACTED]" next
+    ,
+        \\PASSWORD="correct horse battery staple" next
+    );
+    try expectRedacted(
+        \\{"command":"export DB_PASSWORD=\"[REDACTED]\" && run"}
+    ,
+        \\{"command":"export DB_PASSWORD=\"correct horse battery staple\" && run"}
+    );
+    try expectRedacted("SECRET='[REDACTED]';", "SECRET='hunter two words';");
+}
+
+test "redact: the bearer scheme matches any case and spacing" {
+    try expectRedacted(
+        "Authorization: bearer [REDACTED]",
+        "Authorization: bearer abcdefgh12345678",
+    );
+    try expectRedacted(
+        "Authorization: Bearer  [REDACTED]",
+        "Authorization: Bearer  abcdefgh12345678",
+    );
+}
+
+test "project: a key printed by bash does not reach the AG-UI output" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const out = try project(arena_state.allocator(),
+        \\{"ts":1,"event":"tool_call","turn_id":"t","step":1,"tool":"bash","input":"{\"command\":\"cat .env\"}"}
+        \\{"ts":2,"event":"tool_result","step":1,"tool":"bash","is_error":false,"bytes":40,"output":"{\"exit_code\":0,\"output\":\"header\\nsk-abcdefghijklmnop\\n\"}"}
+        \\
+    , "t");
+    try testing.expect(std.mem.indexOf(u8, out, "abcdefghijklmnop") == null);
 }
 
 test "redact: token counts and short values survive, a token value does not" {

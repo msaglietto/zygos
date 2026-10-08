@@ -257,7 +257,7 @@ body.dragging .panel { outline: 3px dashed #8b84e8; outline-offset: 6px; }
     node.style.setProperty('--k', c.k);
   }
   function roleColor(name) {
-    if (ROLE_COLORS[name]) return ROLE_COLORS[name];
+    if (own(ROLE_COLORS, name)) return ROLE_COLORS[name];
     var h = 0;
     for (var i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) >>> 0;
     return OTHER_COLORS[h % OTHER_COLORS.length];
@@ -280,6 +280,7 @@ body.dragging .panel { outline: 3px dashed #8b84e8; outline-offset: 6px; }
     return (n / 1048576).toFixed(1).replace(/\.0$/, '') + ' MB';
   }
   function str(v) { return typeof v === 'string' ? v : v == null ? '' : String(v); }
+  function own(table, key) { return Object.prototype.hasOwnProperty.call(table, key); }
   function firstLine(s) { var i = s.indexOf('\n'); return i < 0 ? s : s.slice(0, i) + ' …'; }
 
   function parseLines(text) {
@@ -306,8 +307,9 @@ body.dragging .panel { outline: 3px dashed #8b84e8; outline-offset: 6px; }
     var run = { threadId: '', t0: null, t1: null, terminal: null, tokIn: 0, tokOut: 0, sawSnapshot: false,
       routes: 0, tools: 0, toolErrors: 0, nonzeroExits: 0, plan: null, steps: [], lanes: [] };
     var root = { items: [], route: null };
-    var lanes = {}, tools = {}, msgs = {};
-    var lastStep = null, prevPlan = {};
+    // Keyed by ids from the file: no prototype, so `__proto__` is just an id.
+    var lanes = Object.create(null), tools = Object.create(null), msgs = Object.create(null);
+    var lastStep = null, prevPlan = Object.create(null);
 
     function place(box, node) {
       if (node.kind === 'tool' && box.route) box.route.items.push(node);
@@ -336,7 +338,10 @@ body.dragging .panel { outline: 3px dashed #8b84e8; outline-offset: 6px; }
           root.route = null;
           run.steps.push(node);
           lastStep = node;
-          if (node.name === 'planning') prevPlan = {};
+          if (node.name === 'planning') {
+            prevPlan = Object.create(null);
+            run.plan = null;
+          }
           break;
         case 'STEP_FINISHED':
           if (lastStep && lastStep.name === ev.stepName && ts != null) lastStep.end = ts;
@@ -346,7 +351,7 @@ body.dragging .panel { outline: 3px dashed #8b84e8; outline-offset: 6px; }
             if (lastStep) lastStep.info = ev.content || null;
           } else if (ev.activityType === 'zygos.plan' && ev.content) {
             run.plan = ev.content;
-            var next = {};
+            var next = Object.create(null);
             (ev.content.items || []).forEach(function (it) {
               var prev = prevPlan[it.index];
               if (it.status === 'active' && (!prev || prev.status !== 'active' || prev.attempts < it.attempts)) {
@@ -603,7 +608,7 @@ body.dragging .panel { outline: 3px dashed #8b84e8; outline-offset: 6px; }
   }
 
   function renderStep(node, run) {
-    var st = STEP_STYLE[node.name] || { accent: 'a-indigo', icon: 'flag' };
+    var st = own(STEP_STYLE, node.name) ? STEP_STYLE[node.name] : { accent: 'a-indigo', icon: 'flag' };
     var bits = [];
     var info = node.info;
     if (info) {

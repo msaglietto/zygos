@@ -6,6 +6,12 @@ Reconstructed from git history on 2026-09-30. A commit that only added a library
 
 The agent that next changes operator-visible behavior adds the new heading in that same commit.
 
+## [4.1.1] - 2026-10-08
+
+### Fixed
+
+- `zygos mission trace --format agui|html` redacts a vendor key that follows an escaped newline or control byte in a tool's JSON payload, a quoted secret value through its closing quote (spaces included), and a bearer token whose scheme is lowercase or followed by several spaces. Before, each of these reached the shareable output. The HTML viewer keys file-supplied ids without a prototype, so a message or tool call with an id such as `__proto__` or `constructor` renders, and a step with such a name no longer stops the page from rendering. Re-entering planning clears the shown plan.
+
 ## [4.1.0] - 2026-10-08
 
 ### Added
