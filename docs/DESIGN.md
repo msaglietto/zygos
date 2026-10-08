@@ -23,8 +23,9 @@ aliases: [zygos, zygos-design, zig-harness]
 > `roadmapper`/`plan-checker`, no PO journal, no `mission::steer/pause`,
 > and no durable mission-step FIFO queue (the loop is driven in-process,
 > persisted per transition). The Z-09 seam is built with in-repo filters
-> (ztk was neither depended on nor ported). Milestone status truth lives in
-> `README.md`/`GOAL.md`; per-module truth in `docs/specs/`.
+> (ztk was neither depended on nor ported). Milestone contracts live in
+> `GOAL.md`; how to run the binary is `README.md`; per-module truth is
+> `docs/specs/`.
 
 **Zygos** (ζυγός, "yoke") is a single-binary agent harness written in Zig. It reimplements the [iii](Tools/iii.md) engine kernel — worker / function / trigger on one message bus — and ships the harness as a stack of replaceable workers per Mike Piccolo's decomposition ([source](raw/sources/how-to-build-your-own-agent-harness-2026-06-02.md)). Its primary workload is a **continuous mission loop** built on the [GSD](https://github.com/opengsd) substrate: role agents — one owning product decisions, one planning, one executing, one verifying — iterating phase after phase until an objective is complete, with **every step routable to a different model/provider**. [Tessera Mnemis](Projects/Tessera Mnemis/PROJECT.md) is embedded as the harness's memory & continuity layer.
 
