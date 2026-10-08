@@ -8,7 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from eval.harbor.zygos_agent import ZygosAgent
+from eval.harbor.zygos_agent import ZygosAgent, mission_brief, terminal_reply
 
 
 class Environment:
@@ -226,6 +226,91 @@ class TrimContract(unittest.IsolatedAsyncioTestCase):
             command = shlex.split(call["command"])
             self.assertEqual(call["timeout_sec"], 870)
             self.assertEqual(command[command.index("--timeout-ms") + 1], "840000")
+
+    async def test_mission_mode_runs_the_mission_loop_with_the_uploaded_route_table(self):
+        class MissionEnvironment(Environment):
+            def __init__(self):
+                super().__init__()
+                self.uploads = {}
+
+            async def upload_file(self, **kwargs):
+                self.uploads[kwargs["target_path"]] = Path(kwargs["source_path"]).read_text()
+
+            async def exec(self, **kwargs):
+                self.calls.append(kwargs)
+                if "mission start" not in kwargs["command"]:
+                    return SimpleNamespace(return_code=0)
+                return SimpleNamespace(
+                    return_code=1,
+                    stdout='log line\n{"state":"gating","stop":"none","paused":true,"role_turns":4,"tasks_done":2}\n',
+                    stderr="mission: deepseek-fixture\n",
+                )
+
+        zon = '.{ .default = .{ .{ .provider_function = "zygos::providers::deepseek-flash", .model = "deepseek/deepseek-v4.1-flash" } } }\n'
+        with tempfile.TemporaryDirectory() as directory:
+            logs = Path(directory)
+            (logs / "arm.zon").write_text(zon)
+            binary = logs / "binary"
+            binary.write_bytes(b"offline-binary")
+            values = {
+                "DEEPSEEK_API_KEY": "deepseek-fixture", "Z_AI_API_KEY": "glm-fixture", "ZYGOS_TASK_ID": "fix-git",
+                "ZYGOS_MODE": "mission", "ZYGOS_CONFIG": str(logs / "arm.zon"), "ZYGOS_LINUX_BIN": str(binary),
+            }
+            with patch.dict(os.environ, values, clear=True):
+                environment = MissionEnvironment()
+                agent = ZygosAgent(logs_dir=logs, model_name="deepseek/deepseek-v4.1-flash")
+                await agent.setup(environment)
+                await agent.run("Fix the repo.\n\n## Details\n\nRun the tests.", environment, None)
+            import tomllib
+            catalog = tomllib.loads(environment.uploads["/logs/agent/providers.toml"])
+            self.assertEqual([p["model"] for p in catalog["providers"]], ["deepseek/deepseek-v4.1-flash", "glm-5.3-flash"])
+            self.assertTrue(all("key" not in p for p in catalog["providers"]))
+            self.assertEqual(environment.uploads["/logs/agent/zygos.zon"], zon)
+            brief = environment.uploads["/logs/agent/brief.md"]
+            self.assertTrue(brief.startswith("---\nmission: fix-git\nbudget:\n"))
+            self.assertIn("## Success criteria", brief)
+            self.assertIn("| Verified by |", brief)
+            self.assertIn("## Non-goals", brief)
+            self.assertTrue(brief.rstrip().endswith("Fix the repo.\n\n### Details\n\nRun the tests."))
+            call = environment.calls[-1]
+            self.assertEqual(call["command"], "cd /app && /logs/agent/zygos mission start /logs/agent/brief.md --planning /logs/agent/planning --no-tui")
+            self.assertEqual(call["env"]["ZYGOS_CONFIG"], "/logs/agent/zygos.zon")
+            self.assertEqual(call["env"]["ZYGOS_APPROVAL_TIMEOUT_MS"], "1000")
+            self.assertEqual(call["env"]["ZYGOS_ROLE_MAX_STEPS"], "24")
+            self.assertEqual(call["env"]["ZYGOS_MISSION_TIMEOUT_MS"], str((570 - 45) * 1000))
+            self.assertEqual(call["env"]["DEEPSEEK_API_KEY"], "deepseek-fixture")
+            self.assertEqual(call["env"]["Z_AI_API_KEY"], "glm-fixture")
+            self.assertEqual(call["timeout_sec"], 570)
+            import json
+            reply = json.loads((logs / "mission.json").read_text())
+            self.assertEqual(reply["state"], "gating")
+            self.assertTrue(reply["paused"])
+            run = json.loads((logs / "mission-run.json").read_text())
+            self.assertEqual(run["mode"], "mission")
+            self.assertEqual(run["exit_code"], 1)
+            self.assertEqual(run["config_sha256"], __import__("hashlib").sha256(zon.encode()).hexdigest())
+            for path in logs.iterdir():
+                if path.is_file():
+                    self.assertNotIn("deepseek-fixture", path.read_text(errors="ignore"), path)
+                    self.assertNotIn("glm-fixture", path.read_text(errors="ignore"), path)
+            self.assertEqual((logs / "exit-code.txt").read_text(), "1")
+
+    async def test_mission_mode_without_config_or_terminal_reply(self):
+        with tempfile.TemporaryDirectory() as directory:
+            environment = Environment()
+            values = {"DEEPSEEK_API_KEY": "k", "ZYGOS_TASK_ID": "fixture", "ZYGOS_MODE": "mission"}
+            with patch.dict(os.environ, values, clear=True):
+                agent = ZygosAgent(logs_dir=Path(directory), model_name="deepseek/deepseek-v4.1-flash")
+                with self.assertRaisesRegex(RuntimeError, "ZYGOS_CONFIG"):
+                    await agent.run("x", environment, None)
+            self.assertEqual(environment.calls, [])
+        self.assertIsNone(terminal_reply("mission: errored: timeout\n"))
+        self.assertEqual(terminal_reply('{"state":"done","stop":"completed"}\n')["stop"], "completed")
+
+    def test_mission_brief_demotes_level_two_headings_only(self):
+        brief = mission_brief("t", "# Title\n## Part\n### Sub\ntext")
+        self.assertIn("\n# Title\n### Part\n### Sub\ntext\n", brief)
+        self.assertEqual(brief.count("\n## "), 3)  # success criteria, non-goals, objective
 
     async def test_default_is_on(self):
         command = shlex.split((await self.invoke(None))[0]["command"])

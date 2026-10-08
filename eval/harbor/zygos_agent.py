@@ -8,6 +8,15 @@ model catalogs are keyless; credentials enter only the container exec env.
 and passed as `--config`, so a configuration arm differs from its control
 only in that file. The route table must name the keyless catalog's slug,
 `zygos::providers::deepseek-flash` for the DeepSeek catalog below.
+
+`ZYGOS_MODE=mission` runs the task through the mission loop instead:
+the instruction becomes a brief, `zygos mission start` runs in the task
+workspace with the uploaded `zygos.zon` as its route table (which model does
+each of the four steps), the completion gate parks after one second because
+no console answers it, and Harbor's verifier judges the workspace. The
+planning root lives under the agent log directory, outside the workspace.
+Both approved catalog rows are uploaded (`deepseek-flash`, `glm-flash`) so a
+route table may send steps to either; keys enter only through the exec env.
 """
 
 from __future__ import annotations
@@ -50,6 +59,27 @@ key_env = "Z_AI_API_KEY"
 """
 
 DEEPSEEK_MODEL = "deepseek/deepseek-v4.1-flash"
+# Mission mode boots every row; the route table picks who does each step.
+MISSION_CATALOG = """[[providers]]
+name = "Deepseek Flash"
+type = "openai_compatible"
+model = "deepseek/deepseek-v4.1-flash"
+endpoint = "https://openrouter.ai/api/v1"
+key_env = "DEEPSEEK_API_KEY"
+max_tokens = 8192
+temperature = 0.7
+
+[[providers]]
+name = "GLM Flash"
+type = "anthropic_compatible"
+model = "glm-5.3-flash"
+endpoint = "https://api.z.ai/api/anthropic"
+key_env = "Z_AI_API_KEY"
+max_tokens = 8192
+temperature = 0.7
+"""
+MISSION_KEY_ENVS = ("DEEPSEEK_API_KEY", "Z_AI_API_KEY")
+MISSION_BUDGET_TOKENS = 1_000_000
 DEEPSEEK_CATALOG = """[[providers]]
 name = "Deepseek Flash"
 type = "openai_compatible"
@@ -68,6 +98,68 @@ def approved_config(model_name: str | None) -> tuple[str, str, str]:
     if model == DEEPSEEK_MODEL:
         return model, DEEPSEEK_CATALOG, "DEEPSEEK_API_KEY"
     raise RuntimeError("refusing an unapproved live model")
+
+
+def run_mode() -> str:
+    mode = os.environ.get("ZYGOS_MODE", "task")
+    if mode not in ("task", "mission"):
+        raise RuntimeError("ZYGOS_MODE must be task or mission")
+    return mode
+
+
+def mission_brief(task_id: str, instruction: str, budget_tokens: int = MISSION_BUDGET_TOKENS) -> str:
+    """A brief that passes the W1 lint, with the instruction as its objective.
+
+    The objective section runs to the next level-2 heading, so it goes last
+    and any level-2 heading inside the instruction is demoted one level;
+    the model still sees the heading text.
+    """
+    body = "\n".join(
+        ("#" + line) if line.startswith("## ") else line for line in instruction.splitlines()
+    ).strip()
+    return (
+        "---\n"
+        f"mission: {task_id}\n"
+        "budget:\n"
+        f"  max_tokens: {budget_tokens}\n"
+        "gates:\n"
+        "  external_actions: human\n"
+        "---\n"
+        "\n"
+        f"# Mission: {task_id}\n"
+        "\n"
+        "## Success criteria\n"
+        "\n"
+        "| # | Criterion | Verified by |\n"
+        "|---|-----------|-------------|\n"
+        "| 1 | The objective below is satisfied in the workspace | Harbor verifier (hidden tests) |\n"
+        "\n"
+        "## Non-goals\n"
+        "\n"
+        "- Changes outside the workspace\n"
+        "- Asking a human; no console answers this run\n"
+        "\n"
+        "## Objective\n"
+        "\n"
+        f"{body}\n"
+    )
+
+
+def terminal_reply(stdout: str) -> dict | None:
+    """The mission CLI's last stdout line is the terminal reply JSON."""
+    import json
+
+    for line in reversed(stdout.splitlines()):
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            value = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(value, dict) and "state" in value:
+            return value
+    return None
 
 
 class ZygosAgent(BaseAgent):
@@ -97,6 +189,8 @@ class ZygosAgent(BaseAgent):
 
     async def setup(self, environment: BaseEnvironment) -> None:
         _, catalog_text, _ = approved_config(self.model_name)
+        if run_mode() == "mission":
+            catalog_text = MISSION_CATALOG
         binary = os.environ.get("ZYGOS_LINUX_BIN", "")
         path = Path(binary)
         if not path.is_file():
@@ -171,8 +265,17 @@ class ZygosAgent(BaseAgent):
         config = os.environ.get("ZYGOS_CONFIG")
         if config is not None and not Path(config).is_file():
             raise RuntimeError("ZYGOS_CONFIG is not a file")
+        mode = run_mode()
+        if mode == "mission" and config is None:
+            raise RuntimeError("ZYGOS_MODE=mission requires ZYGOS_CONFIG")
 
         env_paths = EnvironmentPaths.for_os(environment.os)
+        timeout = 570
+        if self._agent_timeout_sec:
+            timeout = max(1, int(self._agent_timeout_sec) - 30)
+        if mode == "mission":
+            await self.run_mission(environment, env_paths, instruction, key_env, key, task_id, step_cap, workspace, Path(config), timeout)
+            return
         instruction_path = env_paths.agent_dir / "instruction.txt"
         host_instruction = Path(self.logs_dir) / "instruction.txt"
         host_instruction.write_text(instruction, encoding="utf-8")
@@ -218,9 +321,6 @@ class ZygosAgent(BaseAgent):
                 target_path=str(config_path),
             )
             parts += ["--config", str(config_path)]
-        timeout = 570
-        if self._agent_timeout_sec:
-            timeout = max(1, int(self._agent_timeout_sec) - 30)
         # The turn's wall clock sits under the exec ceiling so the trial is
         # written before Harbor kills the command.
         parts += ["--timeout-ms", str(max(1000, (timeout - 30) * 1000))]
@@ -252,3 +352,81 @@ class ZygosAgent(BaseAgent):
             (Path(self.logs_dir) / "exit-code.txt").write_text(
                 str(result.return_code), encoding="utf-8"
             )
+
+    async def run_mission(
+        self,
+        environment: BaseEnvironment,
+        env_paths: EnvironmentPaths,
+        instruction: str,
+        key_env: str,
+        key: str,
+        task_id: str,
+        step_cap: int,
+        workspace: str,
+        config: Path,
+        timeout: int,
+    ) -> None:
+        import hashlib
+        import json
+
+        logs = Path(self.logs_dir)
+        agent_dir = env_paths.agent_dir
+        brief_text = mission_brief(task_id, instruction)
+        (logs / "brief.md").write_text(brief_text, encoding="utf-8")
+        await environment.upload_file(source_path=logs / "brief.md", target_path=str(agent_dir / "brief.md"))
+        (logs / "zygos.zon").write_bytes(config.read_bytes())
+        await environment.upload_file(source_path=logs / "zygos.zon", target_path=str(agent_dir / "zygos.zon"))
+        planning = agent_dir / "planning"
+        binary = str(agent_dir / "zygos")
+        command = " && ".join([
+            f"cd {shlex.quote(workspace)}",
+            " ".join(shlex.quote(p) for p in (
+                binary, "mission", "start", str(agent_dir / "brief.md"), "--planning", str(planning), "--no-tui",
+            )),
+        ])
+        # Every approved key that the host holds rides along: the route
+        # table may send a step to either catalog row.
+        keys = {name: os.environ[name] for name in MISSION_KEY_ENVS if os.environ.get(name)}
+        keys[key_env] = key
+        env = dict(keys)
+        env.update({
+            "AI_PROVIDERS_CONFIG": str(agent_dir / "providers.toml"),
+            "ZYGOS_CONFIG": str(agent_dir / "zygos.zon"),
+            "ZYGOS_NO_TUI": "1",
+            # No console answers the completion gate: park quickly, the
+            # verifier judges the workspace.
+            "ZYGOS_APPROVAL_TIMEOUT_MS": "1000",
+            "ZYGOS_ROLE_MAX_STEPS": str(step_cap),
+            # The mission deadline sits under the exec ceiling so the process
+            # returns and its trace survives.
+            "ZYGOS_MISSION_TIMEOUT_MS": str(max(1000, (timeout - 45) * 1000)),
+        })
+        result = await environment.exec(command=command, env=env, timeout_sec=timeout)
+        secrets = [v for v in keys.values() if v]
+        for stream in ("stdout", "stderr"):
+            text = getattr(result, stream, "") or ""
+            for secret in secrets:
+                text = text.replace(secret, "[REDACTED]")
+            (logs / f"{stream}.txt").write_text(text, encoding="utf-8")
+        reply = terminal_reply((logs / "stdout.txt").read_text(encoding="utf-8"))
+        if reply is None:
+            # The process ended without the terminal line (deadline, kill):
+            # the trace under planning/ still carries usage. Recorded, not lost.
+            reply = {"state": "lost", "stop": "no_terminal_reply", "exit_code": result.return_code}
+        (logs / "mission.json").write_text(json.dumps(reply, indent=2) + "\n", encoding="utf-8")
+        (logs / "mission-run.json").write_text(json.dumps({
+            "mode": "mission",
+            "task_id": task_id,
+            "config_sha256": hashlib.sha256(config.read_bytes()).hexdigest(),
+            "brief_sha256": hashlib.sha256(brief_text.encode("utf-8")).hexdigest(),
+            "role_max_steps": step_cap,
+            "exec_timeout_sec": timeout,
+            "exit_code": result.return_code,
+        }, indent=2) + "\n", encoding="utf-8")
+        if not environment.capabilities.mounted:
+            try:
+                await environment.download_dir(source_dir=str(planning), target_dir=logs / "planning")
+            except Exception as exc:
+                self.logger.error("failed to download planning/: %s", exc)
+        if result.return_code != 0:
+            (logs / "exit-code.txt").write_text(str(result.return_code), encoding="utf-8")

@@ -42,6 +42,9 @@ REPO = Path(__file__).resolve().parents[1]
 DATASET = "terminal-bench/terminal-bench-2-1"
 APPROVED_MODELS = ("glm-5.3-flash", "deepseek/deepseek-v4.1-flash")
 VARIABLES = ("trim", "config", "build")
+MODES = ("task", "mission")
+# Catalog slug -> the key the adapter's keyless mission catalog expects.
+MISSION_SLUG_KEYS = {"deepseek-flash": "DEEPSEEK_API_KEY", "glm-flash": "Z_AI_API_KEY"}
 LINUX_TARGET = "x86_64-linux-gnu"
 OPTIMIZE = "ReleaseSafe"
 DEFAULT_BUILDS_DIR = REPO / "zig-out" / "bench"
@@ -130,6 +133,11 @@ class Experiment:
         self.variable = str(raw.get("variable", ""))
         if self.variable not in VARIABLES:
             raise CampaignError(f"variable must be one of {', '.join(VARIABLES)}")
+        self.mode = str(raw.get("mode", "task"))
+        if self.mode not in MODES:
+            raise CampaignError(f"mode must be one of {', '.join(MODES)}")
+        if self.mode == "mission" and self.variable == "trim":
+            raise CampaignError("trim is a task-mode variable; a mission run always compresses output")
         dataset = raw.get("dataset") or {}
         if dataset.get("id") != DATASET:
             raise CampaignError(f"dataset id must be {DATASET}")
@@ -180,7 +188,21 @@ class Experiment:
         self.baseline, self.candidate = self.arms
         if self.baseline.name == self.candidate.name:
             raise CampaignError("arm names must differ")
+        if self.mode == "mission":
+            for arm in self.arms:
+                if arm.config_path is None:
+                    raise CampaignError(f"arm {arm.name}: a mission arm needs a config (its route table)")
         self.check_single_variable()
+
+    def config_slugs(self) -> set[str]:
+        """Catalog slugs named by any arm's route table (mission mode boots them)."""
+        import re
+
+        slugs: set[str] = set()
+        for arm in self.arms:
+            if arm.config_path is not None:
+                slugs |= set(re.findall(r"zygos::providers::([a-z0-9-]+)", arm.config_path.read_text(encoding="utf-8")))
+        return slugs
 
     def check_single_variable(self) -> None:
         """Matched arms differ in the named variable and nothing else."""
@@ -244,6 +266,7 @@ class Experiment:
         return {
             "name": self.name,
             "variable": self.variable,
+            "mode": self.mode,
             "dataset": DATASET,
             "dataset_source_sha": self.dataset_source_sha,
             "tasks": self.tasks,
@@ -415,6 +438,9 @@ def inspect_job(exp: Experiment, jobs_dir: Path, arm: Arm, repeat: int, task_id:
     if catalog.is_file() and "key =" in catalog.read_text(encoding="utf-8"):
         record["problems"].append("container catalog carries an inline key")
 
+    if exp.mode == "mission":
+        return inspect_mission(exp, jobs_dir, arm, record, agent_dir)
+
     trial_path = agent_dir / "trial.json"
     if not trial_path.is_file():
         record["problems"].append("trial.json missing")
@@ -478,6 +504,73 @@ def inspect_job(exp: Experiment, jobs_dir: Path, arm: Arm, repeat: int, task_id:
             record["scorer_exit"] = int(exit_score.read_text().strip())
         except ValueError:
             record["problems"].append("scorer exit unreadable")
+    return record
+
+
+def inspect_mission(exp: Experiment, jobs_dir: Path, arm: Arm, record: dict, agent_dir: Path) -> dict:
+    """Mission-mode evidence: the uploaded route table, the terminal reply,
+    and the planning trace. Usage comes from the trace's usage lines, which
+    carry no cache counts, so every input token is priced at the ordinary
+    rate and the record says so.
+    """
+    run_path = agent_dir / "mission-run.json"
+    if not run_path.is_file():
+        record["problems"].append("mission-run.json missing")
+        return record
+    run = json.loads(run_path.read_text(encoding="utf-8"))
+    record["exit_code"] = run.get("exit_code")
+    uploaded = agent_dir / "zygos.zon"
+    if uploaded.is_file():
+        actual = sha256_file(uploaded)
+        if actual != arm.config_sha256 or run.get("config_sha256") != arm.config_sha256:
+            record["problems"].append(f"uploaded route table sha256 {actual} differs from the arm")
+    else:
+        record["problems"].append("uploaded route table missing")
+    if run.get("role_max_steps") != exp.step_cap:
+        record["problems"].append(f"role_max_steps is {run.get('role_max_steps')!r}, expected {exp.step_cap}")
+
+    reply_path = agent_dir / "mission.json"
+    if reply_path.is_file():
+        reply = json.loads(reply_path.read_text(encoding="utf-8"))
+        record["mission_state"] = reply.get("state")
+        record["turn_stop"] = reply.get("stop") if reply.get("state") != "lost" else "no_terminal_reply"
+        record["role_turns"] = reply.get("role_turns")
+        record["tasks_done"] = reply.get("tasks_done")
+    else:
+        record["problems"].append("mission.json missing")
+
+    events_path = agent_dir / "planning" / "events.jsonl"
+    if not events_path.is_file():
+        record["problems"].append("planning/events.jsonl missing")
+        return record
+    events = read_events(events_path)
+    usage = [e for e in events if e.get("event") == "usage"]
+    trial = {
+        "input_tokens": sum(int(e.get("input_tokens", 0)) for e in usage),
+        "output_tokens": sum(int(e.get("output_tokens", 0)) for e in usage),
+        "cache_read_tokens": 0,
+        "trim": None,
+    }
+    record["trial"] = trial
+    record["cache_unreported"] = True
+    record["cost_usd"] = str(exp.cost_usd(trial))
+    tool_calls = [e for e in events if e.get("event") == "tool_call"]
+    results = [e for e in events if e.get("event") == "tool_result"]
+    record.update(
+        provider_steps=sum(e.get("event") == "step" for e in events),
+        tool_calls=len(tool_calls),
+        empty_tool_inputs=sum(e.get("input") == "{}" for e in tool_calls),
+        handler_failures=sum(e.get("output") == "handler_failed" for e in results),
+        successful_tools=sum(not e.get("is_error") for e in results),
+        role_starts=sum(e.get("event") == "role_start" for e in events),
+        role_failures=sum(e.get("event") == "role_end" and e.get("outcome") == "failed" for e in events),
+    )
+    if record.get("role_turns") is None:
+        record["role_turns"] = record["role_starts"]
+    if tool_calls and record["empty_tool_inputs"] == len(tool_calls):
+        record["problems"].append("every tool call had empty input")
+    if not usage:
+        record["problems"].append("no usage recorded; the mission never reached a provider")
     return record
 
 
@@ -575,6 +668,7 @@ class Runner:
                 ZYGOS_TRIM=arm.trim,
                 ZYGOS_STEP_CAP=str(self.exp.step_cap),
                 ZYGOS_WORKSPACE=self.exp.workspace,
+                ZYGOS_MODE=self.exp.mode,
             )
             if arm.config_path is not None:
                 env["ZYGOS_CONFIG"] = str(arm.config_path)
@@ -599,7 +693,7 @@ class Runner:
             (self.jobs_dir / f"{name}.harbor-exit.txt").write_text(f"{proc.returncode}\n")
         record = inspect_job(self.exp, self.jobs_dir, arm, repeat, task_id)
         trial_path = record.get("trial_path")
-        if trial_path and record.get("trial") is not None and record["scorer_exit"] is None:
+        if self.exp.mode == "task" and trial_path and record.get("trial") is not None and record["scorer_exit"] is None:
             code, text = self.scorer.score(arm.binary, Path(trial_path) / "agent" / "trial.json")
             (self.jobs_dir / f"{name}.score.txt").write_text(text + "\n", encoding="utf-8")
             (self.jobs_dir / f"{name}.score-exit.txt").write_text(f"{code}\n")
@@ -692,6 +786,18 @@ def preflight(exp: Experiment, args, env: dict) -> dict:
         checks["credential"] = f"{exp.key_env} from environment"
     else:
         raise CampaignError(f"{exp.key_env} is not set")
+    if exp.mode == "mission":
+        # Every slug a route table names must have its key, or a step would
+        # boot keyless and fail mid-mission after money was spent.
+        needed = []
+        for slug in sorted(exp.config_slugs()):
+            key_name = MISSION_SLUG_KEYS.get(slug)
+            if key_name is None:
+                raise CampaignError(f"route table names unknown catalog slug {slug}")
+            if not env.get(key_name):
+                raise CampaignError(f"route table names {slug} but {key_name} is not set")
+            needed.append(f"{slug}:{key_name}")
+        checks["mission_keys"] = needed
     bundle = env.get("ZYGOS_CA_BUNDLE")
     if exp.ca_bundle_sha256:
         if not bundle or not Path(bundle).is_file():
@@ -780,6 +886,10 @@ def arm_summary(exp: Experiment, arm: Arm, records: list[dict]) -> dict:
         "unscored": sum(1 for r in with_trial if r.get("scorer_exit") is None),
         "mean_accepted_reduction": mean(reductions),
         "trim_calls": sum(int((r["trial"].get("trim") or {}).get("calls", 0)) for r in with_trial),
+        "mean_role_turns": mean([r.get("role_turns") for r in with_trial]) if exp.mode == "mission" else None,
+        "mission_states": dict(Counter(r.get("mission_state") for r in records if r.get("mission_state"))) if exp.mode == "mission" else None,
+        "role_failures": sum(int(r.get("role_failures", 0)) for r in with_trial) if exp.mode == "mission" else None,
+        "cache_unreported": sum(1 for r in with_trial if r.get("cache_unreported")),
         "transport_failures": sum(1 for r in records if r.get("transport_failure")),
         "harbor_exceptions": sum(1 for r in records if r.get("exception_type")),
         "problems": sum(1 for r in records if r["problems"]),
@@ -856,6 +966,9 @@ def verdict(exp: Experiment, base: dict, cand: dict, noise: int = 0) -> tuple[st
     if exp.variable == "trim":
         caveats.append(f"trim metric: candidate scorer accepted {cand['scorer_accepted']}, refused {sum(cand['scorer_refused'].values())}; "
                        f"baseline accepted {base['scorer_accepted']}, refused {sum(base['scorer_refused'].values())}")
+    if exp.mode == "mission":
+        caveats.append("mission traces carry no cache counts: every input token is priced at the ordinary rate, "
+                       "so costs are an upper bound and comparable only between these arms")
     return outcome, caveats
 
 
@@ -864,7 +977,7 @@ def render_markdown(exp: Experiment, report: dict) -> str:
     lines = [
         f"# Benchmark report: {exp.name}",
         "",
-        f"Generated {report['generated_utc']}. Variable: **{exp.variable}**. "
+        f"Generated {report['generated_utc']}. Mode: **{exp.mode}**. Variable: **{exp.variable}**. "
         f"Verdict: **{report['verdict']}**.",
         "",
     ]
@@ -887,6 +1000,9 @@ def render_markdown(exp: Experiment, report: dict) -> str:
         ("Snapshot cost USD", lambda s: s["cost_usd"]),
         ("Cost per resolved task USD", lambda s: s["cost_per_resolved_usd"]),
         ("Mean provider steps", lambda s: s["mean_provider_steps"]),
+        ("Mean role turns", lambda s: s["mean_role_turns"]),
+        ("Mission states", lambda s: json.dumps(s["mission_states"], sort_keys=True) if s["mission_states"] is not None else None),
+        ("Role failures", lambda s: s["role_failures"]),
         ("Mean elapsed seconds", lambda s: s["mean_elapsed_seconds"]),
         ("Turn stops", lambda s: json.dumps(s["turn_stops"], sort_keys=True)),
         ("Trim compress calls", lambda s: s["trim_calls"]),

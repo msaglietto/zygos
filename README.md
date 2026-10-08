@@ -115,7 +115,7 @@ eval/campaign.py report --experiment eval/experiments/trim-ablation.json \
     --jobs-dir /tmp/zygos-trim-ablation --out reports/benchmarks/trim-ablation-<date>
 ```
 
-The report states a verdict or the reason it is inconclusive; durable reports live under `reports/benchmarks/`. The contract is `docs/specs/campaign.md`; execution authority is `docs/benchmark-policy.md`.
+The report states a verdict or the reason it is inconclusive; durable reports live under `reports/benchmarks/`. An experiment with `"mode": "mission"` runs each task through the mission loop with the arm's `zygos.zon` as the mission configuration (which model does each step), for example `eval/experiments/mission-routing.json`. The contract is `docs/specs/campaign.md`; execution authority is `docs/benchmark-policy.md`.
 
 Any iii SDK connects unmodified:
 

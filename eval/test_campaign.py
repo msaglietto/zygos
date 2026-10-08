@@ -3,6 +3,7 @@
 import hashlib
 import json
 import os
+from decimal import Decimal
 import stat
 import subprocess
 import sys
@@ -32,6 +33,41 @@ agent.mkdir(parents=True)
 shutil.copyfile(binary, agent / "zygos")
 (agent / "providers.toml").write_text('[[providers]]\nname = "Deepseek Flash"\nkey_env = "DEEPSEEK_API_KEY"\n')
 config = os.environ.get("ZYGOS_CONFIG")
+if os.environ.get("ZYGOS_MODE") == "mission":
+    assert config, "mission mode needs ZYGOS_CONFIG"
+    (agent / "zygos.zon").write_bytes(Path(config).read_bytes())
+    reply = control.get("mission", {}).get(name, {"state": "gating", "stop": "none", "paused": True, "role_turns": 4, "tasks_done": 1})
+    (agent / "mission.json").write_text(json.dumps(reply))
+    (agent / "mission-run.json").write_text(json.dumps({
+        "mode": "mission", "task_id": task, "config_sha256": hashlib.sha256(Path(config).read_bytes()).hexdigest(),
+        "role_max_steps": int(os.environ["ZYGOS_ROLE_MAX_STEPS"]) if os.environ.get("ZYGOS_ROLE_MAX_STEPS") else int(os.environ["ZYGOS_STEP_CAP"]),
+        "exec_timeout_sec": 570, "exit_code": 1,
+    }))
+    tokens = control.get("tokens", {}).get(name, [1000, 100, 0])
+    (agent / "planning").mkdir()
+    events = [
+        {"event": "mission", "from": "defining", "to": "planning"},
+        {"event": "role_start", "role": "product-owner", "role_turn": 1},
+        {"event": "step", "step": 1}, {"event": "usage", "step": 1, "input_tokens": tokens[0] - 1, "output_tokens": tokens[1]},
+        {"event": "turn_end", "stop": "end_turn", "steps": 1},
+        {"event": "role_end", "role": "product-owner", "outcome": "ok"},
+        {"event": "role_start", "role": "executor", "role_turn": 2, "tools": True},
+        {"event": "step", "step": 1}, {"event": "usage", "step": 1, "input_tokens": 1, "output_tokens": 0},
+        {"event": "tool_call", "step": 1, "tool": "bash", "input": "{\"command\":\"ls\"}"},
+        {"event": "tool_result", "step": 1, "tool": "bash", "is_error": False},
+        {"event": "turn_end", "stop": "end_turn", "steps": 1},
+        {"event": "role_end", "role": "executor", "outcome": "ok"},
+    ]
+    (agent / "planning" / "events.jsonl").write_text("".join(json.dumps(e) + "\n" for e in events))
+    reward = control.get("rewards", {}).get(name, 0.0)
+    (trial_dir / "result.json").write_text(json.dumps({
+        "task_checksum": control["checksums"][task], "exception_info": None,
+        "verifier_result": {"rewards": {"reward": reward}},
+        "started_at": "2026-10-08T10:00:00+00:00", "finished_at": "2026-10-08T10:04:00+00:00",
+    }))
+    (out / f"{name}.stub.json").write_text(json.dumps({"argv": args, "mode": "mission", "config": config,
+        "keys": sorted(k for k in ("DEEPSEEK_API_KEY", "Z_AI_API_KEY") if os.environ.get(k))}))
+    sys.exit(0)
 trial = {
     "task_id": task, "dataset": "terminal-bench/terminal-bench-2-1",
     "model_id": args[args.index("-m") + 1], "variable": "trim-" + os.environ["ZYGOS_TRIM"],
@@ -101,7 +137,7 @@ def executable(path: Path, text: str) -> Path:
 class Fixture:
     """An experiment on disk with two builds, four tasks, stubs, and no secrets."""
 
-    def __init__(self, root: Path, variable="trim", repeats=1):
+    def __init__(self, root: Path, variable="trim", repeats=1, mode="task"):
         self.root = root
         self.builds = root / "builds"
         self.tasks = ["alpha", "beta"]
@@ -116,11 +152,16 @@ class Fixture:
         self.bin_b = self.make_build(self.sha_b, b"binary-b")
         self.config = root / "candidate.zon"
         self.config.write_text('.{ .default = .{ .{ .provider_function = "zygos::providers::deepseek-flash", .model = "deepseek/deepseek-v4.1-flash" } } }\n')
+        self.baseline_config = root / "baseline.zon"
+        self.baseline_config.write_text('.{ .default = .{ .{ .provider_function = "zygos::providers::glm-flash", .model = "glm-5.3-flash" } } }\n')
+        self.mode = mode
         self.harbor = executable(root / "harbor", STUB_HARBOR)
         self.scorer = executable(root / "scorer", STUB_SCORER)
         self.control = root / "control.json"
         self.set_control()
         base = {"name": "baseline", "trim": "on", "build": {"git_sha": self.sha_a, "binary_sha256": self.bin_a}}
+        if mode == "mission":
+            base["config"] = "baseline.zon"
         cand = dict(base, name="candidate")
         if variable == "trim":
             cand["trim"] = "off"
@@ -135,6 +176,7 @@ class Fixture:
         self.experiment.write_text(json.dumps({
             "name": "fixture",
             "variable": variable,
+            "mode": self.mode,
             "dataset": {"id": "terminal-bench/terminal-bench-2-1", "source_sha": "",
                         "tasks": [{"id": t, "checksum": self.checksums[t]} for t in self.tasks]},
             "model": {"id": "deepseek/deepseek-v4.1-flash", "key_env": "DEEPSEEK_API_KEY", "key_from_env": "OPENROUTER_API_KEY"},
@@ -160,7 +202,7 @@ class Fixture:
     def run(self, extra=(), env_extra=None):
         jobs = self.root / "jobs"
         env = {"PATH": os.environ["PATH"], "OPENROUTER_API_KEY": "secret-fixture-key", "DEEPSEEK_API_KEY": "stale-direct-key",
-               "STUB_CONTROL": str(self.control)}
+               "Z_AI_API_KEY": "glm-fixture-key", "STUB_CONTROL": str(self.control)}
         env.update(env_extra or {})
         argv = [sys.executable, str(HERE / "campaign.py"), "run", "--experiment", str(self.experiment),
                 "--jobs-dir", str(jobs), "--tasks-dir", str(self.tasks_dir), "--builds-dir", str(self.builds),
@@ -301,6 +343,76 @@ class RunContract(unittest.TestCase):
             report = json.loads((out / "report.json").read_text())
             self.assertEqual(report["verdict"], "inconclusive")
             self.assertTrue(any("baseline: 1 task-run" in r for r in report["verdict_reasons"]), report["verdict_reasons"])
+
+
+class MissionContract(unittest.TestCase):
+    def test_mission_mode_compares_two_route_tables_from_the_planning_trace(self):
+        with tempfile.TemporaryDirectory() as d:
+            fx = Fixture(Path(d), variable="config", mode="mission")
+            fx.set_control(rewards={"candidate-r1-alpha": 1.0, "candidate-r1-beta": 1.0},
+                           tokens={"baseline-r1-alpha": [4000, 300, 0]})
+            result, jobs = fx.run(["--dry-run"])
+            self.assertEqual(result.returncode, 0, result.stderr)
+            plan = json.loads(result.stdout)
+            self.assertEqual(plan["checks"]["mission_keys"], ["deepseek-flash:DEEPSEEK_API_KEY", "glm-flash:Z_AI_API_KEY"])
+            result, jobs = fx.run()
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            stub = json.loads((jobs / "baseline-r1-alpha.stub.json").read_text())
+            self.assertEqual(stub["mode"], "mission")
+            self.assertEqual(Path(stub["config"]).resolve(), fx.baseline_config.resolve())
+            self.assertEqual(stub["keys"], ["DEEPSEEK_API_KEY", "Z_AI_API_KEY"])
+            self.assertFalse((jobs / "baseline-r1-alpha.score.txt").exists())
+            result, out = fx.report(jobs)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            report = json.loads((out / "report.json").read_text())
+            self.assertEqual(report["verdict"], "candidate_better")
+            base, cand = report["arms"]["baseline"], report["arms"]["candidate"]
+            self.assertEqual(base["problems"], 0)
+            self.assertEqual(base["mean_role_turns"], 4)
+            self.assertEqual(base["mission_states"], {"gating": 2})
+            self.assertEqual(base["input_tokens"], 4000 + 1000)
+            self.assertEqual(base["cost_usd"], str((Decimal(5000) * Decimal("0.003") + Decimal(400) * Decimal("2.40")) / Decimal(1_000_000)))
+            self.assertEqual(base["cache_unreported"], 2)
+            self.assertTrue(any("cache counts" in r for r in report["verdict_reasons"]))
+            self.assertEqual(report["matched"][0]["baseline"]["stop"], "none")
+            markdown = (out / "report.md").read_text()
+            self.assertIn("Mode: **mission**", markdown)
+            self.assertIn("| Mean role turns | 4.0 | 4.0 |", markdown)
+            self.assertTrue((out / "baseline.zon").is_file() and (out / "candidate.zon").is_file())
+
+    def test_mission_mode_refuses_trim_variable_missing_config_and_missing_keys(self):
+        with tempfile.TemporaryDirectory() as d:
+            fx = Fixture(Path(d), variable="config", mode="mission")
+            result, _ = fx.run(["--dry-run"], env_extra={"Z_AI_API_KEY": ""})
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("glm-flash but Z_AI_API_KEY is not set", result.stderr)
+            text = json.loads(fx.experiment.read_text())
+            text["variable"] = "trim"
+            text["arms"][1]["trim"] = "off"
+            text["arms"][1]["config"] = "baseline.zon"
+            fx.experiment.write_text(json.dumps(text))
+            with self.assertRaisesRegex(campaign.CampaignError, "task-mode variable"):
+                campaign.Experiment(fx.experiment)
+            text["variable"] = "config"
+            text["arms"][1]["trim"] = "on"
+            del text["arms"][1]["config"]
+            fx.experiment.write_text(json.dumps(text))
+            with self.assertRaisesRegex(campaign.CampaignError, "mission arm needs a config"):
+                campaign.Experiment(fx.experiment)
+
+    def test_a_lost_mission_reply_is_recorded_not_a_problem(self):
+        with tempfile.TemporaryDirectory() as d:
+            fx = Fixture(Path(d), variable="config", mode="mission")
+            fx.set_control()
+            fx.control.write_text(json.dumps(json.loads(fx.control.read_text()) | {
+                "mission": {"baseline-r1-alpha": {"state": "lost", "stop": "no_terminal_reply", "exit_code": 1}}}))
+            result, jobs = fx.run()
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            result, out = fx.report(jobs)
+            report = json.loads((out / "report.json").read_text())
+            self.assertEqual(report["matched"][0]["baseline"]["stop"], "no_terminal_reply")
+            self.assertEqual(report["arms"]["baseline"]["problems"], 0)
+            self.assertEqual(report["arms"]["baseline"]["turn_stops"].get("no_terminal_reply"), 1)
 
 
 class ReportContract(unittest.TestCase):

@@ -159,12 +159,52 @@ paths; instructions, model output, and credentials stay in the jobs
 directory. The report must run from fixture job directories with no Harbor,
 Docker, or network — that is what `eval/test_campaign.py` checks.
 
+## Mission mode
+
+`"mode": "mission"` runs every task through the mission loop instead of
+the single headless turn, so a `zygos.zon` is exercised as a mission
+configuration: which model (and failover ladder) does each of the four
+steps, product-owner, planner, executor, verifier. Each arm must carry a
+`config`; `variable` is `config` or `build` (`trim` is task-only). The
+adapter (`ZYGOS_MODE=mission`) turns the instruction into a brief that
+passes the W1 lint (objective last, level-2 headings inside the instruction
+demoted), uploads the route table and a keyless catalog with both approved
+rows (`deepseek-flash`, `glm-flash`), and runs
+`zygos mission start brief.md --planning <agent-dir>/planning --no-tui`
+in the task workspace. No console answers the completion gate, so
+`ZYGOS_APPROVAL_TIMEOUT_MS=1000` parks the mission after verification and
+Harbor's verifier judges the workspace. `ZYGOS_ROLE_MAX_STEPS` is the step
+cap and `ZYGOS_MISSION_TIMEOUT_MS` sits 45 s under the exec ceiling.
+
+Preflight additionally requires the key for every catalog slug any arm's
+route table names (`DEEPSEEK_API_KEY`, `Z_AI_API_KEY`); an unknown slug
+refuses. Evidence per job: `agent/mission-run.json` (config and brief
+hashes, step cap, exit code), `agent/mission.json` (the CLI's terminal
+reply, or `state: lost` with stop `no_terminal_reply` when the process
+ended without one), `agent/zygos.zon`, and `agent/planning/events.jsonl`.
+Usage is the sum of the trace's usage lines, which carry no cache counts:
+every input token is priced at the ordinary rate, the record says
+`cache_unreported`, and the report's caveats repeat it. The scorer does not
+apply. The report adds mean role turns, mission states, and role failures.
+A lost terminal reply is a recorded stop, not a problem; a missing trace or
+`mission-run.json` is.
+
+Known limit (issue #7): the list and order of steps is fixed in the
+mission FSM. A mission-mode campaign compares who does each step, not
+which steps exist. `.context_strategy` and `.mcp_servers` in an arm's
+`zygos.zon` are honored by the mission (the mission CLI reads them), so a
+mission campaign can compare those too.
+
+Experiments: `eval/experiments/mission-smoke.json` (one task, one repeat,
+to prove the path) and `eval/experiments/mission-routing.json` (the
+eight-task canary, three repeats; every step on DeepSeek Flash versus the
+executor step on GLM Flash) with route tables under
+`eval/experiments/configs/`.
+
 ## What this does not do
 
-It does not run missions. `zygos task run --config` honors only the route
-table (`.default`/`.routes`); a `zygos.zon` carrying `.context_strategy` or
-`.mcp_servers` refuses, so a mission-only setting cannot be "measured" by a
-task campaign that never executes it. Measuring those settings needs the
-mission FSM inside the task container, which is a separate workload.
-It also does not choose a dollar cap or expand the task set; both remain
-operator decisions recorded in `docs/benchmark-policy.md`.
+A task-mode campaign (`mode: task`) runs one headless turn and honors only
+the route table; a `zygos.zon` carrying `.context_strategy` or
+`.mcp_servers` refuses there. It does not choose a dollar cap or expand the
+task set; both remain operator decisions recorded in
+`docs/benchmark-policy.md`.
