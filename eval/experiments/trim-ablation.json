@@ -69,16 +69,16 @@
       "name": "trim-on",
       "trim": "on",
       "build": {
-        "git_sha": "9e5880342c12e6ed256f7796cc607f415dd38256",
-        "binary_sha256": "9dee02992acd6625f3a5e8f47b372bb250b1286934afa694235822cd422c87fb"
+        "git_sha": "b8a79db6300617395a9c3894d9e1fcedb44440a6",
+        "binary_sha256": "54bf161ed54dc520f0f858e3f17669c6b9444e8e71902f1b1179a5c1d2decc2e"
       }
     },
     {
       "name": "trim-off",
       "trim": "off",
       "build": {
-        "git_sha": "9e5880342c12e6ed256f7796cc607f415dd38256",
-        "binary_sha256": "9dee02992acd6625f3a5e8f47b372bb250b1286934afa694235822cd422c87fb"
+        "git_sha": "b8a79db6300617395a9c3894d9e1fcedb44440a6",
+        "binary_sha256": "54bf161ed54dc520f0f858e3f17669c6b9444e8e71902f1b1179a5c1d2decc2e"
       }
     }
   ]
