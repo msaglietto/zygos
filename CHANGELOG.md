@@ -6,6 +6,13 @@ Reconstructed from git history on 2026-09-30. A commit that only added a library
 
 The agent that next changes operator-visible behavior adds the new heading in that same commit.
 
+## [4.1.0] - 2026-10-08
+
+### Added
+
+- `zygos task run --config zygos.zon` routes the task step over the file's `.default`/`.routes` ladder through the model router, with per-attempt failover and per-attempt usage bridging, and records the file's SHA-256 as `config_sha256` on the trial. A config carrying `.context_strategy`, `.mcp_servers`, or any unknown setting refuses with `UnsupportedSetting`; unapproved models, unknown catalog slugs, missing keys, or a `--model` that is not the first attempt refuse before a provider boots. The Harbor adapter uploads `ZYGOS_CONFIG` and passes it as `--config`. Trial adapter version is now `0.2.0`.
+- `eval/campaign.py`: `build` a Linux arm from a clean worktree, `run` a matched two-arm experiment (`eval/experiments/*.json`; variable `build`, `config`, or `trim`) through Harbor with resume and fail-closed stop conditions, and `report` a durable comparison with a verdict or an explicit inconclusive reason. Contract: `docs/specs/campaign.md`.
+
 ## [4.0.4] - 2026-10-07
 
 ### Fixed

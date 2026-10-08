@@ -26,6 +26,8 @@ const trim_mod = @import("trim.zig");
 const turn_mod = @import("turn.zig");
 const fake_mod = @import("provider_fake.zig");
 const trial_mod = @import("trial.zig");
+const router_mod = @import("router.zig");
+const task_config = @import("task_config.zig");
 
 /// Same bounds the mission CLI passes to TrimWorker.
 pub const trim_limits: trim_mod.Limits = .{
@@ -95,6 +97,11 @@ pub const Config = struct {
     live: ?LiveHooks = null,
     /// Deadline for `zygos::turns::run`, which spans every step.
     invoke_timeout_ms: i64 = 30_000,
+    /// `--config zygos.zon`: the task step is routed through
+    /// `zygos::models::resolve` over this ladder, each attempt behind its
+    /// own task bridge. The trial records the file's SHA-256. Null keeps
+    /// the static `upstream` path. Must outlive the run.
+    routes: ?*const task_config.TaskZon = null,
 };
 
 pub const RunResult = struct {
@@ -167,6 +174,7 @@ pub fn run(gpa: std.mem.Allocator, cfg: Config) TaskError!RunResult {
     } else if (cfg.script.len == 0) return error.Refused;
     if (!trial_mod.identityComplete(cfg.identity)) return error.Refused;
     if (cfg.variable.len == 0) return error.Refused;
+    if (cfg.routes) |r| if (r.ladder().len == 0) return error.Refused;
 
     if (cfg.seed_fixture) {
         ops.writeFile(gpa, ops.Workspace.init(cfg.workspace), fixture_rel, fixture_body) catch |err| switch (err) {
@@ -210,6 +218,7 @@ pub fn run(gpa: std.mem.Allocator, cfg: Config) TaskError!RunResult {
         .target_triple = cfg.identity.target_triple,
         .optimize = cfg.identity.optimize,
         .adapter_version = cfg.identity.adapter_version,
+        .config_sha256 = if (cfg.routes) |r| &r.sha256_hex else null,
         .source_lines_read = lines,
         .input_tokens = usage.input_tokens,
         .output_tokens = usage.output_tokens,
@@ -283,6 +292,7 @@ const Session = struct {
     live_ctx: ?*anyopaque = null,
     live_stop: ?*const fn (ctx: *anyopaque) void = null,
     bridge: ?*Bridge = null,
+    router: ?*router_mod.RouterWorker = null,
     turns: ?*turn_mod.TurnOrchestrator = null,
     caller: ?*inproc.Worker = null,
 
@@ -335,7 +345,15 @@ const Session = struct {
                 return mapBoot(err);
             };
         }
-        self.bridge = Bridge.start(gpa, &self.actor, &self.registry, cfg.upstream) catch |err| return mapBoot(err);
+        const routed: []const router_mod.Attempt = if (cfg.routes) |r| r.ladder() else &.{};
+        self.bridge = Bridge.start(gpa, &self.actor, &self.registry, cfg.upstream, routed) catch |err| return mapBoot(err);
+        if (cfg.routes) |r| {
+            var table = try r.routerConfig(gpa);
+            self.router = router_mod.RouterWorker.start(gpa, &self.actor, &self.registry, table) catch |err| {
+                table.deinit();
+                return mapBoot(err);
+            };
+        }
         self.turns = turn_mod.TurnOrchestrator.start(gpa, &self.actor, &self.registry) catch |err| {
             return mapBoot(err);
         };
@@ -349,6 +367,7 @@ const Session = struct {
         const gpa = self.gpa;
         if (self.caller) |w| w.stop();
         if (self.turns) |w| w.stop();
+        if (self.router) |w| w.stop();
         if (self.bridge) |w| w.stop();
         if (self.live_stop) |stop| stop(self.live_ctx.?);
         if (self.fake) |w| w.stop();
@@ -369,8 +388,14 @@ fn buildRequest(arena: std.mem.Allocator, cfg: Config) TaskError![]u8 {
         try std.fmt.allocPrint(arena, ",\"trace_path\":{f}", .{json.fmt(p, .{})})
     else
         "";
+    // With a config the router picks each step's bridge; the static
+    // provider_function below is then the driver's unused fallback.
+    const routing = if (cfg.routes != null)
+        ",\"router_function\":\"zygos::models::resolve\",\"step_id\":\"" ++ task_config.step_id ++ "\""
+    else
+        "";
     return std.fmt.allocPrint(arena,
-        \\{{"model":{f},"system":"Headless Zygos task. Tool denials are results, not a crashed process.","messages":[{{"role":"user","content":{f}}}],"max_steps":{d},"provider_function":"zygos::provider::task::messages","policy_function":{f},"turn_id":"task","tools":{s}{s}}}
+        \\{{"model":{f},"system":"Headless Zygos task. Tool denials are results, not a crashed process.","messages":[{{"role":"user","content":{f}}}],"max_steps":{d},"provider_function":"zygos::provider::task::messages","policy_function":{f},"turn_id":"task","tools":{s}{s}{s}}}
     , .{
         json.fmt(cfg.model_id, .{}),
         json.fmt(cfg.instruction, .{}),
@@ -378,6 +403,7 @@ fn buildRequest(arena: std.mem.Allocator, cfg: Config) TaskError![]u8 {
         json.fmt(cfg.policy_function, .{}),
         tools_json,
         trace,
+        routing,
     }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
     };
@@ -407,40 +433,82 @@ const UsageTotals = struct {
     cache_creation: ?u64 = null,
 };
 
-/// Sits in front of the scripted provider and copies cache counts off the
-/// provider payload before the turn driver writes the usage trace line.
-/// The trace line is not modified.
+/// Sits in front of the provider and copies cache counts off the provider
+/// payload before the turn driver writes the usage trace line. The trace
+/// line is not modified. One bridge function per upstream: the static
+/// `zygos::provider::task::messages`, plus `task_config.via_prefix ++
+/// upstream` for every routed attempt, all into one usage total. An
+/// upstream bus error is a bridge bus error, which is what makes the turn
+/// driver fail over to the next attempt.
 const Bridge = struct {
     gpa: std.mem.Allocator,
     worker: *inproc.Worker,
-    upstream: []const u8,
     mutex: sync.Mutex = .{},
     totals_value: UsageTotals = .{},
+    entries: []Entry,
+
+    const Entry = struct {
+        bridge: *Bridge,
+        upstream: []const u8,
+        /// Owned registration name.
+        name: []const u8,
+    };
 
     fn start(
         gpa: std.mem.Allocator,
         actor: *actor_mod.Actor,
         registry: *inproc.Registry,
         upstream: []const u8,
+        routed: []const router_mod.Attempt,
     ) TaskError!*Bridge {
         const self = try gpa.create(Bridge);
         errdefer gpa.destroy(self);
         self.* = .{
             .gpa = gpa,
             .worker = undefined,
-            .upstream = upstream,
+            .entries = &.{},
         };
         errdefer self.mutex.deinit();
         self.worker = inproc.Worker.spawn(gpa, actor, registry, "task-provider") catch |err| return mapBoot(err);
         errdefer self.worker.stop();
-        self.worker.registerFunction("zygos::provider::task::messages", self, &handler) catch |err| return mapBoot(err);
+
+        const entries = try gpa.alloc(Entry, 1 + routed.len);
+        var filled: usize = 0;
+        errdefer {
+            for (entries[0..filled]) |e| gpa.free(e.name);
+            gpa.free(entries);
+        }
+        entries[0] = .{
+            .bridge = self,
+            .upstream = upstream,
+            .name = try gpa.dupe(u8, "zygos::provider::task::messages"),
+        };
+        filled = 1;
+        for (routed) |a| {
+            const name = try task_config.viaName(gpa, a.provider_function);
+            entries[filled] = .{ .bridge = self, .upstream = a.provider_function, .name = name };
+            filled += 1;
+        }
+        // Entries must not move after registration: handlers hold their address.
+        self.entries = entries;
+        for (entries, 0..) |*e, i| {
+            if (seenBefore(entries[0..i], e.name)) continue;
+            self.worker.registerFunction(e.name, e, &handler) catch |err| return mapBoot(err);
+        }
         return self;
+    }
+
+    fn seenBefore(earlier: []const Entry, name: []const u8) bool {
+        for (earlier) |e| if (std.mem.eql(u8, e.name, name)) return true;
+        return false;
     }
 
     fn stop(self: *Bridge) void {
         self.worker.stop();
         self.mutex.deinit();
         const gpa = self.gpa;
+        for (self.entries) |e| gpa.free(e.name);
+        gpa.free(self.entries);
         gpa.destroy(self);
     }
 
@@ -451,8 +519,9 @@ const Bridge = struct {
     }
 
     fn handler(ctx: ?*anyopaque, arena: std.mem.Allocator, request_json: []const u8) error{ Failed, OutOfMemory }![]const u8 {
-        const self: *Bridge = @ptrCast(@alignCast(ctx.?));
-        const res = self.worker.call(self.upstream, request_json) catch |err| switch (err) {
+        const entry: *Entry = @ptrCast(@alignCast(ctx.?));
+        const self = entry.bridge;
+        const res = self.worker.call(entry.upstream, request_json) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.Shutdown => return error.Failed,
         };
@@ -947,6 +1016,105 @@ const StubProvider = struct {
         return arena.dupe(u8, stub_end_turn);
     }
 };
+
+const BrokenProvider = struct {
+    worker: ?*inproc.Worker = null,
+
+    fn boot(ctx: *anyopaque, gpa: std.mem.Allocator, actor: *actor_mod.Actor, registry: *inproc.Registry) anyerror!void {
+        const self: *BrokenProvider = @ptrCast(@alignCast(ctx));
+        const worker = try inproc.Worker.spawn(gpa, actor, registry, "broken-provider");
+        errdefer worker.stop();
+        try worker.registerFunction("zygos::providers::broken", self, &handler);
+        self.worker = worker;
+    }
+
+    fn stop(ctx: *anyopaque) void {
+        const self: *BrokenProvider = @ptrCast(@alignCast(ctx));
+        if (self.worker) |w| {
+            self.worker = null;
+            w.stop();
+        }
+    }
+
+    fn handler(_: ?*anyopaque, _: std.mem.Allocator, _: []const u8) error{ Failed, OutOfMemory }![]const u8 {
+        return error.Failed;
+    }
+};
+
+/// Both stubs behind one live hook, so the ladder can fail over.
+const TwoProviders = struct {
+    broken: BrokenProvider = .{},
+    stub: StubProvider = .{},
+
+    fn boot(ctx: *anyopaque, gpa: std.mem.Allocator, actor: *actor_mod.Actor, registry: *inproc.Registry) anyerror!void {
+        const self: *TwoProviders = @ptrCast(@alignCast(ctx));
+        try BrokenProvider.boot(@ptrCast(&self.broken), gpa, actor, registry);
+        errdefer BrokenProvider.stop(@ptrCast(&self.broken));
+        try StubProvider.boot(@ptrCast(&self.stub), gpa, actor, registry);
+    }
+
+    fn stop(ctx: *anyopaque) void {
+        const self: *TwoProviders = @ptrCast(@alignCast(ctx));
+        StubProvider.stop(@ptrCast(&self.stub));
+        BrokenProvider.stop(@ptrCast(&self.broken));
+    }
+};
+
+test "a routed config fails over through the task bridges and pins the config sha on the trial" {
+    var dir = try TestDir.init();
+    defer dir.deinit();
+    const root = try dir.root();
+    const events = try std.fmt.allocPrint(testing.allocator, "{s}/events.jsonl", .{root});
+    defer testing.allocator.free(events);
+
+    const zon: [:0]const u8 =
+        \\.{ .default = .{
+        \\    .{ .provider_function = "zygos::providers::broken", .model = "ghost" },
+        \\    .{ .provider_function = "zygos::providers::stub", .model = "glm-5.3-flash" },
+        \\} }
+    ;
+    var routes = try task_config.TaskZon.parse(testing.allocator, zon);
+    defer routes.deinit();
+
+    var providers = TwoProviders{};
+    const result = try run(testing.allocator, .{
+        .workspace = root,
+        .instruction = "Say done.",
+        .task_id = "routed-stub",
+        .dataset = "terminal-bench/terminal-bench-2-1",
+        .model_id = "glm-5.3-flash",
+        .variable = "trim-off",
+        .step_cap = 1,
+        .identity = testIdentity(),
+        .script = &.{},
+        .trace_path = events,
+        .trim = false,
+        .upstream = "zygos::providers::stub",
+        .routes = &routes,
+        .live = .{
+            .ctx = @ptrCast(&providers),
+            .boot = TwoProviders.boot,
+            .stop = TwoProviders.stop,
+        },
+    });
+    defer result.deinit(testing.allocator);
+    try testing.expectEqual(@as(u8, 0), processExit(result));
+    try testing.expect(std.mem.indexOf(u8, result.turn_json, "\"stop\":\"end_turn\"") != null);
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const trial = try parseTrial(arena_state.allocator(), result.trial_json);
+    try testing.expectEqualStrings(&routes.sha256_hex, trial.config_sha256.?);
+    // Usage crossed the second attempt's bridge: the stub's counts, not zero.
+    try testing.expectEqual(@as(u64, 4), trial.input_tokens);
+    try testing.expectEqual(@as(?u64, 9), trial.cache_read_tokens);
+
+    // The trace shows attempt 0 on the broken bridge and attempt 1 on the stub bridge.
+    const log_bytes = fsx_mod.readWholeFile(testing.allocator, events) orelse return error.NoTrace;
+    defer testing.allocator.free(log_bytes);
+    try testing.expect(std.mem.indexOf(u8, log_bytes, "\"provider\":\"zygos::provider::task::via::zygos::providers::broken\",\"model\":\"ghost\",\"attempt\":0") != null);
+    try testing.expect(std.mem.indexOf(u8, log_bytes, "\"provider\":\"zygos::provider::task::via::zygos::providers::stub\",\"model\":\"glm-5.3-flash\",\"attempt\":1") != null);
+}
 
 test "a live hook is forwarded and an empty script without one is refused" {
     var dir = try TestDir.init();

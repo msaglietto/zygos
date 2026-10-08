@@ -3,6 +3,11 @@
 The adapter version is the `adapter_version` const in src/worker/trial.zig.
 Harbor loads this class as `eval.harbor.zygos_agent:ZygosAgent`. Approved
 model catalogs are keyless; credentials enter only the container exec env.
+
+`ZYGOS_CONFIG` names a host `zygos.zon`; it is uploaded next to the binary
+and passed as `--config`, so a configuration arm differs from its control
+only in that file. The route table must name the keyless catalog's slug,
+`zygos::providers::deepseek-flash` for the DeepSeek catalog below.
 """
 
 from __future__ import annotations
@@ -163,6 +168,9 @@ class ZygosAgent(BaseAgent):
         workspace = os.environ.get("ZYGOS_WORKSPACE", "/app")
         if not workspace.startswith("/"):
             raise RuntimeError("ZYGOS_WORKSPACE is not absolute")
+        config = os.environ.get("ZYGOS_CONFIG")
+        if config is not None and not Path(config).is_file():
+            raise RuntimeError("ZYGOS_CONFIG is not a file")
 
         env_paths = EnvironmentPaths.for_os(environment.os)
         instruction_path = env_paths.agent_dir / "instruction.txt"
@@ -176,32 +184,41 @@ class ZygosAgent(BaseAgent):
         binary = str(env_paths.agent_dir / "zygos")
         trial_path = str(env_paths.agent_dir / "trial.json")
         events_path = str(env_paths.agent_dir / "events.jsonl")
-        command = " ".join(
-            shlex.quote(part)
-            for part in (
-                binary,
-                "task",
-                "run",
-                "--model",
-                model,
-                "--workspace",
-                workspace,
-                "--out",
-                trial_path,
-                "--events",
-                events_path,
-                "--step-cap",
-                str(step_cap),
-                "--task-id",
-                task_id,
-                "--dataset",
-                DATASET,
-                "--instruction-file",
-                str(instruction_path),
-                "--trim",
-                trim,
+        parts = [
+            binary,
+            "task",
+            "run",
+            "--model",
+            model,
+            "--workspace",
+            workspace,
+            "--out",
+            trial_path,
+            "--events",
+            events_path,
+            "--step-cap",
+            str(step_cap),
+            "--task-id",
+            task_id,
+            "--dataset",
+            DATASET,
+            "--instruction-file",
+            str(instruction_path),
+            "--trim",
+            trim,
+        ]
+        if config is not None:
+            config_path = env_paths.agent_dir / "zygos.zon"
+            # The uploaded bytes are kept with the logs: the trial pins
+            # their SHA-256 and a report must be able to show the file.
+            host_config = Path(self.logs_dir) / "zygos.zon"
+            host_config.write_bytes(Path(config).read_bytes())
+            await environment.upload_file(
+                source_path=host_config,
+                target_path=str(config_path),
             )
-        )
+            parts += ["--config", str(config_path)]
+        command = " ".join(shlex.quote(part) for part in parts)
         timeout = 570
         if self._agent_timeout_sec:
             timeout = max(1, int(self._agent_timeout_sec) - 30)

@@ -8,6 +8,7 @@ The mission FSM is a different number and is not what this command measures.
 
 ```bash
 zygos task run --offline --workspace DIR --out trial.json [--events events.jsonl] [--trim on|off]
+zygos task run --model MODEL ... [--config zygos.zon]
 zygos task score --trial trial.json --prices prices.txt
 ```
 
@@ -23,12 +24,17 @@ Adapter setup preserves any existing Linux certificate bundle. A minimal image w
 
 `prices.txt` is one `<model_id> <cents_per_mtok>` row per line. `#` comments are ignored. A zero price is a free model. A missing row for the trial's model is `MissingPrice`.
 
+## Configuration (`--config`)
+
+A live run may name a `zygos.zon`. The task honors only its route table: the `task` route when present, else `.default`, walked as the escalation ladder for step id `task` through `zygos::models::resolve`. Each attempt is called through its own task bridge (`zygos::provider::task::via::<function>`) so usage and cache counts are still copied onto the trial, and an upstream failure fails over to the next attempt exactly as a mission turn would. Any other top-level setting (`.context_strategy`, `.mcp_servers`, anything unknown) refuses the run with `UnsupportedSetting` instead of being ignored: a configuration arm must change something this path executes. Before any provider boots, every attempt must name an approved model and a `zygos::providers::<slug>` present in the catalog with a resolvable key, and `--model` must equal the first attempt's model (`ModelRefused`, `UnknownProviderSlug`, `MissingKey`, `ModelMismatch` exit 2). The catalog rows the ladder names are the ones booted. `--offline` with `--config` is a usage error: the offline fixture stays byte-stable. The trial records the file's SHA-256 as `config_sha256`. The Harbor adapter uploads the host file named by `ZYGOS_CONFIG` and passes it as `--config`; the DeepSeek catalog row's slug is `deepseek-flash`.
+
 ## Trial fields
 
-Fixed key order so two offline runs match byte for byte. Cache keys are omitted when the provider sent none.
+Fixed key order so two offline runs match byte for byte. Cache keys are omitted when the provider sent none; `config_sha256` is omitted when there was no config.
 
 - `task_id`, `dataset`, `model_id`, `variable` (`trim-on` or `trim-off`), `step_cap`
-- `git_sha`, `target_triple`, `optimize`, `adapter_version` (currently `0.1.0`)
+- `git_sha`, `target_triple`, `optimize`, `adapter_version` (currently `0.2.0`; `0.1.0` records have no `config_sha256`)
+- `config_sha256` when present: 64 lowercase hex characters, else `MalformedTrial`
 - `source_lines_read` from successful `read_file` only
 - `input_tokens`, `output_tokens`
 - `cache_read_tokens`, `cache_creation_tokens` when present
@@ -56,4 +62,4 @@ Cents are integer: `(input_tokens + output_tokens) * cents_per_mtok / 1000000`.
 
 ## What this command does not do
 
-It does not start Harbor, pick a model id, or choose a dollar cap. `eval/run.sh` is the dataset pin (`terminal-bench/terminal-bench-2-1`) and is not a `zig build test` step. Image platforms live in `eval/image-platforms.json`. While that file says `blocked` and `chosen_triple` is null, no pilot starts.
+It does not start Harbor, pick a model id, or choose a dollar cap. `eval/run.sh` is the dataset pin (`terminal-bench/terminal-bench-2-1`) and is not a `zig build test` step. Image platforms live in `eval/image-platforms.json`. While that file says `blocked` and `chosen_triple` is null, no pilot starts. Matched two-arm campaigns and their reports are `eval/campaign.py` ([campaign spec](campaign.md)).

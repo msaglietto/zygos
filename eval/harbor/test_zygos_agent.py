@@ -129,17 +129,59 @@ class TrimContract(unittest.IsolatedAsyncioTestCase):
             for path in (logs / "providers.toml", logs / "stdout.txt", logs / "stderr.txt"):
                 self.assertNotIn("deepseek-fixture", path.read_text())
 
-    async def invoke(self, trim, model="glm-5.3-flash"):
+    async def invoke(self, trim, model="glm-5.3-flash", config=None):
         with tempfile.TemporaryDirectory() as directory:
             environment = Environment()
             key_env = "DEEPSEEK_API_KEY" if model == "deepseek/deepseek-v4.1-flash" else "Z_AI_API_KEY"
             values = {key_env: "offline-fixture", "ZYGOS_TASK_ID": "fixture"}
             if trim is not None:
                 values["ZYGOS_TRIM"] = trim
+            if config is not None:
+                path = Path(directory) / "arm.zon"
+                path.write_text(config)
+                values["ZYGOS_CONFIG"] = str(path)
             with patch.dict(os.environ, values, clear=True):
                 agent = ZygosAgent(logs_dir=Path(directory), model_name=model)
                 await agent.run("fixture instruction", environment, None)
             return environment.calls
+
+    async def test_config_arms_differ_only_in_the_uploaded_route_table(self):
+        model = "deepseek/deepseek-v4.1-flash"
+        zon = '.{ .default = .{ .{ .provider_function = "zygos::providers::deepseek-flash", .model = "deepseek/deepseek-v4.1-flash" } } }\n'
+
+        class UploadEnvironment(Environment):
+            def __init__(self):
+                super().__init__()
+                self.uploads = {}
+
+            async def upload_file(self, **kwargs):
+                self.uploads[kwargs["target_path"]] = Path(kwargs["source_path"]).read_text()
+
+        with tempfile.TemporaryDirectory() as directory:
+            environment = UploadEnvironment()
+            path = Path(directory) / "arm.zon"
+            path.write_text(zon)
+            values = {"DEEPSEEK_API_KEY": "offline-fixture", "ZYGOS_TASK_ID": "fixture", "ZYGOS_CONFIG": str(path)}
+            with patch.dict(os.environ, values, clear=True):
+                agent = ZygosAgent(logs_dir=Path(directory), model_name=model)
+                await agent.run("fixture instruction", environment, None)
+            self.assertEqual(environment.uploads["/logs/agent/zygos.zon"], zon)
+            self.assertEqual((Path(directory) / "zygos.zon").read_text(), zon)
+            with_config = shlex.split(environment.calls[-1]["command"])
+        without = shlex.split((await self.invoke("on", model))[0]["command"])
+        self.assertEqual(with_config[with_config.index("--config") + 1], "/logs/agent/zygos.zon")
+        self.assertNotIn("--config", without)
+        self.assertEqual(with_config[: with_config.index("--config")], without)
+
+    async def test_missing_config_file_stops_before_exec(self):
+        with tempfile.TemporaryDirectory() as directory:
+            environment = Environment()
+            values = {"DEEPSEEK_API_KEY": "offline-fixture", "ZYGOS_TASK_ID": "fixture", "ZYGOS_CONFIG": str(Path(directory) / "absent.zon")}
+            with patch.dict(os.environ, values, clear=True):
+                agent = ZygosAgent(logs_dir=Path(directory), model_name="deepseek/deepseek-v4.1-flash")
+                with self.assertRaisesRegex(RuntimeError, "ZYGOS_CONFIG"):
+                    await agent.run("fixture instruction", environment, None)
+            self.assertEqual(environment.calls, [])
 
     async def test_deepseek_arms_differ_only_in_trim(self):
         model = "deepseek/deepseek-v4.1-flash"

@@ -52,6 +52,7 @@ pub const tools = @import("worker/tools.zig");
 pub const tools_ops = @import("worker/tools_ops.zig");
 pub const trial = @import("worker/trial.zig");
 pub const task = @import("worker/task.zig");
+pub const task_config = @import("worker/task_config.zig");
 pub const anthropic = @import("worker/anthropic.zig");
 pub const assembler = @import("worker/assembler.zig");
 pub const fsx = @import("worker/fsx.zig");

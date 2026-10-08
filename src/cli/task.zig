@@ -9,6 +9,11 @@
 //! The git sha, target triple, optimize level, and adapter version are pinned
 //! into every trial. Cache counts stay on that trial. The trace usage line
 //! is not this command's to extend.
+//!
+//! `--config zygos.zon` routes the task step over the file's ladder
+//! (task_config.zig) and pins the file's SHA-256 on the trial. Every attempt
+//! must name an approved model and a catalog slug with a key; anything
+//! else refuses before a provider boots.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -38,6 +43,19 @@ pub const RunArgs = struct {
     task_id: ?[]const u8 = null,
     dataset: ?[]const u8 = null,
     instruction_file: ?[]const u8 = null,
+    config: ?[]const u8 = null,
+};
+
+pub const ConfigError = error{
+    /// An attempt names a model outside the live allowlist.
+    ModelRefused,
+    /// An attempt's function is not `zygos::providers::<slug>` for a catalog row.
+    UnknownProviderSlug,
+    /// `--model` is not the ladder's first attempt.
+    ModelMismatch,
+    /// A routed catalog row resolves no key.
+    MissingKey,
+    OutOfMemory,
 };
 
 pub const ScoreArgs = struct {
@@ -89,6 +107,7 @@ pub fn parseRun(argv: []const []const u8) ArgError!RunArgs {
     var task_id: ?[]const u8 = null;
     var dataset: ?[]const u8 = null;
     var instruction_file: ?[]const u8 = null;
+    var config: ?[]const u8 = null;
     var i: usize = 0;
     while (i < argv.len) : (i += 1) {
         const a = argv[i];
@@ -132,6 +151,10 @@ pub fn parseRun(argv: []const []const u8) ArgError!RunArgs {
             i += 1;
             if (i >= argv.len or argv[i].len == 0) return error.Usage;
             instruction_file = argv[i];
+        } else if (std.mem.eql(u8, a, "--config")) {
+            i += 1;
+            if (i >= argv.len or argv[i].len == 0) return error.Usage;
+            config = argv[i];
         } else return error.Usage;
     }
     if (help) return error.Help;
@@ -139,7 +162,8 @@ pub fn parseRun(argv: []const []const u8) ArgError!RunArgs {
     const out = out_path orelse return error.Usage;
     if (ws.len == 0 or out.len == 0) return error.Usage;
     if (offline) {
-        if (model != null or step_cap != null or task_id != null or dataset != null or instruction_file != null) return error.Usage;
+        // The offline fixture is byte-stable; a config would change its provider.
+        if (model != null or step_cap != null or task_id != null or dataset != null or instruction_file != null or config != null) return error.Usage;
         return .{
             .workspace = ws,
             .out_path = out,
@@ -166,7 +190,51 @@ pub fn parseRun(argv: []const []const u8) ArgError!RunArgs {
         .task_id = tid,
         .dataset = ds,
         .instruction_file = instr,
+        .config = config,
     };
+}
+
+fn approvedModel(m: []const u8) bool {
+    return std.mem.eql(u8, m, approved_pilot_model) or std.mem.eql(u8, m, approved_rerun_model);
+}
+
+/// Fail closed over the whole ladder before any provider boots: approved
+/// models only, every function a catalog slug with a resolvable key, and
+/// `--model` equal to the first attempt so the trial's model_id is the
+/// model that answers unless a failover happens.
+pub fn validateConfig(
+    gpa: std.mem.Allocator,
+    zon: *const zygos.task_config.TaskZon,
+    catalog: *const zygos.providers_catalog.Catalog,
+    env: []const zygos.providers_catalog.EnvPair,
+    model: []const u8,
+) ConfigError!void {
+    const ladder = zon.ladder();
+    if (ladder.len == 0 or !std.mem.eql(u8, ladder[0].model, model)) return error.ModelMismatch;
+    for (ladder) |a| {
+        if (!approvedModel(a.model)) return error.ModelRefused;
+        const entry = try entryForFunction(gpa, catalog, a.provider_function) orelse return error.UnknownProviderSlug;
+        const key = entry.resolveKey(env) orelse "";
+        if (key.len == 0) return error.MissingKey;
+    }
+}
+
+const providers_prefix = "zygos::providers::";
+
+/// The catalog row registered as `zygos::providers::<slug>`, if any.
+fn entryForFunction(
+    gpa: std.mem.Allocator,
+    catalog: *const zygos.providers_catalog.Catalog,
+    function: []const u8,
+) error{OutOfMemory}!?*const zygos.providers_catalog.Provider {
+    if (!std.mem.startsWith(u8, function, providers_prefix)) return null;
+    const want = function[providers_prefix.len..];
+    for (catalog.providers) |*entry| {
+        const s = try zygos.providers_catalog.slug(gpa, entry.name);
+        defer gpa.free(s);
+        if (std.mem.eql(u8, s, want)) return entry;
+    }
+    return null;
 }
 
 pub fn parseScore(argv: []const []const u8) ArgError!ScoreArgs {
@@ -334,16 +402,32 @@ const LiveBoot = struct {
     catalog: *const zygos.providers_catalog.Catalog,
     env: []const zygos.providers_catalog.EnvPair,
     model: []const u8,
+    /// With a config, every catalog row its ladder names boots; without
+    /// one, only the row for `model`.
+    routes: ?*const zygos.task_config.TaskZon = null,
     booted: ?zygos.provider_boot.CatalogBoot = null,
 
     fn boot(ctx: *anyopaque, gpa: std.mem.Allocator, actor: *zygos.actor.Actor, registry: *zygos.inproc.Registry) anyerror!void {
         const self: *LiveBoot = @ptrCast(@alignCast(ctx));
-        const entry = findEntry(self.catalog, self.model) orelse return error.ModelNotFound;
-        var one = [1]zygos.providers_catalog.Provider{entry.*};
+        var selected: std.ArrayList(zygos.providers_catalog.Provider) = .empty;
+        defer selected.deinit(gpa);
+        if (self.routes) |zon| {
+            for (zon.ladder()) |a| {
+                const entry = try entryForFunction(gpa, self.catalog, a.provider_function) orelse return error.UnknownProviderSlug;
+                var seen = false;
+                for (selected.items) |already| {
+                    if (std.mem.eql(u8, already.name, entry.name)) seen = true;
+                }
+                if (!seen) try selected.append(gpa, entry.*);
+            }
+        } else {
+            const entry = findEntry(self.catalog, self.model) orelse return error.ModelNotFound;
+            try selected.append(gpa, entry.*);
+        }
         // The view arena owns nothing. Provider slices stay in the parsed catalog.
         var view = zygos.providers_catalog.Catalog{
             .arena = std.heap.ArenaAllocator.init(gpa),
-            .providers = &one,
+            .providers = selected.items,
             .clis = &.{},
         };
         defer view.arena.deinit();
@@ -409,19 +493,52 @@ fn runLive(gpa: std.mem.Allocator, parsed: RunArgs) u8 {
     };
     defer catalog.deinit();
 
-    const upstream = zygos.providers_catalog.functionForModel(gpa, &catalog, parsed.model.?) catch |err| {
-        eprint("task: model refused ({s})\n", .{@errorName(err)});
-        return 2;
-    };
+    var routes: ?zygos.task_config.TaskZon = null;
+    defer if (routes) |*r| r.deinit();
+    if (parsed.config) |config_path| {
+        const config_abs = resolvePath(gpa, config_path) orelse return 1;
+        defer gpa.free(config_abs);
+        const zon_text = fsx.readWholeFileZ(gpa, config_abs) orelse {
+            eprint("task: cannot read config {s}\n", .{config_path});
+            return 2;
+        };
+        defer gpa.free(zon_text);
+        routes = zygos.task_config.TaskZon.parse(gpa, zon_text) catch |err| switch (err) {
+            error.OutOfMemory => return 1,
+            else => {
+                eprint("task: config refused ({s})\n", .{@errorName(err)});
+                return 2;
+            },
+        };
+        validateConfig(gpa, &routes.?, &catalog, env, parsed.model.?) catch |err| switch (err) {
+            error.OutOfMemory => return 1,
+            else => {
+                eprint("task: config refused ({s})\n", .{@errorName(err)});
+                return 2;
+            },
+        };
+    }
+
+    // Without a config the static upstream is the model's row. With one it
+    // is the ladder's first function; the router then picks each step.
+    const upstream = if (routes) |*r|
+        (gpa.dupe(u8, r.ladder()[0].provider_function) catch return 1)
+    else
+        zygos.providers_catalog.functionForModel(gpa, &catalog, parsed.model.?) catch |err| {
+            eprint("task: model refused ({s})\n", .{@errorName(err)});
+            return 2;
+        };
     defer gpa.free(upstream);
-    const entry = findEntry(&catalog, parsed.model.?) orelse {
-        eprint("task: model refused (ModelNotFound)\n", .{});
-        return 2;
-    };
-    const key = entry.resolveKey(env) orelse "";
-    if (key.len == 0) {
-        eprint("task: provider key is missing\n", .{});
-        return 2;
+    if (routes == null) {
+        const entry = findEntry(&catalog, parsed.model.?) orelse {
+            eprint("task: model refused (ModelNotFound)\n", .{});
+            return 2;
+        };
+        const key = entry.resolveKey(env) orelse "";
+        if (key.len == 0) {
+            eprint("task: provider key is missing\n", .{});
+            return 2;
+        }
     }
 
     var io_boot = zygos.provider_boot.IoBoot.start(gpa);
@@ -431,6 +548,7 @@ fn runLive(gpa: std.mem.Allocator, parsed: RunArgs) u8 {
         .catalog = &catalog,
         .env = env,
         .model = parsed.model.?,
+        .routes = if (routes) |*r| r else null,
     };
     const result = zygos.task.run(gpa, .{
         .workspace = workspace,
@@ -446,6 +564,7 @@ fn runLive(gpa: std.mem.Allocator, parsed: RunArgs) u8 {
         .trim = parsed.trim,
         .upstream = upstream,
         .invoke_timeout_ms = pilot_timeout_ms,
+        .routes = if (routes) |*r| r else null,
         .live = .{
             .ctx = @ptrCast(&live),
             .boot = LiveBoot.boot,
@@ -498,10 +617,11 @@ fn parseUsize(text: []const u8) ?usize {
 fn printUsage() void {
     eprint(
         \\usage: zygos task run --offline --workspace DIR --out trial.json [--events events.jsonl] [--trim on|off]
-        \\       zygos task run --model MODEL --workspace DIR --out trial.json --step-cap N --task-id ID --dataset terminal-bench/terminal-bench-2-1 --instruction-file PATH [--events events.jsonl] [--trim on|off]
+        \\       zygos task run --model MODEL --workspace DIR --out trial.json --step-cap N --task-id ID --dataset terminal-bench/terminal-bench-2-1 --instruction-file PATH [--events events.jsonl] [--trim on|off] [--config zygos.zon]
         \\       zygos task score --trial trial.json --prices prices.txt
         \\
         \\--offline is the scripted provider. Live MODEL: glm-5.3-flash or deepseek/deepseek-v4.1-flash.
+        \\--config routes the task step over the file's .default/.routes ladder (approved models, catalog slugs only); other settings refuse.
         \\N is 1..32. Exit 0 means the process finished.
         \\
     , .{});
@@ -546,6 +666,81 @@ test "task run accepts explicitly approved DeepSeek Flash on both trim arms" {
         try testing.expectEqual(@as(usize, 24), args.step_cap.?);
         try testing.expectEqual(std.mem.eql(u8, arm, "on"), args.trim);
     }
+}
+
+test "task run accepts --config on a live invocation and refuses it offline" {
+    const args = try parseRun(&.{
+        "--model",            "deepseek/deepseek-v4.1-flash",
+        "--workspace",        "w",
+        "--out",              "o",
+        "--step-cap",         "24",
+        "--task-id",          "t",
+        "--dataset",          "terminal-bench/terminal-bench-2-1",
+        "--instruction-file", "i",
+        "--config",           "arm.zon",
+    });
+    try testing.expectEqualStrings("arm.zon", args.config.?);
+    try testing.expectError(error.Usage, parseRun(&.{ "--offline", "--workspace", "w", "--out", "o", "--config", "arm.zon" }));
+    try testing.expectError(error.Usage, parseRun(&.{ "--model", "deepseek/deepseek-v4.1-flash", "--workspace", "w", "--out", "o", "--config" }));
+}
+
+const fixture_catalog =
+    \\[[providers]]
+    \\name = "Deepseek Flash"
+    \\type = "openai_compatible"
+    \\model = "deepseek/deepseek-v4.1-flash"
+    \\endpoint = "https://example.invalid/v1"
+    \\key_env = "DEEPSEEK_API_KEY"
+    \\
+    \\[[providers]]
+    \\name = "GLM Flash"
+    \\type = "anthropic_compatible"
+    \\model = "glm-5.3-flash"
+    \\endpoint = "https://example.invalid/anthropic"
+    \\key_env = "Z_AI_API_KEY"
+    \\
+    \\[[providers]]
+    \\name = "Big Model"
+    \\type = "openai_compatible"
+    \\model = "big-model"
+    \\endpoint = "https://example.invalid/v1"
+    \\key_env = "BIG_API_KEY"
+    \\
+;
+
+fn expectConfig(zon: [:0]const u8, env: []const zygos.providers_catalog.EnvPair, model: []const u8, expected: ?ConfigError) !void {
+    var catalog = try zygos.providers_catalog.Catalog.parse(testing.allocator, fixture_catalog, null);
+    defer catalog.deinit();
+    var parsed = try zygos.task_config.TaskZon.parse(testing.allocator, zon);
+    defer parsed.deinit();
+    const got = validateConfig(testing.allocator, &parsed, &catalog, env, model);
+    if (expected) |e| try testing.expectError(e, got) else try got;
+}
+
+test "validateConfig: approved models on catalog slugs with keys pass; everything else refuses" {
+    const both = [_]zygos.providers_catalog.EnvPair{
+        .{ .name = "DEEPSEEK_API_KEY", .value = "k1" },
+        .{ .name = "Z_AI_API_KEY", .value = "k2" },
+        .{ .name = "BIG_API_KEY", .value = "k3" },
+    };
+    const ladder: [:0]const u8 =
+        \\.{ .routes = .{ .{ .step_id = "task", .attempts = .{
+        \\    .{ .provider_function = "zygos::providers::deepseek-flash", .model = "deepseek/deepseek-v4.1-flash" },
+        \\    .{ .provider_function = "zygos::providers::glm-flash", .model = "glm-5.3-flash" },
+        \\} } } }
+    ;
+    try expectConfig(ladder, &both, "deepseek/deepseek-v4.1-flash", null);
+    try expectConfig(ladder, &both, "glm-5.3-flash", error.ModelMismatch);
+    try expectConfig(ladder, &.{.{ .name = "DEEPSEEK_API_KEY", .value = "k1" }}, "deepseek/deepseek-v4.1-flash", error.MissingKey);
+    try expectConfig(
+        \\.{ .default = .{ .{ .provider_function = "zygos::providers::big-model", .model = "big-model" } } }
+    , &both, "big-model", error.ModelRefused);
+    try expectConfig(
+        \\.{ .default = .{ .{ .provider_function = "zygos::providers::nobody", .model = "deepseek/deepseek-v4.1-flash" } } }
+    , &both, "deepseek/deepseek-v4.1-flash", error.UnknownProviderSlug);
+    try expectConfig(
+        \\.{ .default = .{ .{ .provider_function = "zygos::provider::fake::messages", .model = "deepseek/deepseek-v4.1-flash" } } }
+    , &both, "deepseek/deepseek-v4.1-flash", error.UnknownProviderSlug);
 }
 
 test "task run without --offline is refused" {

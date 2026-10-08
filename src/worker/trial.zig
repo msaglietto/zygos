@@ -17,7 +17,7 @@ const jsonx = @import("jsonx.zig");
 const ops = @import("tools_ops.zig");
 const trace_event = @import("trace_event.zig");
 
-pub const adapter_version = "0.1.0";
+pub const adapter_version = "0.2.0";
 
 pub const ParseError = error{ MalformedTrial, MissingBuildIdentity, OutOfMemory };
 pub const ScoreError = error{
@@ -56,6 +56,10 @@ pub const Trial = struct {
     target_triple: []const u8,
     optimize: []const u8,
     adapter_version: []const u8,
+    /// SHA-256 (64 lowercase hex) of the `--config` file text; null when
+    /// the run had no config. Two arms that differ only here are a
+    /// configuration comparison.
+    config_sha256: ?[]const u8 = null,
     source_lines_read: u64,
     input_tokens: u64,
     output_tokens: u64,
@@ -99,13 +103,14 @@ fn requireId(s: []const u8) ParseError!void {
 }
 
 /// Serialize in a fixed key order so two runs of the same arm match byte
-/// for byte. Null cache counts are omitted. `trim` is omitted when null
-/// (that omission is what the scorer calls missing evidence).
+/// for byte. Null cache counts and a null config sha are omitted. `trim`
+/// is omitted when null (that omission is what the scorer calls missing
+/// evidence).
 pub fn write(allocator: std.mem.Allocator, trial: Trial) error{OutOfMemory}![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     try out.print(allocator,
-        \\{{"task_id":{f},"dataset":{f},"model_id":{f},"variable":{f},"step_cap":{d},"git_sha":{f},"target_triple":{f},"optimize":{f},"adapter_version":{f},"source_lines_read":{d},"input_tokens":{d},"output_tokens":{d}
+        \\{{"task_id":{f},"dataset":{f},"model_id":{f},"variable":{f},"step_cap":{d},"git_sha":{f},"target_triple":{f},"optimize":{f},"adapter_version":{f}
     , .{
         json.fmt(trial.task_id, .{}),
         json.fmt(trial.dataset, .{}),
@@ -116,6 +121,9 @@ pub fn write(allocator: std.mem.Allocator, trial: Trial) error{OutOfMemory}![]u8
         json.fmt(trial.target_triple, .{}),
         json.fmt(trial.optimize, .{}),
         json.fmt(trial.adapter_version, .{}),
+    });
+    if (trial.config_sha256) |sha| try out.print(allocator, ",\"config_sha256\":{f}", .{json.fmt(sha, .{})});
+    try out.print(allocator, ",\"source_lines_read\":{d},\"input_tokens\":{d},\"output_tokens\":{d}", .{
         trial.source_lines_read,
         trial.input_tokens,
         trial.output_tokens,
@@ -145,6 +153,7 @@ pub fn parse(arena: std.mem.Allocator, text: []const u8) ParseError!Trial {
         .target_triple = try dupeReq(arena, o, "target_triple"),
         .optimize = try dupeReq(arena, o, "optimize"),
         .adapter_version = try dupeReq(arena, o, "adapter_version"),
+        .config_sha256 = try parseConfigSha(arena, o),
         .source_lines_read = uintReq(o, "source_lines_read") orelse return error.MalformedTrial,
         .input_tokens = uintReq(o, "input_tokens") orelse return error.MalformedTrial,
         .output_tokens = uintReq(o, "output_tokens") orelse return error.MalformedTrial,
@@ -158,6 +167,24 @@ pub fn parse(arena: std.mem.Allocator, text: []const u8) ParseError!Trial {
     try requireId(trial.adapter_version);
     if (trial.variable.len == 0) return error.MalformedTrial;
     return trial;
+}
+
+/// Absent is a run without a config. Present must be 64 lowercase hex
+/// characters: an arm identity that cannot be compared is malformed.
+fn parseConfigSha(arena: std.mem.Allocator, o: json.ObjectMap) ParseError!?[]const u8 {
+    if (o.get("config_sha256") == null) return null;
+    const s = jsonx.strField(o, "config_sha256") orelse return error.MalformedTrial;
+    if (!isSha256Hex(s)) return error.MalformedTrial;
+    return try arena.dupe(u8, s);
+}
+
+pub fn isSha256Hex(s: []const u8) bool {
+    if (s.len != 64) return false;
+    for (s) |c| {
+        const ok = (c >= '0' and c <= '9') or (c >= 'a' and c <= 'f');
+        if (!ok) return false;
+    }
+    return true;
 }
 
 fn parseTrim(o: json.ObjectMap) ParseError!?TrimSnap {
@@ -328,6 +355,33 @@ test "trial round-trip keeps build identity, trim snapshot, and cache counts" {
     try testing.expectEqual(@as(u64, 2), parsed.trim.?.calls);
     try testing.expectEqual(@as(u64, 60), parsed.trim.?.reduction);
     try testing.expect(std.mem.indexOf(u8, raw, "\"cache_read_tokens\":9") != null);
+}
+
+test "config sha is omitted when absent, round-trips when present, and must be 64 hex" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const bare = try write(testing.allocator, baseTrial());
+    defer testing.allocator.free(bare);
+    try testing.expect(std.mem.indexOf(u8, bare, "config_sha256") == null);
+    try testing.expect((try parse(arena, bare)).config_sha256 == null);
+
+    const sha = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    var configured = baseTrial();
+    configured.config_sha256 = sha;
+    const raw = try write(testing.allocator, configured);
+    defer testing.allocator.free(raw);
+    // Fixed key order: identity, then the config, then the counters.
+    try testing.expect(std.mem.indexOf(u8, raw, "\"adapter_version\":\"" ++ adapter_version ++ "\",\"config_sha256\":\"" ++ sha ++ "\",\"source_lines_read\":3") != null);
+    try testing.expectEqualStrings(sha, (try parse(arena, raw)).config_sha256.?);
+
+    const short = try std.mem.replaceOwned(u8, testing.allocator, raw, sha, "abc");
+    defer testing.allocator.free(short);
+    try testing.expectError(error.MalformedTrial, parse(arena, short));
+    const upper = try std.mem.replaceOwned(u8, testing.allocator, raw, sha, "0123456789ABCDEF0123456789abcdef0123456789abcdef0123456789abcdef");
+    defer testing.allocator.free(upper);
+    try testing.expectError(error.MalformedTrial, parse(arena, upper));
 }
 
 test "parse rejects an empty build-identity field" {
