@@ -73,9 +73,11 @@ tests use Harbor's interpreter. All of `eval/test_campaign.py`,
   the experiment. This is the "single variable" rule of the benchmark policy
   made executable.
 - `model.id` must be on the live allowlist. `key_env` is the variable the
-  adapter binds into the container exec environment; `key_from_env` names a
-  host variable to copy it from when `key_env` is unset. Values are never
-  written anywhere.
+  adapter binds into the container exec environment; `key_from_env`, when
+  present, names the host variable whose value is always copied over it
+  (an override, because a host may hold a different vendor's key under
+  `key_env`; a direct DeepSeek key does not authenticate at OpenRouter).
+  Values are never written anywhere.
 - `tasks[].checksum` is the `task_checksum` Harbor records in `result.json`;
   a trial whose checksum differs is a problem, not a result. `source_sha` is
   checked against the tasks checkout's `HEAD` when non-empty.

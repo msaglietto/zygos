@@ -678,12 +678,18 @@ def preflight(exp: Experiment, args, env: dict) -> dict:
             raise CampaignError(f"tasks dir HEAD is {actual}, experiment pins {exp.dataset_source_sha}")
         checks["dataset_source_sha"] = actual
     exp.locate_builds(Path(args.builds_dir).resolve())
-    if not env.get(exp.key_env):
-        if exp.key_from_env and env.get(exp.key_from_env):
-            env[exp.key_env] = env[exp.key_from_env]
-        else:
-            raise CampaignError(f"{exp.key_env} is not set" + (f" (nor {exp.key_from_env})" if exp.key_from_env else ""))
-    checks["credential"] = f"{exp.key_env} from environment" + (f" via {exp.key_from_env}" if exp.key_from_env and exp.key_env != exp.key_from_env else "")
+    # `key_from_env` is an override, not a fallback: the experiment pins the
+    # endpoint, and a host may hold a different vendor's key under
+    # `key_env` (a direct DeepSeek key does not authenticate at OpenRouter).
+    if exp.key_from_env:
+        if not env.get(exp.key_from_env):
+            raise CampaignError(f"{exp.key_from_env} is not set")
+        env[exp.key_env] = env[exp.key_from_env]
+        checks["credential"] = f"{exp.key_env} bound from {exp.key_from_env}"
+    elif env.get(exp.key_env):
+        checks["credential"] = f"{exp.key_env} from environment"
+    else:
+        raise CampaignError(f"{exp.key_env} is not set")
     bundle = env.get("ZYGOS_CA_BUNDLE")
     if exp.ca_bundle_sha256:
         if not bundle or not Path(bundle).is_file():

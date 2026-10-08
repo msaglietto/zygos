@@ -66,6 +66,7 @@ result = {
 # What the runner handed us, without any secret value.
 (out / f"{name}.stub.json").write_text(json.dumps({
     "argv": args, "key_set": bool(os.environ.get("DEEPSEEK_API_KEY")),
+    "key_is_openrouter_value": os.environ.get("DEEPSEEK_API_KEY") == os.environ.get("OPENROUTER_API_KEY"),
     "key_value_in_argv": any(os.environ.get("DEEPSEEK_API_KEY", "\0") in a for a in args),
     "config": config, "platform": os.environ.get("DOCKER_DEFAULT_PLATFORM"),
 }))
@@ -158,7 +159,8 @@ class Fixture:
 
     def run(self, extra=(), env_extra=None):
         jobs = self.root / "jobs"
-        env = {"PATH": os.environ["PATH"], "OPENROUTER_API_KEY": "secret-fixture-key", "STUB_CONTROL": str(self.control)}
+        env = {"PATH": os.environ["PATH"], "OPENROUTER_API_KEY": "secret-fixture-key", "DEEPSEEK_API_KEY": "stale-direct-key",
+               "STUB_CONTROL": str(self.control)}
         env.update(env_extra or {})
         argv = [sys.executable, str(HERE / "campaign.py"), "run", "--experiment", str(self.experiment),
                 "--jobs-dir", str(jobs), "--tasks-dir", str(self.tasks_dir), "--builds-dir", str(self.builds),
@@ -212,7 +214,7 @@ class RunContract(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             plan = json.loads(result.stdout)
             self.assertEqual(plan["jobs"][0], "baseline-r1-alpha")
-            self.assertEqual(plan["checks"]["credential"], "DEEPSEEK_API_KEY from environment via OPENROUTER_API_KEY")
+            self.assertEqual(plan["checks"]["credential"], "DEEPSEEK_API_KEY bound from OPENROUTER_API_KEY")
             self.assertFalse((jobs / "baseline-r1-alpha").exists())
             self.assertNotIn("secret-fixture-key", result.stdout)
 
@@ -221,7 +223,11 @@ class RunContract(unittest.TestCase):
             fx = Fixture(Path(d))
             result, jobs = fx.run(env_extra={"OPENROUTER_API_KEY": ""})
             self.assertEqual(result.returncode, 2)
-            self.assertIn("DEEPSEEK_API_KEY is not set", result.stderr)
+            self.assertIn("OPENROUTER_API_KEY is not set", result.stderr)
+            # A different vendor's key already under key_env must not win over the pinned source.
+            result, _ = fx.run(env_extra={"OPENROUTER_API_KEY": "", "DEEPSEEK_API_KEY": "direct-vendor-key"})
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("OPENROUTER_API_KEY is not set", result.stderr)
             (fx.builds / fx.sha_a / "zygos").write_bytes(b"tampered")
             result, _ = fx.run()
             self.assertEqual(result.returncode, 2)
@@ -239,6 +245,7 @@ class RunContract(unittest.TestCase):
             self.assertIsNone(base["config"])
             self.assertEqual(Path(cand["config"]).resolve(), fx.config.resolve())
             self.assertTrue(base["key_set"] and cand["key_set"])
+            self.assertTrue(base["key_is_openrouter_value"])
             self.assertFalse(base["key_value_in_argv"])
             self.assertEqual(base["platform"], "linux/amd64")
             argv = base["argv"]
