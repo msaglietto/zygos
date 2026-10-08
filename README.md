@@ -103,6 +103,20 @@ zygos task score --trial trial.json --prices prices.txt
 
 `eval/run.sh --dry-run` prints the pinned dataset `terminal-bench/terminal-bench-2-1` and the task command. It is not part of `zig build test`. The contract is `docs/specs/task.md`.
 
+## Benchmark campaigns
+
+To measure a release or a configuration change, run a matched two-arm campaign. The experiment file freezes the tasks, model, prices, step cap, and repeats, and names the one variable the arms differ in: `build` (two git shas), `config` (two `zygos.zon` route tables, passed to `zygos task run --config`), or `trim`.
+
+```bash
+ZYGOS_ZIG=/path/to/zig-0.16 eval/campaign.py build --git-ref <sha>      # Linux arm from a clean worktree
+eval/campaign.py run --experiment eval/experiments/trim-ablation.json \
+    --jobs-dir /tmp/zygos-trim-ablation --tasks-dir <terminal-bench-2-1>/tasks
+eval/campaign.py report --experiment eval/experiments/trim-ablation.json \
+    --jobs-dir /tmp/zygos-trim-ablation --out reports/benchmarks/trim-ablation-<date>
+```
+
+The report states a verdict or the reason it is inconclusive; durable reports live under `reports/benchmarks/`. The contract is `docs/specs/campaign.md`; execution authority is `docs/benchmark-policy.md`.
+
 Any iii SDK connects unmodified:
 
 ```javascript
