@@ -176,7 +176,7 @@ To add MCP tools, list servers in the same file. Zygos spawns each one over stdi
 zygos mission start  <brief.md> [--planning <dir>] [--resume] [--run-stamp] [--no-tui]
 zygos mission resume <brief.md> [--planning <dir>]
 zygos mission queue  [--planning <base>] [--run-stamp] <brief.md>...
-zygos mission trace  <planning-dir|events.jsonl>
+zygos mission trace  <planning-dir|events.jsonl> [--format agui|html]
 zygos mission attach <planning-dir>
 zygos mission dashboard <dir>
 ```
@@ -192,6 +192,14 @@ zygos mission dashboard <dir>
 ```bash
 zygos mission trace .planning
 ```
+
+`--format agui` writes the same log as AG-UI 1.0 JSONL. `--format html` writes one self-contained viewer file with those events inlined; it opens offline. Both redact secret-shaped values. A Harbor trial's agent directory works too:
+
+```bash
+zygos mission trace <jobs>/<trial>/agent --format html > run.html
+```
+
+The projection is specified in `docs/specs/trace.md`, under "AG-UI projection".
 
 `attach` follows that same log from another terminal. Commands you type are appended to `control.jsonl`. A crashed run still shows its history, and the commands wait there until a resume picks them up.
 

@@ -6,6 +6,12 @@ Reconstructed from git history on 2026-09-30. A commit that only added a library
 
 The agent that next changes operator-visible behavior adds the new heading in that same commit.
 
+## [4.1.0] - 2026-10-08
+
+### Added
+
+- `zygos mission trace <target> --format agui|html`. `agui` writes the run's `events.jsonl` as AG-UI 1.0 JSONL. Role turns become subagent runs, tool calls pair with their results, policy and approval refusals are flagged, and a terminal mission or task state becomes `RUN_FINISHED` or `RUN_ERROR`. `html` writes a self-contained viewer with that projection inlined. Both are offline and deterministic, and they redact secret-shaped values. The target may be a Harbor trial's `agent/` directory, whose `trial.json` supplies the thread id. `--format text` (the default) is the existing render. An unknown `--format`, or `--format` on another verb, exits 2.
+
 ## [4.0.0] - 2026-10-01
 
 ### Breaking

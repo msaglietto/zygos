@@ -12,7 +12,7 @@ X2 `CatalogBoot` and auto-approve replaced by a console approval path.
 ```
 zygos mission start <brief.md> [--planning <dir>] [--resume] [--run-stamp] [--no-tui]
 zygos mission resume <brief.md> [--planning <dir>]   # sugar for --resume
-zygos mission trace <planning-dir>                   # render events.jsonl
+zygos mission trace <planning-dir|events.jsonl|trial-agent-dir> [--format text|agui|html]
 ```
 
 - `--run-stamp` (Y3, unattended reruns): the planning root becomes
@@ -22,7 +22,13 @@ zygos mission trace <planning-dir>                   # render events.jsonl
 - `--no-tui` (or `ZYGOS_NO_TUI=1`): keep the plain stderr banner even on a
   tty. Piped/CI runs fall back automatically.
 - `trace` renders the structured `events.jsonl` the mission writes (see
-  README "Mission trace").
+  README "Mission trace") to stdout. `--format text` (default) is the human
+  render. `--format agui` writes the AG-UI 1.0 JSONL projection and
+  `--format html` a self-contained viewer with that projection inlined (see
+  `trace.md`, "AG-UI projection"). `--format` with an unknown value, or on any
+  verb other than `trace`, is usage (exit 2). The target may also be a Harbor
+  trial's `agent/` directory, which holds `events.jsonl` next to `trial.json`:
+  `zygos mission trace <jobs>/<trial>/agent --format html > run.html`.
 
 - Brief: the file's text rides the `missions::start` request as `brief`
   (the W1 lint refuses malformed briefs server-side); the CLI also runs
