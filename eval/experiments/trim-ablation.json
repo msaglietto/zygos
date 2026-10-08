@@ -1,0 +1,85 @@
+{
+  "name": "trim-ablation",
+  "description": "Output-compression ablation on the eight-task canary: trim on (baseline) versus trim off (candidate), identical build, model, and settings. Benchmark policy phase 10 run through the tracked campaign workflow.",
+  "variable": "trim",
+  "dataset": {
+    "id": "terminal-bench/terminal-bench-2-1",
+    "source": "https://github.com/harbor-framework/terminal-bench-2-1",
+    "source_sha": "7131e4375048a0e408a8fb404b5f499d726b695b",
+    "tasks": [
+      {
+        "id": "build-cython-ext",
+        "checksum": "73d894b2d49e5f9f8feb08488f0d52d4818372c775039cc3e1b1815b77256065"
+      },
+      {
+        "id": "cobol-modernization",
+        "checksum": "1d068f63a7d36ec098b620a8b2062419c1a9a2eff6458bc3ff56eb325ebf5903"
+      },
+      {
+        "id": "filter-js-from-html",
+        "checksum": "ed037d7c41a92817e75d6a776fb2a669d1a50b19f77d37df8c049951ba75993e"
+      },
+      {
+        "id": "fix-code-vulnerability",
+        "checksum": "352f6f6321f82b6437fe2ddd664fa359f1263c0a85289c4fb5c81777c44faa79"
+      },
+      {
+        "id": "fix-git",
+        "checksum": "e89f54f2fc73ac576f976c1cd09758e4c9ccf152e53c2dcd91da0c178b89abc7"
+      },
+      {
+        "id": "log-summary-date-ranges",
+        "checksum": "f661ef345f023ef5a2dcdd056c353a1a2bbce29a70b04765c615c25e91b6b662"
+      },
+      {
+        "id": "modernize-scientific-stack",
+        "checksum": "4701954b187290cfad50ddbd3d256b4804e42730c1dbe4ce8318b862451f4cde"
+      },
+      {
+        "id": "regex-log",
+        "checksum": "8e6fca84d707d9c8736d83027308f7b9be7cbb2013df8fb40f4343c1c58bac1f"
+      }
+    ]
+  },
+  "model": {
+    "id": "deepseek/deepseek-v4.1-flash",
+    "key_env": "DEEPSEEK_API_KEY",
+    "key_from_env": "OPENROUTER_API_KEY",
+    "max_tokens": 8192,
+    "temperature": 0.7
+  },
+  "prices": {
+    "source": "https://openrouter.ai/api/v1/models",
+    "retrieved_utc": "2026-10-06T04:11:09.724231+00:00",
+    "canonical_slug": "deepseek/deepseek-v4.1-flash-20260910",
+    "usd_per_million_tokens": {
+      "input": "0.003",
+      "cached_input": "0.003",
+      "output": "2.40"
+    },
+    "scorer_cents_per_mtok": 30
+  },
+  "step_cap": 24,
+  "repeats": 3,
+  "workspace": "/app",
+  "host_concurrency": 2,
+  "ca_bundle_sha256": "9dae8d76e55cb08991f2b672d58999ea15560d910759c16b544f843bdffbb994",
+  "arms": [
+    {
+      "name": "trim-on",
+      "trim": "on",
+      "build": {
+        "git_sha": "9e5880342c12e6ed256f7796cc607f415dd38256",
+        "binary_sha256": "9dee02992acd6625f3a5e8f47b372bb250b1286934afa694235822cd422c87fb"
+      }
+    },
+    {
+      "name": "trim-off",
+      "trim": "off",
+      "build": {
+        "git_sha": "9e5880342c12e6ed256f7796cc607f415dd38256",
+        "binary_sha256": "9dee02992acd6625f3a5e8f47b372bb250b1286934afa694235822cd422c87fb"
+      }
+    }
+  ]
+}
