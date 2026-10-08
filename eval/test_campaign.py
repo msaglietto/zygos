@@ -304,6 +304,19 @@ class RunContract(unittest.TestCase):
 
 
 class ReportContract(unittest.TestCase):
+    def test_a_pass_delta_within_repeat_noise_does_not_decide_the_verdict(self):
+        with tempfile.TemporaryDirectory() as d:
+            fx = Fixture(Path(d), repeats=2)
+            # alpha flips between repeats inside the baseline arm; the candidate wins by exactly one.
+            fx.set_control(rewards={"baseline-r1-alpha": 1.0, "candidate-r1-alpha": 1.0, "candidate-r2-alpha": 1.0})
+            result, jobs = fx.run()
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            result, out = fx.report(jobs)
+            report = json.loads((out / "report.json").read_text())
+            self.assertEqual(report["repeat_noise_tasks"], 1)
+            self.assertEqual(report["verdict"], "no_observed_difference")
+            self.assertTrue(any("within repeat noise" in r for r in report["verdict_reasons"]), report["verdict_reasons"])
+
     def test_report_over_missing_jobs_is_inconclusive_and_still_lists_every_pair(self):
         with tempfile.TemporaryDirectory() as d:
             fx = Fixture(Path(d))

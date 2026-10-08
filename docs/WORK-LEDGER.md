@@ -612,3 +612,35 @@ The combined tree passes 940/940 offline Zig tests, 12 mocked Python adapter/run
 GitNexus comparison reports critical scope across the shared kernel/provider paths. Complete change reports were checked for partial/truncated results; the underlying process index warns that it does not enumerate every flow. Graph scope is supporting evidence rather than proof of exhaustive coverage.
 
 PR preparation ran no paid benchmark. The clean-source a147d52 Linux artifact and its digest remain unchanged, and historical trial identities are not rewritten. Phase 10–12 remain not started under standing benchmark authority.
+
+## Campaign workflow and trim ablation — 2026-10-08
+
+The benchmark now has one tracked workflow instead of per-session scripts: `eval/campaign.py build|run|report` over an experiment file (`eval/experiments/trim-ablation.json`), contract `docs/specs/campaign.md`. `zygos task run --config zygos.zon` (4.1.0) routes the task step over a route table and pins `config_sha256` on the trial, so a configuration arm is identifiable; mission-only settings refuse. A turn wall clock (4.2.0, `wall_clock_ms` / `--timeout-ms`) stops a turn as `timeout` and bounds bash calls by the remainder. Offline: 939/23/3 Zig tests, 25 Python tests, formatting clean.
+
+Three campaign attempts, all under the standing policy, DeepSeek Flash, eight-task canary, three repeats, trim on versus off, step cap 24, one Harbor task per invocation, two host jobs, no retries:
+
+| Attempt | Build | Outcome | Known usage |
+| --- | --- | --- | --- |
+| 1 (`/tmp/zygos-trim-ablation-attempt1-401`) | `9e58803` | Stopped at the first pair: OpenRouter answered 401 because the host's `DEEPSEEK_API_KEY` is a direct-vendor key and the runner only bound `OPENROUTER_API_KEY` as a fallback. No tokens. Fixed: `key_from_env` is an override. | $0 |
+| 2 (`/tmp/zygos-trim-ablation-attempt2-timeout`) | `9e58803` | Stopped after 5 recorded task-runs (plus one drained): `trim-off-r1-filter-js-from-html` ran `sleep 120` at 463 s, overran the in-process 540 s and Harbor's 570 s ceiling, no trial written. Fixed by the turn wall clock; new source needs a new matched baseline, so the attempt was set aside. | $0.219 recorded; the lost job's usage is unrecorded |
+| 3 (`/tmp/zygos-trim-ablation`) | `b8a79db`, binary `54bf161e…cc2e` | Finished 48/48 with zero problems: no transport failures, no Harbor exceptions, no identity or checksum mismatches, every trace ended. | $1.264457484 |
+
+Final campaign, matched on everything but trim (report `reports/benchmarks/trim-ablation-2026-10-08/`, raw jobs in the attempt-3 directory):
+
+| Metric | trim-on (baseline) | trim-off (candidate) |
+| --- | ---: | ---: |
+| Verifier passes / 24 | 14 | 13 |
+| Input tokens (cache reads) | 3998400 (3532032) | 2828228 (2494592) |
+| Output tokens | 281741 | 236583 |
+| Snapshot cost USD | 0.688173600 | 0.576283884 |
+| Cost per resolved task USD | 0.049155 | 0.044330 |
+| Mean provider steps | 15.96 | 13.46 |
+| Turn stops | `{"end_turn": 12, "max_steps": 9, "max_tokens": 3}` | `{"end_turn": 13, "max_steps": 6, "max_tokens": 5}` |
+| Trim compress calls | 462 | 0 |
+| Scorer accepted / refused | 3 / 21 (`TrimOnZeroReduction`) | 24 / 0 |
+
+Verdict `candidate_better`: the pass delta (−1) is within repeat noise (one task flipped outcome between repeats of a single arm: regex-log on trim-on, cobol-modernization on trim-off), so the verdict rests on cost, where trim-off spent 16.3% less. Trim produced a nonzero reduction in 3 of 24 trim-on trials (17–43%, generic truncation only; `filtered=0`, `deduped=0` everywhere), and the trim-on arm took more steps on average. On this canary, output compression as shipped does not pay for itself; it neither raises the pass rate nor lowers cost. That is a measurement of the feature, not a defect in the harness, and it is the first matched result this branch has produced.
+
+Price snapshot $0.003 / $0.003 / $2.40 per million (OpenRouter, 2026-10-06); estimates, not invoices. Session total known usage: $1.484. Harbor 0.24.0 (the machine upgraded from 0.23.0), scorer in `debian:bullseye-slim` with the Linux artifact. Dataset checkout `7131e43`, CA bundle `9dae8d76…bb994`, task checksums verified on every trial.
+
+Not done: a mission-mode workload (the mission FSM inside the task container) so `context_strategy`, roles, and MCP settings can be measured; Phase 11 (89 tasks, SWE-bench Lite pin) and Phase 12 remain as recorded above.

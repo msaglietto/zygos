@@ -771,7 +771,7 @@ def arm_summary(exp: Experiment, arm: Arm, records: list[dict]) -> dict:
         "output_tokens": sum(int(r["trial"].get("output_tokens", 0)) for r in with_trial),
         "cache_read_tokens": sum(int(r["trial"].get("cache_read_tokens", 0) or 0) for r in with_trial),
         "cost_usd": str(cost),
-        "cost_per_resolved_usd": str(cost / passes) if passes else None,
+        "cost_per_resolved_usd": str((cost / passes).quantize(Decimal("0.000001"))) if passes else None,
         "mean_provider_steps": mean([r.get("provider_steps") for r in with_trial]),
         "mean_elapsed_seconds": mean([r.get("elapsed_seconds") for r in records]),
         "turn_stops": dict(Counter(r.get("turn_stop") for r in with_trial)),
@@ -811,7 +811,21 @@ def matched_pairs(exp: Experiment, by_job: dict) -> list[dict]:
     return pairs
 
 
-def verdict(exp: Experiment, base: dict, cand: dict) -> tuple[str, list[str]]:
+def within_arm_flips(exp: Experiment, records: list[dict], arm: Arm) -> int:
+    """Tasks whose verifier outcome differed between repeats of the same arm.
+
+    That is the repeat-to-repeat noise floor: a pass delta no larger than
+    it cannot be attributed to the variable.
+    """
+    flips = 0
+    for task_id in exp.task_ids():
+        rewards = {r.get("reward") for r in records if r["arm"] == arm.name and r["task_id"] == task_id}
+        if len(rewards - {None}) > 1:
+            flips += 1
+    return flips
+
+
+def verdict(exp: Experiment, base: dict, cand: dict, noise: int = 0) -> tuple[str, list[str]]:
     """Observed difference or an explicit reason it cannot be read."""
     reasons = []
     for label, s in (("baseline", base), ("candidate", cand)):
@@ -826,16 +840,17 @@ def verdict(exp: Experiment, base: dict, cand: dict) -> tuple[str, list[str]]:
     dc = Decimal(cand["cost_usd"]) - Decimal(base["cost_usd"])
     base_cost = Decimal(base["cost_usd"])
     rel = (dc / base_cost) if base_cost else None
-    if dp > 0:
-        outcome = "candidate_better"
-    elif dp < 0:
-        outcome = "candidate_worse"
+    if abs(dp) > noise:
+        outcome = "candidate_better" if dp > 0 else "candidate_worse"
     elif rel is not None and abs(rel) > Decimal("0.05"):
         outcome = "candidate_better" if dc < 0 else "candidate_worse"
     else:
         outcome = "no_observed_difference"
     caveats.append(f"pass delta {dp:+d} on {base['expected_task_runs']} matched task-runs; cost delta {dc:+f} USD"
                    + (f" ({rel * 100:+.1f}%)" if rel is not None else ""))
+    if dp != 0 and abs(dp) <= noise:
+        caveats.append(f"pass delta is within repeat noise: {noise} task(s) flipped outcome between repeats of one arm; "
+                       f"the verdict rests on cost")
     if base["expected_task_runs"] < 24:
         caveats.append("fewer than 24 matched task-runs: treat the direction as a hint, not a measurement")
     if exp.variable == "trim":
@@ -860,7 +875,7 @@ def render_markdown(exp: Experiment, report: dict) -> str:
         ("git sha", "git_sha"), ("binary sha256", "binary_sha256"), ("config sha256", "config_sha256"), ("trim", "trim"),
     ]
     for label, key in rows:
-        lines.append(f"| {label} | `{base['arm'][key]}` | `{cand['arm'][key]}` |")
+        lines.append(f"| {label} | `{base['arm'][key] or 'none'}` | `{cand['arm'][key] or 'none'}` |")
     lines += ["", "## Results", "", f"| Metric | {exp.baseline.name} | {exp.candidate.name} |", "|---|---:|---:|"]
     metrics = [
         ("Task-runs recorded / expected", lambda s: f"{s['recorded_task_runs']} / {s['expected_task_runs']}"),
@@ -910,7 +925,8 @@ def cmd_report(args) -> int:
     records = [inspect_job(exp, jobs_dir, arm, repeat, task) for arm, repeat, task in exp.jobs()]
     by_job = {r["job"]: r for r in records}
     arms = {arm.name: arm_summary(exp, arm, [r for r in records if r["arm"] == arm.name]) for arm in exp.arms}
-    outcome, reasons = verdict(exp, arms[exp.baseline.name], arms[exp.candidate.name])
+    noise = max(within_arm_flips(exp, records, arm) for arm in exp.arms)
+    outcome, reasons = verdict(exp, arms[exp.baseline.name], arms[exp.candidate.name], noise)
     campaign_path = jobs_dir / "campaign.json"
     campaign = json.loads(campaign_path.read_text(encoding="utf-8")) if campaign_path.is_file() else {}
     report = {
@@ -923,6 +939,7 @@ def cmd_report(args) -> int:
         "scorer": campaign.get("scorer"),
         "verdict": outcome,
         "verdict_reasons": reasons,
+        "repeat_noise_tasks": noise,
         "arms": arms,
         "matched": matched_pairs(exp, by_job),
         "task_runs": [
