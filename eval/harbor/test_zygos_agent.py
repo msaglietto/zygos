@@ -306,6 +306,9 @@ class TrimContract(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(environment.calls, [])
         self.assertIsNone(terminal_reply("mission: errored: timeout\n"))
         self.assertEqual(terminal_reply('{"state":"done","stop":"completed"}\n')["stop"], "completed")
+        # The console gate prompt has no newline, so the reply shares its line.
+        prompt = 'approve mission::complete: fix it? [y/N] {"state":"gating","stop":"none","paused":true,"role_turns":5,"tasks_done":2}\n'
+        self.assertTrue(terminal_reply(prompt)["paused"])
 
     def test_mission_brief_demotes_level_two_headings_only(self):
         brief = mission_brief("t", "# Title\n## Part\n### Sub\ntext")

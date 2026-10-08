@@ -507,6 +507,25 @@ def inspect_job(exp: Experiment, jobs_dir: Path, arm: Arm, repeat: int, task_id:
     return record
 
 
+def terminal_reply(stdout: str) -> dict | None:
+    """The mission CLI's terminal reply: the last `{"state":...}` object on
+    stdout. It can share a line with the console gate prompt, which has no
+    trailing newline, so the object is searched for inside each line."""
+    import json
+
+    for line in reversed(stdout.splitlines()):
+        start = line.rfind('{"state"')
+        if start < 0:
+            continue
+        try:
+            value = json.loads(line[start:])
+        except ValueError:
+            continue
+        if isinstance(value, dict):
+            return value
+    return None
+
+
 def inspect_mission(exp: Experiment, jobs_dir: Path, arm: Arm, record: dict, agent_dir: Path) -> dict:
     """Mission-mode evidence: the uploaded route table, the terminal reply,
     and the planning trace. Usage comes from the trace's usage lines, which
@@ -529,15 +548,28 @@ def inspect_mission(exp: Experiment, jobs_dir: Path, arm: Arm, record: dict, age
     if run.get("role_max_steps") != exp.step_cap:
         record["problems"].append(f"role_max_steps is {run.get('role_max_steps')!r}, expected {exp.step_cap}")
 
+    # The raw stdout is the evidence; mission.json is the adapter's reading
+    # of it and only stands in when stdout is absent.
+    reply = None
+    stdout_path = agent_dir / "stdout.txt"
+    if stdout_path.is_file():
+        reply = terminal_reply(stdout_path.read_text(encoding="utf-8", errors="replace"))
     reply_path = agent_dir / "mission.json"
-    if reply_path.is_file():
+    if reply is None and reply_path.is_file():
         reply = json.loads(reply_path.read_text(encoding="utf-8"))
-        record["mission_state"] = reply.get("state")
-        record["turn_stop"] = reply.get("stop") if reply.get("state") != "lost" else "no_terminal_reply"
-        record["role_turns"] = reply.get("role_turns")
-        record["tasks_done"] = reply.get("tasks_done")
-    else:
+    if reply is None and not reply_path.is_file():
         record["problems"].append("mission.json missing")
+    if reply is None:
+        reply = {"state": "lost", "stop": "no_terminal_reply"}
+    record["mission_state"] = reply.get("state")
+    if reply.get("state") == "lost":
+        record["turn_stop"] = "no_terminal_reply"
+    elif reply.get("paused"):
+        record["turn_stop"] = "parked"
+    else:
+        record["turn_stop"] = reply.get("stop")
+    record["role_turns"] = reply.get("role_turns")
+    record["tasks_done"] = reply.get("tasks_done")
 
     events_path = agent_dir / "planning" / "events.jsonl"
     if not events_path.is_file():

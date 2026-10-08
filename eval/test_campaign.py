@@ -38,6 +38,7 @@ if os.environ.get("ZYGOS_MODE") == "mission":
     (agent / "zygos.zon").write_bytes(Path(config).read_bytes())
     reply = control.get("mission", {}).get(name, {"state": "gating", "stop": "none", "paused": True, "role_turns": 4, "tasks_done": 1})
     (agent / "mission.json").write_text(json.dumps(reply))
+    (agent / "stdout.txt").write_text("approve mission::complete: x? [y/N] " + json.dumps(reply) + "\n")
     (agent / "mission-run.json").write_text(json.dumps({
         "mode": "mission", "task_id": task, "config_sha256": hashlib.sha256(Path(config).read_bytes()).hexdigest(),
         "role_max_steps": int(os.environ["ZYGOS_ROLE_MAX_STEPS"]) if os.environ.get("ZYGOS_ROLE_MAX_STEPS") else int(os.environ["ZYGOS_STEP_CAP"]),
@@ -374,7 +375,7 @@ class MissionContract(unittest.TestCase):
             self.assertEqual(base["cost_usd"], str((Decimal(5000) * Decimal("0.003") + Decimal(400) * Decimal("2.40")) / Decimal(1_000_000)))
             self.assertEqual(base["cache_unreported"], 2)
             self.assertTrue(any("cache counts" in r for r in report["verdict_reasons"]))
-            self.assertEqual(report["matched"][0]["baseline"]["stop"], "none")
+            self.assertEqual(report["matched"][0]["baseline"]["stop"], "parked")
             markdown = (out / "report.md").read_text()
             self.assertIn("Mode: **mission**", markdown)
             self.assertIn("| Mean role turns | 4.0 | 4.0 |", markdown)
@@ -412,6 +413,12 @@ class MissionContract(unittest.TestCase):
             report = json.loads((out / "report.json").read_text())
             self.assertEqual(report["matched"][0]["baseline"]["stop"], "no_terminal_reply")
             self.assertEqual(report["arms"]["baseline"]["problems"], 0)
+            # stdout is the evidence: a reply there beats a stale mission.json.
+            job = jobs / "candidate-r1-alpha" / "alpha__stub" / "agent"
+            (job / "mission.json").write_text(json.dumps({"state": "lost", "stop": "no_terminal_reply"}))
+            result, out = fx.report(jobs)
+            report = json.loads((out / "report.json").read_text())
+            self.assertEqual(report["matched"][0]["candidate"]["stop"], "parked")
             self.assertEqual(report["arms"]["baseline"]["turn_stops"].get("no_terminal_reply"), 1)
 
 

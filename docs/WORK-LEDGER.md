@@ -644,3 +644,21 @@ Verdict `candidate_better`: the pass delta (−1) is within repeat noise (one ta
 Price snapshot $0.003 / $0.003 / $2.40 per million (OpenRouter, 2026-10-06); estimates, not invoices. Session total known usage: $1.484. Harbor 0.24.0 (the machine upgraded from 0.23.0), scorer in `debian:bullseye-slim` with the Linux artifact. Dataset checkout `7131e43`, CA bundle `9dae8d76…bb994`, task checksums verified on every trial.
 
 Not done: a mission-mode workload (the mission FSM inside the task container) so `context_strategy`, roles, and MCP settings can be measured; Phase 11 (89 tasks, SWE-bench Lite pin) and Phase 12 remain as recorded above.
+
+## Mission-mode benchmark — smoke 2026-10-08
+
+The campaign workflow now runs a task through the mission loop (`mode: mission`, `docs/specs/campaign.md` "Mission mode"): the instruction becomes a lint-passing brief, the arm's `zygos.zon` is the mission's route table, `zygos mission start` runs in the task workspace with the planning root under the agent log directory, the completion gate parks after one second, and Harbor's verifier judges the workspace. Usage comes from the planning trace (no cache counts; input priced at the ordinary rate). Configurable step lists are not in scope; they are issue #7 (https://github.com/msaglietto/zygos/issues/7).
+
+Smoke, `eval/experiments/mission-smoke.json`: one task (`fix-git`), one repeat, build `b8a79db`, arms differ only in the route table (`configs/mission-all-deepseek.zon` vs `configs/mission-executor-glm.zon`). Jobs `/tmp/zygos-mission-smoke`, report `reports/benchmarks/mission-smoke-2026-10-08/`.
+
+| Metric | all-deepseek | executor-glm |
+| --- | ---: | ---: |
+| Verifier pass | 1 | 0 |
+| Mission state / stop | gating / parked | failed / role_failed |
+| Role turns | 5.0 | 3.0 |
+| Input / output tokens | 76963 / 8981 | 601 / 1227 |
+| Snapshot cost USD (upper bound) | 0.021785289 | 0.002946603 |
+
+The DeepSeek mission ran product-owner, planner, executor (two tasks), verifier, reached the gate, parked, and the hidden tests passed. The GLM arm's executor step failed in one second: `api.z.ai` answered 429, the single-attempt ladder was exhausted, and the mission stopped `role_failed`; that is a recorded outcome, not a harness problem. One task is a path proof, not a measurement; the eight-task campaign is `eval/experiments/mission-routing.json` and has not been run. Smoke spend about $0.025.
+
+Two parsing repairs came out of the smoke, both offline-tested: the terminal reply shares a stdout line with the console gate prompt, so it is now found inside the line, and the report reads the raw stdout rather than the adapter's reading of it. A parked gate is reported as stop `parked`.

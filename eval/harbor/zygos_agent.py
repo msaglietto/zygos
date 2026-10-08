@@ -146,18 +146,20 @@ def mission_brief(task_id: str, instruction: str, budget_tokens: int = MISSION_B
 
 
 def terminal_reply(stdout: str) -> dict | None:
-    """The mission CLI's last stdout line is the terminal reply JSON."""
+    """The mission CLI's terminal reply: the last `{"state":...}` object on
+    stdout. It can share a line with the console gate prompt, which has no
+    trailing newline, so the object is searched for inside each line."""
     import json
 
     for line in reversed(stdout.splitlines()):
-        line = line.strip()
-        if not line.startswith("{"):
+        start = line.rfind('{"state"')
+        if start < 0:
             continue
         try:
-            value = json.loads(line)
+            value = json.loads(line[start:])
         except ValueError:
             continue
-        if isinstance(value, dict) and "state" in value:
+        if isinstance(value, dict):
             return value
     return None
 
