@@ -31,7 +31,7 @@ pub fn run(gpa: std.mem.Allocator, args: *std.process.Args.Iterator) u8 {
     var argv: std.ArrayList([]const u8) = .empty;
     while (args.next()) |a| argv.append(gpa, a) catch return oom();
     const parsed = zygos.mission_boot.parseArgs(argv.items) catch return usage();
-    if (parsed.verb == .trace) return runTrace(gpa, parsed.brief_path);
+    if (parsed.verb == .trace) return runTrace(gpa, parsed.brief_path, parsed.format);
     if (parsed.verb == .attach) return runAttach(gpa, parsed.brief_path);
     if (parsed.verb == .dashboard) return runDashboard(gpa, parsed.brief_path);
     const queue_mode = parsed.verb == .queue;
@@ -559,7 +559,7 @@ fn usage() u8 {
     eprint(
         "usage: zygos mission start|resume <brief.md> [--planning <dir>] [--resume] [--run-stamp] [--no-tui]\n" ++
             "       zygos mission queue [--planning <base>] [--run-stamp] <brief.md>...\n" ++
-            "       zygos mission trace <planning-dir|events.jsonl>\n" ++
+            "       zygos mission trace <planning-dir|events.jsonl|trial-agent-dir> [--format text|agui|html]\n" ++
             "       zygos mission attach <planning-dir>\n" ++
             "       zygos mission dashboard <dir>\n",
         .{},
@@ -696,21 +696,40 @@ fn runAttach(gpa: std.mem.Allocator, target: []const u8) u8 {
     return 0;
 }
 
-/// `zygos mission trace <planning-dir|events.jsonl>` — render the run's
-/// event log as a human view. Read-only; exits 2 when there is no trace.
-fn runTrace(gpa: std.mem.Allocator, target: []const u8) u8 {
+/// `zygos mission trace <planning-dir|events.jsonl|trial-agent-dir>
+/// [--format text|agui|html]` — render the run's event log to stdout as a
+/// human view, AG-UI JSONL, or a self-contained HTML viewer. Read-only;
+/// exits 2 when there is no trace.
+fn runTrace(gpa: std.mem.Allocator, target: []const u8, format: zygos.mission_boot.TraceFormat) u8 {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
     // Planning root first: fopen("r") on a directory succeeds with an empty
     // read on macOS, so trying the bare target first would render nothing.
-    const joined = std.fmt.allocPrint(gpa, "{s}/{s}", .{
-        std.mem.trimEnd(u8, target, "/"), zygos.trace.file_name,
-    }) catch return oom();
-    defer gpa.free(joined);
-    const text = readWholeFile(gpa, joined) orelse readWholeFile(gpa, target) orelse {
+    const target_dir = std.mem.trimEnd(u8, target, "/");
+    const joined = std.fmt.allocPrint(arena, "{s}/{s}", .{ target_dir, zygos.trace.file_name }) catch return oom();
+    var dir = target_dir;
+    const text = readWholeFile(arena, joined) orelse blk: {
+        dir = std.fs.path.dirname(target_dir) orelse ".";
+        break :blk readWholeFile(arena, target);
+    } orelse {
         eprint("mission: no trace at {s} (is this a planning root?)\n", .{target});
         return 2;
     };
-    const rendered = zygos.trace.render(gpa, text) catch return oom();
-    writeStdout(rendered);
+    const out = switch (format) {
+        .text => zygos.trace.render(arena, text),
+        .agui, .html => agui: {
+            const thread_id = view_mod.threadId(
+                arena,
+                dir,
+                readWholeFile(arena, std.fmt.allocPrint(arena, "{s}/mission.json", .{dir}) catch return oom()),
+                readWholeFile(arena, std.fmt.allocPrint(arena, "{s}/trial.json", .{dir}) catch return oom()),
+            );
+            const events = zygos.agui.project(arena, text, thread_id) catch return oom();
+            break :agui if (format == .html) zygos.agui.html(arena, events) else events;
+        },
+    } catch return oom();
+    writeStdout(out);
     return 0;
 }
 

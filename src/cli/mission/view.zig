@@ -40,6 +40,22 @@ pub fn dashboardLine(arena: std.mem.Allocator, state_path: []const u8, text: []c
     ) catch null;
 }
 
+/// The AG-UI thread id for a trace whose events live in `dir_path`:
+/// `mission_id` from its mission.json, else `task_id` from its trial.json
+/// (Harbor writes one next to the agent's events.jsonl), else the
+/// directory's basename.
+pub fn threadId(arena: std.mem.Allocator, dir_path: []const u8, mission_json: ?[]const u8, trial_json: ?[]const u8) []const u8 {
+    return stringField(arena, mission_json, "mission_id") orelse
+        stringField(arena, trial_json, "task_id") orelse
+        std.fs.path.basename(dir_path);
+}
+
+fn stringField(arena: std.mem.Allocator, text: ?[]const u8, key: []const u8) ?[]const u8 {
+    const v = json.parseFromSliceLeaky(json.Value, arena, text orelse return null, .{}) catch return null;
+    if (v != .object) return null;
+    return strOf(v.object.get(key));
+}
+
 pub const AttachParse = union(enum) {
     cmd: zygos.control.Command,
     /// Human-readable rejection for the attach console; empty input is
@@ -100,6 +116,23 @@ test "dashboardLine: malformed or non-object snapshots are skipped, fields defau
     try testing.expectEqual(@as(?[]const u8, null), dashboardLine(arena, "p", "[]"));
     const line = dashboardLine(arena, "mission.json", "{}").?;
     try testing.expectEqualStrings("?  ? (?)  tasks 0/0  role_turns 0  mission.json\n", line);
+}
+
+test "threadId: mission.json wins, then trial.json, then the directory basename" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const mission =
+        \\{"mission_id":"brief-radar","state":"failed"}
+    ;
+    const trial =
+        \\{"task_id":"filter-js-from-html","variable":"trim-on"}
+    ;
+    try testing.expectEqualStrings("brief-radar", threadId(arena, "/runs/.planning-1", mission, trial));
+    try testing.expectEqualStrings("filter-js-from-html", threadId(arena, "/jobs/t__a/agent", null, trial));
+    try testing.expectEqualStrings("filter-js-from-html", threadId(arena, "/jobs/t__a/agent", "not json", trial));
+    try testing.expectEqualStrings("agent", threadId(arena, "/jobs/t__a/agent", null, "{}"));
+    try testing.expectEqualStrings(".planning-1", threadId(arena, ".planning-1", null, null));
 }
 
 test "parseAttachCommand: pause, resume, steer and approve verdicts" {
