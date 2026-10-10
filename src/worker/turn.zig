@@ -394,6 +394,8 @@ fn runTurn(self: *TurnOrchestrator, arena: std.mem.Allocator, request_json: []co
     const model = q.model;
     const system = q.system;
     const max_steps = q.max_steps;
+    const wall_clock_ms = q.wall_clock_ms;
+    const started_ms = monotonicMs();
     const static_provider = q.static_provider;
     const router_fn = q.router_fn;
     const step_id = q.step_id;
@@ -436,6 +438,16 @@ fn runTurn(self: *TurnOrchestrator, arena: std.mem.Allocator, request_json: []co
             state = try Fsm.apply(state, .step_budget_exhausted);
             stop = "max_steps";
             break :turn;
+        }
+        // Wall clock: a step never starts past the budget, so a bounded
+        // caller (the headless task under Harbor's ceiling) still gets a
+        // clean stop and its record. Same FSM event as the step budget.
+        if (wall_clock_ms) |wall| {
+            if (elapsedMs(started_ms) >= wall) {
+                state = try Fsm.apply(state, .step_budget_exhausted);
+                stop = "timeout";
+                break :turn;
+            }
         }
 
         // U5 budget gate — fail closed: an unanswerable check is "over".
@@ -570,6 +582,23 @@ fn runTurn(self: *TurnOrchestrator, arena: std.mem.Allocator, request_json: []co
                     .{try rawJson(arena, content)},
                 ));
 
+                const terminal_stop = std.mem.eql(u8, stop_reason, "end_turn") or
+                    std.mem.eql(u8, stop_reason, "max_tokens") or
+                    std.mem.eql(u8, stop_reason, "stop_sequence");
+                if (!terminal_stop and !std.mem.eql(u8, stop_reason, "tool_use")) {
+                    state = try Fsm.apply(state, .provider_error);
+                    try trace_mod.emit(arena, trace_path, .{ .turn_end = .{
+                        .turn_id = turn_id orelse "",
+                        .stop = "failed",
+                        .steps = @intCast(steps),
+                        .err = "unknown_provider_stop",
+                    } });
+                    return try std.fmt.allocPrint(
+                        arena,
+                        "{{\"stop\":\"failed\",\"steps\":{d},\"error\":\"unknown_provider_stop\"}}",
+                        .{steps},
+                    );
+                }
                 if (!std.mem.eql(u8, stop_reason, "tool_use")) {
                     state = try Fsm.apply(state, .provider_end_turn); // → stopped
                     stop = stop_reason;
@@ -634,7 +663,8 @@ fn runTurn(self: *TurnOrchestrator, arena: std.mem.Allocator, request_json: []co
                         }
                     }
 
-                    const tool_res = self.worker.call(route.function_id, try rawJson(arena, input)) catch |err|
+                    const tool_input = try boundedInput(arena, input, route.function_id, wall_clock_ms, started_ms);
+                    const tool_res = self.worker.call(route.function_id, try rawJson(arena, tool_input)) catch |err|
                         return err;
                     switch (tool_res) {
                         .ok => |out| {
@@ -687,6 +717,40 @@ fn runTurn(self: *TurnOrchestrator, arena: std.mem.Allocator, request_json: []co
         "{{\"stop\":{f},\"steps\":{d},\"deltas\":{f},\"transcript\":[{s}]}}",
         .{ json.fmt(stop, .{}), steps, json.fmt(delta_text, .{}), try joinComma(arena, transcript.items) },
     );
+}
+
+fn monotonicMs() i64 {
+    var ts: std.c.timespec = undefined;
+    if (std.c.clock_gettime(.MONOTONIC, &ts) != 0) return 0;
+    return @as(i64, @intCast(ts.sec)) * 1000 + @divTrunc(@as(i64, @intCast(ts.nsec)), std.time.ns_per_ms);
+}
+
+fn elapsedMs(started_ms: i64) u64 {
+    const now = monotonicMs();
+    return if (now > started_ms) @intCast(now - started_ms) else 0;
+}
+
+/// Under a wall clock, a bash call may not outlive the turn: the remaining
+/// budget rides along as `timeout_ms`, which the bash tool caps its own
+/// deadline with. Other tools and unbounded turns get the input untouched.
+/// The transcript already holds the model's original block.
+fn boundedInput(
+    arena: std.mem.Allocator,
+    input: json.Value,
+    function_id: []const u8,
+    wall_clock_ms: ?u64,
+    started_ms: i64,
+) error{OutOfMemory}!json.Value {
+    const wall = wall_clock_ms orelse return input;
+    if (!std.mem.eql(u8, function_id, "zygos::tools::bash")) return input;
+    if (input != .object) return input;
+    const spent = elapsedMs(started_ms);
+    const remaining: i64 = if (spent >= wall) 1 else @intCast(wall - spent);
+    var bounded = input;
+    var copy = try bounded.object.clone(arena);
+    try copy.put(arena, "timeout_ms", .{ .integer = remaining });
+    bounded.object = copy;
+    return bounded;
 }
 
 /// Trace twin of `toolResult`: what the model will see (post-compress),
@@ -900,6 +964,82 @@ test "text-only turn: one step, stops end_turn, transcript has assistant text" {
     const transcript = p.value.object.get("transcript").?.array.items;
     try testing.expectEqual(@as(usize, 2), transcript.len); // user + assistant
     try testing.expectEqualStrings("assistant", transcript[1].object.get("role").?.string);
+}
+
+/// A bash stand-in that sleeps, so a wall clock can expire mid-turn.
+const SlowBash = struct {
+    gpa: std.mem.Allocator,
+    worker: *inproc.Worker,
+    delay_ms: u64,
+    mutex: sync.Mutex = .{},
+    last_input: ?[]u8 = null,
+
+    fn start(gpa: std.mem.Allocator, actor: *actor_mod.Actor, registry: *inproc.Registry, delay_ms: u64) !*SlowBash {
+        const self = try gpa.create(SlowBash);
+        self.* = .{
+            .gpa = gpa,
+            .worker = try inproc.Worker.spawn(gpa, actor, registry, "slow-bash"),
+            .delay_ms = delay_ms,
+        };
+        try self.worker.registerFunction("zygos::tools::bash", self, &handler);
+        return self;
+    }
+
+    fn stop(self: *SlowBash) void {
+        self.worker.stop();
+        if (self.last_input) |r| self.gpa.free(r);
+        self.mutex.deinit();
+        const gpa = self.gpa;
+        gpa.destroy(self);
+    }
+
+    fn handler(ctx: ?*anyopaque, arena: std.mem.Allocator, request_json: []const u8) error{ Failed, OutOfMemory }![]const u8 {
+        const self: *SlowBash = @ptrCast(@alignCast(ctx.?));
+        {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            if (self.last_input) |r| self.gpa.free(r);
+            self.last_input = self.gpa.dupe(u8, request_json) catch null;
+        }
+        var interval: std.c.timespec = .{
+            .sec = @intCast(self.delay_ms / 1000),
+            .nsec = @intCast((self.delay_ms % 1000) * std.time.ns_per_ms),
+        };
+        var rem: std.c.timespec = undefined;
+        _ = std.c.nanosleep(&interval, &rem);
+        return arena.dupe(u8, "{\"exit_code\":0,\"output\":\"slept\"}");
+    }
+};
+
+test "wall clock: the turn stops with timeout before the next step and bounds each bash call" {
+    var h = try Harness.init(testing.allocator, &.{ tool_use_msg, tool_use_msg, end_turn_msg });
+    defer h.deinit();
+    const bash = try SlowBash.start(testing.allocator, &h.actor, &h.registry, 120);
+    defer bash.stop();
+
+    const req =
+        \\{"model":"fake-1","system":"s","max_steps":4,"wall_clock_ms":100,
+        \\ "provider_function":"zygos::provider::fake::messages",
+        \\ "messages":[{"role":"user","content":"go"}],
+        \\ "tools":[{"name":"runner","function_id":"zygos::tools::bash"}]}
+    ;
+    const res = try h.runTurnCall(req);
+    defer res.deinit(testing.allocator);
+    try testing.expect(res == .ok);
+    var p = try json.parseFromSlice(json.Value, testing.allocator, res.ok, .{});
+    defer p.deinit();
+    // Step 1 dispatched the 120 ms tool past the 100 ms budget; step 2 never started.
+    try testing.expectEqualStrings("timeout", p.value.object.get("stop").?.string);
+    try testing.expectEqual(@as(i64, 1), p.value.object.get("steps").?.integer);
+
+    bash.mutex.lock();
+    defer bash.mutex.unlock();
+    const seen = bash.last_input.?;
+    try testing.expect(std.mem.indexOf(u8, seen, "\"command\":\"echo hi\"") != null);
+    var parsed = try json.parseFromSlice(json.Value, testing.allocator, seen, .{});
+    defer parsed.deinit();
+    const bound = parsed.value.object.get("timeout_ms").?.integer;
+    try testing.expect(bound >= 1 and bound <= 100);
 }
 
 test "tool-use turn: tool dispatched over the bus, tool_result in next request, ends end_turn on step 2" {

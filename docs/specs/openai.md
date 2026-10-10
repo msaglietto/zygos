@@ -67,3 +67,5 @@ request shape onto chat-completions messages/functions (tested here, not in
 pair: HTTP/SSE client with a network-free pump, bus function
 `zygos::provider::openai::messages`, base_url + `OPENAI_API_KEY` bearer auth,
 smoke at `test/e2e/openai/` (exit 2 when the key is absent).
+
+Terminal tool arguments must form JSON objects before materialization. A length-limited completion omits partial tool blocks and preserves its max_tokens reason and usage. Other malformed tool arguments stop as unknown with no dispatch; their usage remains available for accounting.

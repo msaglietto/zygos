@@ -36,7 +36,7 @@ pub const StreamOptions = struct {
     idle_timeout_ms: u64 = stream_guard.default_idle_ms,
 };
 
-pub const StreamError = error{ OutOfMemory, HttpFailed, ApiError, BadStream, BadRequest };
+pub const StreamError = error{ OutOfMemory, HttpInvalidUrl, HttpRequestFailed, HttpSendFailed, HttpReceiveFailed, ApiError, BadStream, BadRequest };
 
 /// Join a version-carrying base URL with the chat completions path.
 /// Caller owns the result.
@@ -123,7 +123,10 @@ pub fn streamChat(
 
     const url = chatUrl(gpa, opts.base_url) catch return error.OutOfMemory;
     defer gpa.free(url);
-    const uri = std.Uri.parse(url) catch return error.HttpFailed;
+    const uri = std.Uri.parse(url) catch |err| {
+        log.warn("URL parse failed: {t}", .{err});
+        return error.HttpInvalidUrl;
+    };
 
     const auth = std.fmt.allocPrint(gpa, "Bearer {s}", .{opts.api_key}) catch
         return error.OutOfMemory;
@@ -132,15 +135,29 @@ pub fn streamChat(
     var client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer client.deinit();
 
-    var req = client.request(.POST, uri, .{
-        .extra_headers = &.{
-            .{ .name = "authorization", .value = auth },
-            .{ .name = "content-type", .value = "application/json" },
-            .{ .name = "accept", .value = "text/event-stream" },
-        },
-    }) catch |err| {
-        log.warn("{s} model {s}: request setup failed: {t}", .{ opts.base_url, opts.model, err });
-        return error.HttpFailed;
+    var dns_retries: u8 = 0;
+    var req = setup: while (true) {
+        const request = client.request(.POST, uri, .{
+            .extra_headers = &.{
+                .{ .name = "authorization", .value = auth },
+                .{ .name = "content-type", .value = "application/json" },
+                .{ .name = "accept", .value = "text/event-stream" },
+            },
+        }) catch |err| {
+            // DNS fails before any HTTP body can be sent. Never replay a POST.
+            if (err == error.NameServerFailure and dns_retries < 2) {
+                dns_retries += 1;
+                log.warn("DNS lookup failed; retrying request setup ({d}/2)", .{dns_retries});
+                io.sleep(.fromSeconds(1), .awake) catch {
+                    log.warn("DNS backoff canceled", .{});
+                    return error.HttpRequestFailed;
+                };
+                continue :setup;
+            }
+            log.warn("request setup failed: {t}", .{err});
+            return error.HttpRequestFailed;
+        };
+        break :setup request;
     };
     defer req.deinit();
 
@@ -167,10 +184,16 @@ pub fn streamChat(
     }
 
     req.transfer_encoding = .{ .content_length = body.len };
-    req.sendBodyComplete(body) catch return error.HttpFailed;
+    req.sendBodyComplete(body) catch |err| {
+        log.warn("request send failed: {t}", .{err});
+        return error.HttpSendFailed;
+    };
 
     var redirect_buf: [1024]u8 = undefined;
-    var response = req.receiveHead(&redirect_buf) catch return error.HttpFailed;
+    var response = req.receiveHead(&redirect_buf) catch |err| {
+        log.warn("response head failed: {t}", .{err});
+        return error.HttpReceiveFailed;
+    };
     if (guard) |*g| g.poke();
     if (response.head.status != .ok) {
         log.warn("{s} model {s}: endpoint answered {d}", .{
@@ -213,8 +236,27 @@ pub fn processSse(
 
     var chunk: [4096]u8 = undefined;
     stream: while (true) {
-        const n = reader.readSliceShort(&chunk) catch return error.BadStream;
-        if (n == 0) break :stream;
+        // Consume buffered bytes before any blocking read. readSliceShort
+        // fills the chunk, and readVec can read again behind a short buffer.
+        const n = if (reader.bufferedLen() > 0) buffered: {
+            const bytes = reader.buffered();
+            const count = @min(chunk.len, bytes.len);
+            @memcpy(chunk[0..count], bytes[0..count]);
+            reader.toss(count);
+            break :buffered count;
+        } else read: {
+            var buffers = [_][]u8{&chunk};
+            break :read reader.readVec(&buffers) catch |err| switch (err) {
+                error.EndOfStream => break :stream,
+                error.ReadFailed => {
+                    log.warn("stream read failed: buffered={d}, activity_updates={d}", .{
+                        reader.bufferedLen(), if (guard) |g| g.pokes else 0,
+                    });
+                    return error.BadStream;
+                },
+            };
+        };
+        if (n == 0) continue;
         if (guard) |g| g.poke();
         decoder.feed(chunk[0..n]) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -271,13 +313,12 @@ fn renderMessage(gpa: std.mem.Allocator, msg: assembler_mod.Message) error{OutOf
     }
 
     return std.fmt.allocPrint(gpa,
-        \\{{"id":{f},"model":{f},"stop_reason":"{t}","usage":{{"input_tokens":{d},"output_tokens":{d}}},"content":[{s}]}}
+        \\{{"id":{f},"model":{f},"stop_reason":"{t}","usage":{f},"content":[{s}]}}
     , .{
         json.fmt(msg.id, .{}),
         json.fmt(msg.model, .{}),
         msg.stop_reason,
-        msg.usage.input_tokens,
-        msg.usage.output_tokens,
+        json.fmt(msg.usage, .{ .emit_null_optional_fields = false }),
         blocks.items,
     });
 }
@@ -287,6 +328,106 @@ fn renderMessage(gpa: std.mem.Allocator, msg: assembler_mod.Message) error{OutOf
 // ===========================================================================
 
 const testing = std.testing;
+
+test "processSse omits unreported cache counts" {
+    var reader: std.Io.Reader = .fixed(fixture_text_stream);
+    const out = try processSse(testing.allocator, &reader, null, null);
+    defer testing.allocator.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "cache") == null);
+}
+
+test "processSse preserves OpenRouter cache counts without subtracting prompt usage" {
+    const fixture =
+        "data: {\"id\":\"cache\",\"model\":\"fixture\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\n" ++
+        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":7,\"prompt_tokens_details\":{\"cached_tokens\":80,\"cache_write_tokens\":0}}}\n\n" ++
+        "data: [DONE]\n\n";
+    var reader: std.Io.Reader = .fixed(fixture);
+    const out = try processSse(testing.allocator, &reader, null, null);
+    defer testing.allocator.free(out);
+    var p = try json.parseFromSlice(json.Value, testing.allocator, out, .{});
+    defer p.deinit();
+    const usage = p.value.object.get("usage").?.object;
+    try testing.expect(usage.contains("cache_read_tokens"));
+    try testing.expectEqual(@as(i64, 80), usage.get("cache_read_tokens").?.integer);
+    try testing.expectEqual(@as(i64, 0), usage.get("cache_creation_tokens").?.integer);
+    try testing.expectEqual(@as(i64, 100), usage.get("input_tokens").?.integer);
+    try testing.expectEqual(@as(i64, 7), usage.get("output_tokens").?.integer);
+}
+
+test "streamChat distinguishes URL and request setup failures without network" {
+    try testing.expectError(error.HttpInvalidUrl, streamChat(testing.allocator, .failing, .{
+        .api_key = "offline-fixture",
+        .model = "fixture",
+        .messages_json = "[]",
+        .base_url = "invalid url",
+    }, null));
+    try testing.expectError(error.HttpRequestFailed, streamChat(testing.allocator, .failing, .{
+        .api_key = "offline-fixture",
+        .model = "fixture",
+        .messages_json = "[]",
+        .base_url = "ftp://fixture.invalid",
+    }, null));
+}
+
+const DnsFailureFixture = struct {
+    io: std.Io = undefined,
+    lookup_calls: usize = 0,
+    sleeps: usize = 0,
+    transient_failures: usize,
+    cancel_sleep: bool = false,
+
+    fn lookup(ctx: ?*anyopaque, _: std.Io.net.HostName, results: *std.Io.Queue(std.Io.net.HostName.LookupResult), _: std.Io.net.HostName.LookupOptions) std.Io.net.HostName.LookupError!void {
+        const self: *DnsFailureFixture = @ptrCast(@alignCast(ctx.?));
+        defer results.close(self.io);
+        self.lookup_calls += 1;
+        if (self.lookup_calls <= self.transient_failures) return error.NameServerFailure;
+        return error.NetworkDown;
+    }
+
+    fn sleep(ctx: ?*anyopaque, _: std.Io.Timeout) std.Io.Cancelable!void {
+        const self: *DnsFailureFixture = @ptrCast(@alignCast(ctx.?));
+        self.sleeps += 1;
+        if (self.cancel_sleep) return error.Canceled;
+    }
+
+    fn run(self: *DnsFailureFixture) StreamError![]u8 {
+        var vtable = std.Io.failing.vtable.*;
+        vtable.netLookup = lookup;
+        vtable.sleep = sleep;
+        self.io = .{ .userdata = self, .vtable = &vtable };
+        return streamChat(testing.allocator, self.io, .{
+            .api_key = "offline-fixture",
+            .model = "fixture",
+            .messages_json = "[]",
+            .base_url = "http://fixture.invalid",
+        }, null);
+    }
+};
+
+test "streamChat retries transient DNS setup errors before any HTTP body" {
+    var fixture: DnsFailureFixture = .{ .transient_failures = 2 };
+    try testing.expectError(error.HttpRequestFailed, fixture.run());
+    try testing.expectEqual(@as(usize, 3), fixture.lookup_calls);
+    try testing.expectEqual(@as(usize, 2), fixture.sleeps);
+}
+
+test "streamChat stops after bounded DNS attempts and does not retry permanent errors" {
+    var persistent: DnsFailureFixture = .{ .transient_failures = 10 };
+    try testing.expectError(error.HttpRequestFailed, persistent.run());
+    try testing.expectEqual(@as(usize, 3), persistent.lookup_calls);
+    try testing.expectEqual(@as(usize, 2), persistent.sleeps);
+    var permanent: DnsFailureFixture = .{ .transient_failures = 0 };
+    try testing.expectError(error.HttpRequestFailed, permanent.run());
+    try testing.expectEqual(@as(usize, 1), permanent.lookup_calls);
+    try testing.expectEqual(@as(usize, 0), permanent.sleeps);
+}
+
+test "streamChat cancels during DNS backoff without another request" {
+    var fixture: DnsFailureFixture = .{ .transient_failures = 10, .cancel_sleep = true };
+    try testing.expectError(error.HttpRequestFailed, fixture.run());
+    try testing.expectEqual(@as(usize, 1), fixture.lookup_calls);
+    try testing.expectEqual(@as(usize, 1), fixture.sleeps);
+}
 
 const fixture_text_stream =
     "data: {\"id\":\"cc-1\",\"model\":\"gpt-x\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hi \"},\"finish_reason\":null}]}\n\n" ++
@@ -398,4 +539,150 @@ test "buildChatBody: temperature emitted only when set" {
     defer testing.allocator.free(with_temp);
     try testing.expect(std.mem.indexOf(u8, with_temp, "\"temperature\":") != null);
     try testing.expect(std.mem.indexOf(u8, with_temp, "0.7") != null);
+}
+
+test "processSse processes each short read before requesting more bytes" {
+    const Fragmented = struct {
+        reader: std.Io.Reader = .{
+            .vtable = &.{ .stream = unreachableStream, .readVec = read },
+            .buffer = &.{},
+            .seek = 0,
+            .end = 0,
+        },
+        guard: *stream_guard.StreamGuard,
+        offset: usize = 0,
+        reads: u64 = 0,
+
+        fn unreachableStream(_: *std.Io.Reader, _: *std.Io.Writer, _: std.Io.Limit) std.Io.Reader.StreamError!usize {
+            unreachable;
+        }
+
+        fn read(r: *std.Io.Reader, data: [][]u8) std.Io.Reader.Error!usize {
+            const self: *@This() = @fieldParentPtr("reader", r);
+            // A socket may deliver tiny chunks and stay open after the terminal
+            // event. No second blocking read is safe until activity is poked.
+            if (self.guard.pokes != self.reads or self.offset == fixture_text_stream.len)
+                return error.ReadFailed;
+            const n = @min(17, @min(data[0].len, fixture_text_stream.len - self.offset));
+            @memcpy(data[0][0..n], fixture_text_stream[self.offset..][0..n]);
+            self.offset += n;
+            self.reads += 1;
+            return n;
+        }
+    };
+    var dummy: u8 = 0;
+    var guard = stream_guard.StreamGuard.init(120_000, @ptrCast(&dummy), &noopFire);
+    defer guard.deinit();
+    var input: Fragmented = .{ .guard = &guard };
+    const out = try processSse(testing.allocator, &input.reader, null, &guard);
+    defer testing.allocator.free(out);
+    var parsed = try json.parseFromSlice(json.Value, testing.allocator, out, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("end_turn", parsed.value.object.get("stop_reason").?.string);
+    try testing.expect(input.reads > 1);
+    try testing.expectEqual(input.reads, guard.pokes);
+}
+
+test "processSse drains buffered terminal events without another socket read" {
+    const Buffered = struct {
+        reader: std.Io.Reader,
+        loaded: bool,
+
+        fn unreachableStream(_: *std.Io.Reader, _: *std.Io.Writer, _: std.Io.Limit) std.Io.Reader.StreamError!usize {
+            unreachable;
+        }
+
+        fn read(r: *std.Io.Reader, _: [][]u8) std.Io.Reader.Error!usize {
+            const self: *@This() = @fieldParentPtr("reader", r);
+            if (self.loaded) return error.ReadFailed;
+            @memcpy(r.buffer[0..fixture_text_stream.len], fixture_text_stream);
+            r.end = fixture_text_stream.len;
+            self.loaded = true;
+            // TLS and indirect readers can buffer bytes while returning zero.
+            return 0;
+        }
+    };
+    for ([_]bool{ true, false }) |seeded| {
+        var buffer: [fixture_text_stream.len]u8 = undefined;
+        if (seeded) @memcpy(&buffer, fixture_text_stream);
+        var input: Buffered = .{
+            .reader = .{
+                .vtable = &.{ .stream = Buffered.unreachableStream, .readVec = Buffered.read },
+                .buffer = &buffer,
+                .seek = 0,
+                .end = if (seeded) buffer.len else 0,
+            },
+            .loaded = seeded,
+        };
+        var dummy: u8 = 0;
+        var guard = stream_guard.StreamGuard.init(120_000, @ptrCast(&dummy), &noopFire);
+        defer guard.deinit();
+        const out = try processSse(testing.allocator, &input.reader, null, &guard);
+        defer testing.allocator.free(out);
+        var parsed = try json.parseFromSlice(json.Value, testing.allocator, out, .{});
+        defer parsed.deinit();
+        try testing.expectEqualStrings("end_turn", parsed.value.object.get("stop_reason").?.string);
+        try testing.expectEqual(@as(u64, 1), guard.pokes);
+    }
+}
+
+test "incomplete tool completion stops on the task bus and preserves usage" {
+    const ops = @import("../worker/tools_ops.zig");
+    const task = @import("../worker/task.zig");
+    const trial = @import("../worker/trial.zig");
+    const C = struct {
+        extern "c" fn realpath(path: [*:0]const u8, resolved: [*]u8) ?[*:0]u8;
+    };
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var rel_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const rel = try std.fmt.bufPrintZ(&rel_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const root = std.mem.span(C.realpath(rel, &root_buf) orelse return error.RealpathFailed);
+    for ([_][]const u8{ "length", "tool_calls" }) |finish| {
+        const payload = try json.Stringify.valueAlloc(testing.allocator, .{
+            .id = "truncated",
+            .model = "fixture",
+            .usage = .{ .prompt_tokens = 8124, .completion_tokens = 8192, .prompt_tokens_details = .{ .cached_tokens = 7296 } },
+            .choices = .{.{
+                .index = 0,
+                .finish_reason = finish,
+                .delta = .{ .tool_calls = .{.{ .index = 0, .id = "partial", .function = .{ .name = "bash", .arguments = "{\"command\":\"touch should-not-exist" } }} },
+            }},
+        }, .{});
+        defer testing.allocator.free(payload);
+        const fixture = try std.fmt.allocPrint(testing.allocator, "data: {s}\n\ndata: [DONE]\n\n", .{payload});
+        defer testing.allocator.free(fixture);
+        var reader: std.Io.Reader = .fixed(fixture);
+        const terminal = try processSse(testing.allocator, &reader, null, null);
+        defer testing.allocator.free(terminal);
+        var parsed = try json.parseFromSlice(json.Value, testing.allocator, terminal, .{});
+        defer parsed.deinit();
+        const limited = std.mem.eql(u8, finish, "length");
+        try testing.expectEqualStrings(if (limited) "max_tokens" else "unknown", parsed.value.object.get("stop_reason").?.string);
+        try testing.expectEqual(@as(usize, 0), parsed.value.object.get("content").?.array.items.len);
+        const script = [_][]const u8{terminal};
+        const result = try task.run(testing.allocator, .{
+            .workspace = root,
+            .instruction = "Never dispatch the partial command.",
+            .task_id = "offline-truncated-tool",
+            .dataset = "offline-fixture",
+            .model_id = "fixture",
+            .variable = "trim-on",
+            .step_cap = 1,
+            .identity = .{ .git_sha = "0123456789abcdef0123456789abcdef01234567", .target_triple = "fixture", .optimize = "Debug", .adapter_version = trial.adapter_version },
+            .script = &script,
+        });
+        defer result.deinit(testing.allocator);
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const record = try trial.parse(arena.allocator(), result.trial_json);
+        try testing.expectEqual(@as(u64, 8124), record.input_tokens);
+        try testing.expectEqual(@as(u64, 8192), record.output_tokens);
+        try testing.expectEqual(@as(?u64, 7296), record.cache_read_tokens);
+        try testing.expectEqual(@as(u64, 0), record.trim.?.calls);
+        const turn = try json.parseFromSliceLeaky(json.Value, arena.allocator(), result.turn_json, .{});
+        try testing.expectEqualStrings(if (limited) "max_tokens" else "failed", turn.object.get("stop").?.string);
+        try testing.expectError(error.NotFound, ops.readFile(testing.allocator, ops.Workspace.init(root), "should-not-exist"));
+    }
 }

@@ -8,7 +8,7 @@ Integer knobs go through `mission_boot.envInt`. A missing variable uses the defa
 |---|---|---|---|---|---|
 | `AI_PROVIDERS_CONFIG` | catalog path | server | env, else `$HOME/.agents/providers.toml` | replace the file | Path may point at a file with inline keys. |
 | Provider `key_env` (per entry; examples in fixtures: `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GOOGLE_API_KEY`, `NVIDIA_API_KEY`) | `provider_boot` | server | process env | rotate at the provider | Bearer token on provider HTTP. Inline `key` in the toml is the fallback and is worse (secret at rest on disk). |
-| `ZYGOS_CONFIG` | route table path | server | env, else `./zygos.zon` | n/a | Config, not a secret. Names provider slugs. |
+| `ZYGOS_CONFIG` | route table path | server | env, else `./zygos.zon` | n/a | Config, not a secret. Names provider slugs. The Harbor adapter reads it on the host and passes the file to `zygos task run --config`. |
 | `ZYGOS_PORT` | bare kernel | server | env, else 49134 | n/a | Binds loopback only. Bad parse keeps 49134. |
 | `ZYGOS_LOG` | `std.log` filter | server | env | n/a | `info` logs progress. Do not rely on it to redact tool output. |
 | `ZYGOS_VAULT_ROOT` | tessera workers, pre-mission checkpoint | server | env | n/a | Notes and shadow git live here. Unset skips vault writes. |

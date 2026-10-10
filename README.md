@@ -287,7 +287,17 @@ zygos task score --trial trial.json --prices prices.txt
 
 `--offline` uses the scripted provider. A live run names an allowlisted model and a complete invocation; `--config zygos.zon` routes that step through the file's `.default` and `.routes` ladders. The trial records the git sha, target, optimize level, and config hash. Bench policy allows bash, read, and write inside the workspace.
 
-Matched two-arm campaigns (two builds, two route tables, or trim on against trim off) are `eval/campaign.py`. The contract is [docs/specs/campaign.md](docs/specs/campaign.md). What a run is allowed to spend is [docs/benchmark-policy.md](docs/benchmark-policy.md).
+Matched two-arm campaigns (two builds, two route tables, or trim on against trim off) are `eval/campaign.py`. The experiment file freezes the tasks, model, prices, step cap, and repeats, and names the one variable the arms differ in.
+
+```bash
+ZYGOS_ZIG=/path/to/zig-0.16 eval/campaign.py build --git-ref <sha>      # Linux arm from a clean worktree
+eval/campaign.py run --experiment eval/experiments/trim-ablation.json \
+    --jobs-dir /tmp/zygos-trim-ablation --tasks-dir <terminal-bench-2-1>/tasks
+eval/campaign.py report --experiment eval/experiments/trim-ablation.json \
+    --jobs-dir /tmp/zygos-trim-ablation --out reports/benchmarks/trim-ablation-<date>
+```
+
+The report states a verdict or the reason it is inconclusive; durable reports live under `reports/benchmarks/`. An experiment with `"mode": "mission"` runs each task through the mission loop with the arm's `zygos.zon` as the mission configuration (which model does each step), for example `eval/experiments/mission-routing.json`. The contract is [docs/specs/campaign.md](docs/specs/campaign.md). What a run is allowed to spend is [docs/benchmark-policy.md](docs/benchmark-policy.md).
 
 ```bash
 zygos task run --help

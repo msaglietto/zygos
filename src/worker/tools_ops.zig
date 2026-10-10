@@ -61,6 +61,19 @@ pub const OpsError = error{ OutOfMemory, PathEscapesWorkspace, NotFound, AccessD
 pub const read_cap = 4 * 1024 * 1024; // readFile → TooLarge beyond this
 pub const output_cap = 1024 * 1024; // bash output truncated (not an error)
 
+/// Lines in `text`. A trailing newline does not invent an extra empty line.
+/// Empty input is zero. Shared by the read-file counter and the trial record
+/// so both arms count the same bytes.
+pub fn countLines(text: []const u8) u64 {
+    if (text.len == 0) return 0;
+    var n: u64 = 1;
+    for (text) |byte| {
+        if (byte == '\n') n += 1;
+    }
+    if (text[text.len - 1] == '\n') n -= 1;
+    return n;
+}
+
 pub const Workspace = struct {
     /// Absolute, canonical workspace root, no trailing slash.
     root: []const u8,
@@ -467,4 +480,11 @@ test "no leaks under repeated op loops" {
         const r = try bash(testing.allocator, ws, "true");
         testing.allocator.free(r.output);
     }
+}
+
+test "countLines: empty is zero, a trailing newline is not an extra line" {
+    try testing.expectEqual(@as(u64, 0), countLines(""));
+    try testing.expectEqual(@as(u64, 1), countLines("alpha"));
+    try testing.expectEqual(@as(u64, 3), countLines("alpha\nbeta\ngamma\n"));
+    try testing.expectEqual(@as(u64, 3), countLines("alpha\nbeta\ngamma"));
 }

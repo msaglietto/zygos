@@ -31,7 +31,7 @@ pub const StreamOptions = struct {
     idle_timeout_ms: u64 = stream_guard.default_idle_ms,
 };
 
-pub const StreamError = error{ OutOfMemory, HttpFailed, ApiError, BadStream };
+pub const StreamError = error{ OutOfMemory, HttpInvalidUrl, HttpRequestFailed, HttpSendFailed, HttpReceiveFailed, ApiError, BadStream };
 
 /// Blocking call: POST /v1/messages with stream:true, push text deltas into
 /// `sender` (closed on return), return the assembled terminal message as
@@ -67,7 +67,10 @@ pub fn streamMessages(
     const url = std.fmt.allocPrint(gpa, "{s}/v1/messages", .{opts.base_url}) catch
         return error.OutOfMemory;
     defer gpa.free(url);
-    const uri = std.Uri.parse(url) catch return error.HttpFailed;
+    const uri = std.Uri.parse(url) catch |err| {
+        log.warn("URL parse failed: {t}", .{err});
+        return error.HttpInvalidUrl;
+    };
 
     var client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer client.deinit();
@@ -81,7 +84,7 @@ pub fn streamMessages(
         },
     }) catch |err| {
         log.warn("request setup failed: {t}", .{err});
-        return error.HttpFailed;
+        return error.HttpRequestFailed;
     };
     defer req.deinit();
 
@@ -108,10 +111,16 @@ pub fn streamMessages(
     }
 
     req.transfer_encoding = .{ .content_length = body.len };
-    req.sendBodyComplete(body) catch return error.HttpFailed;
+    req.sendBodyComplete(body) catch |err| {
+        log.warn("request send failed: {t}", .{err});
+        return error.HttpSendFailed;
+    };
 
     var redirect_buf: [1024]u8 = undefined;
-    var response = req.receiveHead(&redirect_buf) catch return error.HttpFailed;
+    var response = req.receiveHead(&redirect_buf) catch |err| {
+        log.warn("response head failed: {t}", .{err});
+        return error.HttpReceiveFailed;
+    };
     if (guard) |*g| g.poke();
     if (response.head.status != .ok) {
         log.warn("anthropic answered {d}", .{@intFromEnum(response.head.status)});
@@ -152,8 +161,27 @@ pub fn processSse(
 
     var chunk: [4096]u8 = undefined;
     stream: while (true) {
-        const n = reader.readSliceShort(&chunk) catch return error.BadStream;
-        if (n == 0) break :stream;
+        // Consume buffered bytes before any blocking read. readSliceShort
+        // fills the chunk, and readVec can read again behind a short buffer.
+        const n = if (reader.bufferedLen() > 0) buffered: {
+            const bytes = reader.buffered();
+            const count = @min(chunk.len, bytes.len);
+            @memcpy(chunk[0..count], bytes[0..count]);
+            reader.toss(count);
+            break :buffered count;
+        } else read: {
+            var buffers = [_][]u8{&chunk};
+            break :read reader.readVec(&buffers) catch |err| switch (err) {
+                error.EndOfStream => break :stream,
+                error.ReadFailed => {
+                    log.warn("stream read failed: buffered={d}, activity_updates={d}", .{
+                        reader.bufferedLen(), if (guard) |g| g.pokes else 0,
+                    });
+                    return error.BadStream;
+                },
+            };
+        };
+        if (n == 0) continue;
         if (guard) |g| g.poke();
         decoder.feed(chunk[0..n]) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -213,13 +241,12 @@ fn renderMessage(gpa: std.mem.Allocator, msg: assembler_mod.Message) error{OutOf
     }
 
     return std.fmt.allocPrint(gpa,
-        \\{{"id":{f},"model":{f},"stop_reason":"{t}","usage":{{"input_tokens":{d},"output_tokens":{d}}},"content":[{s}]}}
+        \\{{"id":{f},"model":{f},"stop_reason":"{t}","usage":{f},"content":[{s}]}}
     , .{
         json.fmt(msg.id, .{}),
         json.fmt(msg.model, .{}),
         msg.stop_reason,
-        msg.usage.input_tokens,
-        msg.usage.output_tokens,
+        json.fmt(msg.usage, .{ .emit_null_optional_fields = false }),
         blocks.items,
     });
 }
@@ -229,6 +256,21 @@ fn renderMessage(gpa: std.mem.Allocator, msg: assembler_mod.Message) error{OutOf
 // ===========================================================================
 
 const testing = std.testing;
+
+test "streamMessages distinguishes URL and request setup failures without network" {
+    try testing.expectError(error.HttpInvalidUrl, streamMessages(testing.allocator, .failing, .{
+        .api_key = "offline-fixture",
+        .model = "fixture",
+        .messages_json = "[]",
+        .base_url = "invalid url",
+    }, null));
+    try testing.expectError(error.HttpRequestFailed, streamMessages(testing.allocator, .failing, .{
+        .api_key = "offline-fixture",
+        .model = "fixture",
+        .messages_json = "[]",
+        .base_url = "ftp://fixture.invalid",
+    }, null));
+}
 
 const fixture_text_stream =
     "event: message_start\n" ++
@@ -317,6 +359,90 @@ test "processSse renders tool_use with accumulated input and works without a sen
     try testing.expectEqualStrings("pwd", block.get("input").?.object.get("command").?.string);
 }
 
+test "start-event tool inputs reach the task bash read and write handlers once each" {
+    const task = @import("../worker/task.zig");
+    const ops = @import("../worker/tools_ops.zig");
+    const trial = @import("../worker/trial.zig");
+    const C = struct {
+        extern "c" fn realpath(path: [*:0]const u8, resolved: [*]u8) ?[*:0]u8;
+    };
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var rel_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const rel = try std.fmt.bufPrintZ(&rel_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const root = std.mem.span(C.realpath(rel, &root_buf) orelse return error.RealpathFailed);
+
+    // Synthetic compatibility fixtures, not a recording of the Phase 8 stream.
+    const starts = [_][]const u8{
+        \\{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t-bash","name":"bash","input":{"command":"seq 1 500"}}}
+        ,
+        \\{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t-read","name":"read_file","input":{"path":"fixture.txt"}}}
+        ,
+        \\{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t-write","name":"write_file","input":{"path":"note.txt","content":"non-empty start input\n"}}}
+        ,
+    };
+    var script: [4][]const u8 = undefined;
+    var made: usize = 0;
+    defer for (script[0..made]) |msg| testing.allocator.free(msg);
+    for (starts) |start| {
+        const fixture = try std.fmt.allocPrint(
+            testing.allocator,
+            "event: message_start\ndata: {{\"type\":\"message_start\",\"message\":{{\"id\":\"m\",\"model\":\"fixture\"}}}}\n\n" ++
+                "event: content_block_start\ndata: {s}\n\n" ++
+                "event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n" ++
+                "event: message_delta\ndata: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"tool_use\"}}}}\n\n" ++
+                "event: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n",
+            .{start},
+        );
+        defer testing.allocator.free(fixture);
+        var reader: std.Io.Reader = .fixed(fixture);
+        script[made] = try processSse(testing.allocator, &reader, null, null);
+        made += 1;
+    }
+    var end_reader: std.Io.Reader = .fixed(fixture_text_stream);
+    script[made] = try processSse(testing.allocator, &end_reader, null, null);
+    made += 1;
+
+    const result = try task.run(testing.allocator, .{
+        .workspace = root,
+        .instruction = "Exercise the SSE tool inputs.",
+        .task_id = "offline-sse-input",
+        .dataset = "offline-fixture",
+        .model_id = "fixture",
+        .variable = "trim-on",
+        .step_cap = 4,
+        .identity = .{
+            .git_sha = "0123456789abcdef0123456789abcdef01234567",
+            .target_triple = "fixture",
+            .optimize = "Debug",
+            .adapter_version = trial.adapter_version,
+        },
+        .script = &script,
+        .seed_fixture = true,
+    });
+    defer result.deinit(testing.allocator);
+    try testing.expect(std.mem.indexOf(u8, result.turn_json, "handler_failed") == null);
+    const written = try ops.readFile(testing.allocator, ops.Workspace.init(root), "note.txt");
+    defer testing.allocator.free(written);
+    try testing.expectEqualStrings("non-empty start input\n", written);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const record = try trial.parse(arena.allocator(), result.trial_json);
+    try testing.expectEqual(@as(u64, 3), record.source_lines_read);
+    try testing.expectEqual(@as(u64, 3), record.trim.?.calls);
+    try testing.expect(record.trim.?.reduction > 0);
+    const turn = try json.parseFromSliceLeaky(json.Value, arena.allocator(), result.turn_json, .{});
+    try testing.expectEqualStrings("end_turn", turn.object.get("stop").?.string);
+    const transcript = turn.object.get("transcript").?.array.items;
+    for ([_]usize{ 2, 4, 6 }) |index| {
+        const replies = transcript[index].object.get("content").?.array.items;
+        try testing.expectEqual(@as(usize, 1), replies.len);
+        try testing.expect(!replies[0].object.get("is_error").?.bool);
+    }
+}
+
 test "processSse surfaces API error events" {
     const fixture =
         "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"later\"}}\n\n";
@@ -330,4 +456,177 @@ test "truncated stream (no message_stop) is BadStream, not a crash" {
         "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"model\":\"c\",\"usage\":{}}}\n\n";
     var reader: std.Io.Reader = .fixed(fixture);
     try testing.expectError(error.BadStream, processSse(testing.allocator, &reader, null, null));
+}
+
+test "processSse processes each short read before requesting more bytes" {
+    const Fragmented = struct {
+        reader: std.Io.Reader = .{
+            .vtable = &.{ .stream = unreachableStream, .readVec = read },
+            .buffer = &.{},
+            .seek = 0,
+            .end = 0,
+        },
+        guard: *stream_guard.StreamGuard,
+        offset: usize = 0,
+        reads: u64 = 0,
+
+        fn unreachableStream(_: *std.Io.Reader, _: *std.Io.Writer, _: std.Io.Limit) std.Io.Reader.StreamError!usize {
+            unreachable;
+        }
+
+        fn read(r: *std.Io.Reader, data: [][]u8) std.Io.Reader.Error!usize {
+            const self: *@This() = @fieldParentPtr("reader", r);
+            // A socket may deliver tiny chunks and stay open after the terminal
+            // event. No second blocking read is safe until activity is poked.
+            if (self.guard.pokes != self.reads or self.offset == fixture_text_stream.len)
+                return error.ReadFailed;
+            const n = @min(17, @min(data[0].len, fixture_text_stream.len - self.offset));
+            @memcpy(data[0][0..n], fixture_text_stream[self.offset..][0..n]);
+            self.offset += n;
+            self.reads += 1;
+            return n;
+        }
+    };
+    var dummy: u8 = 0;
+    var guard = stream_guard.StreamGuard.init(120_000, @ptrCast(&dummy), &noopFire);
+    defer guard.deinit();
+    var input: Fragmented = .{ .guard = &guard };
+    const out = try processSse(testing.allocator, &input.reader, null, &guard);
+    defer testing.allocator.free(out);
+    var parsed = try json.parseFromSlice(json.Value, testing.allocator, out, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("end_turn", parsed.value.object.get("stop_reason").?.string);
+    try testing.expect(input.reads > 1);
+    try testing.expectEqual(input.reads, guard.pokes);
+}
+
+test "processSse drains buffered terminal events without another socket read" {
+    const Buffered = struct {
+        reader: std.Io.Reader,
+        loaded: bool,
+
+        fn unreachableStream(_: *std.Io.Reader, _: *std.Io.Writer, _: std.Io.Limit) std.Io.Reader.StreamError!usize {
+            unreachable;
+        }
+
+        fn read(r: *std.Io.Reader, _: [][]u8) std.Io.Reader.Error!usize {
+            const self: *@This() = @fieldParentPtr("reader", r);
+            if (self.loaded) return error.ReadFailed;
+            @memcpy(r.buffer[0..fixture_text_stream.len], fixture_text_stream);
+            r.end = fixture_text_stream.len;
+            self.loaded = true;
+            // TLS and indirect readers can buffer bytes while returning zero.
+            return 0;
+        }
+    };
+    for ([_]bool{ true, false }) |seeded| {
+        var buffer: [fixture_text_stream.len]u8 = undefined;
+        if (seeded) @memcpy(&buffer, fixture_text_stream);
+        var input: Buffered = .{
+            .reader = .{
+                .vtable = &.{ .stream = Buffered.unreachableStream, .readVec = Buffered.read },
+                .buffer = &buffer,
+                .seek = 0,
+                .end = if (seeded) buffer.len else 0,
+            },
+            .loaded = seeded,
+        };
+        var dummy: u8 = 0;
+        var guard = stream_guard.StreamGuard.init(120_000, @ptrCast(&dummy), &noopFire);
+        defer guard.deinit();
+        const out = try processSse(testing.allocator, &input.reader, null, &guard);
+        defer testing.allocator.free(out);
+        var parsed = try json.parseFromSlice(json.Value, testing.allocator, out, .{});
+        defer parsed.deinit();
+        try testing.expectEqualStrings("end_turn", parsed.value.object.get("stop_reason").?.string);
+        try testing.expectEqual(@as(u64, 1), guard.pokes);
+    }
+}
+
+test "cut-off and malformed tool input stop on the task bus with usage and trace" {
+    const fsx = @import("../worker/fsx.zig");
+    const ops = @import("../worker/tools_ops.zig");
+    const task = @import("../worker/task.zig");
+    const trial = @import("../worker/trial.zig");
+    const C = struct {
+        extern "c" fn realpath(path: [*:0]const u8, resolved: [*]u8) ?[*:0]u8;
+    };
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var rel_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const rel = try std.fmt.bufPrintZ(&rel_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const root = std.mem.span(C.realpath(rel, &root_buf) orelse return error.RealpathFailed);
+
+    const Case = struct { stop: []const u8, start: []const u8, fragments: []const []const u8, want: []const u8, turn: []const u8 };
+    const cases = [_]Case{
+        // Output limit inside the arguments.
+        .{ .stop = "max_tokens", .start = "{}", .fragments = &.{ "{\"command\":", "\"touch should-not-exist" }, .want = "max_tokens", .turn = "max_tokens" },
+        // The same partial input reported as a tool call.
+        .{ .stop = "tool_use", .start = "{}", .fragments = &.{"{\"command\":\"touch should-not-exist"}, .want = "unknown", .turn = "failed" },
+        // Whitespace replaces a dispatchable start input.
+        .{ .stop = "tool_use", .start = "{\"command\":\"touch should-not-exist\"}", .fragments = &.{" "}, .want = "unknown", .turn = "failed" },
+        // Valid JSON that is not an argument object.
+        .{ .stop = "tool_use", .start = "{}", .fragments = &.{"[\"touch should-not-exist\"]"}, .want = "unknown", .turn = "failed" },
+    };
+    for (cases, 0..) |case, n| {
+        var stream: std.ArrayList(u8) = .empty;
+        defer stream.deinit(testing.allocator);
+        try stream.print(testing.allocator, "event: message_start\ndata: {s}\n\n", .{
+            \\{"type":"message_start","message":{"id":"m","model":"fixture","usage":{"input_tokens":8124,"cache_read_input_tokens":7296,"output_tokens":1}}}
+        });
+        try stream.print(testing.allocator, "event: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"tool_use\",\"id\":\"partial\",\"name\":\"bash\",\"input\":{s}}}}}\n\n", .{case.start});
+        for (case.fragments) |fragment| {
+            const data = try json.Stringify.valueAlloc(testing.allocator, .{
+                .type = "content_block_delta",
+                .index = 0,
+                .delta = .{ .type = "input_json_delta", .partial_json = fragment },
+            }, .{});
+            defer testing.allocator.free(data);
+            try stream.print(testing.allocator, "event: content_block_delta\ndata: {s}\n\n", .{data});
+        }
+        try stream.print(testing.allocator, "event: message_delta\ndata: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"{s}\"}},\"usage\":{{\"output_tokens\":8192}}}}\n\n", .{case.stop});
+        try stream.appendSlice(testing.allocator, "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
+
+        var reader: std.Io.Reader = .fixed(stream.items);
+        const terminal = try processSse(testing.allocator, &reader, null, null);
+        defer testing.allocator.free(terminal);
+        var parsed = try json.parseFromSlice(json.Value, testing.allocator, terminal, .{});
+        defer parsed.deinit();
+        try testing.expectEqualStrings(case.want, parsed.value.object.get("stop_reason").?.string);
+        try testing.expectEqual(@as(usize, 0), parsed.value.object.get("content").?.array.items.len);
+
+        const events = try std.fmt.allocPrint(testing.allocator, "{s}/events-{d}.jsonl", .{ root, n });
+        defer testing.allocator.free(events);
+        const script = [_][]const u8{terminal};
+        const result = try task.run(testing.allocator, .{
+            .workspace = root,
+            .instruction = "Never dispatch the partial command.",
+            .task_id = "offline-anthropic-tool-input",
+            .dataset = "offline-fixture",
+            .model_id = "fixture",
+            .variable = "trim-on",
+            .step_cap = 1,
+            .identity = .{ .git_sha = "0123456789abcdef0123456789abcdef01234567", .target_triple = "fixture", .optimize = "Debug", .adapter_version = trial.adapter_version },
+            .script = &script,
+            .trace_path = events,
+        });
+        defer result.deinit(testing.allocator);
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const record = try trial.parse(arena.allocator(), result.trial_json);
+        try testing.expectEqual(@as(u64, 8124), record.input_tokens);
+        try testing.expectEqual(@as(u64, 8192), record.output_tokens);
+        try testing.expectEqual(@as(?u64, 7296), record.cache_read_tokens);
+        const turn = try json.parseFromSliceLeaky(json.Value, arena.allocator(), result.turn_json, .{});
+        try testing.expectEqualStrings(case.turn, turn.object.get("stop").?.string);
+        try testing.expectError(error.NotFound, ops.readFile(testing.allocator, ops.Workspace.init(root), "should-not-exist"));
+
+        const log_bytes = fsx.readWholeFile(testing.allocator, events) orelse return error.NoTrace;
+        defer testing.allocator.free(log_bytes);
+        try testing.expect(std.mem.indexOf(u8, log_bytes, "\"event\":\"usage\"") != null);
+        try testing.expect(std.mem.indexOf(u8, log_bytes, "\"output_tokens\":8192") != null);
+        try testing.expect(std.mem.indexOf(u8, log_bytes, "\"event\":\"turn_end\"") != null);
+        try testing.expect(std.mem.indexOf(u8, log_bytes, "\"event\":\"tool_call\"") == null);
+    }
 }

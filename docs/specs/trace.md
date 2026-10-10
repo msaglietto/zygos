@@ -12,7 +12,9 @@ Variants: `mission`, `role_start`, `role_end`, `task_start`, `task_done`,
 `step`, `tool_call`, `tool_result`, `usage`, `turn_end`.
 
 - `body()` serializes byte-identical to the historical fmt-string emitters —
-  events.jsonl is a wire format; consumers in the wild parse it.
+  events.jsonl is a wire format; consumers in the wild parse it. The usage
+  arm stays `input_tokens` and `output_tokens`. Cache counts, when a provider
+  sends them, are copied onto the task trial and are not fields of this line.
 - `parse()` is tolerant: missing fields read as defaults, unknown event
   names/non-objects as null — consumers keep raw-passthrough semantics for
   foreign lines.

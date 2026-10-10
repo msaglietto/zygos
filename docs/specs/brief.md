@@ -88,5 +88,11 @@ the handler returns an `.ok` reply that refuses without starting:
 ```
 
 No mission is persisted, no `MissionControl` is tracked, the FSM never runs.
-A brief-less start (raw `objective`, the M3 path) is unaffected. Driver-side
-tests live in `worker/mission.zig`.
+A brief-less start (raw `objective`, the M3 path) is not linted.
+
+A fresh start owns `BRIEF.md` in the planning root, which context assembly
+hands every role as the authoritative operator brief. A start with `brief`
+replaces it. A brief-less fresh start removes any earlier `BRIEF.md` before
+the first persist; if it cannot be removed the start fails before any role
+runs. A resume keeps the persisted brief and ignores a request `brief`.
+Driver-side tests live in `worker/mission.zig`.

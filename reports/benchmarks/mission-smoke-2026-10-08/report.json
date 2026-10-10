@@ -1,0 +1,238 @@
+{
+  "experiment": {
+    "name": "mission-smoke",
+    "variable": "config",
+    "mode": "mission",
+    "dataset": "terminal-bench/terminal-bench-2-1",
+    "dataset_source_sha": "7131e4375048a0e408a8fb404b5f499d726b695b",
+    "tasks": [
+      {
+        "id": "fix-git",
+        "checksum": "e89f54f2fc73ac576f976c1cd09758e4c9ccf152e53c2dcd91da0c178b89abc7"
+      }
+    ],
+    "model_id": "deepseek/deepseek-v4.1-flash",
+    "step_cap": 24,
+    "repeats": 1,
+    "workspace": "/app",
+    "host_concurrency": 2,
+    "usd_per_million_tokens": {
+      "input": "0.003",
+      "cached_input": "0.003",
+      "output": "2.40"
+    },
+    "price_source": "https://openrouter.ai/api/v1/models",
+    "price_retrieved_utc": "2026-10-06T04:11:09.724231+00:00",
+    "scorer_cents_per_mtok": 30,
+    "arms": [
+      {
+        "name": "all-deepseek",
+        "trim": "on",
+        "git_sha": "b8a79db6300617395a9c3894d9e1fcedb44440a6",
+        "binary_sha256": "54bf161ed54dc520f0f858e3f17669c6b9444e8e71902f1b1179a5c1d2decc2e",
+        "config": "/Users/msaglietto/Projects/Personal/zygos/eval/experiments/configs/mission-all-deepseek.zon",
+        "config_sha256": "5a9104d695653fb041a3f31480a656f55c4a4d8d37514ee984b29c406434f354"
+      },
+      {
+        "name": "executor-glm",
+        "trim": "on",
+        "git_sha": "b8a79db6300617395a9c3894d9e1fcedb44440a6",
+        "binary_sha256": "54bf161ed54dc520f0f858e3f17669c6b9444e8e71902f1b1179a5c1d2decc2e",
+        "config": "/Users/msaglietto/Projects/Personal/zygos/eval/experiments/configs/mission-executor-glm.zon",
+        "config_sha256": "c16a77a27710f17db4a9bfd6c9ebf524aab6e09ce14006cb8064b71ce2958423"
+      }
+    ]
+  },
+  "experiment_sha256": "800ab83ea52227a3da65995c9d8fe1097e7be2e8b3397055a284ab2dfd3cc6a5",
+  "generated_utc": "2026-10-08T07:54:21.927684+00:00",
+  "jobs_dir": "/private/tmp/zygos-mission-smoke",
+  "campaign_status": "finished",
+  "harbor_version": "0.24.0",
+  "scorer": {
+    "kind": "docker",
+    "image": "debian:bullseye-slim"
+  },
+  "verdict": "candidate_worse",
+  "verdict_reasons": [
+    "pass delta -1 on 1 matched task-runs; cost delta -0.018838686 USD (-86.5%)",
+    "fewer than 24 matched task-runs: treat the direction as a hint, not a measurement",
+    "mission traces carry no cache counts: every input token is priced at the ordinary rate, so costs are an upper bound and comparable only between these arms"
+  ],
+  "repeat_noise_tasks": 0,
+  "arms": {
+    "all-deepseek": {
+      "arm": {
+        "name": "all-deepseek",
+        "trim": "on",
+        "git_sha": "b8a79db6300617395a9c3894d9e1fcedb44440a6",
+        "binary_sha256": "54bf161ed54dc520f0f858e3f17669c6b9444e8e71902f1b1179a5c1d2decc2e",
+        "config": "/Users/msaglietto/Projects/Personal/zygos/eval/experiments/configs/mission-all-deepseek.zon",
+        "config_sha256": "5a9104d695653fb041a3f31480a656f55c4a4d8d37514ee984b29c406434f354"
+      },
+      "expected_task_runs": 1,
+      "recorded_task_runs": 1,
+      "trials_written": 1,
+      "verifier_passes": 1,
+      "pass_rate": 1.0,
+      "input_tokens": 76963,
+      "output_tokens": 8981,
+      "cache_read_tokens": 0,
+      "cost_usd": "0.021785289",
+      "cost_per_resolved_usd": "0.021785",
+      "mean_provider_steps": 20.0,
+      "mean_elapsed_seconds": 105.84,
+      "turn_stops": {
+        "parked": 1
+      },
+      "scorer_accepted": 0,
+      "scorer_refused": {},
+      "unscored": 1,
+      "mean_accepted_reduction": null,
+      "trim_calls": 0,
+      "mean_role_turns": 5.0,
+      "mission_states": {
+        "gating": 1
+      },
+      "role_failures": 0,
+      "cache_unreported": 1,
+      "transport_failures": 0,
+      "harbor_exceptions": 0,
+      "problems": 0
+    },
+    "executor-glm": {
+      "arm": {
+        "name": "executor-glm",
+        "trim": "on",
+        "git_sha": "b8a79db6300617395a9c3894d9e1fcedb44440a6",
+        "binary_sha256": "54bf161ed54dc520f0f858e3f17669c6b9444e8e71902f1b1179a5c1d2decc2e",
+        "config": "/Users/msaglietto/Projects/Personal/zygos/eval/experiments/configs/mission-executor-glm.zon",
+        "config_sha256": "c16a77a27710f17db4a9bfd6c9ebf524aab6e09ce14006cb8064b71ce2958423"
+      },
+      "expected_task_runs": 1,
+      "recorded_task_runs": 1,
+      "trials_written": 1,
+      "verifier_passes": 0,
+      "pass_rate": 0.0,
+      "input_tokens": 601,
+      "output_tokens": 1227,
+      "cache_read_tokens": 0,
+      "cost_usd": "0.002946603",
+      "cost_per_resolved_usd": null,
+      "mean_provider_steps": 3.0,
+      "mean_elapsed_seconds": 38.22,
+      "turn_stops": {
+        "role_failed": 1
+      },
+      "scorer_accepted": 0,
+      "scorer_refused": {},
+      "unscored": 1,
+      "mean_accepted_reduction": null,
+      "trim_calls": 0,
+      "mean_role_turns": 3.0,
+      "mission_states": {
+        "failed": 1
+      },
+      "role_failures": 1,
+      "cache_unreported": 1,
+      "transport_failures": 0,
+      "harbor_exceptions": 0,
+      "problems": 0
+    }
+  },
+  "matched": [
+    {
+      "task_id": "fix-git",
+      "repeat": 1,
+      "all-deepseek": {
+        "reward": 1.0,
+        "cost_usd": "0.021785289",
+        "steps": 20,
+        "stop": "parked",
+        "scorer_exit": null,
+        "problems": []
+      },
+      "executor-glm": {
+        "reward": 0.0,
+        "cost_usd": "0.002946603",
+        "steps": 3,
+        "stop": "role_failed",
+        "scorer_exit": null,
+        "problems": []
+      },
+      "pass_delta": -1,
+      "cost_delta_usd": "-0.018838686"
+    }
+  ],
+  "task_runs": [
+    {
+      "job": "all-deepseek-r1-fix-git",
+      "arm": "all-deepseek",
+      "repeat": 1,
+      "task_id": "fix-git",
+      "problems": [],
+      "reward": 1.0,
+      "scorer_exit": null,
+      "scorer_result": null,
+      "harbor_exit": 0,
+      "trial_path": "/private/tmp/zygos-mission-smoke/all-deepseek-r1-fix-git/fix-git__M7EWMWK",
+      "task_checksum": "e89f54f2fc73ac576f976c1cd09758e4c9ccf152e53c2dcd91da0c178b89abc7",
+      "elapsed_seconds": 105.84,
+      "binary_sha256": "54bf161ed54dc520f0f858e3f17669c6b9444e8e71902f1b1179a5c1d2decc2e",
+      "exit_code": 1,
+      "mission_state": "gating",
+      "turn_stop": "parked",
+      "role_turns": 5,
+      "tasks_done": 2,
+      "cache_unreported": true,
+      "cost_usd": "0.021785289",
+      "provider_steps": 20,
+      "tool_calls": 22,
+      "empty_tool_inputs": 0,
+      "handler_failures": 0,
+      "successful_tools": 22,
+      "role_starts": 5,
+      "role_failures": 0,
+      "trial": {
+        "input_tokens": 76963,
+        "output_tokens": 8981,
+        "cache_read_tokens": 0,
+        "trim": null
+      }
+    },
+    {
+      "job": "executor-glm-r1-fix-git",
+      "arm": "executor-glm",
+      "repeat": 1,
+      "task_id": "fix-git",
+      "problems": [],
+      "reward": 0.0,
+      "scorer_exit": null,
+      "scorer_result": null,
+      "harbor_exit": 0,
+      "trial_path": "/private/tmp/zygos-mission-smoke/executor-glm-r1-fix-git/fix-git__WJW5hdN",
+      "task_checksum": "e89f54f2fc73ac576f976c1cd09758e4c9ccf152e53c2dcd91da0c178b89abc7",
+      "elapsed_seconds": 38.22,
+      "binary_sha256": "54bf161ed54dc520f0f858e3f17669c6b9444e8e71902f1b1179a5c1d2decc2e",
+      "exit_code": 1,
+      "mission_state": "failed",
+      "turn_stop": "role_failed",
+      "role_turns": 3,
+      "tasks_done": 0,
+      "cache_unreported": true,
+      "cost_usd": "0.002946603",
+      "provider_steps": 3,
+      "tool_calls": 0,
+      "empty_tool_inputs": 0,
+      "handler_failures": 0,
+      "successful_tools": 0,
+      "role_starts": 3,
+      "role_failures": 1,
+      "trial": {
+        "input_tokens": 601,
+        "output_tokens": 1227,
+        "cache_read_tokens": 0,
+        "trim": null
+      }
+    }
+  ]
+}

@@ -10,6 +10,7 @@
 const std = @import("std");
 const zygos = @import("zygos");
 const cli_mission = @import("cli/mission.zig");
+const cli_task = @import("cli/task.zig");
 
 // Runtime log filter: ZYGOS_LOG=err|warn|info|debug (default warn). The
 // comptime ceiling stays .debug so the filter decides at runtime; workers'
@@ -103,7 +104,8 @@ pub fn main(proc: std.process.Init) !void {
     if (args.next()) |cmd| {
         if (std.mem.eql(u8, cmd, "mcp-gateway")) return runMcpGateway(gpa);
         if (std.mem.eql(u8, cmd, "mission")) std.process.exit(cli_mission.run(gpa, &args));
-        std.debug.print("unknown command: {s} (try: zygos | zygos mission | zygos mcp-gateway)\n", .{cmd});
+        if (std.mem.eql(u8, cmd, "task")) std.process.exit(cli_task.run(gpa, &args));
+        std.debug.print("unknown command: {s} (try: zygos | zygos mission | zygos task | zygos mcp-gateway)\n", .{cmd});
         std.process.exit(2);
     }
 
@@ -267,4 +269,5 @@ test {
     // submodules in explicitly for test discovery.
     std.testing.refAllDecls(@import("cli/mission/req.zig"));
     std.testing.refAllDecls(@import("cli/mission/view.zig"));
+    std.testing.refAllDecls(@import("cli/task.zig"));
 }

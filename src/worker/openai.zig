@@ -156,15 +156,35 @@ pub const Assembler = struct {
     pub fn message(self: *Assembler) AssembleError!Message {
         if (!self.done) return error.Incomplete;
         if (self.materialized == null) {
-            for (self.tools.items) |*t| canonicalizeDuplicateKeys(self.gpa, &t.args);
+            // A length-limited completion cannot dispatch partial tool input.
+            // The net renderer embeds input_json, so validate before the bus.
+            var tool_count: usize = if (self.stop_reason == .max_tokens) 0 else self.tools.items.len;
+            validate: for (self.tools.items[0..tool_count]) |*t| {
+                canonicalizeDuplicateKeys(self.gpa, &t.args);
+                if (t.args.items.len == 0) continue;
+                const valid = parsed: {
+                    var value = json.parseFromSlice(json.Value, self.gpa, t.args.items, .{}) catch |err| {
+                        if (err == error.OutOfMemory) return error.OutOfMemory;
+                        break :parsed false;
+                    };
+                    defer value.deinit();
+                    break :parsed value.value == .object;
+                };
+                if (!valid) {
+                    std.log.scoped(.openai_assembler).warn("invalid tool arguments; stopped without dispatch", .{});
+                    self.stop_reason = .unknown;
+                    tool_count = 0;
+                    break :validate;
+                }
+            }
             const has_text = self.text.items.len > 0;
-            const out = try self.gpa.alloc(Block, self.tools.items.len + @intFromBool(has_text));
+            const out = try self.gpa.alloc(Block, tool_count + @intFromBool(has_text));
             var i: usize = 0;
             if (has_text) {
                 out[i] = .{ .text = self.text.items };
                 i += 1;
             }
-            for (self.tools.items) |t| {
+            for (self.tools.items[0..tool_count]) |t| {
                 out[i] = .{ .tool_use = .{
                     .id = t.id.items,
                     .name = t.name.items,

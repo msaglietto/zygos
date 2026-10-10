@@ -6,6 +6,12 @@ Reconstructed from git history on 2026-09-30. A commit that only added a library
 
 The agent that next changes operator-visible behavior adds the new heading in that same commit.
 
+## [4.2.0] - 2026-10-08
+
+### Added
+
+- Turn wall clock: a `wall_clock_ms` request field stops a turn as `timeout` before the next step and passes the remaining budget to every bash call as `timeout_ms`, which the bash tool may only shorten its deadline with. `zygos task run --timeout-ms` (default 540000) sets it; the Harbor adapter passes the exec ceiling minus 30 s. A late `sleep` inside a task no longer loses the trial to Harbor's agent timeout.
+
 ## [4.1.1] - 2026-10-08
 
 ### Fixed
@@ -16,7 +22,33 @@ The agent that next changes operator-visible behavior adds the new heading in th
 
 ### Added
 
+- `zygos task run --config zygos.zon` routes the task step over the file's `.default`/`.routes` ladder through the model router, with per-attempt failover and per-attempt usage bridging, and records the file's SHA-256 as `config_sha256` on the trial. A config carrying `.context_strategy`, `.mcp_servers`, or any unknown setting refuses with `UnsupportedSetting`; unapproved models, unknown catalog slugs, missing keys, or a `--model` that is not the first attempt refuse before a provider boots. The Harbor adapter uploads `ZYGOS_CONFIG` and passes it as `--config`. Trial adapter version is now `0.2.0`.
+- `eval/campaign.py`: `build` a Linux arm from a clean worktree, `run` a matched two-arm experiment (`eval/experiments/*.json`; variable `build`, `config`, or `trim`) through Harbor with resume and fail-closed stop conditions, and `report` a durable comparison with a verdict or an explicit inconclusive reason. Contract: `docs/specs/campaign.md`.
 - `zygos mission trace <target> --format agui|html`. `agui` writes the run's `events.jsonl` as AG-UI 1.0 JSONL. Role turns become subagent runs, tool calls pair with their results, policy and approval refusals are flagged, and a terminal mission or task state becomes `RUN_FINISHED` or `RUN_ERROR`. `html` writes a self-contained viewer with that projection inlined. Both are offline and deterministic, and they redact secret-shaped values. The target may be a Harbor trial's `agent/` directory, whose `trial.json` supplies the thread id. `--format text` (the default) is the existing render. An unknown `--format`, or `--format` on another verb, exits 2.
+
+## [4.0.4] - 2026-10-07
+
+### Fixed
+
+- Anthropic-dialect replies no longer dispatch or embed invalid tool input. A `max_tokens` cutoff omits partial tool blocks and stops the turn as `max_tokens`. Truncated, whitespace-only, or non-object tool input stops as `unknown`, which fails the turn without dispatch. In both cases the terminal payload stays valid JSON, so usage is recorded and `turn_end` is traced.
+
+## [4.0.3] - 2026-10-07
+
+### Fixed
+
+- A fresh `zygos::missions::start` without a `brief` removes a `BRIEF.md` left by an earlier mission instead of handing it to every role as the authoritative brief. If the stale file cannot be removed, the start fails before any role runs. Resume still keeps the original brief, and a fresh start with a `brief` replaces it.
+
+## [4.0.2] - 2026-10-07
+
+### Fixed
+
+- `zygos task score` refuses a trim-off trial whose present trim snapshot has any nonzero counter as `MalformedTrial`, instead of reporting its recorded reduction. A trim-off trial with no snapshot still scores reduction 0.
+
+## [4.0.1] - 2026-10-07
+
+### Fixed
+
+- `zygos task score` computes the trim reduction percentage in 128-bit arithmetic, so a parseable raw byte count near the integer limit no longer panics or wraps.
 
 ## [4.0.0] - 2026-10-01
 

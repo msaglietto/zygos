@@ -1,0 +1,60 @@
+{
+  "name": "mission-smoke",
+  "description": "One task through the mission loop per route table: proves the mission benchmark path end to end before a full campaign.",
+  "mode": "mission",
+  "variable": "config",
+  "dataset": {
+    "id": "terminal-bench/terminal-bench-2-1",
+    "source": "https://github.com/harbor-framework/terminal-bench-2-1",
+    "source_sha": "7131e4375048a0e408a8fb404b5f499d726b695b",
+    "tasks": [
+      {
+        "id": "fix-git",
+        "checksum": "e89f54f2fc73ac576f976c1cd09758e4c9ccf152e53c2dcd91da0c178b89abc7"
+      }
+    ]
+  },
+  "model": {
+    "id": "deepseek/deepseek-v4.1-flash",
+    "key_env": "DEEPSEEK_API_KEY",
+    "key_from_env": "OPENROUTER_API_KEY",
+    "max_tokens": 8192,
+    "temperature": 0.7
+  },
+  "prices": {
+    "source": "https://openrouter.ai/api/v1/models",
+    "retrieved_utc": "2026-10-06T04:11:09.724231+00:00",
+    "canonical_slug": "deepseek/deepseek-v4.1-flash-20260910",
+    "usd_per_million_tokens": {
+      "input": "0.003",
+      "cached_input": "0.003",
+      "output": "2.40"
+    },
+    "scorer_cents_per_mtok": 30
+  },
+  "step_cap": 24,
+  "repeats": 1,
+  "workspace": "/app",
+  "host_concurrency": 2,
+  "ca_bundle_sha256": "9dae8d76e55cb08991f2b672d58999ea15560d910759c16b544f843bdffbb994",
+  "arms": [
+    {
+      "name": "all-deepseek",
+      "trim": "on",
+      "build": {
+        "git_sha": "b8a79db6300617395a9c3894d9e1fcedb44440a6",
+        "binary_sha256": "54bf161ed54dc520f0f858e3f17669c6b9444e8e71902f1b1179a5c1d2decc2e"
+      },
+      "config": "configs/mission-all-deepseek.zon"
+    },
+    {
+      "name": "executor-glm",
+      "trim": "on",
+      "build": {
+        "git_sha": "b8a79db6300617395a9c3894d9e1fcedb44440a6",
+        "binary_sha256": "54bf161ed54dc520f0f858e3f17669c6b9444e8e71902f1b1179a5c1d2decc2e"
+      },
+      "config": "configs/mission-executor-glm.zon"
+    }
+  ]
+}

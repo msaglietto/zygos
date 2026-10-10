@@ -9,6 +9,7 @@ const jsonx = @import("jsonx.zig");
 const json = std.json;
 const actor_mod = @import("../kernel/actor.zig");
 const inproc = @import("../kernel/inproc.zig");
+const sync = @import("../kernel/sync.zig");
 const ops = @import("tools_ops.zig");
 
 pub const ToolsWorker = struct {
@@ -16,6 +17,10 @@ pub const ToolsWorker = struct {
     worker: *inproc.Worker,
     root: []const u8, // owned
     ws: ops.Workspace,
+    /// Read-file lines only. Bash and every other tool leave this at zero.
+    /// Guarded: the bus may deliver concurrent reads.
+    mutex: sync.Mutex = .{},
+    lines_read: u64 = 0,
 
     pub fn start(
         gpa: std.mem.Allocator,
@@ -41,17 +46,36 @@ pub const ToolsWorker = struct {
 
     pub fn stop(self: *ToolsWorker) void {
         self.worker.stop();
+        self.mutex.deinit();
         self.gpa.free(self.root);
         const gpa = self.gpa;
         gpa.destroy(self);
+    }
+
+    /// Lines returned by successful `read_file` calls since start.
+    pub fn linesRead(self: *ToolsWorker) u64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.lines_read;
+    }
+
+    fn addLines(self: *ToolsWorker, content: []const u8) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.lines_read += ops.countLines(content);
     }
 
     fn bashHandler(ctx: ?*anyopaque, arena: std.mem.Allocator, request_json: []const u8) error{ Failed, OutOfMemory }![]const u8 {
         const self: *ToolsWorker = @ptrCast(@alignCast(ctx.?));
         const obj = try parseObject(arena, request_json);
         const command = strField(obj, "command") orelse return error.Failed;
+        // A caller-supplied bound only ever shortens the workspace deadline.
+        var ws = self.ws;
+        if (jsonx.uintField(obj, "timeout_ms")) |bound| {
+            if (bound > 0 and bound < ws.shell_timeout_ms) ws.shell_timeout_ms = @intCast(bound);
+        }
 
-        const result = ops.bash(self.gpa, self.ws, command) catch |err| return opError(arena, err);
+        const result = ops.bash(self.gpa, ws, command) catch |err| return opError(arena, err);
         defer self.gpa.free(result.output);
         return std.fmt.allocPrint(arena, "{{\"exit_code\":{d},\"output\":{f}}}", .{
             result.exit_code,
@@ -66,6 +90,7 @@ pub const ToolsWorker = struct {
 
         const content = ops.readFile(self.gpa, self.ws, path) catch |err| return opError(arena, err);
         defer self.gpa.free(content);
+        self.addLines(content);
         return std.fmt.allocPrint(arena, "{{\"content\":{f}}}", .{json.fmt(content, .{})});
     }
 
@@ -140,6 +165,29 @@ const Harness = struct {
     }
 };
 
+fn testClockMs() i64 {
+    var ts: std.c.timespec = undefined;
+    if (std.c.clock_gettime(.MONOTONIC, &ts) != 0) return 0;
+    return @as(i64, @intCast(ts.sec)) * 1000 + @divTrunc(@as(i64, @intCast(ts.nsec)), std.time.ns_per_ms);
+}
+
+test "bash tool: a timeout_ms input shortens the deadline and never lengthens it" {
+    var h = try Harness.init(testing.allocator);
+    defer h.deinit();
+    const started = testClockMs();
+    const res = try h.caller.call("zygos::tools::bash", "{\"command\":\"sleep 2\",\"timeout_ms\":30}");
+    defer res.deinit(testing.allocator);
+    try testing.expect(testClockMs() - started < 1500);
+    try testing.expect(res == .ok);
+    try testing.expect(std.mem.indexOf(u8, res.ok, "ExecFailed") != null);
+
+    // Longer than the workspace limit: the limit stands.
+    try testing.expectEqual(@as(u32, 120_000), h.tools.ws.shell_timeout_ms);
+    const quick = try h.caller.call("zygos::tools::bash", "{\"command\":\"echo bounded\",\"timeout_ms\":999999999}");
+    defer quick.deinit(testing.allocator);
+    try testing.expect(std.mem.indexOf(u8, quick.ok, "bounded") != null);
+}
+
 test "bash tool runs over the bus and reports exit code and output" {
     var h = try Harness.init(testing.allocator);
     defer h.deinit();
@@ -169,10 +217,17 @@ test "write then read round-trips over the bus; escapes are structured errors" {
     var p = try json.parseFromSlice(json.Value, testing.allocator, r.ok, .{});
     defer p.deinit();
     try testing.expectEqualStrings("hello tools", p.value.object.get("content").?.string);
+    try testing.expectEqual(@as(u64, 1), h.tools.linesRead());
 
     const esc = try h.caller.call("zygos::tools::read_file", "{\"path\":\"../../etc/passwd\"}");
     defer esc.deinit(testing.allocator);
     var pe = try json.parseFromSlice(json.Value, testing.allocator, esc.ok, .{});
     defer pe.deinit();
     try testing.expectEqualStrings("PathEscapesWorkspace", pe.value.object.get("error").?.string);
+    // A rejected read is not source lines. Bash is not either.
+    try testing.expectEqual(@as(u64, 1), h.tools.linesRead());
+    const b = try h.caller.call("zygos::tools::bash", "{\"command\":\"echo no-count\"}");
+    defer b.deinit(testing.allocator);
+    try testing.expect(b == .ok);
+    try testing.expectEqual(@as(u64, 1), h.tools.linesRead());
 }

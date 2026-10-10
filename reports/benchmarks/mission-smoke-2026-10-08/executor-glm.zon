@@ -1,0 +1,11 @@
+// Mission route table for the benchmark: which model does each of the
+// four steps. Slugs are the adapter's keyless mission catalog rows.
+.{
+    .default = .{ .{ .provider_function = "zygos::providers::deepseek-flash", .model = "deepseek/deepseek-v4.1-flash" } },
+    .routes = .{
+        .{ .step_id = "product-owner", .attempts = .{ .{ .provider_function = "zygos::providers::deepseek-flash", .model = "deepseek/deepseek-v4.1-flash" } } },
+        .{ .step_id = "planner", .attempts = .{ .{ .provider_function = "zygos::providers::deepseek-flash", .model = "deepseek/deepseek-v4.1-flash" } } },
+        .{ .step_id = "executor", .attempts = .{ .{ .provider_function = "zygos::providers::glm-flash", .model = "glm-5.3-flash" } } },
+        .{ .step_id = "verifier", .attempts = .{ .{ .provider_function = "zygos::providers::deepseek-flash", .model = "deepseek/deepseek-v4.1-flash" } } },
+    },
+}

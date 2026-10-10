@@ -19,6 +19,7 @@ const actor_mod = @import("actor.zig");
 const protocol = @import("protocol.zig");
 const types = @import("types.zig");
 const sync = @import("sync.zig");
+const entropy = @import("entropy.zig");
 
 const log = std.log.scoped(.inproc);
 
@@ -263,7 +264,7 @@ pub const Worker = struct {
         payload_json: []const u8,
     ) error{ OutOfMemory, Shutdown }!CallResult {
         var uuid_bytes: types.Uuid = undefined;
-        std.c.arc4random_buf(&uuid_bytes, uuid_bytes.len);
+        entropy.fill(&uuid_bytes);
         var uuid_text_buf: [36]u8 = undefined;
         const uuid_text = types.formatUuid(uuid_bytes, &uuid_text_buf);
 
@@ -489,7 +490,7 @@ pub const Worker = struct {
 
 fn newWorkerId() WorkerId {
     var id: WorkerId = undefined;
-    std.c.arc4random_buf(&id, id.len);
+    entropy.fill(&id);
     id[6] = (id[6] & 0x0f) | 0x40;
     id[8] = (id[8] & 0x3f) | 0x80;
     return id;

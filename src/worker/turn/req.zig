@@ -19,6 +19,9 @@ pub const Parsed = struct {
     model: []const u8,
     system: []const u8,
     max_steps: usize,
+    /// Wall-clock budget for the whole turn (ms). Null: unbounded. Checked
+    /// before every step; the remainder bounds each bash call.
+    wall_clock_ms: ?u64,
     static_provider: ?[]const u8,
     router_fn: ?[]const u8,
     step_id: []const u8,
@@ -74,6 +77,10 @@ pub fn parse(arena: std.mem.Allocator, request_json: []const u8) error{ OutOfMem
             (if (v == .integer and v.integer > 0) @intCast(v.integer) else 8)
         else
             8,
+        .wall_clock_ms = if (obj.get("wall_clock_ms")) |v|
+            (if (v == .integer and v.integer > 0) @as(?u64, @intCast(v.integer)) else null)
+        else
+            null,
         .static_provider = static_provider,
         .router_fn = router_fn,
         .step_id = strField(obj, "step_id") orelse "",
@@ -128,6 +135,24 @@ test "parse: full request resolves fields, routes and transcript seed" {
     try testing.expect(!p.routes.get("read").?.requires_approval);
     try testing.expectEqual(@as(usize, 1), p.transcript.items.len);
     try testing.expectEqualStrings("{\"role\":\"user\",\"content\":\"hi\"}", p.transcript.items[0]);
+}
+
+test "parse: wall_clock_ms is optional and must be positive" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const set = try parse(arena,
+        \\{"provider_function":"p::f","wall_clock_ms":540000}
+    );
+    try testing.expectEqual(@as(?u64, 540000), set.wall_clock_ms);
+    const absent = try parse(arena,
+        \\{"provider_function":"p::f"}
+    );
+    try testing.expectEqual(@as(?u64, null), absent.wall_clock_ms);
+    const zero = try parse(arena,
+        \\{"provider_function":"p::f","wall_clock_ms":0}
+    );
+    try testing.expectEqual(@as(?u64, null), zero.wall_clock_ms);
 }
 
 test "parse: defaults — max_steps 8 (also on zero/negative), empty tools, no messages" {
