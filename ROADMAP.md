@@ -3,7 +3,7 @@
 Drafted 2026-07-18 from the full-codebase review (`docs/RECONCILIATION-2026-07-18.md`).
 Two consumers with opposite context profiles anchor every proposed item:
 
-- **RADAR** — zahir-radar: broad, shallow, many transient sources; weekly
+- **RADAR** — research-radar: broad, shallow, many transient sources; weekly
   unattended research runs; high-recall / low-depth context.
 - **FACTORY** — orchy software factory: narrow, deep, long-lived; codebase
   state + task threads carried across many mission steps.
@@ -53,7 +53,7 @@ bus as `zygos::mcp::<server>::<tool>`, riding policy/trim/budget).
 **Research workload (M4.6)** — web_search/web_fetch worker (brave/searxng,
 429-retry carve-out, fail-closed parsing) gated like any tool; unattended
 rerun semantics (`--run-stamp`, refuse-if-existing) + external cron recipe;
-zahir-radar Brief 2 ported and lint-clean. Y5 (real-vault unattended run)
+research-radar Brief 2 ported and lint-clean. Y5 (real-vault unattended run)
 stays at the human gate. The brave `key_env` boot bug is fixed (1ebe1aa);
 it is not what blocks that run.
 
@@ -72,7 +72,7 @@ Every item below landed TDD-first (579 → 670 tests green; all five
 network-free e2e legs + the Node SDK leg pass). Section headers below keep
 the original planning text; per-item status:
 
-- **M4.7** — brave key_env fix (1ebe1aa, closes issues/0001), mission_boot
+- **M4.7** — brave key_env fix (1ebe1aa), mission_boot
   extraction (1ebe1aa), shared assembler core (d8e66e9), typed TraceEvent
   (e942078), missing specs (3c42159). Y5's harness blocker is gone; the
   real-vault unattended rerun remains at the human gate.

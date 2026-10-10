@@ -179,7 +179,7 @@ keyless catalog, then runs `zygos task run` inside the task container.
 
 `examples/quickstart/` is the small hello brief and a route table.
 `examples/providers.toml` is a keyless catalog row the build embeds for tests.
-`examples/x5-dogfood/` and `examples/zahir-radar/` are historical missions.
+`examples/x5-dogfood/` and `examples/research-radar/` are historical missions.
 `examples/README.md` says how to point a route table at a real catalog.
 
 ### 10. Documentation

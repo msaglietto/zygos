@@ -27,7 +27,7 @@ aliases: [zygos, zygos-design, zig-harness]
 > `GOAL.md`; how to run the binary is `README.md`; per-module truth is
 > `docs/specs/`.
 
-**Zygos** (ζυγός, "yoke") is a single-binary agent harness written in Zig. It reimplements the [iii](Tools/iii.md) engine kernel — worker / function / trigger on one message bus — and ships the harness as a stack of replaceable workers per Mike Piccolo's decomposition ([source](raw/sources/how-to-build-your-own-agent-harness-2026-06-02.md)). Its primary workload is a **continuous mission loop** built on the [GSD](https://github.com/opengsd) substrate: role agents — one owning product decisions, one planning, one executing, one verifying — iterating phase after phase until an objective is complete, with **every step routable to a different model/provider**. [Tessera Mnemis](Projects/Tessera Mnemis/PROJECT.md) is embedded as the harness's memory & continuity layer.
+**Zygos** (ζυγός, "yoke") is a single-binary agent harness written in Zig. It reimplements the [iii](https://iii.dev) engine kernel — worker / function / trigger on one message bus — and ships the harness as a stack of replaceable workers per Mike Piccolo's decomposition ("How to build your own agent harness", 2026-06-02). Its primary workload is a **continuous mission loop** built on the [GSD](https://github.com/opengsd) substrate: role agents — one owning product decisions, one planning, one executing, one verifying — iterating phase after phase until an objective is complete, with **every step routable to a different model/provider**. Tessera Mnemis is embedded as the harness's memory & continuity layer.
 
 ## Thesis
 
@@ -170,7 +170,7 @@ Resolution precedence (mirrors GSD's `model-resolver.cts` so the two systems agr
 
 Cross-provider caveat handled centrally: the orchestrator normalizes tool-call schemas per provider family (Anthropic tools vs OpenAI function-calling vs Gemini), so step prompts stay provider-agnostic. This normalization lives in the provider workers, not the FSM.
 
-### Pre-turn prompt pipeline (the [pi-fusion](Tools/pi-fusion.md) seam)
+### Pre-turn prompt pipeline (the pi-fusion seam)
 
 One seam the original design missed: **transforming the turn input before the FSM runs it.** The `provisioning` state gains a *prompt pipeline* — an ordered list of `prompt::transform` function IDs read from config or from state at `session/<sid>/prompt_pipeline`. Each stage receives `{prompt, session_id, mode, workspace}` and returns `{prompt, notes?}`.
 
@@ -240,7 +240,7 @@ Each state runs one or more turns via `run::start`, each independently routed �
 | `executor` | execute-phase | code, atomic commits, SUMMARY.md | fast, cheap coder model |
 | `verifier` | verify-work | VERIFICATION.md evidence | different provider than executor |
 
-**The key inversion is discuss-phase.** In GSD, discuss gathers *human* context into CONTEXT.md as locked decisions. In mission mode, the `shaping` state has the product-owner turn answer those questions itself, seeded by the **mission brief** — the objective, constraints, non-goals, and success criteria the human writes once at intake. Everything GSD's workflow would ask a human, the PO answers — except the hard gates. The brief is the control surface of the whole loop and has its own designed contract: [Mission Brief Template](Projects/Zygos/Mission Brief Template.md). Its frontmatter (budgets, gates, escalation thresholds) is machine-enforced; its body (intent, authority ladder, non-goals) is PO-interpreted; `mission::brief::validate` lints it at `mission::start` and refuses briefs with unverifiable success criteria, empty non-goals, or missing budgets. The PO can read the brief but never write it — amendments are human-only and append-only, which is what makes "the PO contradicted the brief" a checkable claim.
+**The key inversion is discuss-phase.** In GSD, discuss gathers *human* context into CONTEXT.md as locked decisions. In mission mode, the `shaping` state has the product-owner turn answer those questions itself, seeded by the **mission brief** — the objective, constraints, non-goals, and success criteria the human writes once at intake. Everything GSD's workflow would ask a human, the PO answers — except the hard gates. The brief is the control surface of the whole loop and has its own designed contract: [brief spec](specs/brief.md). Its frontmatter (budgets, gates, escalation thresholds) is machine-enforced; its body (intent, authority ladder, non-goals) is PO-interpreted; `mission::brief::validate` lints it at `mission::start` and refuses briefs with unverifiable success criteria, empty non-goals, or missing budgets. The PO can read the brief but never write it — amendments are human-only and append-only, which is what makes "the PO contradicted the brief" a checkable claim.
 
 **PO continuity without a long-lived context.** Role turns stay fresh-context per invocation (GSD is right about this). The PO's memory is on disk: the mission brief + a **PO journal** (`.planning/mission/DECISIONS.md` — every accept/redo/pivot with rationale) + the current artifacts. Each PO turn reloads those three. Tessera mirrors phase boundaries into SESSIONS.md automatically, so the human can audit a running mission the way they'd audit any project.
 
@@ -258,7 +258,7 @@ The **gsd-adapter** shrinks accordingly: a thin worker that loads role prompts f
 
 ## Layer 3b — Tessera Mnemis as the memory layer
 
-Tessera stops being an external MCP server bolted onto other people's agents and becomes **the harness's own jobs 12–13, backed by the vault**. This is Tessera Phase C, absorbed ([PROJECT.md](Projects/Tessera Mnemis/PROJECT.md)) — and it honors every standing ADR:
+Tessera stops being an external MCP server bolted onto other people's agents and becomes **the harness's own jobs 12–13, backed by the vault**. This is Tessera Phase C, absorbed — and it honors every standing ADR:
 
 | Worker | Function IDs | What it does |
 |---|---|---|
@@ -303,8 +303,8 @@ The slider moves in `zygos.zon`'s worker boot list. Same protocol, same traces a
 
 ## Sources
 
-- [iii](Tools/iii.md) — engine architecture; five-primitive kernel confirmed against `~/Projects/iii` source (protocol enum in `engine/src/protocol.rs`, catalog/owner CAS in `engine/src/engine/mod.rs`, trigger registry in `engine/src/trigger.rs`, channels in `engine/src/workers/worker/channels.rs`).
-- [How to build your own agent harness](raw/sources/how-to-build-your-own-agent-harness-2026-06-02.md) — the 15-job decomposition, FSM/approval/fail-closed patterns, thin↔thick slider.
-- `~/Projects/gsd-core` — agent definitions (`agents/*.md`), artifact schemas (`gsd-core/templates/`), model routing (`bin/shared/model-catalog.json`, `src/model-resolver.cts`), host contract (`src/host-integration.cts`), active model seam (`src/model-adapter.cts`).
-- [Tessera Mnemis](Projects/Tessera Mnemis/PROJECT.md) + [ADRs](Projects/Tessera Mnemis/ADRs.md) — continuity loop, config-block taxonomy, suppression rules, shadow-git undo.
-- [ztk](https://github.com/codejunkie99/ztk) (Zig, MIT) + rtk (`~/.claude/RTK.md`) — tool-output compression prior art: filter rule set, never-touch list, session dedup cache, savings analytics. ztk shares Zygos's exact toolchain (Zig 0.16+, zero deps).
+- [iii](https://iii.dev) — engine architecture; five-primitive kernel confirmed against the iii engine source (protocol enum in `engine/src/protocol.rs`, catalog/owner CAS in `engine/src/engine/mod.rs`, trigger registry in `engine/src/trigger.rs`, channels in `engine/src/workers/worker/channels.rs`).
+- "How to build your own agent harness" (2026-06-02) — the 15-job decomposition, FSM/approval/fail-closed patterns, thin↔thick slider.
+- gsd-core — agent definitions (`agents/*.md`), artifact schemas (`gsd-core/templates/`), model routing (`bin/shared/model-catalog.json`, `src/model-resolver.cts`), host contract (`src/host-integration.cts`), active model seam (`src/model-adapter.cts`).
+- Tessera Mnemis project notes and ADRs — continuity loop, config-block taxonomy, suppression rules, shadow-git undo.
+- [ztk](https://github.com/codejunkie99/ztk) (Zig, MIT) + rtk — tool-output compression prior art: filter rule set, never-touch list, session dedup cache, savings analytics. ztk shares Zygos's exact toolchain (Zig 0.16+, zero deps).

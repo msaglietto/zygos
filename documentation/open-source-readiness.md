@@ -1,6 +1,6 @@
 # Open-source readiness
 
-Reviewed 2026-10-01 against the [repository audit](../reports/repo_audit_2026-09-30.md).
+Reviewed 2026-10-01 against the repository audit of 2026-09-30 (the audit report itself is no longer kept in the tree).
 That audit described `a2a9bf0`; this branch already contained thirteen follow-up
 commits when this review began. The MIT license and most priority fixes were
 present. Five unfinished stream-limit edits were preserved and completed.

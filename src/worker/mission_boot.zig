@@ -138,7 +138,7 @@ pub fn timeouts(env: []const EnvPair) Timeouts {
 }
 
 // ---------------------------------------------------------------------------
-// brief budget (issues/0003 — the declared budget must be the enforced one)
+// brief budget (the declared budget must be the enforced one)
 // ---------------------------------------------------------------------------
 
 /// Reads `budget.max_tokens` out of the brief's YAML frontmatter: the
@@ -437,7 +437,7 @@ test "timeouts: env overrides apply; malformed values keep defaults" {
 
 const budget_brief =
     \\---
-    \\mission: zahir-radar-verifier-infra
+    \\mission: research-radar-wasm-components
     \\budget:
     \\  max_tokens: 2000000
     \\gates:

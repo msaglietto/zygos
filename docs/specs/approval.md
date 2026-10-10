@@ -13,7 +13,7 @@ test thread) answers via `zygos::approvals::resolve`.
   `true` when a resolve call (or an auto mode) actually answered, `false`
   when the timeout expired or the worker stopped — callers can tell "a
   human said no" from "nobody answered" (the mission gate parks on the
-  latter, issues/0002).
+  latter).
 - `zygos::approvals::resolve` — `{"id":"a-1","approved":true}` →
   `{"resolved":true}`; unknown id → `{"resolved":false}`.
 - `zygos::approvals::pending` — `{}` →
