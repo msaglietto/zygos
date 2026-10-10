@@ -1,111 +1,293 @@
 # Zygos
 
-A single-binary agent harness in Zig. Zygos reimplements the [iii](https://iii.dev)
-engine kernel — workers connect over WebSocket and register *functions* and
-*triggers* on one message bus — and (in later milestones) ships harness
-capabilities as replaceable workers. Wire-compatible with the unmodified iii
-SDKs. See `GOAL.md` for the mission, `docs/ARCHITECTURE.md` and
-`docs/PROTOCOL.md` for the design, `docs/specs/` for per-module contracts.
+A local agent harness in one Zig binary. You give it a brief. Four roles — product owner, planner, executor, verifier — work that brief until it is done or the run stops. Each role can use a different model. The run is written to disk as it goes, so you can leave, come back, and resume.
 
-## Before running missions
+Workers, models, policy, and tools all sit on one message bus. The same bus speaks the [iii](https://iii.dev) wire protocol, so an existing iii SDK can register functions on a Zygos kernel.
 
-Zygos is experimental software for a trusted local operator. Mission policy
-allows bash and web tools by default. Bash runs as your OS user with workspace
-cwd, an environment allowlist, and a two-minute process-group deadline; it is
-not a sandbox. Fetched content can influence commands. The executor can also
-write the attach control file and approve its completion gate. Closed stdin
-does not make that gate independent of the executor. See
-[SECURITY.md](SECURITY.md) and [permissions](documentation/permissions.md).
+> [!WARNING]
+> Zygos is experimental software for a trusted local operator. A mission runs bash as your OS user, with the workspace as its working directory, an environment allowlist, and a two-minute process-group deadline. Default policy allows bash, web search, and web fetch. Text the executor fetches can ask for a shell command, and the process will run it. The executor can also append an approval to the mission control file. Read [SECURITY.md](SECURITY.md) and [permissions](documentation/permissions.md) before you point a run at a real workspace or a real key.
 
-Bare kernel mode binds loopback and rejects browser Origins by default.
-`ZYGOS_TOKEN` optionally requires `?token=<secret>` on worker connections;
-`ZYGOS_ALLOW_ORIGIN` is an exact comma-separated browser Origin allowlist.
-Admitted peers can register and invoke bus functions. Mission mode uses an
-in-process bus and does not expose its tools through the WebSocket listener.
+## What you get
 
-For a fixture-only demonstration, run `./test/e2e/m45/run.sh` (Node.js + git).
-For your own provider catalog and a small mission, see
-[examples](examples/README.md). Contribution rules are in
-[CONTRIBUTING.md](CONTRIBUTING.md).
+- A mission loop with a durable `.planning/` directory. Kill the process and `zygos mission resume` continues from the last saved role.
+- A route table that sends each role to its own provider, and fails over to the next attempt when a provider errors.
+- An executor with bash, web search, and web fetch, plus any MCP servers you list in `zygos.zon`. Those calls pass through policy, approval, budget, and output compression.
+- A live terminal view on a tty: mission state, the current task, the model in use, streamed reasoning, tool calls, and the answer.
+- A second terminal on the same run: steer the next step, pause, resume, or answer an approval.
+- A loopback kernel. Any iii SDK connects and registers functions. Mission mode itself stays in-process and does not publish its tools on that socket.
+- Room for a vault. Set `ZYGOS_VAULT_ROOT` and the run checkpoints the vault before it writes. `zygos mcp-gateway` exposes the vault tools over stdio.
 
-## Status: M4.6 — zahir-radar workload (M0–M4.5 closed)
+Milestone contracts live in [GOAL.md](GOAL.md). This file is how you use the binary.
 
-| Milestone | Criterion | State |
+## How a mission runs
+
+```
+defining → planning → executing → verifying → gating → done
+```
+
+| Role | Step id | What it does |
 |---|---|---|
-| M0 | S1 wire protocol round-trip | ✅ 43 tests (`kernel/protocol.zig`) |
-| M0 | S2 function catalog, owner CAS | ✅ 12 tests (`kernel/catalog.zig`) |
-| M0 | S3 invocation router | ✅ 11 tests (`kernel/invocation.zig`) |
-| M0 | S4 trigger registry | ✅ 14 tests (`kernel/trigger.zig`) |
-| M0 | S5 keyed byte channels | ✅ 13 tests (`kernel/channel.zig`) |
-| M0 | S6 unmodified Node SDK e2e | ✅ `test/e2e/node-sdk/run.sh` |
-| M1 | T1 in-process bus workers | ✅ `kernel/inproc.zig` (frame-path peers, Outbound mux) |
-| M1 | T2 turn FSM | ✅ `worker/turn.zig` (exhaustive legal/illegal transitions) |
-| M1 | T3 provider-anthropic SSE | ✅ `worker/sse.zig` + `worker/anthropic.zig` (fixtures, no network) |
-| M1 | T4 tool dispatch loop | ✅ turn driver tests (fake provider + fake tool) |
-| M1 | T5 agent-tools worker | ✅ `worker/tools{,_ops}.zig` (workspace-confined bash/read/write) |
-| M1 | T6 scripted turn e2e | ✅ `test/e2e/turn/run.sh` |
-| M2 | U1 fail-closed policy gate | ✅ `worker/policy.zig` + turn-driver fail-closed tests |
-| M2 | U2 approval worker, turns::abort/steer | ✅ `worker/approval.zig` (park/resolve/timeout) |
-| M2 | U3 zygos.zon per-step routing + failover | ✅ `worker/router.zig` (`models::resolve`, escalation ladder) |
-| M2 | U4 provider-openai (chat-completions SSE) | ✅ `worker/openai.zig` + `net/{openai,provider_openai}.zig` (fixtures, no network) |
-| M2 | U5 budget enforcement | ✅ `worker/budget.zig` (`stop:"budget_exhausted"`, fail closed) |
-| M2 | U6 output-trim (Z-09) + M2 e2e | ✅ `worker/trim.zig`; `test/e2e/m2/run.sh` |
-| M3 | V1 mission FSM | ✅ `worker/mission.zig` (exhaustive legal/illegal transitions) |
-| M3 | V2 durable `.planning/` substrate | ✅ `worker/mission_store.zig` (tmp+rename atomic saves) |
-| M3 | V3 role turns (po/planner/executor/verifier) | ✅ per-role `step_id` routing, fail-closed output parsing |
-| M3 | V4 missions::{start,status,abort} + resume | ✅ mission driver tests incl. mid-flight resume |
-| M3 | V5 hard completion gate + escalation | ✅ fail-closed gate tests, verify/gate thresholds |
-| M3 | V6 mission e2e + resume leg | ✅ `test/e2e/m3/run.sh` |
-| M4 | W1 mission brief validation | ✅ `worker/brief.zig` (fail-closed lint before the FSM) |
-| M4 | W2 tessera-orient worker | ✅ `worker/tessera_orient.zig` + `worker/tessera/vault.zig` (fixture vault only) |
-| M4 | W3 tessera-continuity + mission auto-log | ✅ `worker/tessera_continuity.zig` + `worker/tessera/session_writer.zig`; continuity seam in the mission driver |
-| M4 | W4 tessera-capture (taxonomy from config) | ✅ `worker/tessera_capture.zig` (full fallback, capture never lost) |
-| M4 | W5 tessera-undo (shadow git) | ✅ `worker/tessera_undo.zig` (`.zygos-shadow`, checkpoint/undo) |
-| M4 | W6 mcp-gateway + M4 e2e | ✅ `worker/mcp/gateway.zig` + `zygos mcp-gateway`; `test/e2e/m4/run.sh` |
-| M4.5 | X1 provider catalog (`~/.agents/providers.toml`) | ✅ `config/providers.zig` (TOML subset, fail-closed validation) |
-| M4.5 | X2 catalog → bus boot (`zygos::providers::<slug>`) | ✅ `net/provider_boot.zig` (Gemini compat base, checkRoutes refusal) |
-| M4.5 | X3 `zygos mission start/resume` CLI | ✅ `cli/mission.zig`; `test/e2e/m45/run.sh` |
-| M4.5 | X4 multi-provider smoke (env-gated) | ✅ `test/smoke/providers.sh` (manual, real keys) |
-| M4.5 | X5 dogfood exit (real autonomous mission) | ✅ verified 2026-07-10 (see below) |
-| M4.6 | Y1 web-tools worker (`web_search`/`web_fetch`) | ✅ `net/web_tools.zig` (fixture-tested, no sockets) |
-| M4.6 | Y2 web tools through policy/trim/budget gates | ✅ turn-level policy-URL test + existing seams |
-| M4.6 | Y3 unattended reruns + cron recipe | ✅ refuse-if-existing, `--run-stamp`; recipe below |
-| M4.6 | Y4 zahir-radar Brief 2 → Z-08 mission brief | ✅ `examples/zahir-radar/` (passes W1 lint) |
-| M4.6 | Y5 unattended run vs the real Zahir vault | ⏳ human gate — staged, awaiting Mauricio |
+| Product owner | `product-owner` | Turns the brief into an objective and acceptance checks. |
+| Planner | `planner` | Writes the task list. |
+| Executor | `executor` | Runs the tasks. This is the only role that receives tools. |
+| Verifier | `verifier` | Checks the success criteria and returns pass or fail. |
 
-## Build & test
+A failed verification sends the mission back to planning. So does an explicit denial of the completion gate. Three failed verifications in a row, or three explicit gate denials, stops the run. A timeout on the gate leaves the mission parked in `gating`. A missing gate, an unreachable gate, or a malformed gate reply can never mark the mission done.
 
-Requires Zig 0.16.0 and libc (pthread + CSPRNG): macOS or Linux with glibc.
-The benchmark artifact targets glibc 2.31; Linux uses `getrandom` and macOS
-uses `arc4random_buf`. CI uses Ubuntu 24.04 and macOS 14.
+By default each role is prompted from the files in `.planning/`. `zygos.zon` can select the `recall` or `thread` strategy; an unknown strategy refuses to boot. See [context](docs/specs/context.md).
+
+When the mission reaches a terminal state it writes `LEDGER.md` (tokens used, bytes trimmed, role turns, final state) next to the other artifacts:
+
+| File | Contents |
+|---|---|
+| `BRIEF.md` | The brief this run was started with. |
+| `MISSION.md` | The objective the product owner accepted. |
+| `PLAN.md` | The task list. |
+| `VERIFY.md` | The verifier's verdict. |
+| `events.jsonl` | Transitions, role boundaries, provider and model, and every tool call with its input and a clipped output. |
+| `LEDGER.md` | The rollup you read after the run. |
+| `control.jsonl` | Commands from `zygos mission attach`, including approvals. |
+
+## Install
+
+Zig 0.16.0, on macOS or Linux with glibc. CI runs on Ubuntu 24.04 and macOS 14.
 
 ```bash
-zig build test   # full suite (leak-checked, no network; CI checks macOS + Linux)
-zig build        # produces zig-out/bin/zygos
+zig build          # zig-out/bin/zygos
+zig build test     # offline; no catalog, vault, or network
 ```
 
-## Run
+## Run a mission
+
+The checked-in quickstart asks for a POSIX script that prints `Hello from Zygos`. It spends provider tokens and runs commands as your user. The token budget is a cap, not a price.
 
 ```bash
-ZYGOS_PORT=49134 ./zig-out/bin/zygos   # 49134 is the iii SDK default
+zig build
+cp examples/providers.toml providers.local.toml
+cp examples/quickstart/zygos.zon ./zygos.zon
 ```
+
+Edit `providers.local.toml`: set `endpoint` and `model`, and export the variable named by `key_env`. Put that same model in `zygos.zon`. `providers.local.toml` is gitignored. Leave keys out of the file.
+
+```bash
+export AI_PROVIDERS_CONFIG="$PWD/providers.local.toml"
+export ZYGOS_CONFIG="$PWD/zygos.zon"
+
+workspace=$(mktemp -d)
+bin="$PWD/zig-out/bin/zygos"
+brief="$PWD/examples/quickstart/brief.md"
+cd "$workspace"
+"$bin" mission start "$brief"
+```
+
+On a terminal you get the live view. An approval is one key: `y` approves, and `n` or Enter denies. The approval timeout denies too. With nothing waiting, `s` opens a steer line for the next role boundary, `p` pauses, and `r` resumes. Ctrl-C aborts the mission and restores the terminal. `--no-tui` or `ZYGOS_NO_TUI=1` keeps the plain progress log, where an approval is a line on stderr and only a line starting with `y` approves. A pipe takes that path on its own.
+
+Stdout is one JSON object when the mission finishes. Exit 0 means `done`. Exit 1 means `failed` or `aborted`. Exit 2 means the brief, catalog, route table, or boot refused the run.
+
+> [!TIP]
+> To watch the whole loop with no API key, run `./test/e2e/m45/run.sh` from the repository root. It needs Node.js and git, talks only to loopback fixtures, and does not read your provider catalog. More setups are in [examples/README.md](examples/README.md).
+
+### The brief
+
+A brief is Markdown with YAML frontmatter. Zygos lints it before the kernel boots and refuses a brief that fails. This is enough to start:
+
+```markdown
+---
+mission: hello
+budget:
+  max_tokens: 20000
+gates:
+  completion: human
+---
+
+# Objective
+
+Write a POSIX shell script `hello.sh` in the current workspace that prints
+`Hello from Zygos` followed by a newline.
+
+## Success criteria
+
+| Criterion | Verified by |
+|---|---|
+| Script prints exactly `Hello from Zygos` plus a newline | `sh hello.sh` exits 0 |
+
+## Non-goals
+
+- Do not install dependencies or change files outside this workspace.
+```
+
+The lint requires `budget`, `gates`, a success-criteria table with a `Verified by` column and at least one row, and a non-empty non-goals section. The full quickstart is [examples/quickstart/brief.md](examples/quickstart/brief.md). The contract is [docs/specs/brief.md](docs/specs/brief.md).
+
+### Providers
+
+The catalog is TOML. `AI_PROVIDERS_CONFIG` overrides `~/.agents/providers.toml`. Each `[[providers]]` entry becomes a bus function `zygos::providers::<slug>` (`"Example OpenAI"` → `example-openai`). `[[clis]]` entries are ignored. A malformed catalog is an error, and the process exits before a mission starts.
+
+```toml
+[[providers]]
+name = "Example OpenAI"
+type = "openai_compatible"
+endpoint = "https://api.openai.com/v1"
+model = "your-model-id"
+key_env = "OPENAI_API_KEY"
+max_tokens = 4096
+temperature = 0.2
+```
+
+Supported `type` values are `openai_compatible`, `anthropic_compatible`, `google`, and `ollama`. Parsing and validation are in [docs/specs/providers.md](docs/specs/providers.md).
+
+### Routes
+
+`ZYGOS_CONFIG` overrides `./zygos.zon`. `.default` is the ladder for any step you do not name. Each `.routes` entry is a `step_id` and an `attempts` list: attempt 0 uses the first provider, the next attempt uses the next, and an empty ladder fails the turn. A route that names a provider slug missing from the catalog refuses to boot.
+
+```zon
+.{
+    .default = .{
+        .{ .provider_function = "zygos::providers::example-openai", .model = "your-model-id" },
+    },
+    .routes = .{
+        .{ .step_id = "executor", .attempts = .{
+            .{ .provider_function = "zygos::providers::example-openai", .model = "your-model-id" },
+        } },
+        .{ .step_id = "verifier", .attempts = .{
+            .{ .provider_function = "zygos::providers::example-openai", .model = "your-model-id" },
+        } },
+    },
+}
+```
+
+Role step ids are `product-owner`, `planner`, `executor`, and `verifier`.
+
+To add MCP tools, list servers in the same file. Zygos spawns each one over stdio, handshakes, and registers its tools as `zygos::mcp::<server>::<tool>`. The model sees `<server>_<tool>`. A server that fails the handshake refuses the run. A server that dies mid-run returns a structured error on the next call.
+
+```zon
+.{
+    .default = .{
+        .{ .provider_function = "zygos::providers::example-openai", .model = "your-model-id" },
+    },
+    .mcp_servers = .{
+        .{ .name = "tavily", .argv = .{ "npx", "-y", "tavily-mcp" } },
+    },
+}
+```
+
+## While it is running
+
+```bash
+zygos mission start  <brief.md> [--planning <dir>] [--resume] [--run-stamp] [--no-tui]
+zygos mission resume <brief.md> [--planning <dir>]
+zygos mission queue  [--planning <base>] [--run-stamp] <brief.md>...
+zygos mission trace  <planning-dir|events.jsonl> [--format agui|html]
+zygos mission attach <planning-dir>
+zygos mission dashboard <dir>
+```
+
+`start` uses `./.planning` unless you pass `--planning`. A second start against a directory that already holds a mission exits 2. `resume` continues that directory and does not repeat finished roles. `--run-stamp` gives this invocation its own directory, named `<root>-YYYYMMDD-HHMMSS-P<pid>`.
+
+`queue` runs the briefs one after another in one process. Each brief gets its own planning directory, `<base>-<stem>`. A directory that already holds that mission is resumed. Ctrl-C aborts the mission in flight and does not start the rest.
+
+`dashboard <dir>` prints one status line per mission substrate under that directory.
+
+`trace` renders `events.jsonl`. The file is the record: mission transitions, which provider and model handled each step, and every tool call. If the file cannot be written, the mission still runs.
+
+```bash
+zygos mission trace .planning
+```
+
+`--format agui` writes the same log as AG-UI 1.0 JSONL. `--format html` writes one self-contained viewer file with those events inlined; it opens offline. Both redact secret-shaped values. A Harbor trial's agent directory works too:
+
+```bash
+zygos mission trace <jobs>/<trial>/agent --format html > run.html
+```
+
+The projection is specified in `docs/specs/trace.md`, under "AG-UI projection".
+
+`attach` follows that same log from another terminal. Commands you type are appended to `control.jsonl`. A crashed run still shows its history, and the commands wait there until a resume picks them up.
+
+```
+steer <text>
+pause
+resume
+approve <id> y|n
+```
+
+Ctrl-D detaches.
+
+`ZYGOS_WORKTREE=1` (or `true`) checks out a detached git worktree at `<planning>/worktree` and runs the executor there. If `git worktree add` fails, the mission does not start.
+
+### Search
+
+| `ZYGOS_SEARCH_ENGINE` | What you also set |
+|---|---|
+| `brave` | The variable named by `ZYGOS_SEARCH_KEY_ENV` (default `BRAVE_API_KEY`). An unset key still boots; each search returns `MissingSearchKey`. |
+| `searxng` | `ZYGOS_SEARCH_ENDPOINT`. No key. |
+
+`web_fetch` accepts `http` and `https`. It refuses recognized literal private addresses and localhost unless `ZYGOS_FETCH_ALLOW_PRIVATE=1`.
+
+### Knobs
+
+Integer values that do not parse fall back to the default. A typo does not refuse boot.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `ZYGOS_BUDGET_MAX_TOKENS` | brief, else 1000000 | Token cap for the mission. When this variable is set it wins over `budget.max_tokens` in the brief. Crossing it stops the turn. |
+| `ZYGOS_ROLE_MAX_STEPS` | 24 | Steps inside one role turn. |
+| `ZYGOS_MAX_ROLE_TURNS` | 48 | Role turns in the mission. |
+| `ZYGOS_MISSION_TIMEOUT_MS` | 24h | Ceiling on the mission call. |
+| `ZYGOS_INVOKE_TIMEOUT_MS` | 1h | Ceiling on every other bus call. A provider timeout fails over to the next route. |
+| `ZYGOS_STREAM_IDLE_MS` | 120000 | Closes a provider stream that sends nothing this long. `0` disables it. |
+| `ZYGOS_APPROVAL_TIMEOUT_MS` | 300000 | Unanswered approval or gate denies. |
+| `ZYGOS_LOG` | `warn` | `err`, `warn`, `info`, or `debug`. `info` is the progress feed when the TUI is off. |
+| `ZYGOS_VAULT_ROOT` | unset | Checkpoint this vault before the mission writes to it. Checkpoint failure refuses the run. |
+
+Closed stdin does not prompt. The approval timer denies, and an unattended mission cannot approve its own completion gate through the console. The executor's shell can still write `control.jsonl`.
+
+## On a schedule
+
+Nothing inside the binary fires on a clock. cron or launchd runs the CLI. Closed stdin makes console approvals time out and deny. `--run-stamp` keeps each fire in its own planning directory. A lock on `<planning>/claim` refuses a second process on the same directory.
+
+```cron
+0 7 * * 1  cd /path/to/workspace && ZYGOS_CONFIG=/path/to/zygos.zon \
+  /path/to/zygos mission start /path/to/brief.md --run-stamp < /dev/null
+```
+
+Put the provider `key_env` variables, and the search settings if you use them, in that crontab's environment. Details are in [documentation/cron.md](documentation/cron.md).
+
+## The worker bus
+
+With no subcommand, Zygos is the kernel. It listens on `127.0.0.1` and the port in `ZYGOS_PORT` (default `49134`, the iii SDK default). Ctrl-C stops it.
+
+```bash
+ZYGOS_PORT=49134 ./zig-out/bin/zygos
+```
+
+Browsers send `Origin`. Those connections are refused unless the origin is listed in `ZYGOS_ALLOW_ORIGIN` (comma-separated, exact match). When `ZYGOS_TOKEN` is set, every worker must open `ws://127.0.0.1:<port>?token=<secret>`. A peer that gets in can register and invoke functions. Mission mode does not open this listener; its tools stay in-process.
+
+An iii SDK connects as it would to any iii kernel:
+
+```javascript
+import { registerWorker } from 'iii-sdk'
+const iii = registerWorker('ws://localhost:49134')
+iii.registerFunction('hello::greet', async (input) => ({ hi: input.name }))
+```
+
+Extensions are new `zygos::*` functions. The frame format is [docs/PROTOCOL.md](docs/PROTOCOL.md).
+
+### Vault tools over MCP
+
+`zygos mcp-gateway` serves the vault over stdio: project status, open threads, stale projects, reflect, session open, session close, checkpoint, and undo. `ZYGOS_VAULT_ROOT` is required. `tessera_capture` is named in the tool list and is not registered on this process, because capture needs a provider and a taxonomy, so that call returns a JSON-RPC error. An unknown tool does too.
 
 ## Headless task (offline)
 
-`zygos task` is the entry a benchmark runner calls. It is not a mission: there is no product-owner gate, and exit 0 means the process finished, not that the task succeeded.
+`zygos task` is the entry a benchmark runner calls. It is a single scripted or live task in a workspace. There is no product-owner gate, and exit 0 means the process finished.
 
 ```bash
 zygos task run --offline --workspace DIR --out trial.json --events events.jsonl
 zygos task score --trial trial.json --prices prices.txt
 ```
 
-`--offline` selects the scripted provider. Live runs require an allowlisted model and a complete invocation; the current Deepseek Flash campaign has standing authorization under [Benchmark operating policy](docs/benchmark-policy.md). Agents review and record evidence at phase boundaries and advance without asking for permission each time. The trial pins the git sha, target triple, optimize level, and adapter version. Bench policy allows only bash, read, and write inside the workspace. Mission policy is unchanged.
+`--offline` uses the scripted provider. A live run names an allowlisted model and a complete invocation; `--config zygos.zon` routes that step through the file's `.default` and `.routes` ladders. The trial records the git sha, target, optimize level, and config hash. Bench policy allows bash, read, and write inside the workspace.
 
-`eval/run.sh --dry-run` prints the pinned dataset `terminal-bench/terminal-bench-2-1` and the task command. It is not part of `zig build test`. The contract is `docs/specs/task.md`.
-
-## Benchmark campaigns
-
-To measure a release or a configuration change, run a matched two-arm campaign. The experiment file freezes the tasks, model, prices, step cap, and repeats, and names the one variable the arms differ in: `build` (two git shas), `config` (two `zygos.zon` route tables, passed to `zygos task run --config`), or `trim`.
+Matched two-arm campaigns (two builds, two route tables, or trim on against trim off) are `eval/campaign.py`. The experiment file freezes the tasks, model, prices, step cap, and repeats, and names the one variable the arms differ in.
 
 ```bash
 ZYGOS_ZIG=/path/to/zig-0.16 eval/campaign.py build --git-ref <sha>      # Linux arm from a clean worktree
@@ -115,371 +297,20 @@ eval/campaign.py report --experiment eval/experiments/trim-ablation.json \
     --jobs-dir /tmp/zygos-trim-ablation --out reports/benchmarks/trim-ablation-<date>
 ```
 
-The report states a verdict or the reason it is inconclusive; durable reports live under `reports/benchmarks/`. An experiment with `"mode": "mission"` runs each task through the mission loop with the arm's `zygos.zon` as the mission configuration (which model does each step), for example `eval/experiments/mission-routing.json`. The contract is `docs/specs/campaign.md`; execution authority is `docs/benchmark-policy.md`.
-
-Any iii SDK connects unmodified:
-
-```javascript
-import { registerWorker } from 'iii-sdk'
-const iii = registerWorker('ws://localhost:49134')
-iii.registerFunction('hello::greet', async (input) => ({ hi: input.name }))
-```
-
-## S6 end-to-end test (documented run)
-
-`test/e2e/node-sdk/run.sh` builds the binary, starts a kernel on a scratch
-port (`ZYGOS_PORT`, default 49142), `npm install`s the **unmodified**
-`iii-sdk` package from npm, and runs `e2e.mjs`: worker A registers
-`echo::reverse`, worker B invokes it through the kernel and asserts the
-result. Exits nonzero on any failure.
-
-```console
-$ ./test/e2e/node-sdk/run.sh
-[iii] Worker registered with ID: 8f55dac3-0881-4d07-87ca-687ffbd67044
-[iii] Worker registered with ID: 2c46efc0-e598-4fd6-8428-4d90e9a302ac
-E2E OK: {"reversed":"sogyz"}
-S6 e2e passed on port 49142
-```
-
-Requires `node` + `npm` on PATH (network on first run for the SDK install).
-
-## M1 turn-loop e2e (documented run)
-
-`test/e2e/turn/run.sh` (= `zig build e2e-turn`) runs a scripted 2-step
-tool-use turn through the full M1 stack in one process: kernel actor, inproc
-bus workers, turn FSM driver, a fake provider streaming deltas over a kernel
-channel, and the **real** `zygos::tools::bash` tool in a scratch workspace.
-
-```console
-$ ./test/e2e/turn/run.sh
-TURN E2E OK: stop=end_turn steps=2 deltas="hello worldhello world"
-```
-
-The real Anthropic provider (`net/anthropic.zig` + `net/provider_anthropic.zig`)
-is exercised only by an env-gated manual smoke — one real streaming API call:
+The report states a verdict or the reason it is inconclusive; durable reports live under `reports/benchmarks/`. An experiment with `"mode": "mission"` runs each task through the mission loop with the arm's `zygos.zon` as the mission configuration (which model does each step), for example `eval/experiments/mission-routing.json`. The contract is [docs/specs/campaign.md](docs/specs/campaign.md). What a run is allowed to spend is [docs/benchmark-policy.md](docs/benchmark-policy.md).
 
 ```bash
-ANTHROPIC_API_KEY=... ./test/e2e/anthropic/run.sh   # zig build smoke-anthropic
+zygos task run --help
 ```
 
-It exits 2 (skipped) without the key and is never part of `zig build test`.
-The openai-compat provider has the same arrangement (`OPENAI_BASE_URL` points
-it at any chat-completions-compatible endpoint):
+## Where to go next
 
-```bash
-OPENAI_API_KEY=... ./test/e2e/openai/run.sh   # zig build smoke-openai
-```
-
-## M2 policy+routing e2e (documented run)
-
-`test/e2e/m2/run.sh` (= `zig build e2e-m2`) runs a scripted 2-step tool-use
-turn through the full M2 stack in one process: the fail-closed policy gate
-(`ask` verdict on bash), the approval worker, `zygos.zon` routing parsed from
-a real file (`models::resolve`), budget enforcement with per-step usage
-accounting, and the Z-09 output-trim filter compressing the real bash tool's
-500-line output on the `zygos::output::compress` seam — savings reported to
-`zygos::budget::record`.
-
-```console
-$ ./test/e2e/m2/run.sh
-M2 E2E OK: stop=end_turn steps=2 used_tokens=30 saved_bytes=1861
-```
-
-## M3 mission-loop e2e (documented run)
-
-`test/e2e/m3/run.sh` (= `zig build e2e-m3`) runs the mission loop over the
-full M2+M3 stack in one process, in two legs. Leg 1: a scripted mission
-(`zygos::missions::start`) walks define → plan → execute → verify → gate to
-`done` — the product-owner/planner/executor/verifier roles each run as one
-turn routed per-role through `zygos.zon` (`models::resolve`), the **real**
-bash tool executes both plan tasks in a scratch workspace behind the
-fail-closed policy gate (`ask` → approval worker), budget accounting sees
-every role turn, the Z-09 trim seam compresses the 500-line task output, and
-the hard completion gate goes through a real `zygos::approvals::request`
-call. Leg 2: a **fresh** orchestrator instance resumes a mid-flight
-`.planning/` substrate (`resume:true`) and finishes it without re-running
-the earlier roles.
-
-```console
-$ ./test/e2e/m3/run.sh
-M3 E2E OK: live=done/completed resumed=done/completed role_turns=5+5 used_tokens=105 saved_bytes=1861
-```
-
-## M4 tessera e2e (documented run)
-
-`test/e2e/m4/run.sh` runs two legs against one temp vault. Leg 1
-(`zig build e2e-m4`): a scripted mission runs to `done` with the W3
-continuity seam (`continuity_function` + `continuity_project` on
-`zygos::missions::start`) — the terminal mission session-closes over the bus
-and the harness, not a model, writes the `SESSIONS.md` entry (phase log,
-accomplished, leaving-behind). Leg 2: this script acts as an **external MCP
-client**, piping a newline-JSON session (initialize → tools/list →
-tools/call `tessera_project_status`) into a separate `zygos mcp-gateway`
-process (stdio transport, `ZYGOS_VAULT_ROOT` pointing at the same vault) and
-asserts the auto-logged entry comes back; an unknown tool must return a
-JSON-RPC `-32602` error (fail closed).
-
-```console
-$ ./test/e2e/m4/run.sh
-M4 E2E leg 1 OK: mission auto-logged .../Projects/zygos-e2e/SESSIONS.md
-M4 E2E OK: mission auto-log read back through the MCP gateway
-```
-
-## M4.5 mission CLI e2e (documented run)
-
-`test/e2e/m45/run.sh` drives the real binary — `zygos mission start <brief.md>`
-— against a localhost SSE stub (node, 127.0.0.1) named by a fixture
-`~/.agents/providers.toml`-shaped catalog. Leg 1: brief lint → catalog +
-route-table boot (`zygos::providers::<slug>` instances) → the full mission
-loop to `state:"done"`, with the completion gate approved over piped stdin
-and the real bash tool writing into the workspace. Leg 2: a seeded mid-flight
-`.planning/` substrate finishes through `zygos mission resume` (earlier roles
-not re-run). Leg 3: a route table naming an unknown provider slug exits 2
-before any kernel boots (fail closed).
-
-```console
-$ ./test/e2e/m45/run.sh
-M45 E2E OK: start→done, seeded resume→done, unknown-slug boot refusal
-```
-
-The CLI reads the provider catalog from `AI_PROVIDERS_CONFIG` (else
-`~/.agents/providers.toml`) and the route table from `ZYGOS_CONFIG` (else
-`./zygos.zon`); approvals prompt on stderr and fail closed (manual timeout
-denies) when stdin closes. Knobs: `ZYGOS_APPROVAL_TIMEOUT_MS`,
-`ZYGOS_INVOKE_TIMEOUT_MS`, `ZYGOS_BUDGET_MAX_TOKENS`, `ZYGOS_ROLE_MAX_STEPS`
-(default 24), `ZYGOS_MAX_ROLE_TURNS` (default 48); web-search backend via
-`ZYGOS_SEARCH_ENGINE`/`ZYGOS_SEARCH_ENDPOINT`/`ZYGOS_SEARCH_KEY_ENV`
-(brave/searxng). Brave resolves that key variable into `SearchConfig.key`
-at boot (`searchConfigFromEnv`); an unset key fails each search with
-`MissingSearchKey` and does not fail boot. Debugging: `ZYGOS_LOG=info`
-streams the harness's progress feed (mission transitions, role turns,
-per-step provider/model, tool dispatches) to stderr; `debug` for more.
-
-Timeouts are tiered — one flat deadline cannot serve both a whole mission
-and the calls inside it:
-
-- `ZYGOS_MISSION_TIMEOUT_MS` (default 24h) — ceiling on the blocking
-  mission call itself; the only knob that bounds total mission duration.
-- `ZYGOS_INVOKE_TIMEOUT_MS` (default 1h) — every other bus invocation
-  (role turns, provider calls, gates). A provider call that times out
-  escalates the route ladder like any provider failure.
-- `ZYGOS_STREAM_IDLE_MS` (default 120s, `0` disables) — HTTP-level idle
-  guard on provider streams: a connection that goes this long without
-  sending a byte is shut down and the call fails over. This is the hang
-  protection; the invoke timeout is only the outer net.
-
-`test/e2e/timeouts/run.sh` locks the contract in: a silent localhost
-provider (accepts, never responds) must trip the idle guard, must not let
-a tight invoke timeout kill the mission call, and must still honor the
-mission ceiling.
-
-## M8 output-compression e2e (documented run)
-
-`test/e2e/m8/run.sh` (= `zig build e2e-m8`) proves decision Z-09's
-command-aware half (M8). It builds a **real** scratch git repo with a real
-uncommitted change, then runs the turn loop with the **real** bash tool
-executing real `git` commands, and asserts four things a fixture cannot:
-the driver's seam context reaches the filter dispatcher, a repeated
-`git status` collapses to a one-line "unchanged" reply, `raw: true` in the
-tool input bypasses compression entirely, and the savings reach the budget
-ledger.
-
-This leg found what 731 unit tests could not: the filters were **inert on the
-real path**, because every tool replies with a JSON envelope
-(`{"exit_code":0,"output":"..."}`) that the structured-data guard skipped —
-and trimming that envelope generically handed the model unparseable JSON. A
-fixture proves the algorithm; only a real command proves the wiring.
-
-```console
-$ ./test/e2e/m8/run.sh
-M8 E2E OK: real git output 1013 -> 378 bytes (63% saved), filtered=2 deduped=1 budget_saved=680
-```
-
-`zig build filter-probe` measures the filters against a mix of real commands
-on this repo — a measurement tool, not a gate. Its first run reported 6%, with
-four of six filters silently declining on real output that every fixture had
-passed:
-
-```console
-$ zig build filter-probe
-command                          raw  filtered   saved  filter
---------------------------------------------------------------------------
-git status                       557       239    +57%  git_status
-git log -20                    15141      1627    +89%  git_log
-git diff HEAD~1                19957     17584    +11%  git_diff
-ls -la src/worker               2430       537    +77%  listing
-find src -name *.zig            1945      1945     +0%  listing
-zig build test                 10081      2194    +78%  testrun
---------------------------------------------------------------------------
-TOTAL                          50111     24126     51%
-```
-
-`find` declines because there is nothing to strip, and that `git diff` is 84%
-real changes — the filters do not invent savings where there is no noise.
-
-`./test/mutation/guards.sh` deletes each load-bearing guard in turn and
-requires `zig build test` to go red for every one. It exists because two M8
-tests passed with the invariant they claimed to protect deleted:
-
-```console
-$ ./test/mutation/guards.sh
-KILLED guard: diff-payload skip in hasErrorSignal
-KILLED guard: error signals bail out git/listing
-KILLED guard: small-output threshold
-KILLED guard: structured output is never reshaped
-KILLED guard: keepIfSmaller rejects non-savings
-KILLED trim: UTF-8 boundary walk in byteFallback
-KILLED trim: stats mutex in note()
-KILLED turn: raw:true bypasses the seam
-KILLED turn: seam carries the tool name
-
-MUTATION CHECK OK: every guard is pinned by a test that detects its removal.
-```
-
-The per-mission rollup lands in `LEDGER.md` at terminal state. This is real
-output from `zygos mission start` in `test/e2e/m45` — the actual binary, the
-real bash tool, the ledger an operator reads:
-
-```
-# Ledger — brief
-
-used_tokens: 105
-saved_bytes: 55861
-role_turns: 5
-state: done (completed)
-
-## Tool-output compression
-
-calls: 2
-filtered: 1
-deduped: 0
-raw_bytes: 57214
-sent_bytes: 2079
-reduction: 96%
-```
-
-## Mission TUI — live progress view
-
-When `zygos mission start` runs on a real terminal (tty on stdin and
-stderr), it takes over the screen with a live progress view instead of the
-plain banner: a header with mission state, tasks, and elapsed time (the
-spinner rides the status line); an objective echo; a live current-task line
-that collapses to a dim `✓` line when the task lands; role/step lines with
-the routed model; a **live `❙ Thinking…` block** streaming the model's
-reasoning (anthropic `thinking_delta`, openai-compatible `reasoning_content`
-— DeepSeek/GLM/Minimax) that collapses to `◆ Thought for Ns` in history;
-**rail-guttered live tool entries** (`┃`) showing the command/file being
-composed as the arguments stream (extracted from the partial JSON); running
-tool calls that collapse into `◆`/`✗` summary lines as results land;
-assistant tokens streaming at full color, promoted answers rendered
-markdown-lite (headers, bold, bullets, numbered lists, fenced code with
-keyword syntax highlighting on a panel background); captured warn/err log
-lines as dim footnotes; and a token counter fed by per-step `usage` trace
-events. Truecolor when `COLORTERM` says so, indexed-256 fallback otherwise.
-History scrolls into the terminal's own scrollback (no alternate screen) —
-only the bottom band repaints, wrapped in synchronized output (`?2026`).
-
-Approvals resolve on a single keypress: the pending ask renders as a
-highlighted keys-first `[y/N] approve? <summary>` band (`y` approves; `n`,
-Enter, or the server-side `ZYGOS_APPROVAL_TIMEOUT_MS` denies — fail
-closed). Ctrl-C restores the terminal before exiting; a panic path
-(`emergencyRestore`) repairs the terminal too. While the TUI owns fd 2,
-stray stderr writers are redirected to a log file; `ZYGOS_TUI_CAPTURE=<path>`
-tees raw frames for debugging. The final mission JSON still prints to
-stdout after the TUI tears down, so `| jq` pipelines and exit codes are
-unchanged.
-
-Opt out with `--no-tui` or `ZYGOS_NO_TUI=1`; piped/CI runs (no tty) keep
-the plain path automatically — the `trace →` banner, stderr approval
-prompts, and stdout JSON are byte-identical to before. The TUI is a second
-consumer of the same trace event stream (`src/worker/trace.zig` sinks) plus
-a live delta observer on the turn loop; rendering is hand-rolled ANSI in
-`src/tui/` (no deps, libc terminal control confined there like the `net/`
-exception).
-
-## Mission trace — the harness view
-
-Every `zygos mission start` writes a structured event log to
-`<planning>/events.jsonl`: mission transitions, role boundaries, per-step
-provider/model, and **every tool call with its input and (clipped) output**.
-Emission is fail-open — an unwritable trace never changes a run's outcome.
-Render it live or post-mortem:
-
-```console
-$ zygos mission trace .planning-20260711-015510
-02:13:20 ── role executor (turn 3, tools on)
-02:13:22   step 1: glm-5.2 via zygos::providers::glm-5-2
-02:13:23     tool web_search {"query":"neural provers 2026"}
-02:13:24       → 5120B: [{"title":"DeepSeek-Prover-V4"},...]
-02:13:25   turn end: max_steps (24 steps)
-02:13:26 ── role executor: failed — executor turn stopped: max_steps
-```
-
-`zig build test` covers the emitters (turn + mission drivers) and the
-renderer; the raw JSONL is the source of truth, the renderer never hides
-unparseable lines.
-
-## MCP servers as tool providers
-
-`zygos.zon` may carry an `.mcp_servers` table; each entry is spawned over
-stdio (JSON-RPC 2.0, MCP `2025-06-18`), handshaken, and its tools registered
-on the bus as `zygos::mcp::<server>::<tool>` — exposed to the model as
-`<server>_<tool>` and riding the same policy/trim/budget gates as native
-tools (Y2 semantics). A configured-but-broken server refuses the run at boot
-(fail closed); a server dying mid-run yields structured
-`{"error":"McpServerUnavailable"}` tool results, never a hang.
-
-```zon
-.{
-    .routes = .{ ... },
-    .mcp_servers = .{
-        .{ .name = "tavily", .argv = .{ "npx", "-y", "tavily-mcp" } },
-    },
-}
-```
-
-The X4 companion is a manual smoke over the **real** catalog — two turns
-routed to two different live providers:
-
-```bash
-./test/smoke/providers.sh                  # auto-picks two keyed entries
-zig build smoke-providers -- <slug-a> <slug-b>
-```
-
-## Scheduled (unattended) missions — the Y3 recipe
-
-The weekly-trigger decision (M4.6/Y3): scheduling lives **outside** the
-binary — cron/launchd invoke the CLI; the kernel stays schedule-free. The
-CLI refuses overlapping runs on one planning root using a process-held
-file lock. Console approvals fail closed on a closed stdin; a non-resume start over an existing substrate refuses (exit 2)
-instead of clobbering it, and `--run-stamp` gives every invocation its own
-planning root (`<root>-YYYYMMDD-HHMMSS-P<pid>`). This is rerun isolation,
-not a sandbox: an executor shell can still write the approval control file.
-
-```cron
-# weekly zahir-radar refresh, Mondays 07:00 — each run gets its own .planning
-0 7 * * 1  cd /path/to/workspace && ZYGOS_CONFIG=/path/to/zygos.zon \
-  /path/to/zygos mission start /path/to/brief.md --run-stamp < /dev/null
-```
-
-## X5 dogfood run (documented, 2026-07-10)
-
-The M4.5 exit: `examples/x5-dogfood/brief.md` (a `wordfreq` POSIX CLI with a
-self-test) run through the real binary against live catalog providers, roles
-routed per `examples/x5-dogfood/zygos.zon` (GLM 5.2 / DeepSeek V4 Pro /
-Minimax M3 / Gemini 3.5-flash, with cross-provider failover ladders), the
-human at intake and the completion gate only. Both `mission start` and a
-mid-flight `mission resume` verified by Mauricio. Dogfood findings folded
-back the same day: provider warnings now name the failing instance
-(rate-limit attribution), and the CLI requests real-mission
-`role_max_steps`/`max_role_turns` instead of the scripted-test defaults that
-starved the first executor run.
-
-## License
-
-MIT — see [LICENSE](LICENSE). The one dependency
-([karlseguin/websocket.zig](https://github.com/karlseguin/websocket.zig),
-pinned in `build.zig.zon`) is MIT-licensed. Its pinned license and provenance
-are recorded in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Include both
-notices when distributing binaries. CI and maintainer publication tasks are
-documented in [open-source readiness](documentation/open-source-readiness.md).
+| | |
+|---|---|
+| [examples/README.md](examples/README.md) | Fixture demo and a real-provider quickstart. |
+| [documentation/architecture.md](documentation/architecture.md) | What the binary actually does, and the trust boundaries. |
+| [documentation/automation.md](documentation/automation.md) | What a role may do, and what the process enforces. |
+| [documentation/variables.md](documentation/variables.md) | Environment, files, and secrets. |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Layer sketch: kernel, harness workers, mission loop. |
+| [docs/specs/](docs/specs/) | Per-module contracts. |
+| [SECURITY.md](SECURITY.md) | The operator threat model. |

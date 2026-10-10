@@ -1,0 +1,1068 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>zygos run</title>
+<style>
+:root {
+  --ink: #1f1d2e;
+  --muted: #6d6a83;
+  --faint: #9a97ad;
+  --line: #e8e6f3;
+  --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono: ui-monospace, "SF Mono", Menlo, monospace;
+}
+* { box-sizing: border-box; }
+html { min-height: 100%; background: radial-gradient(1100px 700px at 15% 0%, rgba(255,255,255,.9), rgba(255,255,255,0) 60%), linear-gradient(165deg, #f0eff9 0%, #e8e6f8 45%, #dcd8f5 100%) fixed; }
+body { margin: 0; padding: 40px 20px 72px; font-family: var(--sans); color: var(--ink); -webkit-font-smoothing: antialiased; }
+.wrap { max-width: 760px; margin: 0 auto; }
+h1 { margin: 0 0 10px; text-align: center; font-size: 23px; font-weight: 600; letter-spacing: .2em; text-transform: uppercase; color: #3d3b57; }
+.sub { display: flex; flex-wrap: wrap; justify-content: center; align-items: center; gap: 8px; margin: 0 0 24px; font-size: 13px; color: var(--muted); }
+.sub .mono { color: #4a4766; }
+.mono { font-family: var(--mono); }
+.panel { display: flex; flex-direction: column; gap: 14px; padding: 22px; border-radius: 28px; border: 1px solid rgba(255,255,255,.95); background: rgba(255,255,255,.62); box-shadow: 0 34px 70px -30px rgba(70,58,160,.32), 0 2px 8px rgba(70,58,160,.05); -webkit-backdrop-filter: blur(10px); backdrop-filter: blur(10px); }
+
+.a-blue   { --a: #4f8fdc; --t: #e9f1fc; --k: #2c5c9b; }
+.a-green  { --a: #6cbf6a; --t: #e9f6e6; --k: #2d6a30; }
+.a-red    { --a: #e05858; --t: #fdeced; --k: #a12b2e; }
+.a-amber  { --a: #dc9a35; --t: #f6e9d2; --k: #855412; }
+.a-indigo { --a: #6a63d8; --t: #eeedfc; --k: #3c3693; }
+.a-violet { --a: #7d5fe0; --t: #f0ebfd; --k: #4f339f; }
+.a-slate  { --a: #8c91a7; --t: #eff0f5; --k: #4a5069; }
+
+.card { position: relative; overflow: hidden; border-radius: 18px; background: #fff; padding: 14px 18px 14px 23px; box-shadow: 0 1px 2px rgba(40,36,90,.04), 0 12px 26px -16px rgba(40,36,90,.26); }
+.card::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 5px; background: var(--a); }
+.card.tinted { background: color-mix(in srgb, var(--t) 55%, #fff); }
+.card.tinted .label { color: var(--k); }
+.row { display: flex; align-items: center; gap: 14px; min-width: 0; }
+.ic { flex: none; display: grid; place-items: center; width: 40px; height: 40px; border-radius: 12px; background: var(--t); color: var(--k); }
+.ic svg { width: 20px; height: 20px; }
+.grow { flex: 1; min-width: 0; }
+.label { font-size: 18px; font-weight: 600; letter-spacing: -.01em; line-height: 1.25; }
+.desc { margin-top: 3px; font-size: 13px; color: var(--muted); line-height: 1.4; }
+.desc.err { color: #a12b2e; white-space: pre-wrap; word-break: break-word; }
+.when { flex: none; font-size: 12px; color: var(--faint); font-variant-numeric: tabular-nums; }
+.pill { display: inline-flex; align-items: center; gap: 5px; padding: 2px 9px; border-radius: 999px; font-size: 12px; font-weight: 600; line-height: 18px; white-space: nowrap; background: var(--t); color: var(--k); }
+.pill svg { width: 13px; height: 13px; }
+.dot { flex: none; display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--a); }
+
+summary { list-style: none; cursor: pointer; }
+summary::-webkit-details-marker { display: none; }
+summary:focus-visible { outline: 2px solid #8b84e8; outline-offset: 3px; border-radius: 12px; }
+.chev { flex: none; width: 16px; height: 16px; color: var(--faint); transition: transform .15s ease; }
+details[open] > summary .chev { transform: rotate(90deg); }
+
+.summary-card { padding: 18px 20px 18px 23px; }
+.stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-top: 14px; }
+.stat.warn b { color: #855412; }
+.stat { padding: 9px 12px; border-radius: 12px; background: #f6f5fb; }
+.stat b { display: block; font-size: 17px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.stat span { font-size: 10px; font-weight: 600; letter-spacing: .06em; white-space: nowrap; text-transform: uppercase; color: var(--faint); }
+.stat.bad b { color: #a12b2e; }
+.section-label { margin: 16px 0 8px; font-size: 10.5px; font-weight: 600; letter-spacing: .1em; text-transform: uppercase; color: var(--faint); }
+.tl { position: relative; border-radius: 10px; background: #f1f0f8; }
+.seg { position: absolute; height: 10px; min-width: 3px; border-radius: 5px; background: var(--a); cursor: pointer; border: 0; padding: 0; }
+.seg:hover, .seg:focus-visible { outline: 2px solid var(--k); outline-offset: 1px; }
+.tick { position: absolute; top: 0; bottom: 0; width: 2px; margin-left: -1px; background: rgba(106,99,216,.32); }
+.tick.red { background: rgba(224,88,88,.6); }
+.tick.amber { background: rgba(220,154,53,.7); }
+.axis { display: flex; justify-content: space-between; margin-top: 5px; font-size: 11px; color: var(--faint); font-variant-numeric: tabular-nums; }
+.legend { display: flex; flex-wrap: wrap; gap: 6px 14px; margin-top: 8px; font-size: 12px; color: var(--muted); }
+.legend span { display: inline-flex; align-items: center; gap: 6px; }
+.plan { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 6px; }
+.plan li { display: flex; align-items: center; gap: 10px; min-width: 0; font-size: 13px; }
+.plan .n { flex: none; display: grid; place-items: center; width: 22px; height: 22px; border-radius: 7px; background: var(--t); color: var(--k); font-size: 11.5px; font-weight: 700; }
+.plan .d { flex: 1; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+
+.divider { display: flex; align-items: center; gap: 10px; min-width: 0; margin: 4px 2px 0; font-size: 12.5px; color: var(--muted); }
+.divider::before, .divider::after { content: ""; flex: 0 0 18px; height: 1px; background: #d9d6ea; }
+.divider::after { flex: 1 1 18px; }
+.divider .d { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.divider b { flex: none; font-weight: 600; color: #4a4766; }
+
+.caption { margin: 6px 2px -4px; font-size: 14px; font-weight: 500; color: #3d3b57; }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 14px; align-items: start; }
+
+.lane { position: relative; overflow: hidden; border-radius: 18px; background: var(--t); box-shadow: 0 1px 2px rgba(40,36,90,.04), 0 12px 26px -16px rgba(40,36,90,.26); }
+.lane::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 5px; background: var(--a); }
+.lane > summary { padding: 15px 18px 14px 23px; }
+.lane-top { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.lane-top .dot { width: 10px; height: 10px; }
+.lane-name { font-size: 18px; font-weight: 600; color: var(--k); letter-spacing: -.01em; }
+.lane-sub { margin-top: 5px; padding-left: 20px; font-size: 13px; color: var(--k); opacity: .82; }
+.lane-err { margin-top: 6px; padding-left: 20px; font-size: 13px; color: #a12b2e; white-space: pre-wrap; word-break: break-word; }
+.lane-body { display: flex; flex-direction: column; gap: 10px; padding: 0 14px 16px 19px; }
+.lane.flash { animation: flash 1.2s ease; }
+@keyframes flash { 0% { box-shadow: 0 0 0 3px var(--a); } 100% { box-shadow: 0 1px 2px rgba(40,36,90,.04), 0 12px 26px -16px rgba(40,36,90,.26); } }
+
+.prompt { border-radius: 12px; background: rgba(255,255,255,.55); }
+.prompt > summary { display: flex; align-items: center; gap: 6px; padding: 7px 12px; font-size: 12.5px; font-weight: 600; color: var(--k); }
+.prompt > pre { margin: 0 8px 8px; }
+
+.route { display: flex; flex-direction: column; gap: 8px; }
+.route-row { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; min-width: 0; font-size: 12.5px; color: var(--muted); }
+.rp { display: inline-block; max-width: 100%; min-width: 0; padding: 3px 11px 3px 8px; border-radius: 999px; background: rgba(255,255,255,.85); color: #4a4766; box-shadow: 0 1px 2px rgba(40,36,90,.06); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.rp svg { width: 13px; height: 13px; margin-right: 5px; vertical-align: -2px; color: #6a63d8; }
+.rp b { font-weight: 600; color: var(--ink); }
+.rp .prov { color: var(--faint); }
+.route.retry .rp { background: #fbf0dc; color: #855412; }
+.route.retry .rp svg { color: #dc9a35; }
+.route-tools { display: flex; flex-direction: column; gap: 8px; margin-left: 12px; padding-left: 12px; border-left: 2px solid rgba(60,54,147,.07); }
+.route-row .tok { margin-left: auto; flex: none; font-variant-numeric: tabular-nums; }
+
+.tool { padding: 0; }
+.tool > summary { padding: 10px 14px 10px 19px; }
+.tool .ic { width: 32px; height: 32px; border-radius: 10px; }
+.tool .ic svg { width: 16px; height: 16px; }
+.tool .row { gap: 11px; }
+.tname { flex: none; font-family: var(--mono); font-size: 14px; font-weight: 600; }
+.targ { flex: 1; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-family: var(--mono); font-size: 12.5px; color: var(--muted); }
+.tstat { flex: none; display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.tstat .bad { color: #a12b2e; font-weight: 600; }
+.tstat .warn { color: #855412; font-weight: 600; }
+.tool-chips { display: flex; flex-wrap: wrap; gap: 6px; padding: 0 14px 10px 62px; margin-top: -2px; }
+.tool-body { padding: 4px 16px 14px 19px; border-top: 1px dashed var(--line); }
+.kv { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; margin: 10px 0 6px; font-size: 11px; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; color: var(--faint); }
+pre.block { margin: 0; max-height: 380px; overflow: auto; padding: 10px 12px; border-radius: 10px; background: #f6f6fb; font-family: var(--mono); font-size: 12px; line-height: 1.5; color: #2b2940; white-space: pre-wrap; word-break: break-word; }
+.kv .pill { text-transform: none; letter-spacing: 0; }
+.tool-chips .pill { white-space: normal; }
+.muted-note { font-size: 12.5px; color: var(--faint); font-style: italic; }
+
+.turn-end { display: flex; align-items: center; gap: 8px; padding: 2px 4px; font-size: 12.5px; color: var(--muted); }
+.turn-end::before { content: ""; width: 14px; height: 1px; background: #cfcbe3; }
+
+.msg-text { margin-top: 4px; padding-left: 54px; font-size: 14.5px; line-height: 1.5; white-space: pre-wrap; word-break: break-word; }
+.card .msg-text.mono { font-size: 12.5px; }
+
+.notice { margin: 0 0 16px; }
+.drop { display: flex; flex-direction: column; align-items: center; gap: 10px; padding: 46px 24px; border-radius: 20px; border: 2px dashed #cdc8ea; background: rgba(255,255,255,.7); text-align: center; color: var(--muted); }
+.drop .ic { width: 52px; height: 52px; border-radius: 16px; }
+.drop .ic svg { width: 26px; height: 26px; }
+.drop .label { color: var(--ink); }
+.drop code { font-family: var(--mono); font-size: 12.5px; color: #4a4766; background: #f1f0f8; padding: 2px 6px; border-radius: 6px; }
+button.btn { font: inherit; font-size: 13px; font-weight: 600; padding: 7px 14px; border-radius: 999px; border: 1px solid #dcd8ef; background: #fff; color: #3c3693; cursor: pointer; box-shadow: 0 1px 2px rgba(40,36,90,.06); }
+button.btn:hover { background: #f6f5fd; }
+.foot { display: flex; justify-content: center; align-items: center; gap: 12px; margin-top: 18px; font-size: 12px; color: var(--faint); }
+.foot a { color: #6a63d8; }
+body.dragging .panel { outline: 3px dashed #8b84e8; outline-offset: 6px; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
+}
+@media (max-width: 560px) {
+  body { padding: 24px 10px 48px; }
+  .panel { padding: 14px; border-radius: 22px; }
+  .tool-chips { padding-left: 19px; }
+}
+</style>
+</head>
+<body>
+<main class="wrap">
+  <h1>An agent run</h1>
+  <div class="sub" id="sub"></div>
+  <div id="notice"></div>
+  <section class="panel" id="panel"></section>
+  <div class="foot" id="foot"></div>
+</main>
+<input type="file" id="file" accept=".jsonl,.ndjson,.json,.txt,application/x-ndjson" hidden>
+<script type="application/x-ndjson" id="zygos-events">@@ZYGOS_EVENTS@@</script>
+<script>
+(function () {
+  'use strict';
+
+  var PLACEHOLDER = '@@ZYGOS_' + 'EVENTS@@';
+  var SVGNS = 'http://www.w3.org/2000/svg';
+  var ICONS = {
+    wrench: ['M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z'],
+    check: ['M20 6 9 17l-5-5'],
+    x: ['M18 6 6 18', 'M6 6l12 12'],
+    hand: ['M18 11V6a2 2 0 0 0-4 0', 'M14 10V4a2 2 0 0 0-4 0v2', 'M10 10.5V6a2 2 0 0 0-4 0v8', 'M18 8a2 2 0 1 1 4 0v6a8 8 0 0 1-8 8h-2c-2.8 0-4.5-.86-6-2.34l-3.6-3.6a2 2 0 0 1 2.83-2.82L7 15'],
+    flag: ['M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z', 'M4 22v-7'],
+    user: ['M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2', 'M16 7a4 4 0 1 1-8 0 4 4 0 0 1 8 0z'],
+    list: ['M8 6h13', 'M8 12h13', 'M8 18h13', 'M3 6h.01', 'M3 12h.01', 'M3 18h.01'],
+    bulb: ['M15 14c.2-1 .7-1.7 1.5-2.5 1-.9 1.5-2.2 1.5-3.5A6 6 0 0 0 6 8c0 1 .2 2.2 1.5 3.5.7.7 1.3 1.5 1.5 2.5', 'M9 18h6', 'M10 22h4'],
+    chat: ['M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z'],
+    zap: ['M13 2 3 14h9l-1 8 10-12h-9l1-8z'],
+    alert: ['M12 8v4', 'M12 16h.01', 'M22 12a10 10 0 1 1-20 0 10 10 0 0 1 20 0z'],
+    clock: ['M12 6v6l4 2', 'M22 12a10 10 0 1 1-20 0 10 10 0 0 1 20 0z'],
+    shield: ['M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z', 'M9.5 9.5l5 5', 'M14.5 9.5l-5 5'],
+    chevron: ['M9 18l6-6-6-6'],
+    file: ['M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7z', 'M14 2v4a2 2 0 0 0 2 2h4', 'M12 12v6', 'M9 15l3-3 3 3']
+  };
+
+  var ROLE_COLORS = {
+    'product-owner': { a: '#8b67e6', t: '#efe9fd', k: '#55339f' },
+    planner: { a: '#22a59f', t: '#e1f4f2', k: '#116a66' },
+    executor: { a: '#4f8fdc', t: '#e7f0fc', k: '#2c5c9b' },
+    verifier: { a: '#d45a90', t: '#fae8f0', k: '#8e2d5a' }
+  };
+  var OTHER_COLORS = [
+    { a: '#8c91a7', t: '#eceef4', k: '#4a5069' },
+    { a: '#6a63d8', t: '#ecebfc', k: '#3c3693' },
+    { a: '#e08a3c', t: '#fbeee0', k: '#8a4b12' },
+    { a: '#3aa0c8', t: '#e2f2f8', k: '#1d6582' }
+  ];
+  var STEP_STYLE = {
+    gating: { accent: 'a-amber', icon: 'hand', label: 'gating · waiting on the completion gate', tinted: true },
+    done: { accent: 'a-green', icon: 'check' },
+    failed: { accent: 'a-red', icon: 'x', tinted: true }
+  };
+  var OUTCOME_ACCENT = { ok: 'a-green', exhausted: 'a-amber', failed: 'a-red' };
+  var ERROR_STOPS = { failed: 1, aborted: 1, timeout: 1, budget_exhausted: 1 };
+
+  var expandAll = false;
+
+  function el(tag, cls, text) {
+    var e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text != null) e.textContent = String(text);
+    return e;
+  }
+  function add(parent) {
+    for (var i = 1; i < arguments.length; i++) {
+      var c = arguments[i];
+      if (c == null || c === false) continue;
+      parent.appendChild(typeof c === 'string' ? document.createTextNode(c) : c);
+    }
+    return parent;
+  }
+  function icon(name) {
+    var s = document.createElementNS(SVGNS, 'svg');
+    s.setAttribute('viewBox', '0 0 24 24');
+    s.setAttribute('fill', 'none');
+    s.setAttribute('stroke', 'currentColor');
+    s.setAttribute('stroke-width', '2');
+    s.setAttribute('stroke-linecap', 'round');
+    s.setAttribute('stroke-linejoin', 'round');
+    s.setAttribute('aria-hidden', 'true');
+    ICONS[name].forEach(function (d) {
+      var p = document.createElementNS(SVGNS, 'path');
+      p.setAttribute('d', d);
+      s.appendChild(p);
+    });
+    return s;
+  }
+  function chip(name) { return add(el('span', 'ic'), icon(name)); }
+  function pill(accent, text, iconName) {
+    var p = el('span', 'pill ' + accent);
+    if (iconName) p.appendChild(icon(iconName));
+    p.appendChild(document.createTextNode(text));
+    return p;
+  }
+  function chev() { var c = icon('chevron'); c.setAttribute('class', 'chev'); return c; }
+  function setColors(node, c) {
+    node.style.setProperty('--a', c.a);
+    node.style.setProperty('--t', c.t);
+    node.style.setProperty('--k', c.k);
+  }
+  function roleColor(name) {
+    if (own(ROLE_COLORS, name)) return ROLE_COLORS[name];
+    var h = 0;
+    for (var i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) >>> 0;
+    return OTHER_COLORS[h % OTHER_COLORS.length];
+  }
+
+  function pad2(n) { return n < 10 ? '0' + n : String(n); }
+  function fmtDur(ms) {
+    var s = Math.max(0, Math.round(ms / 1000));
+    var h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), r = s % 60;
+    return h ? h + ':' + pad2(m) + ':' + pad2(r) : pad2(m) + ':' + pad2(r);
+  }
+  function fmtTok(n) {
+    if (n >= 1e6) return (n / 1e6).toFixed(n >= 1e7 ? 0 : 1).replace(/\.0$/, '') + 'M';
+    if (n >= 1000) return (n / 1000).toFixed(n >= 1e5 ? 0 : 1).replace(/\.0$/, '') + 'k';
+    return String(n);
+  }
+  function fmtBytes(n) {
+    if (n < 1024) return n + ' B';
+    if (n < 1048576) return (n / 1024).toFixed(1).replace(/\.0$/, '') + ' KB';
+    return (n / 1048576).toFixed(1).replace(/\.0$/, '') + ' MB';
+  }
+  function str(v) { return typeof v === 'string' ? v : v == null ? '' : String(v); }
+  function own(table, key) { return Object.prototype.hasOwnProperty.call(table, key); }
+  function firstLine(s) { var i = s.indexOf('\n'); return i < 0 ? s : s.slice(0, i) + ' …'; }
+
+  function parseLines(text) {
+    var events = [], bad = 0;
+    text.split('\n').forEach(function (line) {
+      line = line.trim();
+      if (!line) return;
+      try {
+        var v = JSON.parse(line);
+        if (v && typeof v === 'object' && !Array.isArray(v)) events.push(v); else bad++;
+      } catch (e) { bad++; }
+    });
+    return { events: events, bad: bad };
+  }
+  function streamKind(events) {
+    for (var i = 0; i < events.length; i++) {
+      if (typeof events[i].type === 'string') return 'agui';
+      if (typeof events[i].event === 'string') return 'raw';
+    }
+    return 'empty';
+  }
+
+  function buildModel(events) {
+    var run = { threadId: '', t0: null, t1: null, terminal: null, tokIn: 0, tokOut: 0, sawSnapshot: false,
+      routes: 0, tools: 0, toolErrors: 0, nonzeroExits: 0, plan: null, steps: [], lanes: [] };
+    var root = { items: [], route: null };
+    // Keyed by ids from the file: no prototype, so `__proto__` is just an id.
+    var lanes = Object.create(null), tools = Object.create(null), msgs = Object.create(null);
+    var lastStep = null, prevPlan = Object.create(null);
+
+    function place(box, node) {
+      if (node.kind === 'tool' && box.route) box.route.items.push(node);
+      else box.items.push(node);
+    }
+
+    events.forEach(function (ev) {
+      var ts = typeof ev.timestamp === 'number' ? ev.timestamp : null;
+      if (ts != null) {
+        if (run.t0 == null || ts < run.t0) run.t0 = ts;
+        if (run.t1 == null || ts > run.t1) run.t1 = ts;
+      }
+      var lane = ev.type !== 'SUBAGENT_STARTED' && ev.subagentRunId ? lanes[ev.subagentRunId] : null;
+      var box = lane || root;
+      if (lane && ts != null) lane.last = ts;
+      var z = (ev.metadata && ev.metadata.zygos) || {};
+      var node, t, m;
+
+      switch (ev.type) {
+        case 'RUN_STARTED':
+          run.threadId = str(ev.threadId);
+          break;
+        case 'STEP_STARTED':
+          node = { kind: 'step', name: str(ev.stepName), ts: ts, end: null, info: null };
+          root.items.push(node);
+          root.route = null;
+          run.steps.push(node);
+          lastStep = node;
+          if (node.name === 'planning') {
+            prevPlan = Object.create(null);
+            run.plan = null;
+          }
+          break;
+        case 'STEP_FINISHED':
+          if (lastStep && lastStep.name === ev.stepName && ts != null) lastStep.end = ts;
+          break;
+        case 'ACTIVITY_SNAPSHOT':
+          if (ev.activityType === 'zygos.mission') {
+            if (lastStep) lastStep.info = ev.content || null;
+          } else if (ev.activityType === 'zygos.plan' && ev.content) {
+            run.plan = ev.content;
+            var next = Object.create(null);
+            (ev.content.items || []).forEach(function (it) {
+              var prev = prevPlan[it.index];
+              if (it.status === 'active' && (!prev || prev.status !== 'active' || prev.attempts < it.attempts)) {
+                root.items.push({ kind: 'task', index: it.index, total: ev.content.total, desc: str(it.desc), attempts: it.attempts || 1, ts: ts });
+              }
+              next[it.index] = { status: it.status, attempts: it.attempts || 1 };
+            });
+            prevPlan = next;
+          }
+          break;
+        case 'SUBAGENT_STARTED':
+          node = { kind: 'lane', id: str(ev.subagentRunId), name: str(ev.name) || 'subagent', desc: str(ev.description),
+            roleTurn: z.role_turn, start: ts, end: null, last: ts, outcome: null, message: '', reason: '',
+            items: [], route: null, routes: 0, toolCalls: 0, tokIn: 0, tokOut: 0, turnEnd: null, seq: run.lanes.length };
+          lanes[node.id] = node;
+          run.lanes.push(node);
+          root.items.push(node);
+          root.route = null;
+          break;
+        case 'SUBAGENT_FINISHED':
+        case 'SUBAGENT_ERROR':
+          node = lanes[ev.subagentRunId];
+          if (!node) break;
+          if (ts != null) node.end = ts;
+          node.outcome = ev.type === 'SUBAGENT_ERROR' ? 'failed' : str(z.outcome) || 'ok';
+          node.message = str(ev.message);
+          node.reason = str(z.reason);
+          break;
+        case 'CUSTOM':
+          if (ev.name === 'zygos.route') {
+            var v = ev.value || {};
+            node = { kind: 'route', step: v.step, model: str(v.model), provider: str(v.provider), attempt: v.attempt || 0, ts: ts, items: [], tokens: null };
+            box.items.push(node);
+            box.route = node;
+            run.routes++;
+            if (lane) lane.routes++;
+          } else if (ev.name === 'zygos.turn_end') {
+            var tv = ev.value || {};
+            node = { kind: 'turnEnd', stop: str(tv.stop), steps: tv.steps, error: tv.error == null ? '' : str(tv.error), ts: ts };
+            box.items.push(node);
+            box.route = null;
+            if (lane) lane.turnEnd = node;
+          }
+          break;
+        case 'STATE_SNAPSHOT':
+          var u = ev.snapshot && ev.snapshot.usage;
+          if (u) {
+            run.sawSnapshot = true;
+            run.tokIn = u.input_tokens || 0;
+            run.tokOut = u.output_tokens || 0;
+            if (box.route) box.route.tokens = run.tokIn + run.tokOut;
+          }
+          if (lane) {
+            lane.tokIn += z.input_tokens || 0;
+            lane.tokOut += z.output_tokens || 0;
+          }
+          break;
+        case 'TOOL_CALL_START':
+          node = { kind: 'tool', id: str(ev.toolCallId), name: str(ev.toolCallName), args: '', argsClipped: !!z.clipped, ts: ts, result: null, orphan: false };
+          tools[node.id] = node;
+          place(box, node);
+          run.tools++;
+          if (lane) lane.toolCalls++;
+          break;
+        case 'TOOL_CALL_ARGS':
+          t = tools[ev.toolCallId];
+          if (t) t.args += str(ev.delta);
+          break;
+        case 'TOOL_CALL_RESULT':
+          t = tools[ev.toolCallId];
+          if (!t) {
+            t = { kind: 'tool', id: str(ev.toolCallId), name: '', args: '', argsClipped: false, ts: ts, result: null, orphan: true };
+            tools[t.id] = t;
+            place(box, t);
+            run.tools++;
+            if (lane) lane.toolCalls++;
+          }
+          t.result = { content: str(ev.content), meta: z, exec: parseExec(str(ev.content)) };
+          if (z.is_error) run.toolErrors++;
+          else if (t.result.exec && t.result.exec.code !== 0) run.nonzeroExits++;
+          break;
+        case 'TEXT_MESSAGE_START':
+        case 'TEXT_MESSAGE_CHUNK':
+        case 'TEXT_MESSAGE_CONTENT':
+          m = msgs[ev.messageId];
+          if (!m && ev.type !== 'TEXT_MESSAGE_CONTENT') {
+            var role = str(ev.role) || 'assistant';
+            if (role !== 'user' && role !== 'assistant') break;
+            m = { kind: role === 'user' ? 'user' : 'answer', text: '', ts: ts };
+            msgs[ev.messageId] = m;
+            place(box, m);
+          }
+          if (m && ev.type !== 'TEXT_MESSAGE_START') m.text += str(ev.delta);
+          break;
+        case 'REASONING_MESSAGE_START':
+        case 'REASONING_MESSAGE_CHUNK':
+        case 'REASONING_MESSAGE_CONTENT':
+          m = msgs['r:' + ev.messageId];
+          if (!m) {
+            m = { kind: 'reasoning', text: '', ts: ts };
+            msgs['r:' + ev.messageId] = m;
+            place(box, m);
+          }
+          if (ev.type !== 'REASONING_MESSAGE_START') m.text += str(ev.delta);
+          break;
+        case 'RUN_FINISHED':
+          run.terminal = { kind: 'finished', ev: ev };
+          break;
+        case 'RUN_ERROR':
+          run.terminal = { kind: 'error', ev: ev };
+          break;
+      }
+    });
+
+    if (!run.sawSnapshot && run.terminal && Array.isArray(run.terminal.ev.usage)) {
+      run.terminal.ev.usage.forEach(function (b) { run.tokIn += b.inputTokens || 0; run.tokOut += b.outputTokens || 0; });
+    }
+    run.lanes.forEach(function (l) {
+      if (l.end == null) l.end = l.last != null ? l.last : run.t1;
+      if (l.start == null) l.start = run.t0;
+    });
+    return { run: run, root: root };
+  }
+
+  function relTime(run, ts) { return ts == null || run.t0 == null ? '' : '+' + fmtDur(ts - run.t0); }
+
+  function disclosure(cls, summary, fill, open) {
+    var d = el('details', cls);
+    d.appendChild(summary);
+    var filled = false;
+    d.ensureFilled = function () { if (!filled) { filled = true; fill(d); } };
+    if (open || expandAll) { d.ensureFilled(); d.open = true; }
+    d.addEventListener('toggle', function () { if (d.open) d.ensureFilled(); });
+    return d;
+  }
+
+  function card(accent, iconName, label, opts) {
+    opts = opts || {};
+    var c = el('div', 'card ' + accent + (opts.tinted ? ' tinted' : ''));
+    var r = add(el('div', 'row'), chip(iconName));
+    var g = add(el('div', 'grow'), el('div', 'label' + (opts.mono ? ' mono' : ''), label));
+    if (opts.desc) g.appendChild(el('div', 'desc', opts.desc));
+    if (opts.err) g.appendChild(el('div', 'desc err', opts.err));
+    r.appendChild(g);
+    if (opts.right) r.appendChild(opts.right);
+    if (opts.when) r.appendChild(el('span', 'when', opts.when));
+    c.appendChild(r);
+    if (opts.body) c.appendChild(opts.body);
+    return c;
+  }
+
+  function renderSummary(model) {
+    var run = model.run;
+    var c = el('div', 'card summary-card a-indigo');
+    var status = run.terminal ? (run.terminal.kind === 'finished' ? 'finished' : 'failed') : 'no terminal event';
+    add(c, add(el('div', 'row'), chip('list'),
+      add(el('div', 'grow'), el('div', 'label', 'run summary'),
+        el('div', 'desc', run.lanes.length ? run.lanes.length + ' subagent turns · ' + run.steps.length + ' mission state changes' : 'single task turn'))));
+
+    var stats = el('div', 'stats');
+    function stat(v, k, tone, tip) { var t = add(el('div', 'stat' + (tone ? ' ' + tone : '')), el('b', null, v), el('span', null, k)); if (tip) t.title = tip; stats.appendChild(t); }
+    stat(run.t0 != null ? fmtDur(run.t1 - run.t0) : '–', 'duration');
+    stat(fmtTok(run.tokIn), 'tokens in');
+    stat(fmtTok(run.tokOut), 'tokens out');
+    stat(String(run.routes), 'steps');
+    stat(String(run.tools), 'tool calls');
+    stat(String(run.toolErrors), 'tool errors', run.toolErrors > 0 ? 'bad' : '', 'tool results marked is_error');
+    stat(String(run.nonzeroExits), 'nonzero exits', run.nonzeroExits > 0 ? 'warn' : '', 'results without is_error whose exit_code is not 0');
+    stat(String(run.lanes.length), 'subagent turns');
+    c.appendChild(stats);
+
+    if (run.t0 != null && run.t1 > run.t0 && (run.lanes.length || run.steps.length)) {
+      c.appendChild(el('div', 'section-label', 'timeline'));
+      var span = run.t1 - run.t0;
+      var pct = function (ts) { return ((ts - run.t0) / span * 100) + '%'; };
+      var rowsEnd = [];
+      var segs = run.lanes.map(function (l) {
+        var row = 0;
+        while (row < rowsEnd.length && rowsEnd[row] > l.start) row++;
+        rowsEnd[row] = l.end;
+        return { lane: l, row: row };
+      });
+      var rows = Math.max(1, rowsEnd.length);
+      var tl = el('div', 'tl');
+      tl.style.height = (12 + rows * 14) + 'px';
+      run.steps.forEach(function (s) {
+        if (s.ts == null) return;
+        var tk = el('div', 'tick' + (s.name === 'failed' ? ' red' : s.name === 'gating' ? ' amber' : ''));
+        tk.style.left = pct(s.ts);
+        tk.title = s.name + ' ' + relTime(run, s.ts);
+        tl.appendChild(tk);
+      });
+      segs.forEach(function (sg) {
+        var l = sg.lane;
+        var b = el('button', 'seg');
+        b.type = 'button';
+        setColors(b, roleColor(l.name));
+        b.style.left = pct(l.start);
+        b.style.width = Math.max(0, (l.end - l.start) / span * 100) + '%';
+        b.style.top = (6 + sg.row * 14) + 'px';
+        b.title = l.id + ' · ' + fmtDur(l.end - l.start) + ' · ' + (l.outcome || 'open');
+        b.setAttribute('aria-label', b.title);
+        b.addEventListener('click', function () { jumpToLane(l); });
+        tl.appendChild(b);
+      });
+      c.appendChild(tl);
+      add(c, add(el('div', 'axis'), el('span', null, '+00:00'), el('span', null, '+' + fmtDur(span))));
+      var names = [];
+      run.lanes.forEach(function (l) { if (names.indexOf(l.name) < 0) names.push(l.name); });
+      var lg = el('div', 'legend');
+      names.forEach(function (n) {
+        var d = el('span', 'dot'); setColors(d, roleColor(n));
+        add(lg, add(el('span'), d, n));
+      });
+      if (run.steps.length) {
+        var tkey = el('span', 'dot'); tkey.style.borderRadius = '1px'; tkey.style.width = '2px'; tkey.style.height = '12px'; tkey.style.background = 'rgba(106,99,216,.5)';
+        add(lg, add(el('span'), tkey, 'mission state change'));
+      }
+      c.appendChild(lg);
+    }
+
+    if (run.plan && run.plan.items && run.plan.items.length) {
+      var p = run.plan;
+      var done = p.items.filter(function (it) { return it.status === 'done'; }).length;
+      c.appendChild(el('div', 'section-label', 'plan · ' + done + '/' + (p.total || p.items.length) + ' done'));
+      var ul = el('ul', 'plan');
+      p.items.forEach(function (it) {
+        var acc = it.status === 'done' ? 'a-green' : it.status === 'active' ? 'a-blue' : 'a-slate';
+        var li = el('li', acc);
+        var d = el('span', 'd', str(it.desc));
+        d.title = str(it.desc);
+        add(li, el('span', 'n', it.index), d);
+        if (it.attempts > 1) li.appendChild(pill('a-amber', it.attempts + ' attempts'));
+        li.appendChild(pill(acc, str(it.status)));
+        ul.appendChild(li);
+      });
+      c.appendChild(ul);
+    }
+    return { card: c, status: status };
+  }
+
+  var laneEls = new Map();
+
+  function jumpToLane(lane) {
+    var d = laneEls.get(lane);
+    if (!d) return;
+    d.ensureFilled();
+    d.open = true;
+    var reduce = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    d.scrollIntoView({ behavior: reduce ? 'auto' : 'smooth', block: 'start' });
+    d.classList.remove('flash');
+    void d.offsetWidth;
+    d.classList.add('flash');
+  }
+
+  function renderStep(node, run) {
+    var st = own(STEP_STYLE, node.name) ? STEP_STYLE[node.name] : { accent: 'a-indigo', icon: 'flag' };
+    var bits = [];
+    var info = node.info;
+    if (info) {
+      if (info.from) bits.push('from ' + info.from);
+      if (info.tasks) bits.push('tasks ' + (info.tasks_done || 0) + '/' + info.tasks);
+      if (info.role_turns != null) bits.push(info.role_turns + ' role turns so far');
+    }
+    if (node.end != null && node.ts != null && node.end > node.ts) bits.push('lasted ' + fmtDur(node.end - node.ts));
+    return card(st.accent, st.icon, st.label || node.name, { tinted: st.tinted, desc: bits.join(' · '), when: relTime(run, node.ts) });
+  }
+
+  function renderLane(lane, run, open) {
+    var c = roleColor(lane.name);
+    var s = el('summary');
+    var top = el('div', 'lane-top');
+    add(top, el('span', 'dot'), el('span', 'lane-name', lane.name));
+    var oc = lane.outcome || 'open';
+    top.appendChild(pill(OUTCOME_ACCENT[oc] || 'a-slate', oc));
+    top.appendChild(el('span', 'grow'));
+    top.appendChild(el('span', 'when', relTime(run, lane.start)));
+    top.appendChild(chev());
+    s.appendChild(top);
+    var steps = lane.turnEnd && lane.turnEnd.steps != null ? lane.turnEnd.steps : lane.routes;
+    var parts = [];
+    if (lane.roleTurn != null) parts.push('turn ' + lane.roleTurn);
+    parts.push(steps + (steps === 1 ? ' step' : ' steps'));
+    parts.push(lane.toolCalls + (lane.toolCalls === 1 ? ' tool call' : ' tool calls'));
+    parts.push(fmtTok(lane.tokIn + lane.tokOut) + ' tokens');
+    if (lane.start != null && lane.end != null) parts.push(fmtDur(lane.end - lane.start));
+    s.appendChild(el('div', 'lane-sub', parts.join(' · ')));
+    if (oc === 'failed' && lane.message) s.appendChild(el('div', 'lane-err', lane.message));
+    else if (lane.reason) s.appendChild(el('div', 'lane-sub', lane.reason));
+
+    var d = disclosure('lane', s, function (det) {
+      var body = el('div', 'lane-body');
+      if (lane.desc) {
+        var ps = el('summary');
+        add(ps, chev(), 'prompt');
+        body.appendChild(disclosure('prompt', ps, function (pd) { pd.appendChild(el('pre', 'block', lane.desc)); }, false));
+      }
+      renderItems(lane.items, body, run, false);
+      if (!lane.items.length) body.appendChild(el('div', 'muted-note', 'no events attributed to this lane'));
+      det.appendChild(body);
+    }, open);
+    setColors(d, c);
+    d.id = 'lane-' + lane.seq;
+    laneEls.set(lane, d);
+    return d;
+  }
+
+  function renderRoute(node, run) {
+    var g = el('div', 'route' + (node.attempt > 0 ? ' retry' : ''));
+    var row = el('div', 'route-row');
+    var rp = el('span', 'rp');
+    rp.appendChild(icon('zap'));
+    add(rp, el('b', null, 'step ' + node.step), ' · ', node.model, ' · ');
+    var prov = el('span', 'prov', node.provider.split('::').pop());
+    prov.title = node.provider;
+    rp.appendChild(prov);
+    rp.appendChild(document.createTextNode(' · attempt ' + node.attempt));
+    row.appendChild(rp);
+    if (node.attempt > 0) row.appendChild(pill('a-amber', 'retry'));
+    if (node.tokens != null) {
+      var tk = el('span', 'tok', fmtTok(node.tokens) + ' tok');
+      tk.title = 'run total after this step: ' + node.tokens + ' tokens';
+      row.appendChild(tk);
+    }
+    row.appendChild(el('span', 'when', relTime(run, node.ts)));
+    g.appendChild(row);
+    if (node.items.length) {
+      var list = el('div', 'route-tools');
+      renderItems(node.items, list, run, false);
+      g.appendChild(list);
+    }
+    return g;
+  }
+
+  function argSummary(args) {
+    try {
+      var v = JSON.parse(args);
+      if (v && typeof v === 'object' && !Array.isArray(v)) {
+        var keys = ['command', 'path', 'url', 'query'];
+        for (var i = 0; i < keys.length; i++) if (typeof v[keys[i]] === 'string') return firstLine(v[keys[i]]);
+      }
+      return JSON.stringify(v);
+    } catch (e) {
+      return firstLine(args);
+    }
+  }
+
+  function unescapeFragment(s) {
+    return s.replace(/\\(u[0-9a-fA-F]{4}|["\\\/bfnrt])/g, function (_, c) {
+      switch (c[0]) {
+        case 'n': return '\n';
+        case 't': return '\t';
+        case 'r': return '\r';
+        case 'b': return '\b';
+        case 'f': return '\f';
+        case 'u': return String.fromCharCode(parseInt(c.slice(1), 16));
+        default: return c;
+      }
+    });
+  }
+
+  var CLIP_SUFFIX = /…\[(\d+) bytes total\]$/;
+
+  function decodeBytes(nums) {
+    var bytes = new Uint8Array(nums.length);
+    for (var i = 0; i < nums.length; i++) bytes[i] = nums[i] & 255;
+    return new TextDecoder('utf-8').decode(bytes);
+  }
+
+  function parseExec(content) {
+    var v = null;
+    try { v = JSON.parse(content); } catch (e) { v = null; }
+    if (v && typeof v === 'object' && typeof v.exit_code === 'number') {
+      if (typeof v.output === 'string') return { code: v.exit_code, text: v.output };
+      if (Array.isArray(v.output)) return { code: v.exit_code, text: decodeBytes(v.output) };
+    }
+    if (v !== null) return null;
+    var m = /^\{\s*"exit_code"\s*:\s*(-?\d+)\s*,\s*"output"\s*:\s*("|\[)/.exec(content);
+    if (!m) return null;
+    var rest = content.slice(m[0].length);
+    var suffix = CLIP_SUFFIX.exec(rest);
+    if (suffix) rest = rest.slice(0, suffix.index);
+    var more = suffix ? '\n…' : '';
+    if (m[2] === '[') {
+      var nums = rest.split(',');
+      if (suffix) nums.pop();
+      return { code: Number(m[1]), text: decodeBytes(nums.map(Number).filter(function (n) { return n === n; })) + more, partial: true };
+    }
+    return { code: Number(m[1]), text: unescapeFragment(rest.replace(/\\$/, '')) + more, partial: true };
+  }
+
+  function clipBadge(bytes) {
+    return pill('a-amber', 'clipped at 2 KB' + (bytes ? ' · ' + bytes.toLocaleString('en-US') + ' bytes total' : ''));
+  }
+
+  function renderTool(node) {
+    var res = node.result;
+    var meta = res ? res.meta : {};
+    var exec = res ? res.exec : null;
+    var s = el('summary');
+    var r = el('div', 'row');
+    r.appendChild(chip('wrench'));
+    r.appendChild(el('span', 'tname', node.orphan ? 'orphan result' : node.name || 'tool'));
+    var argText = node.orphan ? node.id : argSummary(node.args);
+    var ta = el('span', 'targ', argText);
+    ta.title = argText;
+    r.appendChild(ta);
+    var st = el('span', 'tstat');
+    if (!res) {
+      st.appendChild(el('span', null, 'no result recorded'));
+    } else {
+      var tone = meta.is_error ? 'error' : exec && exec.code !== 0 ? 'nonzero' : 'ok';
+      st.appendChild(el('span', 'dot ' + (tone === 'error' ? 'a-red' : tone === 'nonzero' ? 'a-amber' : 'a-green')));
+      if (tone === 'error') st.appendChild(el('span', 'bad', 'error'));
+      if (tone === 'ok') st.appendChild(el('span', null, 'ok'));
+      if (exec) st.appendChild(el('span', tone === 'nonzero' ? 'warn' : tone === 'error' && exec.code !== 0 ? 'bad' : null, 'exit ' + exec.code));
+      if (typeof meta.bytes === 'number') st.appendChild(el('span', null, fmtBytes(meta.bytes)));
+    }
+    r.appendChild(st);
+    r.appendChild(chev());
+    s.appendChild(r);
+
+    var chips = [];
+    if (meta.denied === 'policy') {
+      var pp = pill('a-red', 'denied by policy', 'shield');
+      pp.title = res.content.replace(/^policy_denied: /, '');
+      chips.push(pp);
+    } else if (meta.denied === 'approval') {
+      chips.push(pill('a-amber', 'approval denied', 'hand'));
+    }
+    if (node.argsClipped) chips.push(pill('a-amber', 'args clipped at 2 KB'));
+    if (meta.clipped) chips.push(clipBadge(meta.bytes));
+    if (chips.length) {
+      var cw = el('div', 'tool-chips');
+      chips.forEach(function (c) { cw.appendChild(c); });
+      s.appendChild(cw);
+    }
+
+    var d = disclosure('card tool a-blue', s, function (det) {
+      var body = el('div', 'tool-body');
+      if (!node.orphan) {
+        var ak = add(el('div', 'kv'), 'args');
+        if (node.argsClipped) ak.appendChild(pill('a-amber', 'clipped at 2 KB'));
+        body.appendChild(ak);
+        var parsed = null;
+        try { parsed = JSON.parse(node.args); } catch (e) { parsed = null; }
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed) && typeof parsed.command === 'string') {
+          body.appendChild(el('pre', 'block', parsed.command));
+          var restKeys = Object.keys(parsed).filter(function (k) { return k !== 'command'; });
+          if (restKeys.length) {
+            var rest = {};
+            restKeys.forEach(function (k) { rest[k] = parsed[k]; });
+            body.appendChild(el('pre', 'block', JSON.stringify(rest, null, 2)));
+          }
+        } else {
+          body.appendChild(el('pre', 'block', parsed !== null ? JSON.stringify(parsed, null, 2) : node.args || '(empty)'));
+        }
+      } else {
+        body.appendChild(add(el('div', 'kv'), 'tool call id'));
+        body.appendChild(el('pre', 'block', node.id + ' · no TOOL_CALL_START in the stream'));
+      }
+      if (!res) {
+        body.appendChild(el('div', 'kv', 'output'));
+        body.appendChild(el('div', 'muted-note', 'no result recorded'));
+      } else {
+        var ok = add(el('div', 'kv'), 'output');
+        if (exec) ok.appendChild(pill(exec.code === 0 ? 'a-green' : meta.is_error ? 'a-red' : 'a-amber', 'exit ' + exec.code));
+        if (meta.clipped) ok.appendChild(clipBadge(meta.bytes));
+        if (meta.denied === 'policy') ok.appendChild(pill('a-red', 'denied by policy', 'shield'));
+        if (meta.denied === 'approval') ok.appendChild(pill('a-amber', 'approval denied', 'hand'));
+        body.appendChild(ok);
+        var text = exec ? exec.text : meta.denied === 'policy' ? res.content.replace(/^policy_denied: /, '') : res.content;
+        body.appendChild(text ? el('pre', 'block', text) : el('div', 'muted-note', '(empty output)'));
+      }
+      det.appendChild(body);
+    }, false);
+    return d;
+  }
+
+  function renderTurnEnd(node) {
+    if (node.error || ERROR_STOPS[node.stop]) {
+      return card('a-red', 'alert', 'turn stopped · ' + node.stop, {
+        tinted: true,
+        desc: node.steps != null ? node.steps + ' steps' : '',
+        err: node.error
+      });
+    }
+    var line = el('div', 'turn-end');
+    line.appendChild(document.createTextNode('turn ended · '));
+    if (node.stop === 'max_steps') line.appendChild(pill('a-amber', 'max_steps'));
+    else line.appendChild(document.createTextNode(node.stop));
+    if (node.steps != null) line.appendChild(document.createTextNode(' · ' + node.steps + (node.steps === 1 ? ' step' : ' steps')));
+    return line;
+  }
+
+  function renderTask(node) {
+    var dv = el('div', 'divider');
+    var b = el('b', null, 'task ' + node.index + '/' + (node.total || '?') + (node.attempts > 1 ? ' · retry ' + node.attempts : ''));
+    var d = el('span', 'd', node.desc);
+    d.title = node.desc;
+    add(dv, b, d);
+    return dv;
+  }
+
+  function renderMessage(node, run) {
+    if (node.kind === 'user') {
+      var c = card('a-violet', 'user', 'you steered', { when: relTime(run, node.ts) });
+      c.appendChild(el('div', 'msg-text', node.text));
+      return c;
+    }
+    if (node.kind === 'answer') {
+      var a = card('a-violet', 'chat', 'answer', { when: relTime(run, node.ts) });
+      a.appendChild(el('div', 'msg-text', node.text));
+      return a;
+    }
+    var s = el('summary');
+    add(s, add(el('div', 'row'), chip('bulb'), add(el('div', 'grow'), el('div', 'label', 'reasoning')), el('span', 'when', relTime(run, node.ts)), chev()));
+    var d = disclosure('card a-violet', s, function (det) { det.appendChild(el('div', 'msg-text', node.text)); }, false);
+    return d;
+  }
+
+  function renderNode(node, run) {
+    switch (node.kind) {
+      case 'step': return renderStep(node, run);
+      case 'route': return renderRoute(node, run);
+      case 'tool': return renderTool(node);
+      case 'turnEnd': return renderTurnEnd(node);
+      case 'task': return renderTask(node);
+      case 'user': case 'answer': case 'reasoning': return renderMessage(node, run);
+    }
+    return null;
+  }
+
+  function renderItems(items, parent, run, top) {
+    var lastLane = null;
+    if (top) for (var k = items.length - 1; k >= 0; k--) if (items[k].kind === 'lane') { lastLane = items[k]; break; }
+    var laneOpen = function (l) { return l.outcome === 'failed' || l === lastLane; };
+    var i = 0;
+    while (i < items.length) {
+      var node = items[i];
+      if (node.kind !== 'lane') {
+        var n = renderNode(node, run);
+        if (n) parent.appendChild(n);
+        i++;
+        continue;
+      }
+      var cluster = [node], end = node.end, pre = [], hold = [], j = i + 1;
+      while (j < items.length) {
+        var nx = items[j];
+        if (nx.kind === 'lane') {
+          if (nx.start != null && end != null && nx.start < end) {
+            pre = pre.concat(hold); hold = [];
+            cluster.push(nx);
+            end = Math.max(end, nx.end);
+            j++;
+            continue;
+          }
+          break;
+        }
+        if (nx.kind !== 'step' && nx.ts != null && end != null && nx.ts < end) { hold.push(nx); j++; continue; }
+        break;
+      }
+      if (cluster.length === 1) {
+        parent.appendChild(renderLane(node, run, laneOpen(node)));
+        i++;
+        continue;
+      }
+      pre.forEach(function (p) { var e = renderNode(p, run); if (e) parent.appendChild(e); });
+      parent.appendChild(el('div', 'caption', 'handed to subagents, running together'));
+      var grid = el('div', 'grid');
+      cluster.forEach(function (l) { grid.appendChild(renderLane(l, run, laneOpen(l))); });
+      parent.appendChild(grid);
+      hold.forEach(function (p) { var e = renderNode(p, run); if (e) parent.appendChild(e); });
+      i = j;
+    }
+  }
+
+  function renderTerminal(run) {
+    var t = run.terminal;
+    if (!t) return card('a-slate', 'clock', 'no terminal event', { desc: 'the run is live or the log was cut' });
+    var ev = t.ev;
+    var usage = Array.isArray(ev.usage) ? ev.usage.map(function (b) {
+      return str(b.model) + ' · ' + fmtTok(b.inputTokens || 0) + ' in · ' + fmtTok(b.outputTokens || 0) + ' out';
+    }).join('  |  ') : '';
+    if (t.kind === 'finished') {
+      var r = ev.result || {};
+      var right = r.stop ? pill(r.stop === 'max_steps' ? 'a-amber' : 'a-green', str(r.stop)) : null;
+      var sub = r.state ? str(r.state) : r.steps != null ? r.steps + (r.steps === 1 ? ' step' : ' steps') : '';
+      return card('a-green', 'check', 'finished', { desc: [sub, usage].filter(Boolean).join(' · '), right: right, when: relTime(run, ev.timestamp) });
+    }
+    return card('a-red', 'x', 'failed', {
+      tinted: true,
+      err: str(ev.message),
+      desc: usage,
+      right: ev.code ? pill('a-red', str(ev.code)) : null,
+      when: relTime(run, ev.timestamp)
+    });
+  }
+
+  function statusPill(status) {
+    return pill(status === 'finished' ? 'a-green' : status === 'failed' ? 'a-red' : 'a-slate', status);
+  }
+
+  function renderFoot(bad) {
+    var foot = document.getElementById('foot');
+    foot.textContent = '';
+    if (bad) foot.appendChild(el('span', null, bad + (bad === 1 ? ' line' : ' lines') + ' skipped (not JSON)'));
+    var b = el('button', 'btn', 'open file');
+    b.type = 'button';
+    b.addEventListener('click', function () { document.getElementById('file').click(); });
+    foot.appendChild(b);
+    var x = el('a', null, expandAll ? 'collapse all' : 'expand all');
+    x.href = expandAll ? '#' : '#expand';
+    foot.appendChild(x);
+  }
+
+  function renderRun(events, bad) {
+    laneEls = new Map();
+    var model = buildModel(events);
+    var run = model.run;
+    var panel = document.getElementById('panel');
+    panel.textContent = '';
+    var sum = renderSummary(model);
+    panel.appendChild(sum.card);
+    renderItems(model.root.items, panel, run, true);
+    panel.appendChild(renderTerminal(run));
+
+    var sub = document.getElementById('sub');
+    sub.textContent = '';
+    if (run.threadId) sub.appendChild(el('span', 'mono', run.threadId));
+    if (run.t0 != null) sub.appendChild(el('span', null, fmtDur(run.t1 - run.t0)));
+    sub.appendChild(statusPill(sum.status));
+    if (run.threadId) document.title = run.threadId + ' · zygos run';
+    renderFoot(bad);
+  }
+
+  function renderEmpty() {
+    var panel = document.getElementById('panel');
+    panel.textContent = '';
+    document.getElementById('sub').textContent = 'zygos run viewer';
+    var z = el('div', 'drop');
+    add(z, add(el('span', 'ic a-indigo'), icon('file')),
+      el('div', 'label', 'drop an AG-UI .jsonl here'),
+      add(el('div', null), 'make one with ', el('code', null, 'zygos mission trace <dir> --format agui'), ', or open a page from ', el('code', null, '--format html')));
+    var b = el('button', 'btn', 'open file');
+    b.type = 'button';
+    b.addEventListener('click', function () { document.getElementById('file').click(); });
+    z.appendChild(b);
+    panel.appendChild(z);
+    document.getElementById('foot').textContent = '';
+  }
+
+  function showNotice(text, command) {
+    var n = document.getElementById('notice');
+    n.textContent = '';
+    if (!text) return;
+    var c = card('a-amber', 'alert', text, { tinted: true });
+    c.classList.add('notice');
+    if (command) c.appendChild(el('pre', 'block', command));
+    n.appendChild(c);
+  }
+
+  var current = null;
+
+  function load(text) {
+    var parsed = parseLines(text);
+    var kind = streamKind(parsed.events);
+    if (kind === 'raw') {
+      if (!current) renderEmpty();
+      showNotice('this is a raw zygos events.jsonl. Run:', 'zygos mission trace <dir> --format html > run.html');
+      return;
+    }
+    if (kind === 'empty') {
+      if (!current) renderEmpty();
+      showNotice('no AG-UI events found in that file' + (parsed.bad ? ' (' + parsed.bad + ' lines were not JSON)' : ''));
+      return;
+    }
+    showNotice('');
+    current = parsed;
+    renderRun(parsed.events, parsed.bad);
+  }
+
+  function readFile(file) {
+    if (!file) return;
+    var r = new FileReader();
+    r.onload = function () { load(String(r.result)); };
+    r.readAsText(file);
+  }
+
+  document.getElementById('file').addEventListener('change', function (e) { readFile(e.target.files[0]); e.target.value = ''; });
+  var depth = 0;
+  document.addEventListener('dragenter', function (e) { e.preventDefault(); depth++; document.body.classList.add('dragging'); });
+  document.addEventListener('dragleave', function () { if (--depth <= 0) { depth = 0; document.body.classList.remove('dragging'); } });
+  document.addEventListener('dragover', function (e) { e.preventDefault(); });
+  document.addEventListener('drop', function (e) {
+    e.preventDefault();
+    depth = 0;
+    document.body.classList.remove('dragging');
+    readFile(e.dataTransfer && e.dataTransfer.files[0]);
+  });
+
+  function boot() {
+    expandAll = location.hash === '#expand';
+    if (current) { renderRun(current.events, current.bad); return; }
+    var raw = document.getElementById('zygos-events').textContent;
+    if (raw.trim() === PLACEHOLDER || !raw.trim()) { renderEmpty(); return; }
+    load(raw);
+  }
+  window.addEventListener('hashchange', boot);
+  boot();
+})();
+</script>
+</body>
+</html>

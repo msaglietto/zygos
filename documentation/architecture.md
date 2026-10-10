@@ -40,9 +40,9 @@ There are no user accounts, sessions, or row-level policies. Identity is the OS 
 - File-tool confinement is lexical. `tools_ops.zig` states symlink escapes are deferred. `open` follows links.
 - Bash is a shell with workspace `cwd`, not a sandbox. Default policy allows it. The running mission treats `<planning>/control.jsonl` as attach commands, including approve (`src/cli/mission.zig` `controlLoop`). The executor can append that file. `mission attach` uses the same file.
 - `web_fetch` rejects recognized literal private addresses and localhost unless explicitly allowed. DNS/private-address aliases and redirect targets remain unscreened. Size caps apply (`max_fetch_bytes`, `max_text_bytes`).
-- `events.jsonl` stores tool inputs and clipped outputs (`README` mission-trace section). A fetched page or a command that prints a secret lands in that file. Emission is fail-open.
+- `events.jsonl` stores tool inputs and clipped outputs (README, "How a mission runs"). A fetched page or a command that prints a secret lands in that file. Emission is fail-open.
 - Malformed integer env knobs (`envInt`) fall back to the compiled default. A typo does not refuse boot.
-- `docs/ARCHITECTURE.md` still sketches post-M0 work in the future tense. Milestone status is `README.md`. Do not treat the sketch as the list of what is unbuilt.
+- `docs/ARCHITECTURE.md` still sketches post-M0 work in the future tense. Milestone contracts are `GOAL.md`. Do not treat the sketch as the list of what is unbuilt.
 
 ## What this system does not have
 

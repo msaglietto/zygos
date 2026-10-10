@@ -12,12 +12,19 @@ The agent that next changes operator-visible behavior adds the new heading in th
 
 - Turn wall clock: a `wall_clock_ms` request field stops a turn as `timeout` before the next step and passes the remaining budget to every bash call as `timeout_ms`, which the bash tool may only shorten its deadline with. `zygos task run --timeout-ms` (default 540000) sets it; the Harbor adapter passes the exec ceiling minus 30 s. A late `sleep` inside a task no longer loses the trial to Harbor's agent timeout.
 
+## [4.1.1] - 2026-10-08
+
+### Fixed
+
+- `zygos mission trace --format agui|html` redacts a vendor key that follows an escaped newline or control byte in a tool's JSON payload, a quoted secret value through its closing quote (spaces included), and a bearer token whose scheme is lowercase or followed by several spaces. Before, each of these reached the shareable output. The HTML viewer keys file-supplied ids without a prototype, so a message or tool call with an id such as `__proto__` or `constructor` renders, and a step with such a name no longer stops the page from rendering. Re-entering planning clears the shown plan.
+
 ## [4.1.0] - 2026-10-08
 
 ### Added
 
 - `zygos task run --config zygos.zon` routes the task step over the file's `.default`/`.routes` ladder through the model router, with per-attempt failover and per-attempt usage bridging, and records the file's SHA-256 as `config_sha256` on the trial. A config carrying `.context_strategy`, `.mcp_servers`, or any unknown setting refuses with `UnsupportedSetting`; unapproved models, unknown catalog slugs, missing keys, or a `--model` that is not the first attempt refuse before a provider boots. The Harbor adapter uploads `ZYGOS_CONFIG` and passes it as `--config`. Trial adapter version is now `0.2.0`.
 - `eval/campaign.py`: `build` a Linux arm from a clean worktree, `run` a matched two-arm experiment (`eval/experiments/*.json`; variable `build`, `config`, or `trim`) through Harbor with resume and fail-closed stop conditions, and `report` a durable comparison with a verdict or an explicit inconclusive reason. Contract: `docs/specs/campaign.md`.
+- `zygos mission trace <target> --format agui|html`. `agui` writes the run's `events.jsonl` as AG-UI 1.0 JSONL. Role turns become subagent runs, tool calls pair with their results, policy and approval refusals are flagged, and a terminal mission or task state becomes `RUN_FINISHED` or `RUN_ERROR`. `html` writes a self-contained viewer with that projection inlined. Both are offline and deterministic, and they redact secret-shaped values. The target may be a Harbor trial's `agent/` directory, whose `trial.json` supplies the thread id. `--format text` (the default) is the existing render. An unknown `--format`, or `--format` on another verb, exits 2.
 
 ## [4.0.4] - 2026-10-07
 

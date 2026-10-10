@@ -57,5 +57,6 @@ new `zygos::*` bus functions, never frame changes.
 - **M4**: Tessera workers (continuity/capture/orient/undo) + MCP gateway.
 
 Implemented behavior, trust boundaries, and env/secrets inventory:
-`documentation/architecture.md` and the rest of `documentation/`. Milestone
-status: `README.md`. This file stays the layer sketch.
+`documentation/architecture.md` and the rest of `documentation/`. How to run
+the binary: `README.md`. Milestone contracts: `GOAL.md`. This file stays the
+layer sketch.

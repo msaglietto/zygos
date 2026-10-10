@@ -34,6 +34,10 @@ pub fn envInt(env: []const EnvPair, name: []const u8, default: i64) i64 {
 
 pub const Verb = enum { start, trace, attach, queue, dashboard };
 
+/// `mission trace` output: the human render, AG-UI JSONL, or the
+/// self-contained HTML viewer.
+pub const TraceFormat = enum { text, agui, html };
+
 /// `resume` normalizes to `.start` + `resume_flag`; for `.trace`/`.attach`/
 /// `.dashboard`, `brief_path` holds the target. `.queue` takes flags first,
 /// then one-or-more briefs: `brief_path` is the first, `rest` the remainder
@@ -46,6 +50,7 @@ pub const Args = struct {
     resume_flag: bool = false,
     run_stamp: bool = false,
     no_tui: bool = false,
+    format: TraceFormat = .text,
 };
 
 pub const ArgsError = error{Usage};
@@ -82,6 +87,10 @@ pub fn parseArgs(argv: []const []const u8) ArgsError!Args {
             out.run_stamp = true;
         } else if (std.mem.eql(u8, a, "--no-tui")) {
             out.no_tui = true;
+        } else if (std.mem.eql(u8, a, "--format")) {
+            i += 1;
+            if (out.verb != .trace or i >= argv.len) return error.Usage;
+            out.format = std.meta.stringToEnum(TraceFormat, argv[i]) orelse return error.Usage;
         } else if (positional == null) {
             positional = a;
             if (out.verb == .queue) {
@@ -355,6 +364,20 @@ test "parseArgs: trace requires a target" {
     const a = try parseArgs(&.{ "trace", ".planning" });
     try t.expectEqual(Verb.trace, a.verb);
     try t.expectEqualStrings(".planning", a.brief_path);
+}
+
+test "parseArgs: trace --format selects the render, defaults to text" {
+    try t.expectEqual(TraceFormat.text, (try parseArgs(&.{ "trace", "x" })).format);
+    const a = try parseArgs(&.{ "trace", "x", "--format", "agui" });
+    try t.expectEqual(TraceFormat.agui, a.format);
+    try t.expectEqualStrings("x", a.brief_path);
+    try t.expectEqual(TraceFormat.html, (try parseArgs(&.{ "trace", "--format", "html", "x" })).format);
+}
+
+test "parseArgs: an unknown, missing, or misplaced --format is usage" {
+    try t.expectError(error.Usage, parseArgs(&.{ "trace", "x", "--format", "nope" }));
+    try t.expectError(error.Usage, parseArgs(&.{ "trace", "x", "--format" }));
+    try t.expectError(error.Usage, parseArgs(&.{ "start", "b.md", "--format", "html" }));
 }
 
 test "parseArgs: queue takes flags then one-or-more briefs" {

@@ -10,6 +10,7 @@ zig-pkg/
 .tokensave/
 .claude
 .ua
+.understand-anything
 wm
 CLAUDE.md
 .agents/

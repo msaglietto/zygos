@@ -25,7 +25,7 @@ The crontab selects the operator context. The executor shell can also append app
 
 - Process exit code: 0 `done`, 1 `failed` or `aborted`, 2 boot or usage.
 - `<planning-root>/events.jsonl` and the state file.
-- `zygos mission trace <planning-root>`.
+- `zygos mission trace <planning-root>`. Add `--format html > run.html` for a self-contained viewer.
 
 ## Recipe (from README, as built)
 
