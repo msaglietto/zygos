@@ -715,7 +715,7 @@ test "StreamChannelRef round-trips via parse/write helpers" {
     try testing.expect(ref1.direction == ref2.direction);
 }
 
-// --- iii serde leniency (verified against ~/Projects/iii engine/src/protocol.rs) ---
+// --- iii serde leniency (verified against the iii engine's engine/src/protocol.rs) ---
 // iii declares these fields Option<_> / #[serde(default)]; the unmodified Node
 // SDK may omit them, so S6 requires the lenient parse. PROTOCOL.md examples
 // show populated frames and stay accurate; optionality follows the iii source.

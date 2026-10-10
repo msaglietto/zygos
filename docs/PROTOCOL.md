@@ -2,7 +2,7 @@
 
 **This document is the single source of truth for frames.** Code conforms to it.
 Changing it requires the `protocol_change` human gate (see GOAL.md). It transcribes
-the iii engine's protocol (`engine/src/protocol.rs` in `~/Projects/iii`, v0.21.x) —
+the iii engine's protocol (`engine/src/protocol.rs` in `https://github.com/iii-hq/iii`, v0.21.x) —
 compatibility with the unmodified iii SDKs is milestone M0's exit test.
 
 ## Transport

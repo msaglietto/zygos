@@ -146,7 +146,7 @@ the reply:
   like an M6 pause — substrate persisted, non-terminal `"paused":true`
   reply, no FSM transition. `resume` re-enters `gating` and re-asks the
   gate; an unattended run stops burning budget on verified work instead
-  of replanning it (issues/0002).
+  of replanning it.
 - `{"approved":false, ...}` (no `resolved` field, or `resolved:true`) ⇒
   denial: `gate_denials += 1`; if `gate_denials >= gate_threshold` ⇒
   `gate_failed`, else `gate_denied` → planning with the denial reason as

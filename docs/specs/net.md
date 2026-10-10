@@ -10,7 +10,7 @@ approved by Mauricio 2026-07-06**.
 
 - iii Node SDK connects to `ws://localhost:49134` by default (`III_URL` env
   override) — Zygos listens on **49134** by default, `--port` to override.
-- Wire behavior verified against `~/Projects/iii/engine/src/protocol.rs`
+- Wire behavior verified against the iii engine's `engine/src/protocol.rs`
   (v0.21.x): iii omits `None` fields on serialize and accepts explicit nulls;
   our emit-null style is compatible both ways.
 
@@ -83,7 +83,7 @@ verification is **S6**. As built:
    interval cadence)
 4. **e2e (S6)**: `test/e2e/node-sdk/` — script that (a) builds + starts the
    zygos binary on a free port, (b) runs a Node script importing the
-   **unmodified** iii SDK from `~/Projects/iii/sdk/packages/node/iii` (env
+   **unmodified** iii SDK from the iii repo's `sdk/packages/node/iii` (env
    `III_URL=ws://localhost:<port>`), registering `echo::reverse` from worker A,
    invoking it from worker B, asserting the result, (c) kills the server;
    exits nonzero on any failure. Documented run in README.

@@ -1,4 +1,4 @@
-> Historical shipping review. For current remediation and remaining publication tasks, see [open-source readiness](open-source-readiness.md) and the dated review in [the repository audit](../reports/repo_audit_2026-09-30.md). Older test counts and the missing-CI statement below describe that snapshot.
+> Historical shipping review. For current remediation and remaining publication tasks, see [open-source readiness](open-source-readiness.md). The 2026-09-30 repository audit report it cites is no longer kept in the tree. Older test counts and the missing-CI statement below describe that snapshot.
 
 ## Shipping Packet: zygos
 
@@ -104,7 +104,7 @@ Codex (`gpt-5.6-sol`) was started twice as a fresh session, with no checklist an
 
 ### Launch Blockers
 
-- Y5 is still the human gate in `GOAL.md`: an unattended run against the real Zahir vault, with artifacts behind a tessera checkpoint and a diff against the SDK-run brief. `zig build test` does not cover it.
+- Y5 is still the human gate in `GOAL.md`: an unattended run against the real research vault, with artifacts behind a tessera checkpoint and a diff against the SDK-run brief. `zig build test` does not cover it.
 - The completion-gate file is writable by the executor while bash stays allow. Do not treat a cron run as "parked unless a person approves" until that choice is made.
 - Independent review did not run. A second model never saw the tree.
 

@@ -27,7 +27,7 @@ This spends provider tokens and allows commands as your OS user. The token
 budget is a cap, not a price guarantee. Read [SECURITY.md](../SECURITY.md) first.
 Keep the planning transcript private and inspect the script before running it.
 
-`x5-dogfood/` and `zahir-radar/` preserve historical route tables and mission
+`x5-dogfood/` and `research-radar/` preserve historical route tables and mission
 briefs. Their provider slugs/model IDs describe the maintainer's original
 catalog; replace their routes with your own or the quickstart default. These
 examples do not require access to the maintainer's vault or catalog. The Y5

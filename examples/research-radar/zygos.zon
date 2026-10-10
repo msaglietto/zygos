@@ -1,4 +1,4 @@
-// Route table for the zahir-radar research mission (Y5). Slugs verified
+// Route table for the research-radar example mission (Y5). Slugs verified
 // against the real catalog (`zig build smoke-providers -- x x` lists them).
 // The executor does the web research — it gets the big-context ladder
 // (GLM 131k, MiMo 131k); PO/planner/verifier are cheaper seats. Every

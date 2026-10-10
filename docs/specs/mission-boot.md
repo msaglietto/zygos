@@ -16,7 +16,7 @@ fail-closed decision lives here, tested:
   enforced budget; an explicitly set `ZYGOS_BUDGET_MAX_TOKENS` overrides
   it, the Timeouts default (1M) backstops both. Queue mode resolves per
   brief. Before this, the declared budget was decorative and the CLI
-  default silently governed (issues/0003).
+  default silently governed.
 - **Search backend** — `searchConfigFromEnv(env)`: brave|searxng from
   `ZYGOS_SEARCH_*`. The brave branch resolves the `key_env` variable into
   `SearchConfig.key` HERE — web_tools never reads the environment (the Y5
