@@ -104,6 +104,9 @@ role handed tools. Mission-level budget rides the existing `budget_scope`
 passthrough — no new budget machinery. Multi-mission concurrency, context
 compaction, and session-store workers stay out of M3.
 
+Amended 2026-10-11 (issue #7, **ratified by Mauricio 2026-10-11**): V1, V5 and the tools
+note above — see Amendments.
+
 ## Success criteria — milestone M4 (Tessera absorbed)
 
 M3 ratified and closed 2026-07-07 (all V1–V6 green; see README). M4 criteria
@@ -214,3 +217,31 @@ Append-only. Human-written.
   because karlseguin/websocket.zig migrated to the std.Io interface. Kernel modules
   (`src/kernel/*`) remain std.Io-free; the actor boundary insulates them. Rationale
   discussed and accepted: churn exposure confined to one file + the pinned dep.
+- 2026-10-11 (drafted by an agent for issue #7, **ratified by Mauricio 2026-10-11**):
+  configurable mission pipeline. Contract: `docs/specs/mission.md`. Supersedes:
+  - **V1** — Mission FSM: a step cursor over the configured pipeline (`zygos.zon`
+    `.steps`; absent ⇒ product-owner, planner, executor, verifier). States
+    `running → gating → done|failed`; status and trace carry `step` and
+    `step_index`. Every legal transition tested, illegal transitions rejected as
+    errors, terminal states final. Cursor movement (advance, rework target,
+    missing-phase fill) is a pure, exhaustively tested function over the pinned
+    pipeline. Verified by `zig build test` (FSM + pipeline tests in
+    `worker/mission/`).
+  - **V5** — The gate keeps its force: every pipeline, with or without a
+    verifier, ends at the completion gate; `done` still requires a real approval
+    call, and every gate failure mode still fails closed. Changed: a verify
+    failure or a gate denial sends the cursor back to an executor with one fix
+    task built from the feedback, instead of replanning. Consecutive verify
+    failures (across all verifier occurrences) and gate denials still stop the
+    loop at `escalation.test_fail_threshold`.
+  - **M3 tools note** — Tools are per step. With `.tools` omitted the executor
+    gets tools and every other step does not; the verifier never gets tools
+    (boot refuses `.tools = true` on it). Every policy request carries the
+    calling `step_id`.
+  - Extended, not contradicted: **V2** — the substrate gains `EXEC.md`,
+    `step-<id>-<n>.md`, and superseded `MISSION-<n>.md`/`PLAN-<n>.md` copies under
+    the same atomic-write rule. **V3** — the four known ids keep their step_ids
+    and fail-closed reply contracts; any other configured step runs as one turn
+    with its own id as `step_id` and a free-text reply (empty ⇒ the step fails).
+    **V4** — resume also refuses when the current `.steps` (ids + definition
+    hashes) differs from the one pinned in `mission.json`.
