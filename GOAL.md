@@ -104,7 +104,7 @@ role handed tools. Mission-level budget rides the existing `budget_scope`
 passthrough — no new budget machinery. Multi-mission concurrency, context
 compaction, and session-store workers stay out of M3.
 
-Amended 2026-10-11 (issue #7, pending ratification): V1, V5 and the tools
+Amended 2026-10-11 (issue #7, **ratified by Mauricio 2026-10-11**): V1, V5 and the tools
 note above — see Amendments.
 
 ## Success criteria — milestone M4 (Tessera absorbed)
@@ -217,7 +217,7 @@ Append-only. Human-written.
   because karlseguin/websocket.zig migrated to the std.Io interface. Kernel modules
   (`src/kernel/*`) remain std.Io-free; the actor boundary insulates them. Rationale
   discussed and accepted: churn exposure confined to one file + the pinned dep.
-- 2026-10-11 (drafted by an agent for issue #7, **pending ratification by Mauricio**):
+- 2026-10-11 (drafted by an agent for issue #7, **ratified by Mauricio 2026-10-11**):
   configurable mission pipeline. Contract: `docs/specs/mission.md`. Supersedes:
   - **V1** — Mission FSM: a step cursor over the configured pipeline (`zygos.zon`
     `.steps`; absent ⇒ product-owner, planner, executor, verifier). States

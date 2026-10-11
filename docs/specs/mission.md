@@ -1,7 +1,7 @@
 # Spec: `src/worker/mission.zig` + `src/worker/mission/pipeline.zig` + `src/worker/mission_store.zig` — mission loop (M3, V1–V5; issue #7)
 
-> **Status: target contract for issue #7, pending ratification of the
-> 2026-10-11 GOAL.md amendment.** The code on `main` still implements the
+> **Status: target contract for issue #7; the 2026-10-11 GOAL.md amendment
+> was ratified by Mauricio on 2026-10-11.** The code on `master` still implements the
 > fixed M3 chain (`defining → planning → executing → verifying → gating`).
 > The implementation PR follows this spec test-first. Everything below
 > describes the configurable pipeline.
