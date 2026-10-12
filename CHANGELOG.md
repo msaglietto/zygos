@@ -6,6 +6,25 @@ Reconstructed from git history on 2026-09-30. A commit that only added a library
 
 The agent that next changes operator-visible behavior adds the new heading in that same commit.
 
+## [5.0.0] - 2026-10-12
+
+### Breaking
+
+- Mission states are now `running`, `gating`, then `done` or `failed`, with a step cursor (`step`, the step id, and `step_index`) replacing `defining`, `planning`, `executing` and `verifying`. `status`, the terminal and parked replies, `mission.json`, the `mission` trace event and the AG-UI mission snapshot carry the cursor. A `mission.json` written before this version loads under the default pipeline with its old state mapped onto the cursor.
+- A verify failure or a gate denial no longer replans. The cursor returns to an executor, which runs one fix task carrying the verifier's reason or the denial. A verify failure returns to the last executor before the failing verifier, a denial to the last executor in the list.
+- A `role-<id>.md` override replaces only the step's behaviour text. The reply-format contract of the product-owner, planner and verifier is still appended after it. The verifier also reads `EXEC.md`.
+- Resuming a mission whose configured steps (ids, definition hashes, tools) differ from the ones pinned at start refuses with "pipeline changed since start".
+
+### Added
+
+- `zygos.zon` `.steps` configures the mission pipeline: each entry has an `.id`, an optional `.definition` file and an optional `.tools`. Definition paths resolve next to the zon file and are pinned by SHA-256 at boot. Steps may come in any order, and an id may repeat. Without `.steps` the pipeline is product-owner, planner, executor, verifier, as before. The mission CLI exits 2 naming the entry for an empty list, an unknown key, a missing or malformed or reserved id, no executor, `.tools` on a verifier, a custom step without a definition, or a definition that is unreadable, empty, over 64 KiB or outside the zon file's directory. `zygos task --config` refuses a file carrying `.steps`.
+- A step whose id is not a built-in kind is a custom step: it reads the brief and the earlier artifacts and writes `step-<id>-<n>.md`, which every later step then reads. A pipeline without a planner starts the executor on one task equal to the objective, and one without a product-owner starts with `MISSION.md` seeded from the objective.
+- The built-in step prompts live in `src/worker/mission/agents/<id>.md`. To rewrite one, copy it next to `zygos.zon` and name it in `.definition`. The executor writes `EXEC.md`, and a repeated product-owner or planner keeps the earlier `MISSION.md` or `PLAN.md` as `MISSION-<n>.md` or `PLAN-<n>.md`.
+- A `pipeline` trace event opens each mission's trace with the pinned steps. `zygos mission trace` renders it, and `--format agui` emits it as a `zygos.pipeline` custom event.
+- Tools go to the executor only by default. `.tools = true` gives them to a product-owner, planner or custom step, and the verifier never gets them.
+- Policy requests carry the calling turn's `step_id`, and a policy rule may be scoped to a step with `step`. An operator cannot configure such rules yet (issue #12).
+- Campaign arms include the definition hashes in their identity, so arms with different definition bytes differ. Inspection checks the traced pipeline against the arm, and the Harbor adapter uploads the definition files and records the pipeline in `mission-run.json`.
+
 ## [4.2.0] - 2026-10-08
 
 ### Added
