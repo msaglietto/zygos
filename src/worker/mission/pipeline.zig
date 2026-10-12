@@ -271,7 +271,7 @@ pub fn planText(arena: std.mem.Allocator, tasks: []const Task) error{OutOfMemory
     return md.items;
 }
 
-fn taskLabel(arena: std.mem.Allocator, desc: []const u8) error{OutOfMemory}![]const u8 {
+pub fn taskLabel(arena: std.mem.Allocator, desc: []const u8) error{OutOfMemory}![]const u8 {
     const fix = (try parseFixTask(arena, desc)) orelse return desc;
     switch (fix) {
         .feedback => |fb| {
@@ -596,6 +596,83 @@ pub fn verifyReworkTarget(steps: []const Step, verifier_index: usize) ?usize {
 /// `gate_denied`: the last executor in the list.
 pub fn gateReworkTarget(steps: []const Step) ?usize {
     return lastExecutorBefore(steps, steps.len);
+}
+
+pub const Rework = struct {
+    tasks: []Task,
+    /// The step the cursor returns to (`verifyReworkTarget` / `gateReworkTarget`).
+    step_index: usize,
+    /// The first unfinished task: normally the appended fix task.
+    task_index: usize,
+};
+
+/// `verify_failed` / `gate_denied`: earlier tasks stay done and one fix task
+/// carrying the feedback is appended.
+pub fn rework(arena: std.mem.Allocator, tasks: []const Task, target: usize, feedback: []const u8) error{OutOfMemory}!Rework {
+    const grown = try appendTask(arena, tasks, try feedbackTask(arena, feedback));
+    return .{ .tasks = grown, .step_index = target, .task_index = firstUnfinished(grown) orelse tasks.len };
+}
+
+// -- EXEC.md and step inputs ---------------------------------------------------------
+
+const no_output = "(no output)";
+
+/// One EXEC.md section per completed task: the verifier's evidence of what
+/// each executor turn reported.
+pub fn execSection(arena: std.mem.Allocator, n: usize, desc: []const u8, outcome: []const u8) error{OutOfMemory}![]const u8 {
+    const body = std.mem.trim(u8, outcome, ws);
+    return std.fmt.allocPrint(arena, "## Task {d}: {s}\n\n{s}\n\n", .{
+        n,
+        try taskLabel(arena, desc),
+        if (body.len == 0) no_output else body,
+    });
+}
+
+/// `more` appended to `names`, skipping any name already present.
+pub fn appendMissing(arena: std.mem.Allocator, names: []const []const u8, more: []const []const u8) error{OutOfMemory}![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    try out.appendSlice(arena, names);
+    for (more) |name| {
+        var present = false;
+        for (out.items) |have| {
+            if (std.mem.eql(u8, have, name)) present = true;
+        }
+        if (!present) try out.append(arena, name);
+    }
+    return out.items;
+}
+
+/// The artifact names a step's input carries beyond its listed input, oldest
+/// first: a custom step reads everything written so far; a known kind reads
+/// each `step-*.md`; an executor fix task over artifacts reads its sources
+/// last, so clipping spares them longest.
+pub fn inputArtifacts(
+    arena: std.mem.Allocator,
+    steps: []const Step,
+    step_index: usize,
+    runs: StepRuns,
+    current_desc: ?[]const u8,
+) error{OutOfMemory}![]const []const u8 {
+    const step = steps[step_index];
+    if (step.kind == .custom) return artifactsSoFar(arena, steps, runs);
+    const step_files = try stepArtifactsSoFar(arena, steps, runs);
+    if (step.kind != .executor) return step_files;
+    const desc = current_desc orelse return step_files;
+    const fix = (try parseFixTask(arena, desc)) orelse return step_files;
+    switch (fix) {
+        .feedback => return step_files,
+        .artifacts => |sources| {
+            var others: std.ArrayList([]const u8) = .empty;
+            for (step_files) |name| {
+                var is_source = false;
+                for (sources) |s| {
+                    if (std.mem.eql(u8, s, name)) is_source = true;
+                }
+                if (!is_source) try others.append(arena, name);
+            }
+            return appendMissing(arena, others.items, sources);
+        },
+    }
 }
 
 // -- system prompts --------------------------------------------------------------
@@ -1414,4 +1491,95 @@ test "prompt precedence: pinned definition > role-<id>.md > built-in; the contra
     // A custom step with no pinned text may still take a role-<id>.md override; with neither, null.
     try testing.expectEqualStrings("Override.", (try systemPrompt(arena, mk("architect"), "Override.")).?);
     try testing.expect((try systemPrompt(arena, mk("architect"), null)) == null);
+}
+
+// ===========================================================================
+// Layer 3 helpers: rework, EXEC.md sections, input artifact lists
+// ===========================================================================
+
+test "rework appends one feedback fix task, points the cursor at the target and the task at the first unfinished" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const tasks = [_]Task{ .{ .desc = "a", .done = true, .result = "kept" }, .{ .desc = "b", .done = true } };
+    const r = try rework(arena, &tasks, 2, "missing tests");
+    try testing.expectEqual(@as(usize, 2), r.step_index);
+    try testing.expectEqual(@as(usize, 3), r.tasks.len);
+    try testing.expectEqual(@as(usize, 2), r.task_index);
+    try testing.expect(r.tasks[0].done and r.tasks[1].done and !r.tasks[2].done);
+    try testing.expectEqualStrings("kept", r.tasks[0].result);
+    try testing.expectEqualStrings("missing tests", (try parseFixTask(arena, r.tasks[2].desc)).?.feedback);
+
+    // An earlier unfinished task (a planner placed after the executor) runs first.
+    const pending = [_]Task{ .{ .desc = "a", .done = true }, .{ .desc = "later" } };
+    const r2 = try rework(arena, &pending, 0, "no");
+    try testing.expectEqual(@as(usize, 1), r2.task_index);
+    try testing.expectEqual(@as(usize, 3), r2.tasks.len);
+}
+
+test "execSection renders task, outcome and keeps fix tasks to a one-line label" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    try testing.expectEqualStrings(
+        "## Task 1: build the gizmo\n\nbuilt it at ./gizmo\n\n",
+        try execSection(arena, 1, "build the gizmo", "built it at ./gizmo"),
+    );
+    const fix = try feedbackTask(arena, "missing tests\nsecond line");
+    try testing.expectEqualStrings(
+        "## Task 3: fix: missing tests\n\ndone\n\n",
+        try execSection(arena, 3, fix.desc, "done"),
+    );
+    // An empty outcome still leaves a section the verifier can read.
+    try testing.expectEqualStrings("## Task 2: t\n\n(no output)\n\n", try execSection(arena, 2, "t", ""));
+}
+
+test "appendMissing keeps order and drops names already present" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const merged = try appendMissing(arena, &.{ "a.md", "b.md" }, &.{ "b.md", "c.md", "c.md" });
+    try expectNames(&.{ "a.md", "b.md", "c.md" }, merged);
+}
+
+test "input artifacts: known kinds get step-*, custom gets everything so far, a fix task adds its sources last" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const steps = [_]Step{ mk("product-owner"), mk("architect"), mk("executor"), mk("reviewer"), mk("executor"), mk("verifier") };
+    const runs = try runsOf(arena, &.{
+        .{ .id = "product-owner", .count = 1 },
+        .{ .id = "architect", .count = 1 },
+        .{ .id = "executor", .count = 1 },
+        .{ .id = "reviewer", .count = 1 },
+    });
+
+    // Known kinds: the step-*.md files only.
+    try expectNames(&.{ "step-architect-1.md", "step-reviewer-1.md" }, try inputArtifacts(arena, &steps, 5, runs, null));
+    try expectNames(&.{ "step-architect-1.md", "step-reviewer-1.md" }, try inputArtifacts(arena, &steps, 0, runs, "do it"));
+
+    // Custom: everything written so far, in step order (the reviewer has not run yet).
+    const before_review = try runsOf(arena, &.{
+        .{ .id = "product-owner", .count = 1 },
+        .{ .id = "architect", .count = 1 },
+        .{ .id = "executor", .count = 1 },
+    });
+    try expectNames(
+        &.{ "MISSION.md", "step-architect-1.md", "EXEC.md" },
+        try inputArtifacts(arena, &steps, 3, before_review, null),
+    );
+
+    // An executor fix task over artifacts: other step-* first, its sources last.
+    const fix = try artifactsTask(arena, &.{ "step-reviewer-1.md", "PLAN.md" });
+    try expectNames(
+        &.{ "step-architect-1.md", "step-reviewer-1.md", "PLAN.md" },
+        try inputArtifacts(arena, &steps, 4, runs, fix.desc),
+    );
+    // A feedback fix task carries its text in the task itself.
+    const fb = try feedbackTask(arena, "boom");
+    try expectNames(&.{ "step-architect-1.md", "step-reviewer-1.md" }, try inputArtifacts(arena, &steps, 4, runs, fb.desc));
 }

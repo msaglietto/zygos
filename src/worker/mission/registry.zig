@@ -16,7 +16,7 @@ pub const Control = struct {
     paused: bool = false,
     /// M6: pending operator steer, gpa-owned, consumed at the next boundary.
     steer: ?[]u8 = null,
-    state: fsm.State = .defining,
+    state: fsm.State = .running,
     stop: model.StopReason = .none,
     task_index: usize = 0,
     fail_count: usize = 0,
@@ -249,7 +249,7 @@ test "updateSnapshot publishes persisted state into status and snapshotAll" {
 
     const m: model.Mission = .{
         .mission_id = "m-1",
-        .state = .verifying,
+        .state = .gating,
         .stop = .none,
         .task_index = 2,
         .fail_count = 1,
@@ -259,7 +259,7 @@ test "updateSnapshot publishes persisted state into status and snapshotAll" {
     reg.updateSnapshot(ctl, &m);
 
     const snap = reg.status("m-1").?;
-    try testing.expectEqual(fsm.State.verifying, snap.state);
+    try testing.expectEqual(fsm.State.gating, snap.state);
     try testing.expectEqual(@as(usize, 2), snap.task_index);
     try testing.expectEqual(@as(usize, 1), snap.fail_count);
     try testing.expectEqual(@as(usize, 3), snap.gate_denials);
@@ -268,5 +268,5 @@ test "updateSnapshot publishes persisted state into status and snapshotAll" {
     const all = try reg.snapshotAll(arena_state.allocator());
     try testing.expectEqual(@as(usize, 1), all.len);
     try testing.expectEqualStrings("m-1", all[0].mission_id);
-    try testing.expectEqual(fsm.State.verifying, all[0].snap.state);
+    try testing.expectEqual(fsm.State.gating, all[0].snap.state);
 }

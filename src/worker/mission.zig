@@ -1,12 +1,13 @@
 //! Mission orchestrator (M3, V1/V3–V5 — docs/specs/mission.md). One mission =
-//! one objective driven to a terminal state by role turns (product-owner →
-//! planner → executor → verifier) over the durable `.planning/` substrate,
-//! closed by a hard human gate.
+//! one objective driven to a terminal state by the steps of a configured
+//! pipeline (default: product-owner → planner → executor → verifier) over the
+//! durable `.planning/` substrate, closed by a hard human gate.
 //!
 //! Split hard, like the turn worker: `Fsm` is a pure table-driven state
-//! machine (exhaustively tested, no I/O); `MissionOrchestrator` is bus glue
-//! over an inproc worker — every role runs as one `zygos::turns::run` turn,
-//! so providers, policy, approvals, routing, and budgets compose unchanged.
+//! machine and `pipeline` the pure step rules (both exhaustively tested, no
+//! I/O); `MissionOrchestrator` is bus glue over an inproc worker — every step
+//! runs as one `zygos::turns::run` turn, so providers, policy, approvals,
+//! routing, and budgets compose unchanged.
 //!
 //! Deviation from the spec's ErrorBody wording (flagged, same as turn.zig):
 //! the inproc Handler contract carries no custom ErrorBody codes, so
@@ -42,7 +43,7 @@ pub const Fsm = fsm.Fsm;
 pub const StopReason = model.StopReason;
 pub const Task = model.Task;
 pub const Mission = model.Mission;
-pub const Role = model.Role;
+const Step = pipeline.Step;
 const cloneToArena = model.cloneToArena;
 
 pub const registry_mod = @import("mission/registry.zig");
@@ -105,9 +106,10 @@ const StoreSubstrate = struct {
 const mission_artifact = "MISSION.md";
 const plan_artifact = "PLAN.md";
 const verify_artifact = "VERIFY.md";
+const exec_artifact = "EXEC.md";
 const decisions_artifact = "DECISIONS.md";
 
-/// PO decision journal (M6): every accept/redo/replan appends one audit
+/// PO decision journal (M6): every accept/redo/rework appends one audit
 /// line. Fail-open — a journal write never changes a mission outcome — and
 /// append-only. ThreadStrategy pins DECISIONS.md into every role's context,
 /// so journaled decisions survive every step of long factory missions.
@@ -414,8 +416,20 @@ fn runMission(self: *MissionOrchestrator, arena: std.mem.Allocator, request_json
         m = try cloneToArena(arena, &loaded);
         // Resuming a terminal mission is idempotent: report, run nothing.
         if (m.state == .done or m.state == .failed) return replyTerminal(arena, &m);
+        m.pipeline = p.steps;
+        // A running cursor outside the pipeline is a different pipeline's
+        // state: fail closed. The gate sits past the last step by definition.
+        if (m.state == .gating) {
+            m.step_index = m.pipeline.len;
+        } else if (m.step_index >= m.pipeline.len) {
+            return error.Failed;
+        }
     } else {
-        m = .{ .mission_id = p.mission_id, .objective = p.objective orelse return error.MalformedRequest };
+        m = .{
+            .mission_id = p.mission_id,
+            .objective = p.objective orelse return error.MalformedRequest,
+            .pipeline = p.steps,
+        };
     }
 
     const ctl = try self.track(p.mission_id);
@@ -429,10 +443,17 @@ fn runMission(self: *MissionOrchestrator, arena: std.mem.Allocator, request_json
         if (p.brief) |brief_text| {
             try putArtifact(self, cfg, "BRIEF.md", brief_text);
         } else {
-            cfg.store.removeArtifact(self.gpa, "BRIEF.md") catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => return error.Failed,
-            };
+            try removeStale(self, cfg, "BRIEF.md");
+        }
+        // A fresh start owns the pipeline artifacts too: EXEC.md is
+        // append-only and MISSION.md/PLAN.md are archived on a rewrite, so a
+        // leftover from an earlier mission in a reused root must not leak in.
+        for ([_][]const u8{ exec_artifact, mission_artifact, plan_artifact }) |name| {
+            try removeStale(self, cfg, name);
+        }
+        if (pipeline.needsMissionSeed(m.pipeline)) {
+            m.acceptance = pipeline.seed_acceptance;
+            try putArtifact(self, cfg, mission_artifact, try pipeline.seedMissionText(arena, m.mission_id, m.objective));
         }
     }
 
@@ -442,8 +463,9 @@ fn runMission(self: *MissionOrchestrator, arena: std.mem.Allocator, request_json
 
     var phase_log: std.ArrayList([]const u8) = .empty;
     while (m.state != .done and m.state != .failed) {
-        const prev = m.state;
-        // Role boundary: abort wins, then the role-turn budget (the gate
+        const prev_state = m.state;
+        const prev_index = m.step_index;
+        // Step boundary: abort wins, then the role-turn budget (the gate
         // call is not a role turn and stays exempt).
         if (self.pollAborted(ctl)) {
             m.stop = .aborted;
@@ -469,10 +491,7 @@ fn runMission(self: *MissionOrchestrator, arena: std.mem.Allocator, request_json
                 } });
             }
             switch (m.state) {
-                .defining => try roleDefine(self, arena, cfg, &m),
-                .planning => try rolePlan(self, arena, cfg, &m),
-                .executing => try roleExecute(self, arena, cfg, &m),
-                .verifying => try roleVerify(self, arena, cfg, &m),
+                .running => try runStep(self, arena, cfg, &m),
                 .gating => if (try gate(self, arena, cfg, &m)) {
                     // Unanswered gate: park durably at gating (same shape
                     // as M6 pause) — resume re-asks the gate.
@@ -485,18 +504,22 @@ fn runMission(self: *MissionOrchestrator, arena: std.mem.Allocator, request_json
             m.steer = "";
         }
         try self.persist(cfg.store, ctl, &m);
-        if (m.state != prev) {
-            log.info("mission {s}: {t} → {t} (role_turns {d}, tasks {d}/{d})", .{
-                m.mission_id, prev, m.state, m.role_turns_used, m.tasksDone(), m.tasks.len,
+        if (m.state != prev_state or m.step_index != prev_index) {
+            const from = try phaseLabel(arena, &m, prev_state, prev_index);
+            const to = try phaseLabel(arena, &m, m.state, m.step_index);
+            log.info("mission {s}: {s} → {s} (role_turns {d}, tasks {d}/{d})", .{
+                m.mission_id, from, to, m.role_turns_used, m.tasksDone(), m.tasks.len,
             });
             try trace_mod.emit(arena, cfg.trace_path, .{ .mission = .{
-                .from = @tagName(prev),
+                .from = @tagName(prev_state),
                 .to = @tagName(m.state),
+                .step = stepNameAt(&m, m.state, m.step_index),
+                .step_index = @intCast(m.step_index),
                 .role_turns = @intCast(m.role_turns_used),
                 .tasks_done = @intCast(m.tasksDone()),
                 .tasks = @intCast(m.tasks.len),
             } });
-            try phase_log.append(arena, try std.fmt.allocPrint(arena, "{t} → {t}", .{ prev, m.state }));
+            try phase_log.append(arena, try std.fmt.allocPrint(arena, "{s} → {s}", .{ from, to }));
         }
     }
 
@@ -508,6 +531,20 @@ fn runMission(self: *MissionOrchestrator, arena: std.mem.Allocator, request_json
     };
     writeLedger(self, arena, cfg, &m);
     return replyTerminal(arena, &m);
+}
+
+/// The step id a (state, index) pair points at; null at gating and done, and
+/// for an index past the list.
+fn stepNameAt(m: *const Mission, state: State, step_index: usize) ?[]const u8 {
+    if (state != .running and state != .failed) return null;
+    if (step_index >= m.pipeline.len) return null;
+    return m.pipeline[step_index].id;
+}
+
+/// "running (executor)", "gating", "done" — the phase log's vocabulary.
+fn phaseLabel(arena: std.mem.Allocator, m: *const Mission, state: State, step_index: usize) error{OutOfMemory}![]const u8 {
+    const step = stepNameAt(m, state, step_index) orelse return @tagName(state);
+    return std.fmt.allocPrint(arena, "{t} ({s})", .{ state, step });
 }
 
 /// M7 mission-level budget ledger: the scope's spend rollup (tokens +
@@ -616,37 +653,39 @@ fn closeContinuity(
     }
 }
 
-/// One role = one `zygos::turns::run` turn. Counts against max_role_turns
-/// whether it succeeds or not. Role boundaries bracket the turn's own events
-/// in the trace, so a stalled executor is attributable at a glance.
+/// One step turn = one `zygos::turns::run` turn. Counts against
+/// max_role_turns whether it succeeds or not. Step boundaries bracket the
+/// turn's own events in the trace, so a stalled executor is attributable at a
+/// glance. A step offers the mission's tools only when its pinned `tools` is
+/// true; the verifier never gets them, whatever the pin says.
 fn runRole(
     self: *MissionOrchestrator,
     arena: std.mem.Allocator,
     cfg: RunConfig,
     m: *Mission,
-    role: Role,
+    step: Step,
     content: []const u8,
-    with_tools: bool,
 ) MissionError!RoleOut {
+    const with_tools = step.tools and step.kind != .verifier;
     try trace_mod.emit(arena, cfg.trace_path, .{ .role_start = .{
-        .role = role.stepId(),
+        .role = step.id,
         .role_turn = @intCast(m.role_turns_used + 1),
         .tools = with_tools,
         .content = try trace_mod.clip(arena, content),
     } });
-    const out = try runRoleTurn(self, arena, cfg, m, role, content, with_tools);
+    const out = try runRoleTurn(self, arena, cfg, m, step, content, with_tools);
     switch (out) {
         .ok => try trace_mod.emit(arena, cfg.trace_path, .{ .role_end = .{
-            .role = role.stepId(),
+            .role = step.id,
             .outcome = "ok",
         } }),
         .failed => |reason| try trace_mod.emit(arena, cfg.trace_path, .{ .role_end = .{
-            .role = role.stepId(),
+            .role = step.id,
             .outcome = "failed",
             .reason = reason,
         } }),
         .exhausted => try trace_mod.emit(arena, cfg.trace_path, .{ .role_end = .{
-            .role = role.stepId(),
+            .role = step.id,
             .outcome = "exhausted",
         } }),
     }
@@ -654,11 +693,11 @@ fn runRole(
     // driver updates task state after this returns). Absorb failures degrade
     // context, never the mission (fail-open, like the trace).
     const outcome: context_mod.Outcome = switch (out) {
-        .ok => |t| .{ .role = role.stepId(), .ok = true, .text = t },
-        .failed => |r| .{ .role = role.stepId(), .ok = false, .text = r },
-        .exhausted => .{ .role = role.stepId(), .ok = false, .text = "max_steps" },
+        .ok => |t| .{ .role = step.id, .ok = true, .text = t },
+        .failed => |r| .{ .role = step.id, .ok = false, .text = r },
+        .exhausted => .{ .role = step.id, .ok = false, .text = "max_steps" },
     };
-    cfg.strategy.absorb(try stepRefFor(arena, cfg, m, role), outcome) catch |err| switch (err) {
+    cfg.strategy.absorb(try stepRefFor(arena, cfg, m), outcome) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => log.warn("context absorb failed (mission unaffected): {t}", .{err}),
     };
@@ -670,23 +709,26 @@ fn runRoleTurn(
     arena: std.mem.Allocator,
     cfg: RunConfig,
     m: *Mission,
-    role: Role,
+    step: Step,
     content: []const u8,
     with_tools: bool,
 ) MissionError!RoleOut {
     m.role_turns_used += 1;
     log.info("mission {s}: role turn {d} — {s} (tools: {})", .{
-        m.mission_id, m.role_turns_used, role.stepId(), with_tools,
+        m.mission_id, m.role_turns_used, step.id, with_tools,
     });
 
-    // Playbook (M7): a role-<id>.md artifact overrides the built-in prompt;
-    // reply-shape parsing stays fail-closed regardless of the prompt source.
-    const system = (try playbook_mod.resolve(arena, cfg.substrate, role.stepId())) orelse
-        playbook_mod.defaultSystem(role.stepId()).?;
+    // Prompt precedence (docs/specs/mission.md "Definitions"): the pinned
+    // definition, else a non-empty role-<id>.md, else the built-in; the
+    // kind's reply contract is appended after whichever won, and reply-shape
+    // parsing stays fail-closed regardless of the prompt source.
+    const override = try playbook_mod.overrideFor(arena, cfg.substrate, step.id);
+    const system = (try pipeline.systemPrompt(arena, step, override)) orelse
+        return .{ .failed = try std.fmt.allocPrint(arena, "{s}: no system prompt (no definition, no role override)", .{step.id}) };
 
     const req = try role_turn_mod.buildRequest(arena, .{
         .system = system,
-        .step_id = role.stepId(),
+        .step_id = step.id,
         .max_steps = cfg.role_max_steps,
         .content = content,
         .provider_function = cfg.provider_function,
@@ -705,26 +747,33 @@ fn runRoleTurn(
     switch (res) {
         .err => |code| {
             defer self.gpa.free(code);
-            return .{ .failed = try std.fmt.allocPrint(arena, "{s} turn errored: {s}", .{ role.stepId(), code }) };
+            return .{ .failed = try std.fmt.allocPrint(arena, "{s} turn errored: {s}", .{ step.id, code }) };
         },
         .ok => |payload| {
             defer self.gpa.free(payload);
-            return role_turn_mod.parseReply(arena, role.stepId(), payload);
+            return role_turn_mod.parseReply(arena, step.id, payload);
         },
     }
 }
 
-/// Neutral strategy view of the mission (TaskView slice arena-built).
+/// Neutral strategy view of the mission at its cursor (TaskView slice
+/// arena-built).
 fn stepRefFor(
     arena: std.mem.Allocator,
     cfg: RunConfig,
     m: *const Mission,
-    role: Role,
 ) error{OutOfMemory}!context_mod.StepRef {
+    const step = m.pipeline[m.step_index];
     const tasks = try arena.alloc(context_mod.TaskView, m.tasks.len);
     for (m.tasks, 0..) |t, i| tasks[i] = .{ .desc = t.desc, .done = t.done, .result = t.result };
+    const current: ?[]const u8 = if (step.kind == .executor and m.task_index < m.tasks.len)
+        m.tasks[m.task_index].desc
+    else
+        null;
     return .{
-        .role = role.stepId(),
+        .role = step.id,
+        .step_index = m.step_index,
+        .artifacts = try pipeline.inputArtifacts(arena, m.pipeline, m.step_index, m.step_runs, current),
         .mission = .{
             .mission_id = m.mission_id,
             .objective = m.objective,
@@ -737,23 +786,22 @@ fn stepRefFor(
     };
 }
 
-/// Strategy-assembled role content. Null means the mission already moved to
+/// Strategy-assembled step content. Null means the mission already moved to
 /// failed (with the strategy's exact diagnostic as detail) — callers return.
 fn assembleContent(
     arena: std.mem.Allocator,
     cfg: RunConfig,
     m: *Mission,
-    role: Role,
 ) MissionError!?[]const u8 {
     var diag: context_mod.Diag = .{};
-    const step = try stepRefFor(arena, cfg, m, role);
+    const step = try stepRefFor(arena, cfg, m);
     const out = cfg.strategy.assemble(arena, step, cfg.context_budget, &diag) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.BudgetExceeded => {
             try failRole(m, try std.fmt.allocPrint(
                 arena,
                 "context budget exceeded assembling {s} content ({d} tokens max)",
-                .{ role.stepId(), cfg.context_budget.max_tokens },
+                .{ step.role, cfg.context_budget.max_tokens },
             ));
             return null;
         },
@@ -787,81 +835,141 @@ fn rejectRole(
     arena: std.mem.Allocator,
     cfg: RunConfig,
     m: *Mission,
-    role: Role,
+    step: Step,
     text: []const u8,
     reason: []const u8,
 ) MissionError!void {
-    const name = try std.fmt.allocPrint(arena, "REJECTED-{s}.md", .{role.stepId()});
+    const name = try std.fmt.allocPrint(arena, "REJECTED-{s}.md", .{step.id});
     try putArtifact(self, cfg, name, text);
     try failRole(m, reason);
 }
 
-fn roleDefine(self: *MissionOrchestrator, arena: std.mem.Allocator, cfg: RunConfig, m: *Mission) MissionError!void {
-    const content = (try assembleContent(arena, cfg, m, .product_owner)) orelse return;
-    switch (try runRole(self, arena, cfg, m, .product_owner, content, false)) {
+/// A step failure that a turn reports as `max_steps` outside the executor.
+fn failExhausted(arena: std.mem.Allocator, m: *Mission, step: Step) MissionError!void {
+    try failRole(m, try std.fmt.allocPrint(arena, "{s} turn stopped: max_steps", .{step.id}));
+}
+
+/// The step at the cursor finished: count the run (it names the step's
+/// artifact) and move the cursor, or fire `steps_done` past the last step.
+fn completeStep(arena: std.mem.Allocator, m: *Mission, step: Step) MissionError!void {
+    _ = try m.step_runs.bump(arena, step.id);
+    try advanceCursor(m);
+}
+
+fn advanceCursor(m: *Mission) error{IllegalTransition}!void {
+    switch (pipeline.advance(m.pipeline.len, m.step_index)) {
+        .step => |next| {
+            m.state = try Fsm.apply(m.state, .step_done);
+            m.step_index = next;
+        },
+        .steps_done => {
+            m.state = try Fsm.apply(m.state, .steps_done);
+            m.step_index = m.pipeline.len;
+        },
+    }
+}
+
+/// Write `bytes` onto a versioned artifact; an existing version is parked
+/// under the next free `<NAME>-<n>.md` first.
+fn writeVersioned(
+    self: *MissionOrchestrator,
+    arena: std.mem.Allocator,
+    cfg: RunConfig,
+    which: pipeline.Versioned,
+    versions: *usize,
+    name: []const u8,
+    bytes: []const u8,
+) MissionError!void {
+    if (getArtifact(self, arena, cfg, name)) |previous| {
+        const slot = try pipeline.archive(arena, which, versions.*);
+        try putArtifact(self, cfg, slot.name, previous);
+        versions.* = slot.versions;
+    }
+    try putArtifact(self, cfg, name, bytes);
+}
+
+fn runStep(self: *MissionOrchestrator, arena: std.mem.Allocator, cfg: RunConfig, m: *Mission) MissionError!void {
+    std.debug.assert(m.step_index < m.pipeline.len);
+    const step = m.pipeline[m.step_index];
+    switch (step.kind) {
+        .product_owner => try stepProductOwner(self, arena, cfg, m, step),
+        .planner => try stepPlanner(self, arena, cfg, m, step),
+        .executor => try stepExecutor(self, arena, cfg, m, step),
+        .verifier => try stepVerifier(self, arena, cfg, m, step),
+        .custom => try stepCustom(self, arena, cfg, m, step),
+    }
+}
+
+fn stepProductOwner(self: *MissionOrchestrator, arena: std.mem.Allocator, cfg: RunConfig, m: *Mission, step: Step) MissionError!void {
+    const content = (try assembleContent(arena, cfg, m)) orelse return;
+    switch (try runRole(self, arena, cfg, m, step, content)) {
         .failed => |reason| try failRole(m, reason),
-        .exhausted => try failRole(m, "product-owner turn stopped: max_steps"),
+        .exhausted => try failExhausted(arena, m, step),
         .ok => |text| switch (try role_turn_mod.interpretDefine(arena, text)) {
-            .reject => |r| return rejectRole(self, arena, cfg, m, .product_owner, r.raw, r.reason),
+            .reject => |r| return rejectRole(self, arena, cfg, m, step, r.raw, r.reason),
             .ok => |defined| {
-                const objective = defined.objective;
-                const acceptance = defined.acceptance;
-                m.objective = objective;
-                m.acceptance = acceptance;
-                const md = try std.fmt.allocPrint(
-                    arena,
-                    "# Mission {s}\n\n## Objective\n\n{s}\n\n## Acceptance\n\n{s}\n",
-                    .{ m.mission_id, objective, acceptance },
-                );
-                try putArtifact(self, cfg, mission_artifact, md);
-                m.state = try Fsm.apply(m.state, .objective_ready);
+                m.objective = defined.objective;
+                m.acceptance = defined.acceptance;
+                const md = try pipeline.missionText(arena, m.mission_id, defined.objective, defined.acceptance);
+                try writeVersioned(self, arena, cfg, .mission, &m.mission_versions, mission_artifact, md);
+                try completeStep(arena, m, step);
             },
         },
     }
 }
 
-fn rolePlan(self: *MissionOrchestrator, arena: std.mem.Allocator, cfg: RunConfig, m: *Mission) MissionError!void {
-    const content = (try assembleContent(arena, cfg, m, .planner)) orelse return;
-    switch (try runRole(self, arena, cfg, m, .planner, content, false)) {
+fn stepPlanner(self: *MissionOrchestrator, arena: std.mem.Allocator, cfg: RunConfig, m: *Mission, step: Step) MissionError!void {
+    const content = (try assembleContent(arena, cfg, m)) orelse return;
+    switch (try runRole(self, arena, cfg, m, step, content)) {
         .failed => |reason| try failRole(m, reason),
-        .exhausted => try failRole(m, "planner turn stopped: max_steps"),
+        .exhausted => try failExhausted(arena, m, step),
         .ok => |text| switch (try role_turn_mod.interpretPlan(arena, text)) {
-            .reject => |r| return rejectRole(self, arena, cfg, m, .planner, r.raw, r.reason),
+            .reject => |r| return rejectRole(self, arena, cfg, m, step, r.raw, r.reason),
             .ok => |descs| {
-                const tasks = try arena.alloc(Task, descs.len);
-                var md: std.ArrayList(u8) = .empty;
-                try md.appendSlice(arena, "# Plan\n\n");
-                for (descs, 0..) |desc, i| {
-                    tasks[i] = .{ .desc = desc };
-                    try md.appendSlice(arena, "- [ ] ");
-                    try md.appendSlice(arena, desc);
-                    try md.append(arena, '\n');
-                }
-                try putArtifact(self, cfg, plan_artifact, md.items);
-                m.tasks = tasks;
-                m.task_index = 0;
+                const replan = try pipeline.replaceUnfinished(arena, m.tasks, descs);
+                m.tasks = replan.tasks;
+                m.task_index = replan.task_index;
                 m.feedback = "";
-                m.state = try Fsm.apply(m.state, .plan_ready);
+                const md = try pipeline.planText(arena, m.tasks);
+                try writeVersioned(self, arena, cfg, .plan, &m.plan_versions, plan_artifact, md);
+                try completeStep(arena, m, step);
             },
         },
     }
 }
 
-/// First `max` bytes of a role answer, cut back to a space (and never inside
-/// a UTF-8 sequence) — enough context for the next turn, not a transcript.
-fn roleExecute(self: *MissionOrchestrator, arena: std.mem.Allocator, cfg: RunConfig, m: *Mission) MissionError!void {
-    std.debug.assert(m.task_index < m.tasks.len);
-    const content = (try assembleContent(arena, cfg, m, .executor)) orelse return;
+/// Bytes of a task's outcome kept in its EXEC.md section.
+const exec_outcome_bytes = 2000;
+
+fn stepExecutor(self: *MissionOrchestrator, arena: std.mem.Allocator, cfg: RunConfig, m: *Mission, step: Step) MissionError!void {
+    // Re-deriving the arrival from the tasks each iteration is idempotent:
+    // unfinished tasks keep running, and only a finished list appends a fix
+    // task (which is then unfinished).
+    const arrival = try pipeline.arriveAtExecutor(arena, m.objective, m.tasks, m.pipeline, m.step_index, m.step_runs);
+    m.tasks = arrival.tasks;
+    m.task_index = arrival.task_index;
+    switch (arrival.entry) {
+        .run_unfinished => {},
+        .seeded, .fix_appended => try putArtifact(
+            self,
+            cfg,
+            plan_artifact,
+            arrival.plan_md orelse try pipeline.planText(arena, m.tasks),
+        ),
+    }
+
+    const content = (try assembleContent(arena, cfg, m)) orelse return;
+    const label = try pipeline.taskLabel(arena, m.tasks[m.task_index].desc);
 
     // Task edges are trace-only (fail-open, not protocol frames): the TUI
     // keys its live current-task line off start/done pairs.
     try trace_mod.emit(arena, cfg.trace_path, .{ .task_start = .{
         .index = @intCast(m.task_index + 1),
         .total = @intCast(m.tasks.len),
-        .desc = try trace_mod.clip(arena, m.tasks[m.task_index].desc),
+        .desc = try trace_mod.clip(arena, label),
     } });
 
-    switch (try runRole(self, arena, cfg, m, .executor, content, true)) {
+    switch (try runRole(self, arena, cfg, m, step, content)) {
         .failed => |reason| try failRole(m, reason),
         // A step-budget stop is exhaustion, not malfunction: retry the same
         // task with feedback, counted against the same escalation threshold
@@ -879,7 +987,7 @@ fn roleExecute(self: *MissionOrchestrator, arena: std.mem.Allocator, cfg: RunCon
             } else {
                 m.feedback = "the previous attempt ran out of steps (max_steps); " ++
                     "finish this task with fewer, more decisive tool calls and then stop";
-                // state stays .executing — the loop re-runs this task.
+                // state stays .running at this cursor — the loop re-runs this task.
             }
         },
         .ok => |text| {
@@ -890,48 +998,111 @@ fn roleExecute(self: *MissionOrchestrator, arena: std.mem.Allocator, cfg: RunCon
             try trace_mod.emit(arena, cfg.trace_path, .{ .task_done = .{
                 .index = @intCast(m.task_index + 1),
                 .total = @intCast(m.tasks.len),
-                .desc = try trace_mod.clip(arena, m.tasks[m.task_index].desc),
+                .desc = try trace_mod.clip(arena, label),
             } });
-            m.task_index += 1;
-            m.state = try Fsm.apply(m.state, if (m.task_index == m.tasks.len) .tasks_done else .task_done);
+            const section = try pipeline.execSection(
+                arena,
+                m.task_index + 1,
+                m.tasks[m.task_index].desc,
+                try role_turn_mod.outcomeExcerpt(arena, text, exec_outcome_bytes),
+            );
+            cfg.store.appendArtifact(self.gpa, exec_artifact, section) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.Failed,
+            };
+            switch (pipeline.afterTask(m.tasks)) {
+                .task_done => |next| {
+                    m.task_index = next;
+                    m.state = try Fsm.apply(m.state, .task_done);
+                },
+                .step_done => {
+                    m.task_index = m.tasks.len;
+                    try completeStep(arena, m, step);
+                },
+            }
         },
     }
 }
 
-fn roleVerify(self: *MissionOrchestrator, arena: std.mem.Allocator, cfg: RunConfig, m: *Mission) MissionError!void {
-    const content = (try assembleContent(arena, cfg, m, .verifier)) orelse return;
-    switch (try runRole(self, arena, cfg, m, .verifier, content, false)) {
+fn stepVerifier(self: *MissionOrchestrator, arena: std.mem.Allocator, cfg: RunConfig, m: *Mission, step: Step) MissionError!void {
+    const content = (try assembleContent(arena, cfg, m)) orelse return;
+    switch (try runRole(self, arena, cfg, m, step, content)) {
         .failed => |reason| try failRole(m, reason),
-        .exhausted => try failRole(m, "verifier turn stopped: max_steps"),
+        .exhausted => try failExhausted(arena, m, step),
         .ok => |text| switch (try role_turn_mod.interpretVerify(arena, text)) {
-            .reject => |r| return rejectRole(self, arena, cfg, m, .verifier, r.raw, r.reason),
+            .reject => |r| return rejectRole(self, arena, cfg, m, step, r.raw, r.reason),
             .ok => |verdict| {
-                const passed = verdict.passed;
                 const reason = verdict.reason;
-
-                const md = try std.fmt.allocPrint(arena, "# Verify\n\npassed: {}\n\n{s}\n", .{ passed, reason });
+                const md = try std.fmt.allocPrint(arena, "# Verify\n\npassed: {}\n\n{s}\n", .{ verdict.passed, reason });
                 try putArtifact(self, cfg, verify_artifact, md);
 
-                if (passed) {
+                if (verdict.passed) {
                     m.fail_count = 0;
-                    m.state = try Fsm.apply(m.state, .verify_passed);
-                } else {
-                    journal(self, cfg, "replan", reason);
-                    m.fail_count += 1;
-                    if (m.fail_count >= cfg.fail_threshold) {
-                        m.stop = .escalated;
-                        m.detail = try std.fmt.allocPrint(
-                            arena,
-                            "verify failed {d} consecutive times; last: {s}",
-                            .{ m.fail_count, reason },
-                        );
-                        m.state = try Fsm.apply(m.state, .escalate);
-                    } else {
-                        m.feedback = reason;
-                        m.state = try Fsm.apply(m.state, .verify_failed);
-                    }
+                    try completeStep(arena, m, step);
+                    return;
                 }
+                // Every failed verdict counts as a run; the count spans all
+                // verifier occurrences.
+                _ = try m.step_runs.bump(arena, step.id);
+                journal(self, cfg, "rework", reason);
+                m.fail_count += 1;
+                if (m.fail_count >= cfg.fail_threshold) {
+                    m.stop = .escalated;
+                    m.detail = try std.fmt.allocPrint(
+                        arena,
+                        "verify failed {d} consecutive times; last: {s}",
+                        .{ m.fail_count, reason },
+                    );
+                    m.state = try Fsm.apply(m.state, .escalate);
+                    return;
+                }
+                // No executor to send the work back to cannot happen after
+                // validation; if it ever does, stop rather than continue.
+                const target = pipeline.verifyReworkTarget(m.pipeline, m.step_index) orelse {
+                    m.stop = .escalated;
+                    m.detail = "verify failed and the pipeline has no executor to rework";
+                    m.state = try Fsm.apply(m.state, .escalate);
+                    return;
+                };
+                try applyRework(self, arena, cfg, m, target, if (reason.len == 0) "verification failed (no reason given)" else reason);
+                m.state = try Fsm.apply(m.state, .verify_failed);
             },
+        },
+    }
+}
+
+/// Send the work back to `target` with a fix task carrying `feedback`; the
+/// plan artifact follows the grown task list.
+fn applyRework(
+    self: *MissionOrchestrator,
+    arena: std.mem.Allocator,
+    cfg: RunConfig,
+    m: *Mission,
+    target: usize,
+    feedback: []const u8,
+) MissionError!void {
+    const rw = try pipeline.rework(arena, m.tasks, target, feedback);
+    m.tasks = rw.tasks;
+    m.task_index = rw.task_index;
+    m.step_index = rw.step_index;
+    m.feedback = "";
+    m.exec_fail_count = 0;
+    try putArtifact(self, cfg, plan_artifact, try pipeline.planText(arena, m.tasks));
+}
+
+fn stepCustom(self: *MissionOrchestrator, arena: std.mem.Allocator, cfg: RunConfig, m: *Mission, step: Step) MissionError!void {
+    const content = (try assembleContent(arena, cfg, m)) orelse return;
+    switch (try runRole(self, arena, cfg, m, step, content)) {
+        .failed => |reason| try failRole(m, reason),
+        // Only the executor retries a max_steps stop.
+        .exhausted => try failExhausted(arena, m, step),
+        .ok => |text| {
+            if (std.mem.trim(u8, text, &std.ascii.whitespace).len == 0) {
+                return failRole(m, try std.fmt.allocPrint(arena, "{s} step produced an empty reply", .{step.id}));
+            }
+            const n = try m.step_runs.bump(arena, step.id);
+            try putArtifact(self, cfg, try pipeline.stepArtifactName(arena, step.id, n), text);
+            try advanceCursor(m);
         },
     }
 }
@@ -942,7 +1113,7 @@ fn roleVerify(self: *MissionOrchestrator, arena: std.mem.Allocator, cfg: RunConf
 ///
 /// Returns true when the gate went UNANSWERED (`resolved:false` on the
 /// deny — an approval timeout/EOF, not a human refusal): the caller parks
-/// the mission at `gating` instead of replanning, so an unattended run
+/// the mission at `gating` instead of reworking, so an unattended run
 /// stops burning budget on verified work and `resume` re-asks the gate.
 fn gate(self: *MissionOrchestrator, arena: std.mem.Allocator, cfg: RunConfig, m: *Mission) MissionError!bool {
     const gate_fn = cfg.gate_function orelse
@@ -979,8 +1150,8 @@ fn gate(self: *MissionOrchestrator, arena: std.mem.Allocator, cfg: RunConfig, m:
                 return false;
             }
             // An unanswered deny (approval timeout/EOF, `resolved:false`)
-            // is silence, not refusal: park, don't replan. A deny without
-            // the field (older approvers) keeps the replan semantics.
+            // is silence, not refusal: park, don't rework. A deny without
+            // the field (older approvers) keeps the rework semantics.
             if (parsed.object.get("resolved")) |rv| {
                 if (rv == .bool and !rv.bool) return true;
             }
@@ -990,7 +1161,12 @@ fn gate(self: *MissionOrchestrator, arena: std.mem.Allocator, cfg: RunConfig, m:
             if (m.gate_denials >= cfg.gate_threshold) {
                 return gateFail(m, reason);
             }
-            m.feedback = reason;
+            // Back to the last executor with the denial as a fix task. A
+            // pipeline without one cannot pass validation; if it ever
+            // reaches here, fail closed.
+            const target = pipeline.gateReworkTarget(m.pipeline) orelse
+                return gateFail(m, "gate denied and the pipeline has no executor to rework");
+            try applyRework(self, arena, cfg, m, target, if (reason.len == 0) "the gate denied the work (no reason given)" else reason);
             m.state = try Fsm.apply(m.state, .gate_denied);
             return false;
         },
@@ -1006,6 +1182,15 @@ fn gateFail(m: *Mission, reason: []const u8) error{IllegalTransition}!bool {
 
 fn putArtifact(self: *MissionOrchestrator, cfg: RunConfig, name: []const u8, bytes: []const u8) MissionError!void {
     cfg.store.writeArtifact(self.gpa, name, bytes) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.Failed,
+    };
+}
+
+/// Remove a leftover artifact; anything but "already absent" refuses, so a
+/// stale file can never be read as this mission's.
+fn removeStale(self: *MissionOrchestrator, cfg: RunConfig, name: []const u8) MissionError!void {
+    cfg.store.removeArtifact(self.gpa, name) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.Failed,
     };
@@ -1280,8 +1465,8 @@ test "context_strategy: kind recall runs the pipeline and persists a source inde
     defer testing.allocator.free(spath);
     const text = trace_mod.readFile(testing.allocator, spath) orelse return error.ReadFailed;
     defer testing.allocator.free(text);
-    try testing.expect(std.mem.indexOf(u8, text, "\"id\":\"outcome:executor:0\"") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "\"id\":\"outcome:verifier:") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "\"id\":\"outcome:executor:2:0\"") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "\"id\":\"outcome:verifier:3:") != null);
 }
 
 test "context_strategy: kind thread runs the pipeline and persists per-task threads" {
@@ -1360,7 +1545,8 @@ test "trace_path threads through role turns: role, mission and turn events land 
     }
     // Mission transitions.
     try testing.expect(std.mem.indexOf(u8, text, "\"event\":\"mission\"") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "\"from\":\"defining\",\"to\":\"planning\"") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "\"from\":\"running\",\"to\":\"running\",\"step\":\"planner\",\"step_index\":1") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "\"to\":\"gating\",\"step\":null,\"step_index\":4") != null);
     // trace_path reached the turn driver: per-step provider events interleave.
     try testing.expect(std.mem.indexOf(u8, text, "\"event\":\"step\"") != null);
     try testing.expect(std.mem.indexOf(u8, text, "\"event\":\"turn_end\"") != null);
@@ -1412,7 +1598,7 @@ test "executor emits task_start and task_done with index, total and desc" {
     try testing.expect(done1 < start2);
 }
 
-test "happy path: define, plan, execute x2, verify, gate approve; artifacts + terminal state on disk" {
+test "carried M3: happy path (no leaks across a full mission): define, plan, execute x2, verify, gate approve; artifacts + terminal state on disk" {
     var h = try Harness.init(testing.allocator, &.{ po_ok, plan2, exec_ok, exec_ok, verify_pass });
     defer h.deinit();
     const approvals = try approval_mod.ApprovalWorker.start(testing.allocator, &h.actor, &h.registry, .auto_approve);
@@ -1563,9 +1749,10 @@ test "non-executor role hitting max_steps still fails the mission (no retry loop
     try expectTerminal(res.ok, "failed", "role_failed");
 }
 
-test "verify fail replans with the verdict as feedback, then passes" {
+test "verify fail reworks the executor with the verdict as a fix task, then passes" {
+    // No planner re-run: the failed verdict rides a fix task on the executor.
     var h = try Harness.init(testing.allocator, &.{
-        po_ok, plan2, exec_ok, exec_ok, verify_fail, plan1, exec_ok, verify_pass,
+        po_ok, plan2, exec_ok, exec_ok, verify_fail, exec_ok, verify_pass,
     });
     defer h.deinit();
     const approvals = try approval_mod.ApprovalWorker.start(testing.allocator, &h.actor, &h.registry, .auto_approve);
@@ -1578,17 +1765,19 @@ test "verify fail replans with the verdict as feedback, then passes" {
     try testing.expect(res == .ok);
     try expectTerminal(res.ok, "done", "completed");
 
-    // Call 5 (0-based) is the replanning planner turn — the verifier's
+    // Call 5 (0-based) is the fix-task executor turn — the verifier's
     // reason must ride in its request.
+    try testing.expectEqual(@as(usize, 7), h.provider.callCount());
     try testing.expect(std.mem.indexOf(u8, h.provider.requests.items[5], "missing tests") != null);
     var m = try h.store().load(testing.allocator);
     defer m.deinit(testing.allocator);
     try testing.expectEqual(@as(usize, 0), m.fail_count); // reset on pass
+    try testing.expectEqual(@as(usize, 3), m.tasks.len); // two planned + one fix task
 }
 
 test "fail_threshold consecutive verify failures escalate to failed" {
     var h = try Harness.init(testing.allocator, &.{
-        po_ok, plan2, exec_ok, exec_ok, verify_fail, plan1, exec_ok, verify_fail,
+        po_ok, plan2, exec_ok, exec_ok, verify_fail, exec_ok, verify_fail,
     });
     defer h.deinit();
 
@@ -1600,9 +1789,9 @@ test "fail_threshold consecutive verify failures escalate to failed" {
     try expectTerminal(res.ok, "failed", "escalated");
 }
 
-test "gate denial replans with the denial as feedback; second gate approves" {
+test "gate denial reworks the executor with the denial as a fix task; second gate approves" {
     var h = try Harness.init(testing.allocator, &.{
-        po_ok, plan1, exec_ok, verify_pass, plan1, exec_ok, verify_pass,
+        po_ok, plan1, exec_ok, verify_pass, exec_ok, verify_pass,
     });
     defer h.deinit();
     const gate_worker = try FakeGate.start(testing.allocator, &h.actor, &h.registry, &.{
@@ -1621,11 +1810,13 @@ test "gate denial replans with the denial as feedback; second gate approves" {
     try testing.expect(res == .ok);
     try expectTerminal(res.ok, "done", "completed");
     try testing.expectEqual(@as(usize, 2), gate_worker.calls);
-    // Call 4 (0-based) replans after the denial.
+    // Call 4 (0-based) is the executor's fix task after the denial; the
+    // verifier (call 5) re-runs because it sits after the rework target.
+    try testing.expectEqual(@as(usize, 6), h.provider.callCount());
     try testing.expect(std.mem.indexOf(u8, h.provider.requests.items[4], "needs polish") != null);
 }
 
-test "gate_threshold denials fail the mission as gate_failed" {
+test "carried M3: gate_threshold denials ⇒ gate_failed" {
     var h = try Harness.init(testing.allocator, &.{ po_ok, plan1, exec_ok, verify_pass });
     defer h.deinit();
     const gate_worker = try FakeGate.start(testing.allocator, &h.actor, &h.registry, &.{
@@ -1663,14 +1854,14 @@ test "unanswered gate deny (resolved:false) parks at gating; resume + approve co
     defer res.deinit(testing.allocator);
     try testing.expect(res == .ok);
 
-    // Parked, not terminal, not replanned: verified work stays done.
+    // Parked, not terminal, not reworked: verified work stays done.
     try testing.expect(std.mem.indexOf(u8, res.ok, "\"paused\":true") != null);
     try testing.expect(std.mem.indexOf(u8, res.ok, "\"state\":\"gating\"") != null);
     var parked = try h.store().load(testing.allocator);
     defer parked.deinit(testing.allocator);
     try testing.expectEqual(State.gating, parked.state);
     {
-        // Exactly the 4 role turns of the first pass — no replanning burn.
+        // Exactly the 4 role turns of the first pass — no rework burn.
         h.provider.mutex.lock();
         defer h.provider.mutex.unlock();
         try testing.expectEqual(@as(usize, 4), h.provider.requests.items.len);
@@ -1690,9 +1881,9 @@ test "unanswered gate deny (resolved:false) parks at gating; resume + approve co
     try testing.expectEqual(@as(usize, 2), gate_worker.calls);
 }
 
-test "gate deny with resolved:true replans like a plain deny (a human said no)" {
+test "gate deny with resolved:true reworks like a plain deny (a human said no)" {
     var h = try Harness.init(testing.allocator, &.{
-        po_ok, plan1, exec_ok, verify_pass, plan1, exec_ok, verify_pass,
+        po_ok, plan1, exec_ok, verify_pass, exec_ok, verify_pass,
     });
     defer h.deinit();
     const gate_worker = try FakeGate.start(testing.allocator, &h.actor, &h.registry, &.{
@@ -1713,7 +1904,7 @@ test "gate deny with resolved:true replans like a plain deny (a human said no)" 
     try testing.expectEqual(@as(usize, 2), gate_worker.calls);
 }
 
-test "no gate_function: mission can never complete (fail closed)" {
+test "carried M3: no gate function ⇒ failed, never done" {
     var h = try Harness.init(testing.allocator, &.{ po_ok, plan1, exec_ok, verify_pass });
     defer h.deinit();
 
@@ -1726,7 +1917,7 @@ test "no gate_function: mission can never complete (fail closed)" {
     try testing.expect(std.mem.indexOf(u8, res.ok, "ungated") != null);
 }
 
-test "unreachable gate function fails the mission as gate_failed" {
+test "carried M3: unreachable gate ⇒ gate_failed" {
     var h = try Harness.init(testing.allocator, &.{ po_ok, plan1, exec_ok, verify_pass });
     defer h.deinit();
 
@@ -1742,7 +1933,7 @@ test "unreachable gate function fails the mission as gate_failed" {
     try testing.expect(std.mem.indexOf(u8, res.ok, "gate unreachable") != null);
 }
 
-test "malformed planner output fails the mission as role_failed" {
+test "carried M3: malformed planner output ⇒ role_failed" {
     var h = try Harness.init(testing.allocator, &.{ po_ok, roleText("not json at all") });
     defer h.deinit();
 
@@ -1799,7 +1990,7 @@ test "fenced role JSON is unwrapped deterministically" {
     try expectTerminal(res.ok, "done", "completed");
 }
 
-test "provider error mid-role fails the mission as role_failed" {
+test "carried M3: provider error mid-step ⇒ role_failed" {
     var h = try Harness.init(testing.allocator, &.{ po_ok, "ERR" });
     defer h.deinit();
 
@@ -1935,7 +2126,7 @@ test "resumed roles keep the persisted operator brief instead of replacement int
     const original = good_brief ++ "\nOriginal acceptance: 2 -3 8 must print 7.\n";
     try h.store().writeArtifact(testing.allocator, "BRIEF.md", original);
     try h.store().writeArtifact(testing.allocator, "MISSION.md", "Generated acceptance: ship the gizmo.\n");
-    try h.store().save(testing.allocator, &.{ .mission_id = "m-1", .state = .planning, .objective = "gizmo", .acceptance = "generated" });
+    try h.store().save(testing.allocator, &.{ .mission_id = "m-1", .state = .running, .step_index = 1, .objective = "gizmo", .acceptance = "generated" });
     const req = try h.startReq(testing.allocator, ",\"resume\":true,\"gate_function\":\"test::gate::request\"");
     defer testing.allocator.free(req);
     const res = try h.caller.call("zygos::missions::start", req);
@@ -2021,7 +2212,7 @@ test "a stale brief that cannot be cleared refuses the fresh start before any ro
     try testing.expectError(error.NotFound, h.store().load(testing.allocator));
 }
 
-test "abort mid-mission stops durably with aborted" {
+test "carried M3: abort ⇒ aborted" {
     var h = try Harness.init(testing.allocator, &.{ po_ok, plan2, exec_ok, exec_ok, verify_pass });
     defer h.deinit();
     h.provider.park_at = 2; // park the first executor turn
@@ -2118,10 +2309,11 @@ test "pause parks durably at a role boundary; the substrate resumes to done" {
     // boundary parked the run with the state persisted.
     try testing.expect(ctx.res == .ok);
     try testing.expect(std.mem.indexOf(u8, ctx.res.ok, "\"paused\":true") != null);
-    try testing.expect(std.mem.indexOf(u8, ctx.res.ok, "\"state\":\"executing\"") != null);
+    try testing.expect(std.mem.indexOf(u8, ctx.res.ok, "\"state\":\"running\"") != null);
     var parked = try h.store().load(testing.allocator);
     defer parked.deinit(testing.allocator);
-    try testing.expectEqual(State.executing, parked.state);
+    try testing.expectEqual(State.running, parked.state);
+    try testing.expectEqual(@as(usize, 2), parked.step_index); // still at the executor
 
     // The substrate already resumes: a resume start completes the mission.
     const rreq = try h.startReq(testing.allocator, seed_and_gate ++ ",\"resume\":true");
@@ -2151,6 +2343,50 @@ test "role playbook: a role-executor.md artifact overrides the executor system p
     try testing.expect(std.mem.indexOf(u8, h.provider.requests.items[2], "orchy's integrator") != null);
     // …while the planner (call 1) kept its built-in reply-shape prompt.
     try testing.expect(std.mem.indexOf(u8, h.provider.requests.items[1], "planner of a mission") != null);
+}
+
+test "role playbook: an override replaces behaviour only; the reply contract is still appended" {
+    var h = try Harness.init(testing.allocator, &.{ po_ok, plan1, exec_ok, verify_pass });
+    defer h.deinit();
+    const approvals = try approval_mod.ApprovalWorker.start(testing.allocator, &h.actor, &h.registry, .auto_approve);
+    defer approvals.stop();
+    try h.store().writeArtifact(testing.allocator, "role-planner.md", "You are orchy's planner; plan in thirds.\n");
+
+    const req = try h.startReq(testing.allocator, seed_and_gate);
+    defer testing.allocator.free(req);
+    const res = try h.caller.call("zygos::missions::start", req);
+    defer res.deinit(testing.allocator);
+    try expectTerminal(res.ok, "done", "completed");
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const system = try systemOf(arena_state.allocator(), h.provider.requests.items[1]);
+    try testing.expectEqualStrings(
+        "You are orchy's planner; plan in thirds. " ++
+            "Reply with ONLY a JSON object: {\"tasks\": [<task description>, ...]}.",
+        system,
+    );
+}
+
+test "role playbook: a pinned definition beats a role-<id>.md override" {
+    var h = try Harness.init(testing.allocator, &.{ exec_ok, verify_pass });
+    defer h.deinit();
+    const approvals = try approval_mod.ApprovalWorker.start(testing.allocator, &h.actor, &h.registry, .auto_approve);
+    defer approvals.stop();
+    try h.store().writeArtifact(testing.allocator, "role-verifier.md", "The override that must lose.\n");
+
+    const req = try h.startReq(testing.allocator, seed_and_gate ++
+        ",\"steps\":[{\"id\":\"executor\"},{\"id\":\"verifier\",\"system\":\"The pinned verifier.\"}]");
+    defer testing.allocator.free(req);
+    const res = try h.caller.call("zygos::missions::start", req);
+    defer res.deinit(testing.allocator);
+    try expectTerminal(res.ok, "done", "completed");
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const system = try systemOf(arena_state.allocator(), h.provider.requests.items[1]);
+    try testing.expect(std.mem.startsWith(u8, system, "The pinned verifier. Reply with ONLY a JSON object"));
+    try testing.expect(std.mem.indexOf(u8, system, "must lose") == null);
 }
 
 test "budget ledger: terminal mission writes LEDGER.md with the scope rollup" {
@@ -2231,11 +2467,11 @@ test "M8: the ledger reports the compression ratio when a trim worker rides the 
 }
 
 test "PO decision journal: gate denial, verify failure, and acceptance land in DECISIONS.md" {
-    // verify fails once (replan), gate denies once (redo), then both pass.
+    // verify fails once (rework), gate denies once (redo), then both pass.
     var h = try Harness.init(testing.allocator, &.{
-        po_ok, plan1, exec_ok, verify_fail, // → replanning
-        plan1, exec_ok, verify_pass, // → gating (denied)
-        plan1, exec_ok, verify_pass, // → gating (approved)
+        po_ok, plan1, exec_ok, verify_fail, // → rework
+        exec_ok, verify_pass, // → gating (denied)
+        exec_ok, verify_pass, // → gating (approved)
     });
     defer h.deinit();
     const gate_worker = try FakeGate.start(testing.allocator, &h.actor, &h.registry, &.{
@@ -2256,14 +2492,14 @@ test "PO decision journal: gate denial, verify failure, and acceptance land in D
 
     const text = try h.store().readArtifact(testing.allocator, "DECISIONS.md");
     defer testing.allocator.free(text);
-    // Append-only audit trail, in order: replan → redo → accept.
-    const replan = std.mem.indexOf(u8, text, "[replan] missing tests") orelse return error.Missing;
+    // Append-only audit trail, in order: rework → redo → accept.
+    const rework = std.mem.indexOf(u8, text, "[rework] missing tests") orelse return error.Missing;
     const redo = std.mem.indexOf(u8, text, "[redo] brief contradiction: scope creep") orelse return error.Missing;
     const accept = std.mem.indexOf(u8, text, "[accept]") orelse return error.Missing;
-    try testing.expect(replan < redo and redo < accept);
+    try testing.expect(rework < redo and redo < accept);
 }
 
-test "max_role_turns exhausts at a role boundary" {
+test "carried M3: max_role_turns ⇒ role_turns_exhausted" {
     var h = try Harness.init(testing.allocator, &.{ po_ok, plan2, exec_ok });
     defer h.deinit();
 
@@ -2296,7 +2532,7 @@ test "missions::list snapshots every live mission and empties at terminal state"
     const lres = try ctl_worker.call("zygos::missions::list", "{}");
     defer lres.deinit(testing.allocator);
     try testing.expect(std.mem.indexOf(u8, lres.ok, "\"mission_id\":\"m-1\"") != null);
-    try testing.expect(std.mem.indexOf(u8, lres.ok, "\"state\":\"executing\"") != null);
+    try testing.expect(std.mem.indexOf(u8, lres.ok, "\"state\":\"running\"") != null);
     h.provider.release.set();
     t.join();
     ctx.res.deinit(testing.allocator);
@@ -2306,7 +2542,7 @@ test "missions::list snapshots every live mission and empties at terminal state"
     try testing.expect(std.mem.indexOf(u8, after.ok, "\"missions\":[]") != null);
 }
 
-test "status reflects a live mission; unknown mission_id errors" {
+test "carried M3: status reflects a live mission; unknown mission_id errors" {
     var h = try Harness.init(testing.allocator, &.{ po_ok, plan2, exec_ok, exec_ok, verify_pass });
     defer h.deinit();
     const approvals = try approval_mod.ApprovalWorker.start(testing.allocator, &h.actor, &h.registry, .auto_approve);
@@ -2326,7 +2562,7 @@ test "status reflects a live mission; unknown mission_id errors" {
     try testing.expect(sres == .ok);
     var sp = try json.parseFromSlice(json.Value, testing.allocator, sres.ok, .{});
     defer sp.deinit();
-    try testing.expectEqualStrings("executing", sp.value.object.get("state").?.string);
+    try testing.expectEqualStrings("running", sp.value.object.get("state").?.string);
     try testing.expectEqual(@as(i64, 2), sp.value.object.get("role_turns").?.integer);
 
     h.provider.release.set();
@@ -2350,14 +2586,15 @@ test "resume mid-flight runs only the remaining roles" {
     defer approvals.stop();
 
     // Seed the substrate exactly as a killed mission would have left it:
-    // executing, task 2 of 2 pending, three role turns spent.
+    // running at the executor, task 2 of 2 pending, three role turns spent.
     var tasks = [_]Task{
         .{ .desc = "build the gizmo", .done = true },
         .{ .desc = "test the gizmo", .done = false },
     };
     const seeded: Mission = .{
         .mission_id = "m-1",
-        .state = .executing,
+        .state = .running,
+        .step_index = 2,
         .objective = "Ship the gizmo",
         .acceptance = "the gizmo ships",
         .tasks = &tasks,
@@ -2386,7 +2623,7 @@ test "resume mid-flight runs only the remaining roles" {
     try testing.expectEqual(@as(i64, 2), p.value.object.get("tasks_done").?.integer);
 }
 
-test "resume of a terminal mission replies without running any role turn" {
+test "carried M3: terminal resume runs no turn" {
     var h = try Harness.init(testing.allocator, &.{});
     defer h.deinit();
 
@@ -2512,11 +2749,12 @@ test "continuity seam: terminal mission session-closes once with the phase log" 
     // leaving_behind never blank, names the terminal state
     try testing.expect(std.mem.indexOf(u8, obj.get("leaving_behind").?.string, "done") != null);
     try testing.expect(std.mem.indexOf(u8, obj.get("accomplished").?.string, "1/1") != null);
-    // phase log covers first and last transitions, in order
+    // phase log covers first and last transitions, in order, in the new
+    // vocabulary: the cursor's step rides each running phase.
     const log_arr = obj.get("log").?.array.items;
     try testing.expect(log_arr.len >= 2);
-    try testing.expect(std.mem.indexOf(u8, log_arr[0].string, "defining") != null);
-    try testing.expect(std.mem.indexOf(u8, log_arr[log_arr.len - 1].string, "done") != null);
+    try testing.expectEqualStrings("running (product-owner) → running (planner)", log_arr[0].string);
+    try testing.expectEqualStrings("gating → done", log_arr[log_arr.len - 1].string);
     // no unfinished tasks => no open threads
     try testing.expectEqual(@as(usize, 0), obj.get("open_threads").?.array.items.len);
 }
@@ -2534,4 +2772,470 @@ test "continuity seam: unreachable continuity function does not change the missi
     defer res.deinit(testing.allocator);
     try testing.expect(res == .ok);
     try expectTerminal(res.ok, "done", "completed");
+}
+
+// -- Configurable pipeline (docs/specs/mission.md test contract 19-28) --------
+
+/// The `system` field of a recorded provider request.
+fn systemOf(arena: std.mem.Allocator, request: []const u8) ![]const u8 {
+    const parsed = try json.parseFromSliceLeaky(json.Value, arena, request, .{});
+    return parsed.object.get("system").?.string;
+}
+
+/// The `field` of every `event` line in an events.jsonl, in order. Strings
+/// as-is, `null` as "null", booleans as "true"/"false", integers printed.
+fn traceField(arena: std.mem.Allocator, text: []const u8, event: []const u8, field: []const u8) ![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        const v = try json.parseFromSliceLeaky(json.Value, arena, line, .{});
+        if (v != .object) continue;
+        const ev = v.object.get("event") orelse continue;
+        if (ev != .string or !std.mem.eql(u8, ev.string, event)) continue;
+        const f = v.object.get(field) orelse continue;
+        try out.append(arena, switch (f) {
+            .string => |x| x,
+            .null => "null",
+            .bool => |b| if (b) "true" else "false",
+            .integer => |n| try std.fmt.allocPrint(arena, "{d}", .{n}),
+            else => "?",
+        });
+    }
+    return out.items;
+}
+
+fn expectSeq(want: []const []const u8, got: []const []const u8) !void {
+    try testing.expectEqual(want.len, got.len);
+    for (want, got) |w, g| try testing.expectEqualStrings(w, g);
+}
+
+/// Run one mission in `h` with a trace file; the caller owns neither.
+const Traced = struct {
+    res: inproc.CallResult,
+    trace: []u8,
+    tpath: []u8,
+
+    fn deinit(self: *Traced) void {
+        self.res.deinit(testing.allocator);
+        testing.allocator.free(self.trace);
+        testing.allocator.free(self.tpath);
+    }
+};
+
+fn runTraced(h: *Harness, extra: []const u8) !Traced {
+    const tpath = try std.fmt.allocPrint(testing.allocator, "{s}/events.jsonl", .{h.root});
+    errdefer testing.allocator.free(tpath);
+    const full = try std.fmt.allocPrint(testing.allocator, "{s},\"trace_path\":{f}", .{ extra, json.fmt(tpath, .{}) });
+    defer testing.allocator.free(full);
+    const req = try h.startReq(testing.allocator, full);
+    defer testing.allocator.free(req);
+    const res = try h.caller.call("zygos::missions::start", req);
+    errdefer res.deinit(testing.allocator);
+    const trace = trace_mod.readFile(testing.allocator, tpath) orelse return error.ReadFailed;
+    return .{ .res = res, .trace = trace, .tpath = tpath };
+}
+
+test "default pipeline: same turn order and step_ids as M3; states read running → gating → done" {
+    var h = try Harness.init(testing.allocator, &.{ po_ok, plan1, exec_ok, verify_pass });
+    defer h.deinit();
+    const approvals = try approval_mod.ApprovalWorker.start(testing.allocator, &h.actor, &h.registry, .auto_approve);
+    defer approvals.stop();
+
+    // Real routing proves the step_ids: each id resolves to its own model.
+    const zon =
+        \\.{ .routes = .{
+        \\    .{ .step_id = "product-owner", .attempts = .{ .{ .provider_function = "zygos::provider::rec::messages", .model = "po-m" } } },
+        \\    .{ .step_id = "planner", .attempts = .{ .{ .provider_function = "zygos::provider::rec::messages", .model = "plan-m" } } },
+        \\    .{ .step_id = "executor", .attempts = .{ .{ .provider_function = "zygos::provider::rec::messages", .model = "exec-m" } } },
+        \\    .{ .step_id = "verifier", .attempts = .{ .{ .provider_function = "zygos::provider::rec::messages", .model = "verify-m" } } },
+        \\} }
+    ;
+    const rcfg = try router_mod.Config.parse(testing.allocator, zon);
+    const router = try router_mod.RouterWorker.start(testing.allocator, &h.actor, &h.registry, rcfg);
+    defer router.stop();
+
+    var tr = try runTraced(h, ",\"objective\":\"seed: gizmo\",\"router_function\":\"zygos::models::resolve\"," ++
+        "\"gate_function\":\"zygos::approvals::request\"");
+    defer tr.deinit();
+    try expectTerminal(tr.res.ok, "done", "completed");
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try expectSeq(&.{ "product-owner", "planner", "executor", "verifier" }, try traceField(arena, tr.trace, "role_start", "role"));
+    for ([_][]const u8{ "po-m", "plan-m", "exec-m", "verify-m" }, h.provider.requests.items) |route_model, request| {
+        const needle = try std.fmt.allocPrint(arena, "\"model\":\"{s}\"", .{route_model});
+        try testing.expect(std.mem.indexOf(u8, request, needle) != null);
+    }
+    try expectSeq(&.{ "running", "running", "running", "gating", "done" }, try traceField(arena, tr.trace, "mission", "to"));
+    try expectSeq(&.{ "planner", "executor", "verifier", "null", "null" }, try traceField(arena, tr.trace, "mission", "step"));
+    try expectSeq(&.{ "1", "2", "3", "4", "4" }, try traceField(arena, tr.trace, "mission", "step_index"));
+    for ([_][]const u8{ "defining", "planning", "executing", "verifying" }) |legacy| {
+        try testing.expect(std.mem.indexOf(u8, tr.trace, legacy) == null);
+    }
+}
+
+test "executor → verifier: MISSION and PLAN seeded, no product-owner or planner turn" {
+    var h = try Harness.init(testing.allocator, &.{ exec_ok, verify_pass });
+    defer h.deinit();
+    const approvals = try approval_mod.ApprovalWorker.start(testing.allocator, &h.actor, &h.registry, .auto_approve);
+    defer approvals.stop();
+
+    var tr = try runTraced(h, seed_and_gate ++ ",\"steps\":[{\"id\":\"executor\"},{\"id\":\"verifier\"}]");
+    defer tr.deinit();
+    try expectTerminal(tr.res.ok, "done", "completed");
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    try expectSeq(&.{ "executor", "verifier" }, try traceField(arena_state.allocator(), tr.trace, "role_start", "role"));
+    try testing.expectEqual(@as(usize, 2), h.provider.callCount());
+
+    const mission_md = try h.store().readArtifact(testing.allocator, "MISSION.md");
+    defer testing.allocator.free(mission_md);
+    try testing.expect(std.mem.indexOf(u8, mission_md, "seed: gizmo") != null);
+    try testing.expect(std.mem.indexOf(u8, mission_md, "per the operator brief") != null);
+    const plan_md = try h.store().readArtifact(testing.allocator, "PLAN.md");
+    defer testing.allocator.free(plan_md);
+    try testing.expect(std.mem.indexOf(u8, plan_md, "- [ ] seed: gizmo") != null);
+    // The verifier saw both seeds and the executor's EXEC.md section.
+    try testing.expect(std.mem.indexOf(u8, h.provider.requests.items[1], "per the operator brief") != null);
+    try testing.expect(std.mem.indexOf(u8, h.provider.requests.items[1], "task complete") != null);
+}
+
+test "architect → executor → verifier: the architect's text lands in step-architect-1.md and in the executor and verifier prompts" {
+    const design = roleText("DESIGN: use a ring buffer of 64 slots");
+    var h = try Harness.init(testing.allocator, &.{ design, exec_ok, verify_pass });
+    defer h.deinit();
+    const approvals = try approval_mod.ApprovalWorker.start(testing.allocator, &h.actor, &h.registry, .auto_approve);
+    defer approvals.stop();
+
+    var tr = try runTraced(h, seed_and_gate ++ ",\"steps\":[" ++
+        "{\"id\":\"architect\",\"system\":\"You are the architect. Design before building.\"}," ++
+        "{\"id\":\"executor\"},{\"id\":\"verifier\"}]");
+    defer tr.deinit();
+    try expectTerminal(tr.res.ok, "done", "completed");
+
+    const note = try h.store().readArtifact(testing.allocator, "step-architect-1.md");
+    defer testing.allocator.free(note);
+    try testing.expectEqualStrings("DESIGN: use a ring buffer of 64 slots", note);
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try testing.expectEqualStrings("You are the architect. Design before building.", try systemOf(arena, h.provider.requests.items[0]));
+    for (h.provider.requests.items[1..3]) |request| {
+        try testing.expect(std.mem.indexOf(u8, request, "DESIGN: use a ring buffer of 64 slots") != null);
+        try testing.expect(std.mem.indexOf(u8, request, "step-architect-1.md") != null);
+    }
+    // The architect itself saw only the brief, not its own output.
+    try testing.expect(std.mem.indexOf(u8, h.provider.requests.items[0], "ring buffer") == null);
+    var m = try h.store().load(testing.allocator);
+    defer m.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), m.step_runs.get("architect"));
+}
+
+test "a pipeline with no verifier goes from its last step to the gate" {
+    var h = try Harness.init(testing.allocator, &.{exec_ok});
+    defer h.deinit();
+    const gate_worker = try FakeGate.start(testing.allocator, &h.actor, &h.registry, &.{"{\"approved\":true}"});
+    defer gate_worker.stop();
+
+    var tr = try runTraced(h, ",\"objective\":\"seed: gizmo\",\"gate_function\":\"test::gate::request\"," ++
+        "\"steps\":[{\"id\":\"executor\"}]");
+    defer tr.deinit();
+    try expectTerminal(tr.res.ok, "done", "completed");
+    try testing.expectEqual(@as(usize, 1), gate_worker.calls);
+    try testing.expectEqual(@as(usize, 1), h.provider.callCount());
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try expectSeq(&.{"executor"}, try traceField(arena, tr.trace, "role_start", "role"));
+    try expectSeq(&.{ "gating", "done" }, try traceField(arena, tr.trace, "mission", "to"));
+    try expectSeq(&.{ "1", "1" }, try traceField(arena, tr.trace, "mission", "step_index"));
+}
+
+test "verify fail ⇒ fix task on the last executor before the verifier; later steps re-run; fail_count resets on pass" {
+    const summary = roleText("SUMMARY: the gizmo ships");
+    var h = try Harness.init(testing.allocator, &.{
+        exec_ok, verify_fail, roleText("added the missing tests"), verify_pass, summary,
+    });
+    defer h.deinit();
+    const approvals = try approval_mod.ApprovalWorker.start(testing.allocator, &h.actor, &h.registry, .auto_approve);
+    defer approvals.stop();
+
+    var tr = try runTraced(h, seed_and_gate ++ ",\"steps\":[{\"id\":\"executor\"},{\"id\":\"verifier\"}," ++
+        "{\"id\":\"summarizer\",\"system\":\"Summarize the verified work.\"}]");
+    defer tr.deinit();
+    try expectTerminal(tr.res.ok, "done", "completed");
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // The summarizer sits after the verifier, so it runs once, on the pass.
+    try expectSeq(
+        &.{ "executor", "verifier", "executor", "verifier", "summarizer" },
+        try traceField(arena, tr.trace, "role_start", "role"),
+    );
+    // Call 2 is the fix-task executor turn carrying the verdict.
+    try testing.expect(std.mem.indexOf(u8, h.provider.requests.items[2], "missing tests") != null);
+    try testing.expect(std.mem.indexOf(u8, h.provider.requests.items[2], "Address this feedback") != null);
+    // The rework moved the cursor back to the executor (index 0).
+    try testing.expect(std.mem.indexOf(u8, tr.trace, "\"to\":\"running\",\"step\":\"executor\",\"step_index\":0") != null);
+
+    var m = try h.store().load(testing.allocator);
+    defer m.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 0), m.fail_count);
+    try testing.expectEqual(@as(usize, 2), m.step_runs.get("executor"));
+    try testing.expectEqual(@as(usize, 2), m.step_runs.get("verifier"));
+    try testing.expectEqual(@as(usize, 1), m.step_runs.get("summarizer"));
+    try testing.expectEqual(@as(usize, 2), m.tasks.len);
+    try testing.expectEqual(@as(usize, 2), m.tasksDone());
+    const out = try h.store().readArtifact(testing.allocator, "step-summarizer-1.md");
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("SUMMARY: the gizmo ships", out);
+}
+
+test "gate denial ⇒ fix task on the last executor in the list" {
+    var h = try Harness.init(testing.allocator, &.{ exec_ok, verify_pass, exec_ok, exec_ok });
+    defer h.deinit();
+    const gate_worker = try FakeGate.start(testing.allocator, &h.actor, &h.registry, &.{
+        "{\"approved\":false,\"reason\":\"needs polish\"}",
+        "{\"approved\":true}",
+    });
+    defer gate_worker.stop();
+
+    var tr = try runTraced(h, ",\"objective\":\"seed: gizmo\",\"gate_function\":\"test::gate::request\"," ++
+        "\"steps\":[{\"id\":\"executor\"},{\"id\":\"verifier\"},{\"id\":\"executor\"}]");
+    defer tr.deinit();
+    try expectTerminal(tr.res.ok, "done", "completed");
+    try testing.expectEqual(@as(usize, 2), gate_worker.calls);
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    // The denial returns to the LAST executor (index 2), not the first: no
+    // verifier or first-executor turn follows it.
+    try expectSeq(
+        &.{ "executor", "verifier", "executor", "executor" },
+        try traceField(arena_state.allocator(), tr.trace, "role_start", "role"),
+    );
+    try testing.expect(std.mem.indexOf(u8, h.provider.requests.items[3], "needs polish") != null);
+    // The second executor's own arrival fixed up the verifier's artifact.
+    try testing.expect(std.mem.indexOf(u8, h.provider.requests.items[2], "acceptance met") != null);
+    var m = try h.store().load(testing.allocator);
+    defer m.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 3), m.tasks.len);
+    try testing.expectEqual(@as(usize, 1), m.gate_denials);
+}
+
+test "executor → reviewer → executor: the second executor runs one fix task built from the reviewer output" {
+    var h = try Harness.init(testing.allocator, &.{
+        roleText("implemented foo"), roleText("REVIEW: rename foo to bar"), roleText("renamed foo to bar"),
+    });
+    defer h.deinit();
+    const approvals = try approval_mod.ApprovalWorker.start(testing.allocator, &h.actor, &h.registry, .auto_approve);
+    defer approvals.stop();
+
+    var tr = try runTraced(h, seed_and_gate ++ ",\"steps\":[{\"id\":\"executor\"}," ++
+        "{\"id\":\"reviewer\",\"system\":\"You review the work.\"},{\"id\":\"executor\"}]");
+    defer tr.deinit();
+    try expectTerminal(tr.res.ok, "done", "completed");
+
+    // Exactly one turn for the second executor: the single fix task.
+    try testing.expectEqual(@as(usize, 3), h.provider.callCount());
+    // The reviewer read the first executor's EXEC.md section.
+    try testing.expect(std.mem.indexOf(u8, h.provider.requests.items[1], "implemented foo") != null);
+    // The fix task points at the reviewer artifact and carries its contents.
+    const fix_req = h.provider.requests.items[2];
+    try testing.expect(std.mem.indexOf(u8, fix_req, "Address the findings in these artifacts") != null);
+    try testing.expect(std.mem.indexOf(u8, fix_req, "step-reviewer-1.md") != null);
+    try testing.expect(std.mem.indexOf(u8, fix_req, "REVIEW: rename foo to bar") != null);
+
+    var m = try h.store().load(testing.allocator);
+    defer m.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 2), m.tasks.len);
+    try testing.expectEqual(@as(usize, 2), m.tasksDone());
+    const exec_md = try h.store().readArtifact(testing.allocator, "EXEC.md");
+    defer testing.allocator.free(exec_md);
+    try testing.expect(std.mem.indexOf(u8, exec_md, "## Task 1: seed: gizmo") != null);
+    try testing.expect(std.mem.indexOf(u8, exec_md, "## Task 2: fix: address findings in step-reviewer-1.md") != null);
+    try testing.expect(std.mem.indexOf(u8, exec_md, "renamed foo to bar") != null);
+}
+
+test "fail_threshold verify failures across two verifier occurrences ⇒ failed, stop escalated" {
+    // The first verifier passes (count 0), the second fails (1), the rework
+    // re-runs the first, which now fails (2): one mission-level counter.
+    var h = try Harness.init(testing.allocator, &.{
+        exec_ok, verify_pass, verify_fail, exec_ok, verify_fail,
+    });
+    defer h.deinit();
+
+    var tr = try runTraced(h, seed_and_gate ++ ",\"fail_threshold\":2," ++
+        "\"steps\":[{\"id\":\"executor\"},{\"id\":\"verifier\"},{\"id\":\"verifier\"}]");
+    defer tr.deinit();
+    try expectTerminal(tr.res.ok, "failed", "escalated");
+    try testing.expect(std.mem.indexOf(u8, tr.res.ok, "verify failed 2 consecutive times") != null);
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    try expectSeq(
+        &.{ "executor", "verifier", "verifier", "executor", "verifier" },
+        try traceField(arena_state.allocator(), tr.trace, "role_start", "role"),
+    );
+}
+
+test "a custom step's empty reply ⇒ role_failed; a custom step's max_steps stop ⇒ role_failed" {
+    const steps = ",\"steps\":[{\"id\":\"reviewer\",\"system\":\"You review.\"},{\"id\":\"executor\"}]";
+    {
+        var h = try Harness.init(testing.allocator, &.{roleText("")});
+        defer h.deinit();
+        const req = try h.startReq(testing.allocator, seed_and_gate ++ steps);
+        defer testing.allocator.free(req);
+        const res = try h.caller.call("zygos::missions::start", req);
+        defer res.deinit(testing.allocator);
+        try testing.expect(res == .ok);
+        try expectTerminal(res.ok, "failed", "role_failed");
+        try testing.expect(std.mem.indexOf(u8, res.ok, "empty reply") != null);
+        try testing.expectError(error.NotFound, h.store().readArtifact(testing.allocator, "step-reviewer-1.md"));
+        try testing.expectEqual(@as(usize, 1), h.provider.callCount());
+    }
+    {
+        // The executor alone retries a max_steps stop; a custom step must not.
+        var h = try Harness.init(testing.allocator, &.{exec_toolspin});
+        defer h.deinit();
+        const req = try h.startReq(testing.allocator, seed_and_gate ++ steps ++ ",\"role_max_steps\":1");
+        defer testing.allocator.free(req);
+        const res = try h.caller.call("zygos::missions::start", req);
+        defer res.deinit(testing.allocator);
+        try testing.expect(res == .ok);
+        try expectTerminal(res.ok, "failed", "role_failed");
+        try testing.expect(std.mem.indexOf(u8, res.ok, "reviewer turn stopped: max_steps") != null);
+        try testing.expectEqual(@as(usize, 1), h.provider.callCount());
+    }
+}
+
+test "only steps with tools:true receive tools; the verifier never does" {
+    var h = try Harness.init(testing.allocator, &.{
+        roleText("design done"), roleText("notes written"), exec_ok, verify_pass,
+    });
+    defer h.deinit();
+    const approvals = try approval_mod.ApprovalWorker.start(testing.allocator, &h.actor, &h.registry, .auto_approve);
+    defer approvals.stop();
+
+    const tools = ",\"tools\":[{\"name\":\"bash\",\"function_id\":\"zygos::tools::bash\"," ++
+        "\"input_schema\":{\"type\":\"object\"}}]";
+    var tr = try runTraced(h, seed_and_gate ++ tools ++ ",\"steps\":[" ++
+        "{\"id\":\"architect\",\"system\":\"You design.\",\"tools\":true}," ++
+        "{\"id\":\"scribe\",\"system\":\"You write.\"}," ++
+        "{\"id\":\"executor\"},{\"id\":\"verifier\"}]");
+    defer tr.deinit();
+    try expectTerminal(tr.res.ok, "done", "completed");
+
+    // Architect (opted in) and executor (default) get the tool; the scribe
+    // (default off) and the verifier do not.
+    const has_tool = "\"name\":\"bash\"";
+    try testing.expect(std.mem.indexOf(u8, h.provider.requests.items[0], has_tool) != null);
+    try testing.expect(std.mem.indexOf(u8, h.provider.requests.items[1], has_tool) == null);
+    try testing.expect(std.mem.indexOf(u8, h.provider.requests.items[2], has_tool) != null);
+    try testing.expect(std.mem.indexOf(u8, h.provider.requests.items[3], has_tool) == null);
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    try expectSeq(
+        &.{ "true", "false", "true", "false" },
+        try traceField(arena_state.allocator(), tr.trace, "role_start", "tools"),
+    );
+
+    // A verifier pinned with tools never starts: the start is refused.
+    const bad = try h.startReq(testing.allocator, ",\"objective\":\"x\"" ++ tools ++
+        ",\"steps\":[{\"id\":\"executor\"},{\"id\":\"verifier\",\"tools\":true}]");
+    defer testing.allocator.free(bad);
+    const refused = try h.caller.call("zygos::missions::start", bad);
+    defer refused.deinit(testing.allocator);
+    try testing.expect(std.mem.indexOf(u8, refused.ok, "steps[1]: verifier cannot have tools") != null);
+}
+
+test "a fresh start clears leftovers of an earlier mission; EXEC.md holds this mission's sections only" {
+    var h = try Harness.init(testing.allocator, &.{ exec_ok, verify_pass });
+    defer h.deinit();
+    const approvals = try approval_mod.ApprovalWorker.start(testing.allocator, &h.actor, &h.registry, .auto_approve);
+    defer approvals.stop();
+    try h.store().writeArtifact(testing.allocator, "EXEC.md", "## Task 9: STALE\n\nold run\n\n");
+    try h.store().writeArtifact(testing.allocator, "PLAN.md", "# Plan\n\n- [x] STALE\n");
+
+    const req = try h.startReq(testing.allocator, seed_and_gate ++ ",\"steps\":[{\"id\":\"executor\"},{\"id\":\"verifier\"}]");
+    defer testing.allocator.free(req);
+    const res = try h.caller.call("zygos::missions::start", req);
+    defer res.deinit(testing.allocator);
+    try expectTerminal(res.ok, "done", "completed");
+
+    const exec_md = try h.store().readArtifact(testing.allocator, "EXEC.md");
+    defer testing.allocator.free(exec_md);
+    try testing.expect(std.mem.indexOf(u8, exec_md, "STALE") == null);
+    try testing.expect(std.mem.indexOf(u8, exec_md, "## Task 1: seed: gizmo") != null);
+    try testing.expectError(error.NotFound, h.store().readArtifact(testing.allocator, "PLAN-1.md"));
+}
+
+test "a product-owner after a seeded MISSION.md archives it as MISSION-1.md; a repeated planner archives PLAN-1.md and keeps done tasks" {
+    const po2 = roleText("{\"objective\":\"Ship the gizmo v2\",\"acceptance\":\"v2 ships\"}");
+    var h = try Harness.init(testing.allocator, &.{
+        plan1, exec_ok, po2, roleText("{\"tasks\":[\"polish v2\"]}"), exec_ok, verify_pass,
+    });
+    defer h.deinit();
+    const approvals = try approval_mod.ApprovalWorker.start(testing.allocator, &h.actor, &h.registry, .auto_approve);
+    defer approvals.stop();
+
+    // [planner, executor, product-owner, planner, executor, verifier]: step 0
+    // is not a product-owner, so MISSION.md is seeded; the later PO rewrites it.
+    const req = try h.startReq(testing.allocator, seed_and_gate ++ ",\"steps\":[{\"id\":\"planner\"},{\"id\":\"executor\"}," ++
+        "{\"id\":\"product-owner\"},{\"id\":\"planner\"},{\"id\":\"executor\"},{\"id\":\"verifier\"}]");
+    defer testing.allocator.free(req);
+    const res = try h.caller.call("zygos::missions::start", req);
+    defer res.deinit(testing.allocator);
+    try expectTerminal(res.ok, "done", "completed");
+
+    const archived = try h.store().readArtifact(testing.allocator, "MISSION-1.md");
+    defer testing.allocator.free(archived);
+    try testing.expect(std.mem.indexOf(u8, archived, "per the operator brief") != null);
+    const live = try h.store().readArtifact(testing.allocator, "MISSION.md");
+    defer testing.allocator.free(live);
+    try testing.expect(std.mem.indexOf(u8, live, "Ship the gizmo v2") != null);
+
+    const old_plan = try h.store().readArtifact(testing.allocator, "PLAN-1.md");
+    defer testing.allocator.free(old_plan);
+    try testing.expect(std.mem.indexOf(u8, old_plan, "polish the gizmo") != null);
+    const plan = try h.store().readArtifact(testing.allocator, "PLAN.md");
+    defer testing.allocator.free(plan);
+    try testing.expect(std.mem.indexOf(u8, plan, "- [x] polish the gizmo") != null);
+    try testing.expect(std.mem.indexOf(u8, plan, "- [ ] polish v2") != null);
+
+    var m = try h.store().load(testing.allocator);
+    defer m.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), m.mission_versions);
+    try testing.expectEqual(@as(usize, 1), m.plan_versions);
+    try testing.expectEqual(@as(usize, 2), m.tasks.len);
+}
+
+test "a mission resumed from a legacy state file continues from the mapped cursor" {
+    var h = try Harness.init(testing.allocator, &.{verify_pass});
+    defer h.deinit();
+    const approvals = try approval_mod.ApprovalWorker.start(testing.allocator, &h.actor, &h.registry, .auto_approve);
+    defer approvals.stop();
+    try h.store().writeArtifact(testing.allocator, "MISSION.md", "# Mission m-1\n\nShip the gizmo\n");
+    try h.store().writeArtifact(testing.allocator, "PLAN.md", "# Plan\n\n- [ ] build\n");
+    try h.store().writeArtifact(testing.allocator, "mission.json",
+        \\{"mission_id":"m-1","state":"verifying","stop":"none","detail":"","objective":"Ship the gizmo",
+        \\ "acceptance":"ships","feedback":"","tasks":[{"desc":"build","done":true}],
+        \\ "task_index":1,"fail_count":0,"gate_denials":0,"role_turns_used":4}
+    );
+
+    const req = try h.startReq(testing.allocator, seed_and_gate ++ ",\"resume\":true");
+    defer testing.allocator.free(req);
+    const res = try h.caller.call("zygos::missions::start", req);
+    defer res.deinit(testing.allocator);
+    try expectTerminal(res.ok, "done", "completed");
+    // Only the verifier ran: the legacy `verifying` state maps to step 3,
+    // and a missing EXEC.md does not stop it.
+    try testing.expectEqual(@as(usize, 1), h.provider.callCount());
 }

@@ -10,6 +10,7 @@ const jsonx = @import("jsonx.zig");
 const c = std.c;
 const json = std.json;
 const mission_mod = @import("mission.zig");
+const pipeline_mod = @import("mission/pipeline.zig");
 
 pub const StoreError = error{ OutOfMemory, NotFound, Corrupt, BadName, Io };
 
@@ -181,16 +182,49 @@ fn serialize(gpa: std.mem.Allocator, m: *const mission_mod.Mission) StoreError![
     const tasks_json = std.mem.join(gpa, ",", task_parts.items) catch return error.OutOfMemory;
     defer gpa.free(tasks_json);
 
+    var runs: std.Io.Writer.Allocating = .init(gpa);
+    defer runs.deinit();
+    for (m.step_runs.items, 0..) |r, i| {
+        runs.writer.print("{s}{{\"id\":{f},\"count\":{d}}}", .{
+            if (i == 0) "" else ",", json.fmt(r.id, .{}), r.count,
+        }) catch return error.OutOfMemory;
+    }
+
     return std.fmt.allocPrint(gpa, "{{\"mission_id\":{f},\"state\":\"{t}\",\"stop\":\"{t}\"," ++
         "\"detail\":{f},\"objective\":{f},\"acceptance\":{f},\"feedback\":{f}," ++
         "\"tasks\":[{s}],\"task_index\":{d},\"fail_count\":{d},\"exec_fail_count\":{d}," ++
-        "\"gate_denials\":{d},\"role_turns_used\":{d}}}", .{
+        "\"gate_denials\":{d},\"role_turns_used\":{d},\"step_index\":{d}," ++
+        "\"step_runs\":[{s}],\"mission_versions\":{d},\"plan_versions\":{d}}}", .{
         json.fmt(m.mission_id, .{}), m.state,                    m.stop,
         json.fmt(m.detail, .{}),     json.fmt(m.objective, .{}), json.fmt(m.acceptance, .{}),
         json.fmt(m.feedback, .{}),   tasks_json,                 m.task_index,
         m.fail_count,                m.exec_fail_count,          m.gate_denials,
-        m.role_turns_used,
+        m.role_turns_used,           m.step_index,               runs.written(),
+        m.mission_versions,          m.plan_versions,
     }) catch return error.OutOfMemory;
+}
+
+const StateCursor = struct { state: mission_mod.State, step_index: usize };
+
+/// New state names, or a pre-pipeline state mapped onto the default
+/// pipeline's cursor (docs/specs/mission.md "Legacy state files").
+fn parseState(name: []const u8) ?StateCursor {
+    if (std.meta.stringToEnum(mission_mod.State, name)) |state| return .{ .state = state, .step_index = 0 };
+    const legacy = [_]struct { name: []const u8, step_index: usize }{
+        .{ .name = "defining", .step_index = 0 },
+        .{ .name = "planning", .step_index = 1 },
+        .{ .name = "executing", .step_index = 2 },
+        .{ .name = "verifying", .step_index = 3 },
+    };
+    for (legacy) |l| {
+        if (std.mem.eql(u8, name, l.name)) return .{ .state = .running, .step_index = l.step_index };
+    }
+    return null;
+}
+
+fn optUintField(obj: json.ObjectMap, key: []const u8) StoreError!usize {
+    if (obj.get(key) == null) return 0;
+    return uintField(obj, key);
 }
 
 fn deserialize(gpa: std.mem.Allocator, bytes: []const u8) StoreError!mission_mod.Mission {
@@ -202,8 +236,20 @@ fn deserialize(gpa: std.mem.Allocator, bytes: []const u8) StoreError!mission_mod
     if (root != .object) return error.Corrupt;
     const obj = root.object;
 
-    const state = std.meta.stringToEnum(mission_mod.State, strField(obj, "state") orelse
-        return error.Corrupt) orelse return error.Corrupt;
+    const cursor = parseState(strField(obj, "state") orelse return error.Corrupt) orelse
+        return error.Corrupt;
+    const state = cursor.state;
+    const is_legacy_state = obj.get("step_index") == null;
+    const step_index = if (is_legacy_state) cursor.step_index else try uintField(obj, "step_index");
+    const runs_val = obj.get("step_runs");
+    if (runs_val) |rv| {
+        if (rv != .array) return error.Corrupt;
+        for (rv.array.items) |item| {
+            if (item != .object) return error.Corrupt;
+            if (strField(item.object, "id") == null) return error.Corrupt;
+            _ = try uintField(item.object, "count");
+        }
+    }
     const stop = std.meta.stringToEnum(mission_mod.StopReason, strField(obj, "stop") orelse
         return error.Corrupt) orelse return error.Corrupt;
     const tasks_val = obj.get("tasks") orelse return error.Corrupt;
@@ -246,9 +292,30 @@ fn deserialize(gpa: std.mem.Allocator, bytes: []const u8) StoreError!mission_mod
         built += 1;
     }
 
+    const run_items = gpa.alloc(pipeline_mod.RunCount, if (runs_val) |rv| rv.array.items.len else 0) catch
+        return error.OutOfMemory;
+    var runs_built: usize = 0;
+    errdefer {
+        for (run_items[0..runs_built]) |r| gpa.free(r.id);
+        gpa.free(run_items);
+    }
+    if (runs_val) |rv| {
+        for (rv.array.items, run_items) |item, *out| {
+            out.* = .{
+                .id = gpa.dupe(u8, strField(item.object, "id").?) catch return error.OutOfMemory,
+                .count = try uintField(item.object, "count"),
+            };
+            runs_built += 1;
+        }
+    }
+
     return .{
         .mission_id = mission_id,
         .state = state,
+        .step_index = step_index,
+        .step_runs = .{ .items = run_items },
+        .mission_versions = try optUintField(obj, "mission_versions"),
+        .plan_versions = try optUintField(obj, "plan_versions"),
         .stop = stop,
         .detail = detail,
         .objective = objective,
@@ -305,7 +372,11 @@ const TestRoot = struct {
 fn sampleMission() mission_mod.Mission {
     return .{
         .mission_id = "m-rt",
-        .state = .executing,
+        .state = .running,
+        .step_index = 2,
+        .step_runs = .{ .items = @constCast(&sample_runs) },
+        .mission_versions = 3,
+        .plan_versions = 1,
         .stop = .none,
         .detail = "in flight",
         .objective = "ship the \"gizmo\"",
@@ -319,6 +390,10 @@ fn sampleMission() mission_mod.Mission {
         .role_turns_used = 5,
     };
 }
+const sample_runs = [_]pipeline_mod.RunCount{
+    .{ .id = "product-owner", .count = 2 },
+    .{ .id = "architect", .count = 1 },
+};
 const sample_tasks = [_]mission_mod.Task{
     .{ .desc = "build it", .done = true },
     .{ .desc = "test it", .done = false },
@@ -351,6 +426,66 @@ test "save then load round-trips every Mission field" {
     try testing.expectEqual(m.exec_fail_count, got.exec_fail_count);
     try testing.expectEqual(m.gate_denials, got.gate_denials);
     try testing.expectEqual(m.role_turns_used, got.role_turns_used);
+    try testing.expectEqual(m.step_index, got.step_index);
+    try testing.expectEqual(m.mission_versions, got.mission_versions);
+    try testing.expectEqual(m.plan_versions, got.plan_versions);
+    try testing.expectEqual(m.step_runs.items.len, got.step_runs.items.len);
+    for (m.step_runs.items) |want| try testing.expectEqual(want.count, got.step_runs.get(want.id));
+}
+
+test "legacy state names load as running with the default pipeline's cursor" {
+    var t = TestRoot.init();
+    defer t.deinit();
+    const store = Store.init(try t.path());
+
+    const cases = [_]struct { name: []const u8, state: mission_mod.State, step_index: usize }{
+        .{ .name = "defining", .state = .running, .step_index = 0 },
+        .{ .name = "planning", .state = .running, .step_index = 1 },
+        .{ .name = "executing", .state = .running, .step_index = 2 },
+        .{ .name = "verifying", .state = .running, .step_index = 3 },
+        .{ .name = "gating", .state = .gating, .step_index = 0 },
+        .{ .name = "done", .state = .done, .step_index = 0 },
+        .{ .name = "failed", .state = .failed, .step_index = 0 },
+    };
+    for (cases) |case| {
+        const text = try std.fmt.allocPrint(testing.allocator,
+            \\{{"mission_id":"m-old","state":"{s}","stop":"none","detail":"",
+            \\ "objective":"x","acceptance":"","feedback":"","tasks":[],
+            \\ "task_index":0,"fail_count":0,"gate_denials":0,"role_turns_used":0}}
+        , .{case.name});
+        defer testing.allocator.free(text);
+        try store.writeArtifact(testing.allocator, state_file, text);
+        var got = try store.load(testing.allocator);
+        defer got.deinit(testing.allocator);
+        try testing.expectEqual(case.state, got.state);
+        try testing.expectEqual(case.step_index, got.step_index);
+        try testing.expectEqual(@as(usize, 0), got.step_runs.items.len);
+        try testing.expectEqual(@as(usize, 0), got.mission_versions);
+        try testing.expectEqual(@as(usize, 0), got.plan_versions);
+    }
+}
+
+test "an unknown state name or a malformed step_runs is Corrupt" {
+    var t = TestRoot.init();
+    defer t.deinit();
+    const store = Store.init(try t.path());
+    const head =
+        \\{"mission_id":"m","state":"running","stop":"none","detail":"","objective":"x",
+        \\ "acceptance":"","feedback":"","tasks":[],"task_index":0,"fail_count":0,
+        \\ "gate_denials":0,"role_turns_used":0
+    ;
+    for ([_][]const u8{ ",\"step_runs\":{}}", ",\"step_runs\":[{\"id\":\"a\"}]}", ",\"step_index\":-1}" }) |tail| {
+        const text = try std.mem.concat(testing.allocator, u8, &.{ head, tail });
+        defer testing.allocator.free(text);
+        try store.writeArtifact(testing.allocator, state_file, text);
+        try testing.expectError(error.Corrupt, store.load(testing.allocator));
+    }
+    try store.writeArtifact(testing.allocator, state_file,
+        \\{"mission_id":"m","state":"paused","stop":"none","detail":"","objective":"x",
+        \\ "acceptance":"","feedback":"","tasks":[],"task_index":0,"fail_count":0,
+        \\ "gate_denials":0,"role_turns_used":0}
+    );
+    try testing.expectError(error.Corrupt, store.load(testing.allocator));
 }
 
 test "load defaults exec_fail_count to 0 for pre-retry substrates" {

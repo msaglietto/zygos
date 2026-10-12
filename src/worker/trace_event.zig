@@ -30,6 +30,11 @@ pub const TraceEvent = union(enum) {
     pub const Mission = struct {
         from: []const u8 = "?",
         to: []const u8 = "?",
+        /// The pipeline cursor after the transition: the step id (null at
+        /// gating and done) and its index. Both are absent from pre-pipeline
+        /// lines; `step_index == null` means "not recorded".
+        step: ?[]const u8 = null,
+        step_index: ?i64 = null,
         role_turns: i64 = 0,
         tasks_done: i64 = 0,
         tasks: i64 = 0,
@@ -89,11 +94,7 @@ pub const TraceEvent = union(enum) {
 /// surrounding braces and no "ts". Byte-identical to the legacy emitters.
 pub fn body(arena: std.mem.Allocator, ev: TraceEvent) error{OutOfMemory}![]const u8 {
     return switch (ev) {
-        .mission => |m| std.fmt.allocPrint(
-            arena,
-            "\"event\":\"mission\",\"from\":{f},\"to\":{f},\"role_turns\":{d},\"tasks_done\":{d},\"tasks\":{d}",
-            .{ json.fmt(m.from, .{}), json.fmt(m.to, .{}), m.role_turns, m.tasks_done, m.tasks },
-        ),
+        .mission => |m| missionBody(arena, m),
         .role_start => |r| std.fmt.allocPrint(
             arena,
             "\"event\":\"role_start\",\"role\":{f},\"role_turn\":{d},\"tools\":{},\"content\":{f}",
@@ -147,6 +148,18 @@ pub fn body(arena: std.mem.Allocator, ev: TraceEvent) error{OutOfMemory}![]const
     };
 }
 
+fn missionBody(arena: std.mem.Allocator, m: TraceEvent.Mission) error{OutOfMemory}![]const u8 {
+    const cursor = if (m.step_index) |idx|
+        try std.fmt.allocPrint(arena, ",\"step\":{f},\"step_index\":{d}", .{ json.fmt(m.step, .{}), idx })
+    else
+        "";
+    return std.fmt.allocPrint(
+        arena,
+        "\"event\":\"mission\",\"from\":{f},\"to\":{f}{s},\"role_turns\":{d},\"tasks_done\":{d},\"tasks\":{d}",
+        .{ json.fmt(m.from, .{}), json.fmt(m.to, .{}), cursor, m.role_turns, m.tasks_done, m.tasks },
+    );
+}
+
 fn taskBody(arena: std.mem.Allocator, comptime name: []const u8, t: TraceEvent.Task) error{OutOfMemory}![]const u8 {
     return std.fmt.allocPrint(
         arena,
@@ -170,6 +183,8 @@ pub fn parse(arena: std.mem.Allocator, line: []const u8) ?Parsed {
     const ev: TraceEvent = if (std.mem.eql(u8, name, "mission")) .{ .mission = .{
         .from = str(obj, "from") orelse "?",
         .to = str(obj, "to") orelse "?",
+        .step = str(obj, "step"),
+        .step_index = if (obj.get("step_index")) |si| (if (si == .integer) si.integer else null) else null,
         .role_turns = int(obj, "role_turns"),
         .tasks_done = int(obj, "tasks_done"),
         .tasks = int(obj, "tasks"),
@@ -264,6 +279,12 @@ test "body: every variant serializes byte-identical to the legacy emitters" {
         \\"event":"mission","from":"planning","to":"executing","role_turns":2,"tasks_done":1,"tasks":6
     , .{ .mission = .{ .from = "planning", .to = "executing", .role_turns = 2, .tasks_done = 1, .tasks = 6 } });
     try expectBody(
+        \\"event":"mission","from":"running","to":"running","step":"executor","step_index":2,"role_turns":2,"tasks_done":1,"tasks":6
+    , .{ .mission = .{ .from = "running", .to = "running", .step = "executor", .step_index = 2, .role_turns = 2, .tasks_done = 1, .tasks = 6 } });
+    try expectBody(
+        \\"event":"mission","from":"running","to":"gating","step":null,"step_index":4,"role_turns":4,"tasks_done":1,"tasks":1
+    , .{ .mission = .{ .from = "running", .to = "gating", .step_index = 4, .role_turns = 4, .tasks_done = 1, .tasks = 1 } });
+    try expectBody(
         \\"event":"role_start","role":"executor","role_turn":3,"tools":true,"content":"Objective: ship"
     , .{ .role_start = .{ .role = "executor", .role_turn = 3, .tools = true, .content = "Objective: ship" } });
     try expectBody(
@@ -305,6 +326,8 @@ test "parse: body round-trips through a full line for every variant" {
 
     const cases = [_]TraceEvent{
         .{ .mission = .{ .from = "a", .to = "b", .role_turns = 1, .tasks_done = 2, .tasks = 3 } },
+        .{ .mission = .{ .from = "running", .to = "running", .step = "architect", .step_index = 1, .role_turns = 1, .tasks_done = 0, .tasks = 0 } },
+        .{ .mission = .{ .from = "running", .to = "gating", .step = null, .step_index = 3, .role_turns = 2, .tasks_done = 1, .tasks = 1 } },
         .{ .role_start = .{ .role = "planner", .role_turn = 1, .tools = false, .content = "hi" } },
         .{ .role_end = .{ .role = "planner", .outcome = "failed", .reason = "why" } },
         .{ .task_start = .{ .index = 1, .total = 2, .desc = "d" } },

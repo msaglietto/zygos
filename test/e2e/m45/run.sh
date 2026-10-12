@@ -116,12 +116,13 @@ grep -qE '^reduction: [0-9]+%' "$TMP/planning/LEDGER.md" || {
   echo "M45 E2E FAIL leg1: ledger reports no reduction"; cat "$TMP/planning/LEDGER.md"; exit 1; }
 
 # ---- Leg 2: a seeded mid-flight substrate resumes through the real CLI -------
-# Seed exactly what a killed mission leaves: persisted `executing` state with
-# the second task not yet done (the e2e/m3 leg-2 pattern, via the CLI).
+# Seed exactly what a killed mission leaves: persisted `running` state at the
+# executor step (index 2) with the second task not yet done (the e2e/m3 leg-2
+# pattern, via the CLI).
 cp "$TMP/brief.md" "$TMP/resume-brief.md"
 mkdir -p "$TMP/planning2"
 cat > "$TMP/planning2/mission.json" <<'EOF'
-{"mission_id":"resume-brief","state":"executing","stop":"none","detail":"","objective":"Ship the gizmo","acceptance":"greeting written and count run","feedback":"","tasks":[{"desc":"write a greeting file","done":true},{"desc":"count to 500","done":false}],"task_index":1,"fail_count":0,"gate_denials":0,"role_turns_used":3}
+{"mission_id":"resume-brief","state":"running","step_index":2,"stop":"none","detail":"","objective":"Ship the gizmo","acceptance":"greeting written and count run","feedback":"","tasks":[{"desc":"write a greeting file","done":true},{"desc":"count to 500","done":false}],"task_index":1,"fail_count":0,"gate_denials":0,"role_turns_used":3}
 EOF
 printf '# Mission resume-brief\n\nShip the gizmo\n' > "$TMP/planning2/MISSION.md"
 printf '# Plan\n\n- [x] write a greeting file\n- [ ] count to 500\n' > "$TMP/planning2/PLAN.md"

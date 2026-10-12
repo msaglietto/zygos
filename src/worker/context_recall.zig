@@ -21,6 +21,7 @@ const readWholeFile = fsx.readWholeFile;
 const json = std.json;
 const context = @import("context.zig");
 const substrate_mod = @import("context_substrate.zig");
+const pipeline = @import("mission/pipeline.zig");
 
 pub const Options = struct {
     ttl_ms: i64 = 7 * 24 * 3600 * 1000,
@@ -354,12 +355,12 @@ pub const RecallStrategy = struct {
         const self: *RecallStrategy = @ptrCast(@alignCast(ctx));
         // The substrate base stays the prompt spine; ranked excerpts append
         // under it within the remaining budget.
-        const base = try substrate_mod.assembleContent(arena, step, diag);
+        const base = try substrate_mod.assembleContent(arena, step, budget, diag);
         const base_tokens = context.estTokens(base.content);
         if (base_tokens >= budget.max_tokens) return base; // seam wrapper refuses
 
         const m = step.mission;
-        const query = if (std.mem.eql(u8, step.role, "executor") and m.task_index < m.tasks.len)
+        const query = if (pipeline.kindOf(step.role) == .executor and m.task_index < m.tasks.len)
             try std.fmt.allocPrint(arena, "{s} {s}", .{ m.objective, m.tasks[m.task_index].desc })
         else
             m.objective;
@@ -382,10 +383,11 @@ pub const RecallStrategy = struct {
         const arena = arena_state.allocator();
 
         const m = step.mission;
-        // Per role+task id: a retried task's newer outcome replaces the old
-        // one (Index.add last-wins) instead of piling up near-duplicates.
-        const id = try std.fmt.allocPrint(arena, "outcome:{s}:{d}", .{ outcome.role, m.task_index });
-        const title = if (std.mem.eql(u8, outcome.role, "executor") and m.task_index < m.tasks.len)
+        // Per role+step+task id: a retried task's newer outcome replaces the
+        // old one (Index.add last-wins) instead of piling up near-duplicates,
+        // while a repeated step id at another position keeps its own entry.
+        const id = try std.fmt.allocPrint(arena, "outcome:{s}:{d}:{d}", .{ outcome.role, step.step_index, m.task_index });
+        const title = if (pipeline.kindOf(outcome.role) == .executor and m.task_index < m.tasks.len)
             m.tasks[m.task_index].desc
         else
             outcome.role;
@@ -631,6 +633,28 @@ test "absorb → assemble: an absorbed outcome surfaces as a ranked source under
     try testing.expect(std.mem.startsWith(u8, out.content, "Objective:\nweekly zig ecosystem brief\n"));
     try testing.expect(std.mem.indexOf(u8, out.content, "Relevant sources") != null);
     try testing.expect(std.mem.indexOf(u8, out.content, "found three zig allocator articles") != null);
+}
+
+test "absorb ids include the step index: a repeated step id keeps one entry per position, a retry replaces its own" {
+    var tmp = try TmpDir.init();
+    defer tmp.cleanup();
+    const dir = try tmp.path();
+
+    const rs = try RecallStrategy.create(testing.allocator, dir, test_opts);
+    defer rs.destroy();
+
+    var step = executorStep(@ptrCast(@constCast(&{})), &nullRead);
+    step.step_index = 0;
+    try rs.strategy().absorb(step, .{ .role = "executor", .ok = true, .text = "first pass" });
+    step.step_index = 2;
+    try rs.strategy().absorb(step, .{ .role = "executor", .ok = true, .text = "second pass" });
+    try testing.expectEqual(@as(usize, 2), rs.index.len());
+    try testing.expectEqualStrings("outcome:executor:0:0", rs.index.entries.items[0].id);
+    try testing.expectEqualStrings("outcome:executor:2:0", rs.index.entries.items[1].id);
+
+    try rs.strategy().absorb(step, .{ .role = "executor", .ok = true, .text = "second pass, retried" });
+    try testing.expectEqual(@as(usize, 2), rs.index.len());
+    try testing.expectEqualStrings("second pass, retried", rs.index.entries.items[1].text);
 }
 
 test "prior-brief jsonl lines in sources.jsonl load at create" {

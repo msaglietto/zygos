@@ -204,14 +204,15 @@ pub fn main(init: std.process.Init) !void {
 
     // Seed .planning-resume exactly as a killed mission leaves it: state is
     // persisted before every role turn, so an interrupted executor shows as
-    // `executing` with its task not yet done.
+    // `running` at the executor step (index 2) with its task not yet done.
     var tasks = [_]zygos.mission.Task{
         .{ .desc = "write a greeting file", .done = true },
         .{ .desc = "count to 500", .done = false },
     };
     const seeded: zygos.mission.Mission = .{
         .mission_id = "m3-resume",
-        .state = .executing,
+        .state = .running,
+        .step_index = 2,
         .objective = "Ship the gizmo",
         .acceptance = "greeting written and count run",
         .tasks = &tasks,

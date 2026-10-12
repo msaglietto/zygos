@@ -54,8 +54,13 @@ pub const Substrate = struct {
 
 /// The pipeline step whose context is being assembled.
 pub const StepRef = struct {
-    /// Step id: product-owner | planner | executor | verifier.
+    /// Step id. Its kind is `pipeline.kindOf(role)`: any other id is custom.
     role: []const u8,
+    /// Position in the pinned pipeline, so repeated ids stay distinguishable.
+    step_index: usize = 0,
+    /// Artifact names appended after the kind's listed input, oldest first;
+    /// the driver builds the list (`pipeline.inputArtifacts`).
+    artifacts: []const []const u8 = &.{},
     mission: MissionView,
     substrate: Substrate,
 };
@@ -70,6 +75,70 @@ pub const Outcome = struct {
     ok: bool,
     text: []const u8,
 };
+
+// ---------------------------------------------------------------------------
+// Shared input clipping (docs/specs/mission.md "Steps"): one rule for every
+// strategy, applied where the substrate spine is assembled.
+// ---------------------------------------------------------------------------
+
+pub const Part = struct {
+    /// The block exactly as it appears in the content, header included.
+    text: []const u8,
+    /// Never clipped or dropped (MISSION.md).
+    pinned: bool = false,
+};
+
+pub const clip_marker = "\n[clipped to fit the context budget]\n";
+
+/// The smallest clipped remainder worth keeping; below it the block is dropped.
+const min_clipped_text = 16;
+
+/// `prefix ++ blocks ++ suffix` within `max_tokens`. The prefix (the current
+/// task), the suffix and pinned blocks are never dropped; the other blocks
+/// are listed oldest first and are clipped from the oldest. When the
+/// never-dropped part alone exceeds the budget the result is
+/// `error.BudgetExceeded`, as at the seam.
+pub fn fit(
+    arena: std.mem.Allocator,
+    prefix: []const u8,
+    blocks: []const Part,
+    suffix: []const u8,
+    max_tokens: usize,
+) error{ OutOfMemory, BudgetExceeded }![]const u8 {
+    const max_bytes = max_tokens *| 4;
+    var fixed = prefix.len + suffix.len;
+    for (blocks) |b| {
+        if (b.pinned) fixed += b.text.len;
+    }
+    if (fixed > max_bytes) return error.BudgetExceeded;
+
+    var room = max_bytes - fixed;
+    const kept = try arena.alloc([]const u8, blocks.len);
+    var i = blocks.len;
+    while (i > 0) {
+        i -= 1;
+        const b = blocks[i];
+        if (b.pinned) {
+            kept[i] = b.text;
+        } else if (b.text.len <= room) {
+            kept[i] = b.text;
+            room -= b.text.len;
+        } else if (room >= clip_marker.len + min_clipped_text) {
+            var cut = room - clip_marker.len;
+            while (cut > 0 and (b.text[cut] & 0xC0) == 0x80) cut -= 1;
+            kept[i] = try std.fmt.allocPrint(arena, "{s}{s}", .{ b.text[0..cut], clip_marker });
+            room -= kept[i].len;
+        } else {
+            kept[i] = "";
+        }
+    }
+
+    var out: std.ArrayList(u8) = .empty;
+    try out.appendSlice(arena, prefix);
+    for (kept) |k| try out.appendSlice(arena, k);
+    try out.appendSlice(arena, suffix);
+    return out.items;
+}
 
 /// Failure detail for `error.Failed` (providers_catalog Diag idiom): the
 /// driver surfaces `message` verbatim in the mission detail.
@@ -230,6 +299,84 @@ test "assemble under budget passes through; absorb dispatches to the impl" {
     try testing.expectEqualStrings("hello", out.content);
     try fixed.strategy().absorb(testStep(), .{ .role = "executor", .ok = true, .text = "done" });
     try testing.expectEqual(@as(usize, 1), fixed.absorbed);
+}
+
+test "fit: everything under budget passes through in order" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const out = try fit(arena_state.allocator(), "TASK\n", &.{
+        .{ .text = "old\n" },
+        .{ .text = "new\n" },
+    }, "TAIL\n", 100);
+    try testing.expectEqualStrings("TASK\nold\nnew\nTAIL\n", out);
+}
+
+test "fit: older blocks are clipped first and the newest survives whole" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const old = "o" ** 400;
+    const new = "n" ** 100;
+    // prefix 10 + new 100 + 150 left for the old block.
+    const budget = (10 + 100 + 150) / 4;
+    const out = try fit(arena_state.allocator(), "P" ** 10, &.{ .{ .text = old }, .{ .text = new } }, "", budget);
+    try testing.expect(estTokens(out) <= budget);
+    try testing.expect(std.mem.indexOf(u8, out, new) != null);
+    try testing.expect(std.mem.indexOf(u8, out, clip_marker) != null);
+    try testing.expect(std.mem.indexOf(u8, out, old) == null);
+    try testing.expect(std.mem.indexOf(u8, out, "ooooo") != null);
+    try testing.expect(std.mem.startsWith(u8, out, "P" ** 10));
+}
+
+test "fit: an older block with no room left is dropped, not stubbed" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const new = "n" ** 100;
+    const out = try fit(arena_state.allocator(), "T", &.{ .{ .text = "o" ** 50 }, .{ .text = new } }, "", 26);
+    try testing.expectEqualStrings("T" ++ new, out);
+}
+
+test "fit: pinned blocks are never dropped, even the oldest" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const mission = "MISSION-TEXT " ** 4;
+    const out = try fit(arena_state.allocator(), "T", &.{
+        .{ .text = mission, .pinned = true },
+        .{ .text = "x" ** 400 },
+    }, "", (1 + mission.len + 20) / 4 + 1);
+    try testing.expect(std.mem.indexOf(u8, out, mission) != null);
+    try testing.expect(std.mem.indexOf(u8, out, "x" ** 100) == null);
+}
+
+test "fit: the never-dropped part alone over budget is BudgetExceeded" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try testing.expectError(error.BudgetExceeded, fit(arena, "x" ** 100, &.{}, "", 24));
+    try testing.expectError(error.BudgetExceeded, fit(arena, "x" ** 50, &.{}, "y" ** 50, 24));
+    try testing.expectError(error.BudgetExceeded, fit(arena, "x", &.{.{ .text = "m" ** 100, .pinned = true }}, "", 24));
+    // The boundary itself fits: 25 tokens hold 100 bytes.
+    const edge = try fit(arena, "x" ** 100, &.{.{ .text = "dropped" }}, "", 25);
+    try testing.expectEqual(@as(usize, 100), edge.len);
+}
+
+test "fit: content stays within budget and valid UTF-8 across a budget sweep" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const blocks = [_]Part{
+        .{ .text = "héllo wörld → " ** 12 },
+        .{ .text = "日本語のテキスト" ** 9, .pinned = false },
+        .{ .text = "naïve café " ** 8 },
+    };
+    var max: usize = 0;
+    while (max < 120) : (max += 1) {
+        const out = fit(arena, "task ", &blocks, "tail", max) catch |err| switch (err) {
+            error.BudgetExceeded => continue,
+            error.OutOfMemory => return err,
+        };
+        try testing.expect(estTokens(out) <= max);
+        try testing.expect(std.unicode.utf8ValidateSlice(out));
+    }
 }
 
 test "Config.parse: absent block defaults to substrate with the default budget" {

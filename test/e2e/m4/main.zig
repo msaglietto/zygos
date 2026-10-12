@@ -91,6 +91,8 @@ pub fn main() !void {
         fail("SESSIONS.md has no session entry:\n{s}", .{sessions});
     if (std.mem.indexOf(u8, sessions, "mission done") == null)
         fail("SESSIONS.md leaving-behind missing:\n{s}", .{sessions});
+    if (std.mem.indexOf(u8, sessions, "running (executor) → running (verifier)") == null)
+        fail("SESSIONS.md step phase missing:\n{s}", .{sessions});
     if (std.mem.indexOf(u8, sessions, "gating → done") == null)
         fail("SESSIONS.md phase log missing:\n{s}", .{sessions});
 

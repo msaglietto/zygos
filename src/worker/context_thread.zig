@@ -18,6 +18,7 @@ const readWholeFile = fsx.readWholeFile;
 const json = std.json;
 const context = @import("context.zig");
 const substrate_mod = @import("context_substrate.zig");
+const pipeline = @import("mission/pipeline.zig");
 
 pub const CmdRunner = struct {
     ctx: *anyopaque,
@@ -119,12 +120,12 @@ pub const ThreadStrategy = struct {
         diag: *context.Diag,
     ) context.Error!context.Assembled {
         const self: *ThreadStrategy = @ptrCast(@alignCast(ctx));
-        const base = try substrate_mod.assembleContent(arena, step, diag);
+        const base = try substrate_mod.assembleContent(arena, step, budget, diag);
 
         var out: std.ArrayList(u8) = .empty;
         try out.appendSlice(arena, base.content);
         const max = budget.max_tokens;
-        const is_executor = std.mem.eql(u8, step.role, "executor");
+        const is_executor = pipeline.kindOf(step.role) == .executor;
 
         // Priority under budget pressure: pinned decisions, then the task
         // thread, then the codebase digest — the base spine always survives.
@@ -143,7 +144,7 @@ pub const ThreadStrategy = struct {
         const self: *ThreadStrategy = @ptrCast(@alignCast(ctx));
         // Per-task threads are the executor carry; other roles' state lives
         // in the planning artifacts already.
-        if (!std.mem.eql(u8, outcome.role, "executor")) return;
+        if (pipeline.kindOf(outcome.role) != .executor) return;
         const m = step.mission;
         if (m.task_index >= m.tasks.len) return;
 
