@@ -203,6 +203,8 @@ body.dragging .panel { outline: 3px dashed #8b84e8; outline-offset: 6px; }
     { a: '#e08a3c', t: '#fbeee0', k: '#8a4b12' },
     { a: '#3aa0c8', t: '#e2f2f8', k: '#1d6582' }
   ];
+  // Mission states that are not pipeline steps. A running step takes the
+  // default style; its label is its (arbitrary) id.
   var STEP_STYLE = {
     gating: { accent: 'a-amber', icon: 'hand', label: 'gating · waiting on the completion gate', tinted: true },
     done: { accent: 'a-green', icon: 'check' },
@@ -281,6 +283,13 @@ body.dragging .panel { outline: 3px dashed #8b84e8; outline-offset: 6px; }
   }
   function str(v) { return typeof v === 'string' ? v : v == null ? '' : String(v); }
   function own(table, key) { return Object.prototype.hasOwnProperty.call(table, key); }
+  // The mission state a step node stands for. The snapshot's state wins over
+  // the step name, so a pipeline step that happens to be called `done` or
+  // `failed` is not styled as the terminal state. Legacy logs carry no
+  // snapshot state beyond the name.
+  function stepState(node) {
+    return node.info && typeof node.info.state === 'string' ? node.info.state : node.name;
+  }
   function firstLine(s) { var i = s.indexOf('\n'); return i < 0 ? s : s.slice(0, i) + ' …'; }
 
   function parseLines(text) {
@@ -305,7 +314,7 @@ body.dragging .panel { outline: 3px dashed #8b84e8; outline-offset: 6px; }
 
   function buildModel(events) {
     var run = { threadId: '', t0: null, t1: null, terminal: null, tokIn: 0, tokOut: 0, sawSnapshot: false,
-      routes: 0, tools: 0, toolErrors: 0, nonzeroExits: 0, plan: null, steps: [], lanes: [] };
+      routes: 0, tools: 0, toolErrors: 0, nonzeroExits: 0, plan: null, steps: [], lanes: [], pipeline: null };
     var root = { items: [], route: null };
     // Keyed by ids from the file: no prototype, so `__proto__` is just an id.
     var lanes = Object.create(null), tools = Object.create(null), msgs = Object.create(null);
@@ -338,7 +347,7 @@ body.dragging .panel { outline: 3px dashed #8b84e8; outline-offset: 6px; }
           root.route = null;
           run.steps.push(node);
           lastStep = node;
-          if (node.name === 'planning') {
+          if (node.name === 'planner' || node.name === 'planning') {
             prevPlan = Object.create(null);
             run.plan = null;
           }
@@ -381,7 +390,12 @@ body.dragging .panel { outline: 3px dashed #8b84e8; outline-offset: 6px; }
           node.reason = str(z.reason);
           break;
         case 'CUSTOM':
-          if (ev.name === 'zygos.route') {
+          if (ev.name === 'zygos.pipeline') {
+            var pv = ev.value || {};
+            node = { kind: 'pipeline', steps: Array.isArray(pv.steps) ? pv.steps : [], ts: ts };
+            run.pipeline = node.steps;
+            root.items.push(node);
+          } else if (ev.name === 'zygos.route') {
             var v = ev.value || {};
             node = { kind: 'route', step: v.step, model: str(v.model), provider: str(v.provider), attempt: v.attempt || 0, ts: ts, items: [], tokens: null };
             box.items.push(node);
@@ -509,7 +523,7 @@ body.dragging .panel { outline: 3px dashed #8b84e8; outline-offset: 6px; }
     var status = run.terminal ? (run.terminal.kind === 'finished' ? 'finished' : 'failed') : 'no terminal event';
     add(c, add(el('div', 'row'), chip('list'),
       add(el('div', 'grow'), el('div', 'label', 'run summary'),
-        el('div', 'desc', run.lanes.length ? run.lanes.length + ' subagent turns · ' + run.steps.length + ' mission state changes' : 'single task turn'))));
+        el('div', 'desc', run.lanes.length ? run.lanes.length + ' subagent turns · ' + run.steps.length + ' mission step changes' : 'single task turn'))));
 
     var stats = el('div', 'stats');
     function stat(v, k, tone, tip) { var t = add(el('div', 'stat' + (tone ? ' ' + tone : '')), el('b', null, v), el('span', null, k)); if (tip) t.title = tip; stats.appendChild(t); }
@@ -539,7 +553,8 @@ body.dragging .panel { outline: 3px dashed #8b84e8; outline-offset: 6px; }
       tl.style.height = (12 + rows * 14) + 'px';
       run.steps.forEach(function (s) {
         if (s.ts == null) return;
-        var tk = el('div', 'tick' + (s.name === 'failed' ? ' red' : s.name === 'gating' ? ' amber' : ''));
+        var ss = stepState(s);
+        var tk = el('div', 'tick' + (ss === 'failed' ? ' red' : ss === 'gating' ? ' amber' : ''));
         tk.style.left = pct(s.ts);
         tk.title = s.name + ' ' + relTime(run, s.ts);
         tl.appendChild(tk);
@@ -568,7 +583,7 @@ body.dragging .panel { outline: 3px dashed #8b84e8; outline-offset: 6px; }
       });
       if (run.steps.length) {
         var tkey = el('span', 'dot'); tkey.style.borderRadius = '1px'; tkey.style.width = '2px'; tkey.style.height = '12px'; tkey.style.background = 'rgba(106,99,216,.5)';
-        add(lg, add(el('span'), tkey, 'mission state change'));
+        add(lg, add(el('span'), tkey, 'mission step change'));
       }
       c.appendChild(lg);
     }
@@ -608,16 +623,31 @@ body.dragging .panel { outline: 3px dashed #8b84e8; outline-offset: 6px; }
   }
 
   function renderStep(node, run) {
-    var st = own(STEP_STYLE, node.name) ? STEP_STYLE[node.name] : { accent: 'a-indigo', icon: 'flag' };
+    var state = stepState(node);
+    var st = own(STEP_STYLE, state) ? STEP_STYLE[state] : { accent: 'a-indigo', icon: 'flag' };
     var bits = [];
     var info = node.info;
     if (info) {
-      if (info.from) bits.push('from ' + info.from);
+      if (typeof info.step_index === 'number' && info.step != null) {
+        var total = run.pipeline ? run.pipeline.length : 0;
+        bits.push('step ' + (info.step_index + 1) + (total ? '/' + total : ''));
+      }
+      if (info.from && info.from !== info.state) bits.push('from ' + info.from);
       if (info.tasks) bits.push('tasks ' + (info.tasks_done || 0) + '/' + info.tasks);
       if (info.role_turns != null) bits.push(info.role_turns + ' role turns so far');
     }
     if (node.end != null && node.ts != null && node.end > node.ts) bits.push('lasted ' + fmtDur(node.end - node.ts));
     return card(st.accent, st.icon, st.label || node.name, { tinted: st.tinted, desc: bits.join(' · '), when: relTime(run, node.ts) });
+  }
+
+  // Step ids come from the file and render as text only.
+  function renderPipeline(node, run) {
+    var ids = node.steps.map(function (s) {
+      var id = str(s && s.id);
+      return s && s.tools ? id + ' (tools)' : id;
+    });
+    return card('a-indigo', 'list', 'pipeline · ' + node.steps.length + (node.steps.length === 1 ? ' step' : ' steps'),
+      { desc: ids.join(' → '), when: relTime(run, node.ts) });
   }
 
   function renderLane(lane, run, open) {
@@ -876,6 +906,7 @@ body.dragging .panel { outline: 3px dashed #8b84e8; outline-offset: 6px; }
   function renderNode(node, run) {
     switch (node.kind) {
       case 'step': return renderStep(node, run);
+      case 'pipeline': return renderPipeline(node, run);
       case 'route': return renderRoute(node, run);
       case 'tool': return renderTool(node);
       case 'turnEnd': return renderTurnEnd(node);

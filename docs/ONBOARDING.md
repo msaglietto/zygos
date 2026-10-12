@@ -135,7 +135,7 @@ attach specs.
 | File | What it does |
 |---|---|
 | `mission.zig` | Product-owner, planner, executor, verifier, then a hard human gate. Registers `zygos::missions::{start,status,abort,steer,pause,resume,list}`. Each role is one `zygos::turns::run`. |
-| `mission/fsm.zig` | Legal transitions among defining, planning, executing, verifying, gating, and failed. |
+| `mission/fsm.zig` | Legal transitions among `running`, `gating`, `done`, and `failed`. The step cursor lives in `mission/pipeline.zig`. |
 | `mission/model.zig` | `Mission`, `Task`, `Role`, `StopReason`. |
 | `mission/role_turn.zig` | Builds the turn request and parses `RoleOut`. |
 | `mission/start.zig` | Shared bytes of `zygos::missions::start` so the CLI and the orchestrator share field names. |

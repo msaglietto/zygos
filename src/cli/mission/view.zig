@@ -19,6 +19,7 @@ pub fn dashboardLine(arena: std.mem.Allocator, state_path: []const u8, text: []c
     const v = json.parseFromSliceLeaky(json.Value, arena, text, .{}) catch return null;
     if (v != .object) return null;
     const state = strOf(v.object.get("state")) orelse "?";
+    const state_label = stateLabel(arena, v.object, state) orelse return null;
     const stop = strOf(v.object.get("stop")) orelse "?";
     const mid = strOf(v.object.get("mission_id")) orelse "?";
     var tasks: usize = 0;
@@ -36,8 +37,30 @@ pub fn dashboardLine(arena: std.mem.Allocator, state_path: []const u8, text: []c
     return std.fmt.allocPrint(
         arena,
         "{s}  {s} ({s})  tasks {d}/{d}  role_turns {d}  {s}\n",
-        .{ mid, state, stop, done, tasks, turns, root },
+        .{ mid, state_label, stop, done, tasks, turns, root },
     ) catch null;
+}
+
+/// "running · executor (3/4)": the state plus the step the persisted cursor
+/// points at. The step ids come from the pinned `pipeline` array, else the
+/// default pipeline. A cursor outside the list (gating, done) or a file with
+/// no `step_index` (pre-pipeline) shows the state alone.
+fn stateLabel(arena: std.mem.Allocator, obj: json.ObjectMap, state: []const u8) ?[]const u8 {
+    const idx_v = obj.get("step_index") orelse return state;
+    if (idx_v != .integer or idx_v.integer < 0) return state;
+    const idx: usize = @intCast(idx_v.integer);
+
+    const pinned: ?[]const json.Value = if (obj.get("pipeline")) |p|
+        (if (p == .array) p.array.items else null)
+    else
+        null;
+    const total = if (pinned) |items| items.len else zygos.mission.pipeline.default_pipeline.len;
+    if (idx >= total) return state;
+    const id: []const u8 = if (pinned) |items| blk: {
+        if (items[idx] != .object) return state;
+        break :blk strOf(items[idx].object.get("id")) orelse return state;
+    } else zygos.mission.pipeline.default_pipeline[idx].id;
+    return std.fmt.allocPrint(arena, "{s} · {s} ({d}/{d})", .{ state, id, idx + 1, total }) catch null;
 }
 
 /// The AG-UI thread id for a trace whose events live in `dir_path`:
@@ -99,12 +122,59 @@ test "dashboardLine: full snapshot renders one line with task and turn counts" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const line = dashboardLine(arena, "/runs/m1/mission.json",
-        \\{"mission_id":"m1","state":"executing","stop":"none","role_turns_used":4,
+        \\{"mission_id":"m1","state":"gating","stop":"none","role_turns_used":4,"step_index":4,
         \\ "tasks":[{"desc":"a","done":true},{"desc":"b","done":false}]}
     ).?;
     try testing.expectEqualStrings(
-        "m1  executing (none)  tasks 1/2  role_turns 4  /runs/m1\n",
+        "m1  gating (none)  tasks 1/2  role_turns 4  /runs/m1\n",
         line,
+    );
+}
+
+test "dashboardLine: a running mission names the step at the cursor" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // No pipeline array: the default four ids apply.
+    const dflt = dashboardLine(arena, "/runs/m1/mission.json",
+        \\{"mission_id":"m1","state":"running","stop":"none","role_turns_used":4,"step_index":2,"tasks":[]}
+    ).?;
+    try testing.expectEqualStrings(
+        "m1  running · executor (3/4) (none)  tasks 0/0  role_turns 4  /runs/m1\n",
+        dflt,
+    );
+    // A pinned custom pipeline names the step and sets the length.
+    const custom = dashboardLine(arena, "/runs/m2/mission.json",
+        \\{"mission_id":"m2","state":"running","stop":"none","role_turns_used":1,"step_index":0,
+        \\ "pipeline":[{"id":"architect","definition_sha256":"ab","tools":true},{"id":"executor","definition_sha256":null,"tools":true}],
+        \\ "tasks":[]}
+    ).?;
+    try testing.expectEqualStrings(
+        "m2  running · architect (1/2) (none)  tasks 0/0  role_turns 1  /runs/m2\n",
+        custom,
+    );
+    // A failed mission keeps the step that failed.
+    const failed = dashboardLine(arena, "/runs/m3/mission.json",
+        \\{"mission_id":"m3","state":"failed","stop":"role_failed","role_turns_used":2,"step_index":1,"tasks":[]}
+    ).?;
+    try testing.expectEqualStrings(
+        "m3  failed · planner (2/4) (role_failed)  tasks 0/0  role_turns 2  /runs/m3\n",
+        failed,
+    );
+    // A cursor past the list (gating/done) or a pre-pipeline file shows the state alone.
+    const past = dashboardLine(arena, "/runs/m4/mission.json",
+        \\{"mission_id":"m4","state":"done","stop":"none","role_turns_used":2,"step_index":9,"tasks":[]}
+    ).?;
+    try testing.expectEqualStrings(
+        "m4  done (none)  tasks 0/0  role_turns 2  /runs/m4\n",
+        past,
+    );
+    const legacy = dashboardLine(arena, "/runs/m5/mission.json",
+        \\{"mission_id":"m5","state":"executing","stop":"none","role_turns_used":4,"tasks":[]}
+    ).?;
+    try testing.expectEqualStrings(
+        "m5  executing (none)  tasks 0/0  role_turns 4  /runs/m5\n",
+        legacy,
     );
 }
 

@@ -14,6 +14,10 @@ answers.
   mutex; byte slices passed in are valid only for the call (the model copies
   what it keeps). Unknown event kinds are ignored — the view must survive a
   newer emitter; known kinds go through an exhaustive switch.
+- Mission header: the model keeps the last `mission` event's state and step
+  cursor and the `pipeline` event's length, and the band shows
+  `running · executor (2/4)` (1-based position; `(2)` when no `pipeline`
+  event was seen; the state alone at `gating`, `done`, `failed`).
 - `loop.zig` — lifecycle: one render thread over model + renderer. `tui/`
   never touches the bus or the trace registry; the CLI composes those
   (registers the model as sink/observer, runs the approval key loop).

@@ -177,9 +177,20 @@ fn renderLine(
     try appendClock(gpa, &w, parsed.ts);
 
     switch (parsed.event) {
-        .mission => |m| try appendFmt(gpa, &w, "mission {s} → {s} (role_turns {d}, tasks {d}/{d})", .{
-            m.from, m.to, m.role_turns, m.tasks_done, m.tasks,
-        }),
+        .mission => |m| {
+            try appendFmt(gpa, &w, "mission {s} → {s}", .{ m.from, m.to });
+            if (m.step_index) |idx| {
+                try appendFmt(gpa, &w, " [step {s} #{d}]", .{ m.step orelse "-", idx });
+            }
+            try appendFmt(gpa, &w, " (role_turns {d}, tasks {d}/{d})", .{ m.role_turns, m.tasks_done, m.tasks });
+        },
+        .pipeline => |p| {
+            try appendFmt(gpa, &w, "pipeline ({d} steps):", .{p.steps.len});
+            for (p.steps) |st| {
+                try appendFmt(gpa, &w, " {s}{s}", .{ st.id, if (st.tools) "+tools" else "" });
+                if (st.definition_sha256) |h| try appendFmt(gpa, &w, "@{s}", .{h[0..@min(h.len, 8)]});
+            }
+        },
         .role_start => |r| try appendFmt(gpa, &w, "── role {s} (turn {d}, tools {s})", .{
             r.role, r.role_turn, if (r.tools) "on" else "off",
         }),
@@ -278,7 +289,9 @@ test "event with a null path is a no-op; an unwritable path is swallowed (fail o
 
 test "render pretty-prints every event kind and passes unknown lines through raw" {
     const jsonl =
-        \\{"ts":1752200000000,"event":"mission","from":"defining","to":"planning","role_turns":1,"tasks_done":0,"tasks":6}
+        \\{"ts":1752199999000,"event":"pipeline","steps":[{"id":"architect","definition_sha256":"0123456789abcdef","tools":true},{"id":"executor","definition_sha256":null,"tools":false}]}
+        \\{"ts":1752200000000,"event":"mission","from":"running","to":"running","step":"executor","step_index":1,"role_turns":1,"tasks_done":0,"tasks":6}
+        \\{"ts":1752200000500,"event":"mission","from":"running","to":"gating","step":null,"step_index":2,"role_turns":1,"tasks_done":0,"tasks":6}
         \\{"ts":1752200001000,"event":"role_start","role":"executor","role_turn":3,"tools":true,"content":"Objective: ship"}
         \\{"ts":1752200001500,"event":"task_start","index":2,"total":6,"desc":"implement the lexer"}
         \\{"ts":1752200001700,"event":"task_done","index":2,"total":6,"desc":"implement the lexer"}
@@ -293,7 +306,9 @@ test "render pretty-prints every event kind and passes unknown lines through raw
     const out = try render(testing.allocator, jsonl);
     defer testing.allocator.free(out);
 
-    try testing.expect(std.mem.indexOf(u8, out, "mission defining → planning") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "pipeline (2 steps): architect+tools@01234567 executor") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "mission running → running [step executor #1]") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "mission running → gating [step - #2]") != null);
     try testing.expect(std.mem.indexOf(u8, out, "role executor") != null);
     try testing.expect(std.mem.indexOf(u8, out, "glm-5.2") != null);
     try testing.expect(std.mem.indexOf(u8, out, "zygos::providers::glm-5-2") != null);

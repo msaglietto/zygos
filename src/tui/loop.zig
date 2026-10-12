@@ -111,14 +111,14 @@ test "start/stop joins the render thread and leaves the last frame drawn" {
     try tui.start();
 
     tui.model.onEvent(
-        \\{"ts":1,"event":"mission","from":"defining","to":"planning","role_turns":0,"tasks_done":0,"tasks":4}
+        \\{"ts":1,"event":"mission","from":"running","to":"running","step":"executor","step_index":1,"role_turns":0,"tasks_done":0,"tasks":4}
     );
     tui.stop();
 
     const out = fake.written();
     // The final frame paints the mission transition and the header band.
-    try testing.expect(std.mem.indexOf(u8, out, "mission defining → planning") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "planning · tasks 0/4") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "mission running → running · executor (2)") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "running · executor (2) · tasks 0/4") != null);
     try testing.expect(std.mem.indexOf(u8, out, term.esc.sync_on) != null);
     // Cursor parked on a fresh line after teardown.
     try testing.expect(std.mem.endsWith(u8, out, "\r\n"));

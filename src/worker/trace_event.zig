@@ -12,6 +12,7 @@ const json = std.json;
 
 pub const TraceEvent = union(enum) {
     mission: Mission,
+    pipeline: Pipeline,
     role_start: RoleStart,
     role_end: RoleEnd,
     task_start: Task,
@@ -38,6 +39,17 @@ pub const TraceEvent = union(enum) {
         role_turns: i64 = 0,
         tasks_done: i64 = 0,
         tasks: i64 = 0,
+    };
+    /// Emitted once at mission start, before the first `mission` event: the
+    /// pinned pipeline the run executes. A step with no pinned definition
+    /// (a built-in prompt) has a null hash.
+    pub const Pipeline = struct {
+        steps: []const PipelineStep = &.{},
+    };
+    pub const PipelineStep = struct {
+        id: []const u8 = "?",
+        definition_sha256: ?[]const u8 = null,
+        tools: bool = false,
     };
     pub const RoleStart = struct {
         role: []const u8 = "?",
@@ -95,6 +107,7 @@ pub const TraceEvent = union(enum) {
 pub fn body(arena: std.mem.Allocator, ev: TraceEvent) error{OutOfMemory}![]const u8 {
     return switch (ev) {
         .mission => |m| missionBody(arena, m),
+        .pipeline => |p| pipelineBody(arena, p),
         .role_start => |r| std.fmt.allocPrint(
             arena,
             "\"event\":\"role_start\",\"role\":{f},\"role_turn\":{d},\"tools\":{},\"content\":{f}",
@@ -160,6 +173,22 @@ fn missionBody(arena: std.mem.Allocator, m: TraceEvent.Mission) error{OutOfMemor
     );
 }
 
+fn pipelineBody(arena: std.mem.Allocator, p: TraceEvent.Pipeline) error{OutOfMemory}![]const u8 {
+    var w: std.ArrayList(u8) = .empty;
+    try w.appendSlice(arena, "\"event\":\"pipeline\",\"steps\":[");
+    for (p.steps, 0..) |st, i| {
+        if (i > 0) try w.append(arena, ',');
+        const entry = try std.fmt.allocPrint(
+            arena,
+            "{{\"id\":{f},\"definition_sha256\":{f},\"tools\":{}}}",
+            .{ json.fmt(st.id, .{}), json.fmt(st.definition_sha256, .{}), st.tools },
+        );
+        try w.appendSlice(arena, entry);
+    }
+    try w.append(arena, ']');
+    return w.items;
+}
+
 fn taskBody(arena: std.mem.Allocator, comptime name: []const u8, t: TraceEvent.Task) error{OutOfMemory}![]const u8 {
     return std.fmt.allocPrint(
         arena,
@@ -188,6 +217,8 @@ pub fn parse(arena: std.mem.Allocator, line: []const u8) ?Parsed {
         .role_turns = int(obj, "role_turns"),
         .tasks_done = int(obj, "tasks_done"),
         .tasks = int(obj, "tasks"),
+    } } else if (std.mem.eql(u8, name, "pipeline")) .{ .pipeline = .{
+        .steps = parsePipelineSteps(arena, obj),
     } } else if (std.mem.eql(u8, name, "role_start")) .{ .role_start = .{
         .role = str(obj, "role") orelse "?",
         .role_turn = int(obj, "role_turn"),
@@ -233,6 +264,24 @@ pub fn parse(arena: std.mem.Allocator, line: []const u8) ?Parsed {
     } } else return null;
 
     return .{ .ts = ts, .event = ev };
+}
+
+/// Tolerant: a missing or non-array `steps` reads as empty; entries that are
+/// not objects are skipped. An allocation failure also reads as empty (the
+/// parse contract is null-or-event, never an error).
+fn parsePipelineSteps(arena: std.mem.Allocator, obj: json.ObjectMap) []const TraceEvent.PipelineStep {
+    const v = obj.get("steps") orelse return &.{};
+    if (v != .array) return &.{};
+    var list: std.ArrayList(TraceEvent.PipelineStep) = .empty;
+    for (v.array.items) |item| {
+        if (item != .object) continue;
+        list.append(arena, .{
+            .id = str(item.object, "id") orelse "?",
+            .definition_sha256 = str(item.object, "definition_sha256"),
+            .tools = boolOf(item.object, "tools"),
+        }) catch return &.{};
+    }
+    return list.items;
 }
 
 fn parseTask(obj: json.ObjectMap) TraceEvent.Task {
@@ -285,6 +334,15 @@ test "body: every variant serializes byte-identical to the legacy emitters" {
         \\"event":"mission","from":"running","to":"gating","step":null,"step_index":4,"role_turns":4,"tasks_done":1,"tasks":1
     , .{ .mission = .{ .from = "running", .to = "gating", .step_index = 4, .role_turns = 4, .tasks_done = 1, .tasks = 1 } });
     try expectBody(
+        \\"event":"pipeline","steps":[{"id":"architect","definition_sha256":"ab12","tools":true},{"id":"executor","definition_sha256":null,"tools":false}]
+    , .{ .pipeline = .{ .steps = &.{
+        .{ .id = "architect", .definition_sha256 = "ab12", .tools = true },
+        .{ .id = "executor" },
+    } } });
+    try expectBody(
+        \\"event":"pipeline","steps":[]
+    , .{ .pipeline = .{} });
+    try expectBody(
         \\"event":"role_start","role":"executor","role_turn":3,"tools":true,"content":"Objective: ship"
     , .{ .role_start = .{ .role = "executor", .role_turn = 3, .tools = true, .content = "Objective: ship" } });
     try expectBody(
@@ -328,6 +386,11 @@ test "parse: body round-trips through a full line for every variant" {
         .{ .mission = .{ .from = "a", .to = "b", .role_turns = 1, .tasks_done = 2, .tasks = 3 } },
         .{ .mission = .{ .from = "running", .to = "running", .step = "architect", .step_index = 1, .role_turns = 1, .tasks_done = 0, .tasks = 0 } },
         .{ .mission = .{ .from = "running", .to = "gating", .step = null, .step_index = 3, .role_turns = 2, .tasks_done = 1, .tasks = 1 } },
+        .{ .pipeline = .{ .steps = &.{
+            .{ .id = "architect", .definition_sha256 = "ab12", .tools = true },
+            .{ .id = "executor" },
+        } } },
+        .{ .pipeline = .{} },
         .{ .role_start = .{ .role = "planner", .role_turn = 1, .tools = false, .content = "hi" } },
         .{ .role_end = .{ .role = "planner", .outcome = "failed", .reason = "why" } },
         .{ .task_start = .{ .index = 1, .total = 2, .desc = "d" } },
@@ -366,4 +429,18 @@ test "parse: missing fields read as defaults, absent ts as 0" {
     try testing.expectEqualStrings("?", parsed.event.role_end.role);
     try testing.expectEqualStrings("?", parsed.event.role_end.outcome);
     try testing.expect(parsed.event.role_end.reason == null);
+}
+
+test "parse: a malformed pipeline event reads tolerant defaults" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const bare = parse(arena, "{\"event\":\"pipeline\"}") orelse return error.ParseFailed;
+    try testing.expectEqual(@as(usize, 0), bare.event.pipeline.steps.len);
+    const odd = parse(arena, "{\"event\":\"pipeline\",\"steps\":[7,{\"tools\":true},{\"id\":\"x\",\"definition_sha256\":3}]}") orelse return error.ParseFailed;
+    try testing.expectEqual(@as(usize, 2), odd.event.pipeline.steps.len);
+    try testing.expectEqualStrings("?", odd.event.pipeline.steps[0].id);
+    try testing.expect(odd.event.pipeline.steps[0].tools);
+    try testing.expectEqualStrings("x", odd.event.pipeline.steps[1].id);
+    try testing.expect(odd.event.pipeline.steps[1].definition_sha256 == null);
 }

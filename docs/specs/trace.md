@@ -8,8 +8,23 @@ role boundaries, provider steps, tool calls/results, usage, task edges.
 `TraceEvent` is a tagged union shared by emitters (mission/turn drivers via
 `trace.emit`) and consumers (JSONL renderer, TUI model): adding a variant
 breaks every exhaustive switch at compile time instead of silently dropping.
-Variants: `mission`, `role_start`, `role_end`, `task_start`, `task_done`,
-`step`, `tool_call`, `tool_result`, `usage`, `turn_end`.
+Variants: `mission`, `pipeline`, `role_start`, `role_end`, `task_start`,
+`task_done`, `step`, `tool_call`, `tool_result`, `usage`, `turn_end`, `steer`.
+
+### Mission events
+
+- `pipeline`, emitted once at mission start before the first `mission`
+  event: `{"ts":<ms>,"event":"pipeline","steps":[{"id":"architect","definition_sha256":"<hex>"|null,"tools":true},...]}`.
+  `definition_sha256` is null for a step with a built-in prompt. Ids are
+  arbitrary strings from the config.
+- `mission` carries the state names `running`, `gating`, `done`, `failed`
+  in `from` and `to`, plus the cursor after the transition: `step` (the
+  step id; null at `gating` and `done`) and `step_index`. The driver emits
+  it whenever `(state, step_index)` changes, so a step advance is
+  `running → running` with a different `step`. Lines written before the
+  pipeline existed carry neither field and the old state names; parse
+  reads them as "cursor not recorded".
+- `role_start` and `role_end` carry `role` = the step id.
 
 - `body()` serializes byte-identical to the historical fmt-string emitters —
   events.jsonl is a wire format; consumers in the wild parse it. The usage
@@ -32,7 +47,10 @@ Variants: `mission`, `role_start`, `role_end`, `task_start`, `task_done`,
   and infallible. Registry is process-global (the path travels as a string
   in request JSON — there is no object to hang a sink on).
 - `render()` (the `zygos mission trace` view) passes unknown or unparseable
-  lines through raw — the renderer must never hide evidence.
+  lines through raw — the renderer must never hide evidence. A `mission`
+  line renders as `mission running → running [step executor #2] (...)`
+  (`[step - #4]` at gating), and the `pipeline` line lists
+  `id[+tools][@hash8]` per step.
 
 ## AG-UI projection (`agui.zig`)
 
@@ -47,6 +65,15 @@ exhaustive `switch` over `TraceEvent` in `Projector.apply`.
   `<thread_id>:1`, tool calls are `call-<n>` by `tool_call` ordinal, unmatched
   results are `result-<m>`, steers are `steer-<n>`, and a role turn is the
   subagent run `<role>:<role_turn>`. Key order in each line is fixed.
+- Steps follow the cursor. A `mission` event opens an AG-UI step named by
+  the step id while the state is `running`, and by the state name at
+  `gating`, `done` and `failed`. The step changes when that name or
+  `step_index` changes; a repeated event for the same cursor only
+  refreshes the `zygos.mission` activity snapshot (`state`, `from`, `step`,
+  `step_index`, counters). A `planner` step starting clears the shown plan.
+  The `pipeline` event becomes `CUSTOM` `zygos.pipeline` with
+  `value.steps` (`id`, `definition_sha256`, `tools`). Logs that predate the
+  cursor fall back to one step per state name.
 - Lines `parse()` rejects are skipped. A mission log ends in `RUN_FINISHED`
   only at `done` and `RUN_ERROR` only at `failed`. A task log ends on its
   `turn_end`. A live or truncated log ends without either, because AG-UI

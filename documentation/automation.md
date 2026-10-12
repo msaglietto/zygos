@@ -8,7 +8,7 @@ The product is the automation. This file is the line between what a model propos
 |---|---|
 | Trigger | `zygos mission start` or `resume`, or `missions::start` on the bus. |
 | Owner | The operator who launched the process. |
-| Runs automatically? | Yes, through defining, planning, executing, and verifying. `done` waits for the completion gate. |
+| Runs automatically? | Yes, through every pipeline step (`running`: by default product-owner, planner, executor, and verifier). `done` waits for the completion gate. |
 | May read | Brief, `.planning/` artifacts, tool results, vault notes when tessera workers are booted. |
 | May call | The mission tool list is `bash`, `web_search`, `web_fetch`, plus `zygos::mcp::<server>::<tool>` for servers in `zygos.zon` (`src/worker/mission/start.zig`). Other roles are not handed tools. `read_file` and `write_file` are registered on the bus and are not in that list. Bash can still read and write files, and it can append to `<planning>/control.jsonl`, which the running CLI treats as an attach command, including approve. |
 | Steering | Role prompts assembled from the persisted artifacts (`GOAL.md` M3 notes). Playbook text is data (`worker/playbook.zig`). `missions::steer` merges operator input into the next step. |

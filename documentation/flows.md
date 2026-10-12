@@ -21,7 +21,7 @@ Actors: **operator** (the OS user), **kernel** (bus), **model** (a provider work
   4. Boot workers: tools, policy (`policySeed`: bash / web_fetch / web_search / MCP names = allow), web tools, approvals, router, budget, trim, orchestrator. Optional MCP children; spawn or handshake failure exits 2.
   5. `budget::configure` with `budgetMaxTokens`: `ZYGOS_BUDGET_MAX_TOKENS` if set, else the brief's `budget.max_tokens`, else 1_000_000.
   6. If `ZYGOS_VAULT_ROOT` is set, `tessera::checkpoint`. Failure exits 2.
-  7. `missions::start` walks defining → planning → executing → verifying → gating → done|failed. Each role is one turn with its own `step_id`.
+  7. `missions::start` runs the pipeline: state `running` while a cursor walks the steps (by default product-owner, planner, executor, verifier), then `gating`, then `done` or `failed`. The first trace line is a `pipeline` event. Each step run is one turn with its own `step_id`.
 - **Authz.** Boot refusal is the deny case for bad config, bad brief, unknown provider, or a vault that cannot be checkpointed. Tool calls during the mission use flow 3. Completion uses flow 4.
 - **Side effects.** `.planning/` writes (atomic tmp+rename). Workspace file writes and bash. Optional vault notes. `events.jsonl`. Provider HTTP calls. Search/fetch HTTP calls.
 
@@ -38,9 +38,9 @@ Actors: **operator** (the OS user), **kernel** (bus), **model** (a provider work
 ## 4. Completion gate
 
 - **Precondition.** Verifier passed and the mission is in `gating`.
-- **Sequence.** Orchestrator calls the gate through `approvals::request`. Only an explicit approval moves to `done`. Missing gate function, unreachable gate, or malformed reply cannot complete. A deny with `resolved:true` (or no `resolved` field) feeds back into planning, bounded by `gate_threshold`. A deny with `resolved:false` (manual timeout, including closed stdin) parks in `gating` with `paused:true`. `mission resume` re-asks.
+- **Sequence.** Orchestrator calls the gate through `approvals::request`. Only an explicit approval moves to `done`. Missing gate function, unreachable gate, or malformed reply cannot complete. A deny with `resolved:true` (or no `resolved` field) feeds back into rework (the mission returns to `running` at the last executor step), bounded by `gate_threshold`. A deny with `resolved:false` (manual timeout, including closed stdin) parks in `gating` with `paused:true`. `mission resume` re-asks.
 - **Authz.** The approver is the operator at the TUI/console, the timeout, or any writer of `<planning>/control.jsonl` (the attach channel, including the executor's shell). EOF does not approve. A line in that file can.
-- **Side effects.** State file updated. Parked missions do not replan and do not mark `done`.
+- **Side effects.** State file updated. Parked missions do not return to rework and do not mark `done`.
 
 ## 5. Web fetch and search
 
@@ -52,7 +52,7 @@ Actors: **operator** (the OS user), **kernel** (bus), **model** (a provider work
 ## 6. Unattended rerun
 
 - **Precondition.** Cron or launchd runs `zygos mission start <brief> --run-stamp` with stdin closed.
-- **Sequence.** `--run-stamp` builds a new planning root (`<base>-<stamp>`). Closed stdin makes approval timeouts deny. An unanswered completion gate parks (flow 4) rather than replanning. Refuse-if-existing still applies when the flag is absent.
+- **Sequence.** `--run-stamp` builds a new planning root (`<base>-<stamp>`). Closed stdin makes approval timeouts deny. An unanswered completion gate parks (flow 4) rather than returning to rework. Refuse-if-existing still applies when the flag is absent.
 - **Authz.** The OS user of the crontab. No separate internal credential.
 - **Side effects.** A new `.planning-*` tree per invocation. Network and tool effects as in flows 2–5.
 

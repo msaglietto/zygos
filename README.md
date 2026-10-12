@@ -22,8 +22,10 @@ Milestone contracts live in [GOAL.md](GOAL.md). This file is how you use the bin
 ## How a mission runs
 
 ```
-defining → planning → executing → verifying → gating → done
+running (product-owner → planner → executor → verifier) → gating → done
 ```
+
+While `running`, the mission state names the step at its cursor, for example `running · executor (3/4)`.
 
 | Role | Step id | What it does |
 |---|---|---|
@@ -32,7 +34,7 @@ defining → planning → executing → verifying → gating → done
 | Executor | `executor` | Runs the tasks. This is the only role that receives tools. |
 | Verifier | `verifier` | Checks the success criteria and returns pass or fail. |
 
-A failed verification sends the mission back to planning. So does an explicit denial of the completion gate. Three failed verifications in a row, or three explicit gate denials, stops the run. A timeout on the gate leaves the mission parked in `gating`. A missing gate, an unreachable gate, or a malformed gate reply can never mark the mission done.
+A failed verification sends the mission back to the executor step. So does an explicit denial of the completion gate. Three failed verifications in a row, or three explicit gate denials, stops the run. A timeout on the gate leaves the mission parked in `gating`. A missing gate, an unreachable gate, or a malformed gate reply can never mark the mission done.
 
 By default each role is prompted from the files in `.planning/`. `zygos.zon` can select the `recall` or `thread` strategy; an unknown strategy refuses to boot. See [context](docs/specs/context.md).
 

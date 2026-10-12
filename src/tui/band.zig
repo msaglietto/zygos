@@ -39,6 +39,11 @@ pub const BandView = struct {
     phase_started_ms: i64,
     role_started_ms: ?i64,
     mission_state: ?[]const u8,
+    /// Pipeline cursor: the step id, its 1-based position, and the pipeline
+    /// length (0 = unknown, e.g. attached mid-run). Null at gating/done.
+    mission_step: ?[]const u8 = null,
+    mission_step_pos: i64 = 0,
+    mission_steps_total: i64 = 0,
     tasks_done: i64,
     tasks: i64,
     role: ?[]const u8,
@@ -63,6 +68,18 @@ pub const BandView = struct {
     stream_bytes: usize,
 };
 
+/// "running · executor (2/4)": the mission state, then the step at the
+/// cursor with its 1-based position (and the pipeline length when known).
+/// States with no step (gating, done, failed-before-start) render alone.
+pub fn missionLabel(arena: std.mem.Allocator, view: BandView) error{OutOfMemory}![]const u8 {
+    const state = view.mission_state orelse return "starting";
+    const step = view.mission_step orelse return state;
+    if (view.mission_steps_total > 0) {
+        return std.fmt.allocPrint(arena, "{s} · {s} ({d}/{d})", .{ state, step, view.mission_step_pos, view.mission_steps_total });
+    }
+    return std.fmt.allocPrint(arena, "{s} · {s} ({d})", .{ state, step, view.mission_step_pos });
+}
+
 /// Compose the band rows into `arena`. `cols` shapes the tool box borders;
 /// the renderer still truncates every row defensively.
 pub fn build(
@@ -80,7 +97,7 @@ pub fn build(
     try bottom.append(arena, try std.fmt.allocPrint(arena, "{s}zygos{s} · {s} · tasks {d}/{d} · {s}", .{
         theme.fg(&color, theme.Color.accent),
         theme.reset,
-        if (view.mission_state) |s| s else "starting",
+        try missionLabel(arena, view),
         view.tasks_done,
         view.tasks,
         theme.elapsed(&e_buf, view.started_ms, now_ms),
@@ -178,7 +195,7 @@ fn statusLine(
         },
         .thinking => "Thinking…",
         .streaming => "Responding…",
-        .idle => view.mission_state orelse "starting",
+        .idle => try missionLabel(arena, view),
     };
     const label_sgr: []const u8 = switch (view.activity) {
         .approval => theme.fg(&color, theme.Color.err),
@@ -320,9 +337,29 @@ test "status line labels follow the activity class with its color" {
     try testing.expect(std.mem.indexOf(u8, row, "Run bash") != null);
 
     view.activity = .idle;
-    view.mission_state = "verifying";
+    view.mission_state = "running";
+    view.mission_step = "verifier";
+    view.mission_step_pos = 3;
+    view.mission_steps_total = 4;
     row = try statusLine(view, arena, 80, 0);
-    try testing.expect(std.mem.indexOf(u8, row, "verifying") != null);
+    try testing.expect(std.mem.indexOf(u8, row, "running · verifier (3/4)") != null);
+}
+
+test "mission label: state, then step with position, total when known" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var high: usize = 0;
+    var view = emptyView(&high);
+    try testing.expectEqualStrings("starting", try missionLabel(arena, view));
+    view.mission_state = "gating";
+    try testing.expectEqualStrings("gating", try missionLabel(arena, view));
+    view.mission_state = "running";
+    view.mission_step = "executor";
+    view.mission_step_pos = 2;
+    try testing.expectEqualStrings("running · executor (2)", try missionLabel(arena, view));
+    view.mission_steps_total = 4;
+    try testing.expectEqualStrings("running · executor (2/4)", try missionLabel(arena, view));
 }
 
 test "status line pads to the full width with the turn timer right" {

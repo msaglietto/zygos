@@ -47,6 +47,11 @@ pub const Model = struct {
 
     started_ms: i64,
     mission_state: ?[]u8 = null,
+    /// Pipeline cursor from the last mission event: step id, 1-based
+    /// position (0 = none), and the pipeline length (0 = not yet known).
+    mission_step: ?[]u8 = null,
+    mission_step_pos: i64 = 0,
+    pipeline_len: i64 = 0,
     tasks_done: i64 = 0,
     tasks: i64 = 0,
     role: ?[]u8 = null,
@@ -102,6 +107,7 @@ pub const Model = struct {
         self.live_tool_args.deinit(self.gpa);
         if (self.live_tool_name) |n| self.gpa.free(n);
         if (self.mission_state) |s| self.gpa.free(s);
+        if (self.mission_step) |s| self.gpa.free(s);
         if (self.role) |r| self.gpa.free(r);
         if (self.step_model) |m| self.gpa.free(m);
         if (self.approval) |a| self.gpa.free(a);
@@ -303,9 +309,43 @@ pub const Model = struct {
                 try self.replaceOwned(&self.mission_state, m.to);
                 self.tasks_done = m.tasks_done;
                 self.tasks = m.tasks;
+                if (m.step) |id| {
+                    try self.replaceOwned(&self.mission_step, id);
+                } else if (self.mission_step) |old| {
+                    self.gpa.free(old);
+                    self.mission_step = null;
+                }
+                self.mission_step_pos = if (m.step != null) (m.step_index orelse -1) + 1 else 0;
+                // At gating/done the cursor sits at the list length: that is
+                // the pipeline length when no `pipeline` event was seen.
+                if (m.step == null) {
+                    if (m.step_index) |idx| {
+                        if (self.pipeline_len == 0) self.pipeline_len = idx;
+                    }
+                }
                 var color: [24]u8 = undefined;
-                try self.log.appendFmt("{s}◆ mission {s} → {s}{s}", .{
-                    theme.fg(&color, theme.Color.accent), m.from, m.to, theme.reset,
+                var suffix: []const u8 = "";
+                if (self.mission_step) |id| {
+                    suffix = if (self.pipeline_len > 0)
+                        try std.fmt.allocPrint(arena, " · {s} ({d}/{d})", .{ id, self.mission_step_pos, self.pipeline_len })
+                    else
+                        try std.fmt.allocPrint(arena, " · {s} ({d})", .{ id, self.mission_step_pos });
+                }
+                try self.log.appendFmt("{s}◆ mission {s} → {s}{s}{s}", .{
+                    theme.fg(&color, theme.Color.accent), m.from, m.to, suffix, theme.reset,
+                });
+            },
+            .pipeline => |p| {
+                self.pipeline_len = @intCast(p.steps.len);
+                var line: std.ArrayList(u8) = .empty;
+                defer line.deinit(arena);
+                for (p.steps, 0..) |st, i| {
+                    if (i > 0) try line.appendSlice(arena, " → ");
+                    try line.appendSlice(arena, try scrub_mod.scrub(arena, st.id));
+                }
+                var color: [24]u8 = undefined;
+                try self.log.appendFmt("{s}◆ pipeline {s}{s}", .{
+                    theme.fg(&color, theme.Color.accent), line.items, theme.reset,
                 });
             },
             .role_start => |r| {
@@ -478,6 +518,9 @@ pub const Model = struct {
             .phase_started_ms = self.phase_started_ms,
             .role_started_ms = self.role_started_ms,
             .mission_state = self.mission_state,
+            .mission_step = self.mission_step,
+            .mission_step_pos = self.mission_step_pos,
+            .mission_steps_total = self.pipeline_len,
             .tasks_done = self.tasks_done,
             .tasks = self.tasks,
             .role = self.role,
@@ -607,13 +650,55 @@ test "mission event updates the header state and logs the transition" {
     var m = Model.init(testing.allocator, 0);
     defer m.deinit();
     m.onEvent(
-        \\{"ts":1,"event":"mission","from":"planning","to":"executing","role_turns":2,"tasks_done":1,"tasks":6}
+        \\{"ts":1,"event":"mission","from":"running","to":"gating","step":null,"step_index":4,"role_turns":2,"tasks_done":1,"tasks":6}
     );
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const view = try renderJoined(&m, arena_state.allocator());
-    try testing.expect(std.mem.indexOf(u8, view, "mission planning → executing") != null);
-    try testing.expect(std.mem.indexOf(u8, view, "executing · tasks 1/6") != null);
+    try testing.expect(std.mem.indexOf(u8, view, "mission running → gating") != null);
+    try testing.expect(std.mem.indexOf(u8, view, "gating · tasks 1/6") != null);
+}
+
+test "mission event shows the step cursor against the pipeline length" {
+    var m = Model.init(testing.allocator, 0);
+    defer m.deinit();
+    m.onEvent(
+        \\{"ts":0,"event":"pipeline","steps":[{"id":"planner","definition_sha256":null,"tools":false},{"id":"executor","definition_sha256":null,"tools":true},{"id":"verifier","definition_sha256":null,"tools":false},{"id":"fixer","definition_sha256":null,"tools":false}]}
+    );
+    m.onEvent(
+        \\{"ts":1,"event":"mission","from":"running","to":"running","step":"executor","step_index":1,"role_turns":2,"tasks_done":1,"tasks":6}
+    );
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const view = try renderJoined(&m, arena_state.allocator());
+    try testing.expect(std.mem.indexOf(u8, view, "pipeline planner → executor → verifier → fixer") != null);
+    try testing.expect(std.mem.indexOf(u8, view, "mission running → running · executor (2/4)") != null);
+    try testing.expect(std.mem.indexOf(u8, view, "running · executor (2/4) · tasks 1/6") != null);
+}
+
+test "mission step without a pipeline event shows the position only" {
+    var m = Model.init(testing.allocator, 0);
+    defer m.deinit();
+    m.onEvent(
+        \\{"ts":1,"event":"mission","from":"running","to":"running","step":"architect","step_index":0,"role_turns":0,"tasks_done":0,"tasks":0}
+    );
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const view = try renderJoined(&m, arena_state.allocator());
+    try testing.expect(std.mem.indexOf(u8, view, "running · architect (1) · tasks 0/0") != null);
+}
+
+test "pipeline step ids are scrubbed before they reach the terminal" {
+    var m = Model.init(testing.allocator, 0);
+    defer m.deinit();
+    m.onEvent(
+        \\{"ts":0,"event":"pipeline","steps":[{"id":"a\u001b]52;c;eA==\u0007b","definition_sha256":null,"tools":false}]}
+    );
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const view = try renderJoined(&m, arena_state.allocator());
+    try testing.expect(std.mem.indexOfScalar(u8, view, 0x07) == null);
+    try testing.expect(std.mem.indexOf(u8, view, "]52;") == null);
 }
 
 test "role_start opens a role and role_end collapses it with the outcome" {

@@ -58,7 +58,10 @@ const Projector = struct {
     steers: u32 = 0,
     plan: std.ArrayList(PlanItem) = .empty,
     plan_total: i64 = 0,
+    /// The open AG-UI step (a pipeline step id or a terminal/gating state)
+    /// and the cursor index it opened at.
     step: ?[]const u8 = null,
+    step_index: ?i64 = null,
     /// Non-null once any `mission` event is seen: the log is a mission log
     /// and this is the latest state.
     mission_state: ?[]const u8 = null,
@@ -76,22 +79,43 @@ const Projector = struct {
         p.last_ts = ts;
         switch (parsed.event) {
             .mission => |m| {
-                if (p.step) |open| if (std.mem.eql(u8, open, m.from))
-                    try p.emit("STEP_FINISHED", ts, ",\"stepName\":{f}", .{jstr(m.from)}, .{});
-                try p.emit("STEP_STARTED", ts, ",\"stepName\":{f}", .{jstr(m.to)}, .{});
-                p.step = m.to;
+                // An AG-UI step is a pipeline step (its id) while running, else
+                // the state itself (gating, done, failed). It changes when the
+                // name or the cursor index does, never on a repeat event.
+                const running = std.mem.eql(u8, m.to, "running");
+                const name = if (running) (m.step orelse m.to) else m.to;
+                const same = if (p.step) |open|
+                    std.mem.eql(u8, open, name) and p.step_index == m.step_index
+                else
+                    false;
+                if (!same) {
+                    if (p.step) |open| try p.emit("STEP_FINISHED", ts, ",\"stepName\":{f}", .{jstr(open)}, .{});
+                    try p.emit("STEP_STARTED", ts, ",\"stepName\":{f}", .{jstr(name)}, .{});
+                    p.step = name;
+                    p.step_index = m.step_index;
+                    if (running and std.mem.eql(u8, name, "planner")) {
+                        p.plan.clearRetainingCapacity();
+                        p.plan_total = 0;
+                    }
+                }
                 p.mission_state = m.to;
                 try p.emit(
                     "ACTIVITY_SNAPSHOT",
                     ts,
-                    ",\"messageId\":\"zygos.mission\",\"activityType\":\"zygos.mission\",\"content\":{{\"state\":{f},\"from\":{f},\"role_turns\":{d},\"tasks_done\":{d},\"tasks\":{d}}},\"replace\":true",
-                    .{ jstr(m.to), jstr(m.from), m.role_turns, m.tasks_done, m.tasks },
+                    ",\"messageId\":\"zygos.mission\",\"activityType\":\"zygos.mission\",\"content\":{{\"state\":{f},\"from\":{f},\"step\":{f},\"step_index\":{f},\"role_turns\":{d},\"tasks_done\":{d},\"tasks\":{d}}},\"replace\":true",
+                    .{ jstr(m.to), jstr(m.from), json.fmt(m.step, .{}), json.fmt(m.step_index, .{}), m.role_turns, m.tasks_done, m.tasks },
                     .{},
                 );
-                if (std.mem.eql(u8, m.to, "planning")) {
-                    p.plan.clearRetainingCapacity();
-                    p.plan_total = 0;
+            },
+            .pipeline => |pl| {
+                var steps: std.ArrayList(u8) = .empty;
+                for (pl.steps, 0..) |st, i| {
+                    if (i > 0) try steps.append(a, ',');
+                    try steps.print(a, "{{\"id\":{f},\"definition_sha256\":{f},\"tools\":{}}}", .{
+                        jstr(st.id), json.fmt(st.definition_sha256, .{}), st.tools,
+                    });
                 }
+                try p.emit("CUSTOM", ts, ",\"name\":\"zygos.pipeline\",\"value\":{{\"steps\":[{s}]}}", .{steps.items}, .{});
             },
             .role_start => |r| {
                 const id = try std.fmt.allocPrint(a, "{s}:{d}", .{ r.role, r.role_turn });
@@ -593,7 +617,8 @@ fn expectProjection(thread_id: []const u8, input: []const u8, expected: []const 
 
 test "project: mission log projects roles, interleaved results, clip, denials, steer, plan and a failed finish" {
     try expectProjection("m1",
-        \\{"ts":100,"event":"mission","from":"defining","to":"planning","role_turns":0,"tasks_done":0,"tasks":0}
+        \\{"ts":99,"event":"pipeline","steps":[{"id":"planner","definition_sha256":null,"tools":false},{"id":"executor","definition_sha256":"ab12","tools":true}]}
+        \\{"ts":100,"event":"mission","from":"running","to":"running","step":"planner","step_index":0,"role_turns":0,"tasks_done":0,"tasks":0}
         \\{"ts":101,"event":"role_start","role":"planner","role_turn":1,"tools":false,"content":"Plan it"}
         \\{"ts":102,"event":"step","turn_id":"","step":1,"provider":"p1","model":"m-a","attempt":0}
         \\{"ts":103,"event":"usage","turn_id":"","step":1,"input_tokens":100,"output_tokens":10}
@@ -602,7 +627,7 @@ test "project: mission log projects roles, interleaved results, clip, denials, s
         \\{"ts":106,"event":"turn_end","turn_id":"","stop":"end_turn","steps":1}
         \\{"ts":107,"event":"role_end","role":"planner","outcome":"ok"}
         \\not json, a torn write
-        \\{"ts":108,"event":"mission","from":"planning","to":"executing","role_turns":1,"tasks_done":0,"tasks":2}
+        \\{"ts":108,"event":"mission","from":"running","to":"running","step":"executor","step_index":1,"role_turns":1,"tasks_done":0,"tasks":2}
         \\{"ts":109,"event":"task_start","index":1,"total":2,"desc":"build it"}
         \\{"ts":110,"event":"role_start","role":"executor","role_turn":2,"tools":true,"content":"Do task 1"}
         \\{"ts":111,"event":"step","turn_id":"","step":1,"provider":"p2","model":"m-b","attempt":0}
@@ -617,12 +642,13 @@ test "project: mission log projects roles, interleaved results, clip, denials, s
         \\{"ts":120,"event":"task_done","index":1,"total":2,"desc":"build it"}
         \\{"ts":121,"event":"turn_end","turn_id":"","stop":"max_steps","steps":2}
         \\{"ts":122,"event":"role_end","role":"executor","outcome":"failed","reason":"max_steps"}
-        \\{"ts":123,"event":"mission","from":"executing","to":"failed","role_turns":2,"tasks_done":1,"tasks":2}
+        \\{"ts":123,"event":"mission","from":"running","to":"failed","step":"executor","step_index":1,"role_turns":2,"tasks_done":1,"tasks":2}
         \\
     ,
-        \\{"type":"RUN_STARTED","timestamp":100,"threadId":"m1","runId":"m1:1","protocolVersion":"1.0"}
-        \\{"type":"STEP_STARTED","timestamp":100,"stepName":"planning"}
-        \\{"type":"ACTIVITY_SNAPSHOT","timestamp":100,"messageId":"zygos.mission","activityType":"zygos.mission","content":{"state":"planning","from":"defining","role_turns":0,"tasks_done":0,"tasks":0},"replace":true}
+        \\{"type":"RUN_STARTED","timestamp":99,"threadId":"m1","runId":"m1:1","protocolVersion":"1.0"}
+        \\{"type":"CUSTOM","timestamp":99,"name":"zygos.pipeline","value":{"steps":[{"id":"planner","definition_sha256":null,"tools":false},{"id":"executor","definition_sha256":"ab12","tools":true}]}}
+        \\{"type":"STEP_STARTED","timestamp":100,"stepName":"planner"}
+        \\{"type":"ACTIVITY_SNAPSHOT","timestamp":100,"messageId":"zygos.mission","activityType":"zygos.mission","content":{"state":"running","from":"running","step":"planner","step_index":0,"role_turns":0,"tasks_done":0,"tasks":0},"replace":true}
         \\{"type":"SUBAGENT_STARTED","timestamp":101,"subagentRunId":"planner:1","name":"planner","description":"Plan it","metadata":{"zygos":{"role_turn":1,"tools":false}}}
         \\{"type":"CUSTOM","timestamp":102,"name":"zygos.route","value":{"step":1,"provider":"p1","model":"m-a","attempt":0},"subagentRunId":"planner:1"}
         \\{"type":"STATE_SNAPSHOT","timestamp":103,"snapshot":{"usage":{"input_tokens":100,"output_tokens":10}},"subagentRunId":"planner:1","metadata":{"zygos":{"step":1,"input_tokens":100,"output_tokens":10}}}
@@ -632,9 +658,9 @@ test "project: mission log projects roles, interleaved results, clip, denials, s
         \\{"type":"TOOL_CALL_RESULT","timestamp":105,"messageId":"call-1:result","toolCallId":"call-1","content":"hi","role":"tool","subagentRunId":"planner:1","metadata":{"zygos":{"step":1,"is_error":false,"bytes":2,"clipped":false}}}
         \\{"type":"CUSTOM","timestamp":106,"name":"zygos.turn_end","value":{"stop":"end_turn","steps":1},"subagentRunId":"planner:1"}
         \\{"type":"SUBAGENT_FINISHED","timestamp":107,"subagentRunId":"planner:1","metadata":{"zygos":{"outcome":"ok"}}}
-        \\{"type":"STEP_FINISHED","timestamp":108,"stepName":"planning"}
-        \\{"type":"STEP_STARTED","timestamp":108,"stepName":"executing"}
-        \\{"type":"ACTIVITY_SNAPSHOT","timestamp":108,"messageId":"zygos.mission","activityType":"zygos.mission","content":{"state":"executing","from":"planning","role_turns":1,"tasks_done":0,"tasks":2},"replace":true}
+        \\{"type":"STEP_FINISHED","timestamp":108,"stepName":"planner"}
+        \\{"type":"STEP_STARTED","timestamp":108,"stepName":"executor"}
+        \\{"type":"ACTIVITY_SNAPSHOT","timestamp":108,"messageId":"zygos.mission","activityType":"zygos.mission","content":{"state":"running","from":"running","step":"executor","step_index":1,"role_turns":1,"tasks_done":0,"tasks":2},"replace":true}
         \\{"type":"ACTIVITY_SNAPSHOT","timestamp":109,"messageId":"zygos.plan","activityType":"zygos.plan","content":{"total":2,"items":[{"index":1,"desc":"build it","status":"active","attempts":1}]},"replace":true}
         \\{"type":"SUBAGENT_STARTED","timestamp":110,"subagentRunId":"executor:2","name":"executor","description":"Do task 1","metadata":{"zygos":{"role_turn":2,"tools":true}}}
         \\{"type":"CUSTOM","timestamp":111,"name":"zygos.route","value":{"step":1,"provider":"p2","model":"m-b","attempt":0},"subagentRunId":"executor:2"}
@@ -657,9 +683,9 @@ test "project: mission log projects roles, interleaved results, clip, denials, s
         \\{"type":"ACTIVITY_SNAPSHOT","timestamp":120,"messageId":"zygos.plan","activityType":"zygos.plan","content":{"total":2,"items":[{"index":1,"desc":"build it","status":"done","attempts":1}]},"replace":true}
         \\{"type":"CUSTOM","timestamp":121,"name":"zygos.turn_end","value":{"stop":"max_steps","steps":2},"subagentRunId":"executor:2"}
         \\{"type":"SUBAGENT_ERROR","timestamp":122,"subagentRunId":"executor:2","message":"max_steps","metadata":{"zygos":{"outcome":"failed"}}}
-        \\{"type":"STEP_FINISHED","timestamp":123,"stepName":"executing"}
+        \\{"type":"STEP_FINISHED","timestamp":123,"stepName":"executor"}
         \\{"type":"STEP_STARTED","timestamp":123,"stepName":"failed"}
-        \\{"type":"ACTIVITY_SNAPSHOT","timestamp":123,"messageId":"zygos.mission","activityType":"zygos.mission","content":{"state":"failed","from":"executing","role_turns":2,"tasks_done":1,"tasks":2},"replace":true}
+        \\{"type":"ACTIVITY_SNAPSHOT","timestamp":123,"messageId":"zygos.mission","activityType":"zygos.mission","content":{"state":"failed","from":"running","step":"executor","step_index":1,"role_turns":2,"tasks_done":1,"tasks":2},"replace":true}
         \\{"type":"STEP_FINISHED","timestamp":123,"stepName":"failed"}
         \\{"type":"RUN_ERROR","timestamp":123,"message":"max_steps","code":"mission_failed","usage":[{"provider":"p1","model":"m-a","inputTokens":100,"outputTokens":10,"totalTokens":110},{"provider":"p2","model":"m-b","inputTokens":200,"outputTokens":20,"totalTokens":220}]}
         \\
@@ -696,15 +722,109 @@ test "project: task run without roles finishes on turn_end with the stop, steps 
 
 test "project: a truncated mission emits no finish and no error; a zero ts is omitted" {
     try expectProjection("m2",
-        \\{"ts":300,"event":"mission","from":"defining","to":"planning","role_turns":0,"tasks_done":0,"tasks":0}
+        \\{"ts":300,"event":"mission","from":"running","to":"running","step":"planner","step_index":1,"role_turns":0,"tasks_done":0,"tasks":0}
         \\{"event":"role_start","role":"planner","role_turn":1,"tools":false,"content":"Plan"}
         \\{"ts":302,"event":"turn_end","turn_id":"","stop":"failed","steps":0,"error":"route_exhausted"}
     ,
         \\{"type":"RUN_STARTED","timestamp":300,"threadId":"m2","runId":"m2:1","protocolVersion":"1.0"}
-        \\{"type":"STEP_STARTED","timestamp":300,"stepName":"planning"}
-        \\{"type":"ACTIVITY_SNAPSHOT","timestamp":300,"messageId":"zygos.mission","activityType":"zygos.mission","content":{"state":"planning","from":"defining","role_turns":0,"tasks_done":0,"tasks":0},"replace":true}
+        \\{"type":"STEP_STARTED","timestamp":300,"stepName":"planner"}
+        \\{"type":"ACTIVITY_SNAPSHOT","timestamp":300,"messageId":"zygos.mission","activityType":"zygos.mission","content":{"state":"running","from":"running","step":"planner","step_index":1,"role_turns":0,"tasks_done":0,"tasks":0},"replace":true}
         \\{"type":"SUBAGENT_STARTED","subagentRunId":"planner:1","name":"planner","description":"Plan","metadata":{"zygos":{"role_turn":1,"tools":false}}}
         \\{"type":"CUSTOM","timestamp":302,"name":"zygos.turn_end","value":{"stop":"failed","steps":0,"error":"route_exhausted"},"subagentRunId":"planner:1"}
+        \\
+    );
+}
+
+test "project: steps follow the cursor, so running to running with a new step opens a new step" {
+    try expectProjection("m3",
+        \\{"ts":10,"event":"mission","from":"running","to":"running","step":"executor","step_index":2,"role_turns":0,"tasks_done":0,"tasks":1}
+        \\{"ts":11,"event":"mission","from":"running","to":"running","step":"executor","step_index":2,"role_turns":1,"tasks_done":1,"tasks":1}
+        \\{"ts":12,"event":"mission","from":"running","to":"running","step":"verifier","step_index":3,"role_turns":1,"tasks_done":1,"tasks":1}
+        \\{"ts":13,"event":"mission","from":"running","to":"running","step":"executor","step_index":2,"role_turns":2,"tasks_done":1,"tasks":1}
+        \\{"ts":14,"event":"mission","from":"running","to":"gating","step":null,"step_index":4,"role_turns":3,"tasks_done":1,"tasks":1}
+        \\{"ts":15,"event":"mission","from":"gating","to":"done","step":null,"step_index":4,"role_turns":3,"tasks_done":1,"tasks":1}
+        \\
+    ,
+        \\{"type":"RUN_STARTED","timestamp":10,"threadId":"m3","runId":"m3:1","protocolVersion":"1.0"}
+        \\{"type":"STEP_STARTED","timestamp":10,"stepName":"executor"}
+        \\{"type":"ACTIVITY_SNAPSHOT","timestamp":10,"messageId":"zygos.mission","activityType":"zygos.mission","content":{"state":"running","from":"running","step":"executor","step_index":2,"role_turns":0,"tasks_done":0,"tasks":1},"replace":true}
+        \\{"type":"ACTIVITY_SNAPSHOT","timestamp":11,"messageId":"zygos.mission","activityType":"zygos.mission","content":{"state":"running","from":"running","step":"executor","step_index":2,"role_turns":1,"tasks_done":1,"tasks":1},"replace":true}
+        \\{"type":"STEP_FINISHED","timestamp":12,"stepName":"executor"}
+        \\{"type":"STEP_STARTED","timestamp":12,"stepName":"verifier"}
+        \\{"type":"ACTIVITY_SNAPSHOT","timestamp":12,"messageId":"zygos.mission","activityType":"zygos.mission","content":{"state":"running","from":"running","step":"verifier","step_index":3,"role_turns":1,"tasks_done":1,"tasks":1},"replace":true}
+        \\{"type":"STEP_FINISHED","timestamp":13,"stepName":"verifier"}
+        \\{"type":"STEP_STARTED","timestamp":13,"stepName":"executor"}
+        \\{"type":"ACTIVITY_SNAPSHOT","timestamp":13,"messageId":"zygos.mission","activityType":"zygos.mission","content":{"state":"running","from":"running","step":"executor","step_index":2,"role_turns":2,"tasks_done":1,"tasks":1},"replace":true}
+        \\{"type":"STEP_FINISHED","timestamp":14,"stepName":"executor"}
+        \\{"type":"STEP_STARTED","timestamp":14,"stepName":"gating"}
+        \\{"type":"ACTIVITY_SNAPSHOT","timestamp":14,"messageId":"zygos.mission","activityType":"zygos.mission","content":{"state":"gating","from":"running","step":null,"step_index":4,"role_turns":3,"tasks_done":1,"tasks":1},"replace":true}
+        \\{"type":"STEP_FINISHED","timestamp":15,"stepName":"gating"}
+        \\{"type":"STEP_STARTED","timestamp":15,"stepName":"done"}
+        \\{"type":"ACTIVITY_SNAPSHOT","timestamp":15,"messageId":"zygos.mission","activityType":"zygos.mission","content":{"state":"done","from":"gating","step":null,"step_index":4,"role_turns":3,"tasks_done":1,"tasks":1},"replace":true}
+        \\{"type":"STEP_FINISHED","timestamp":15,"stepName":"done"}
+        \\{"type":"RUN_FINISHED","timestamp":15,"threadId":"m3","runId":"m3:1","outcome":{"type":"success"},"result":{"state":"done"}}
+        \\
+    );
+}
+
+test "project: custom step ids pass through as names, JSON-escaped" {
+    try expectProjection("m4",
+        \\{"ts":20,"event":"pipeline","steps":[{"id":"__proto__","definition_sha256":null,"tools":false},{"id":"a\"b","definition_sha256":null,"tools":true}]}
+        \\{"ts":21,"event":"mission","from":"running","to":"running","step":"__proto__","step_index":0,"role_turns":0,"tasks_done":0,"tasks":0}
+        \\{"ts":22,"event":"mission","from":"running","to":"running","step":"a\"b","step_index":1,"role_turns":1,"tasks_done":0,"tasks":0}
+        \\
+    ,
+        \\{"type":"RUN_STARTED","timestamp":20,"threadId":"m4","runId":"m4:1","protocolVersion":"1.0"}
+        \\{"type":"CUSTOM","timestamp":20,"name":"zygos.pipeline","value":{"steps":[{"id":"__proto__","definition_sha256":null,"tools":false},{"id":"a\"b","definition_sha256":null,"tools":true}]}}
+        \\{"type":"STEP_STARTED","timestamp":21,"stepName":"__proto__"}
+        \\{"type":"ACTIVITY_SNAPSHOT","timestamp":21,"messageId":"zygos.mission","activityType":"zygos.mission","content":{"state":"running","from":"running","step":"__proto__","step_index":0,"role_turns":0,"tasks_done":0,"tasks":0},"replace":true}
+        \\{"type":"STEP_FINISHED","timestamp":22,"stepName":"__proto__"}
+        \\{"type":"STEP_STARTED","timestamp":22,"stepName":"a\"b"}
+        \\{"type":"ACTIVITY_SNAPSHOT","timestamp":22,"messageId":"zygos.mission","activityType":"zygos.mission","content":{"state":"running","from":"running","step":"a\"b","step_index":1,"role_turns":1,"tasks_done":0,"tasks":0},"replace":true}
+        \\
+    );
+}
+
+test "project: a planner step starting clears the plan" {
+    try expectProjection("m5",
+        \\{"ts":30,"event":"mission","from":"running","to":"running","step":"planner","step_index":1,"role_turns":0,"tasks_done":0,"tasks":0}
+        \\{"ts":31,"event":"task_start","index":1,"total":2,"desc":"old"}
+        \\{"ts":32,"event":"mission","from":"running","to":"running","step":"planner","step_index":1,"role_turns":1,"tasks_done":0,"tasks":2}
+        \\{"ts":33,"event":"task_start","index":2,"total":2,"desc":"same step, plan kept"}
+        \\{"ts":34,"event":"mission","from":"running","to":"running","step":"executor","step_index":2,"role_turns":1,"tasks_done":0,"tasks":2}
+        \\{"ts":35,"event":"mission","from":"running","to":"running","step":"planner","step_index":1,"role_turns":2,"tasks_done":0,"tasks":2}
+        \\{"ts":36,"event":"task_start","index":1,"total":1,"desc":"new"}
+        \\
+    ,
+        \\{"type":"RUN_STARTED","timestamp":30,"threadId":"m5","runId":"m5:1","protocolVersion":"1.0"}
+        \\{"type":"STEP_STARTED","timestamp":30,"stepName":"planner"}
+        \\{"type":"ACTIVITY_SNAPSHOT","timestamp":30,"messageId":"zygos.mission","activityType":"zygos.mission","content":{"state":"running","from":"running","step":"planner","step_index":1,"role_turns":0,"tasks_done":0,"tasks":0},"replace":true}
+        \\{"type":"ACTIVITY_SNAPSHOT","timestamp":31,"messageId":"zygos.plan","activityType":"zygos.plan","content":{"total":2,"items":[{"index":1,"desc":"old","status":"active","attempts":1}]},"replace":true}
+        \\{"type":"ACTIVITY_SNAPSHOT","timestamp":32,"messageId":"zygos.mission","activityType":"zygos.mission","content":{"state":"running","from":"running","step":"planner","step_index":1,"role_turns":1,"tasks_done":0,"tasks":2},"replace":true}
+        \\{"type":"ACTIVITY_SNAPSHOT","timestamp":33,"messageId":"zygos.plan","activityType":"zygos.plan","content":{"total":2,"items":[{"index":1,"desc":"old","status":"active","attempts":1},{"index":2,"desc":"same step, plan kept","status":"active","attempts":1}]},"replace":true}
+        \\{"type":"STEP_FINISHED","timestamp":34,"stepName":"planner"}
+        \\{"type":"STEP_STARTED","timestamp":34,"stepName":"executor"}
+        \\{"type":"ACTIVITY_SNAPSHOT","timestamp":34,"messageId":"zygos.mission","activityType":"zygos.mission","content":{"state":"running","from":"running","step":"executor","step_index":2,"role_turns":1,"tasks_done":0,"tasks":2},"replace":true}
+        \\{"type":"STEP_FINISHED","timestamp":35,"stepName":"executor"}
+        \\{"type":"STEP_STARTED","timestamp":35,"stepName":"planner"}
+        \\{"type":"ACTIVITY_SNAPSHOT","timestamp":35,"messageId":"zygos.mission","activityType":"zygos.mission","content":{"state":"running","from":"running","step":"planner","step_index":1,"role_turns":2,"tasks_done":0,"tasks":2},"replace":true}
+        \\{"type":"ACTIVITY_SNAPSHOT","timestamp":36,"messageId":"zygos.plan","activityType":"zygos.plan","content":{"total":1,"items":[{"index":1,"desc":"new","status":"active","attempts":1}]},"replace":true}
+        \\
+    );
+}
+
+test "project: a legacy log without a cursor still opens a step per state" {
+    try expectProjection("m6",
+        \\{"ts":40,"event":"mission","from":"defining","to":"planning","role_turns":0,"tasks_done":0,"tasks":0}
+        \\{"ts":41,"event":"mission","from":"planning","to":"executing","role_turns":1,"tasks_done":0,"tasks":1}
+        \\
+    ,
+        \\{"type":"RUN_STARTED","timestamp":40,"threadId":"m6","runId":"m6:1","protocolVersion":"1.0"}
+        \\{"type":"STEP_STARTED","timestamp":40,"stepName":"planning"}
+        \\{"type":"ACTIVITY_SNAPSHOT","timestamp":40,"messageId":"zygos.mission","activityType":"zygos.mission","content":{"state":"planning","from":"defining","step":null,"step_index":null,"role_turns":0,"tasks_done":0,"tasks":0},"replace":true}
+        \\{"type":"STEP_FINISHED","timestamp":41,"stepName":"planning"}
+        \\{"type":"STEP_STARTED","timestamp":41,"stepName":"executing"}
+        \\{"type":"ACTIVITY_SNAPSHOT","timestamp":41,"messageId":"zygos.mission","activityType":"zygos.mission","content":{"state":"executing","from":"planning","step":null,"step_index":null,"role_turns":1,"tasks_done":0,"tasks":1},"replace":true}
         \\
     );
 }
