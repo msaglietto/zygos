@@ -16,6 +16,10 @@ pub const Rule = struct {
     /// trailing '*' does prefix match on either.
     tool: []const u8,
     verdict: Verdict,
+    /// Matched against the request's `step_id` with the same matcher as
+    /// `tool`. Null matches every step; non-null never matches a request
+    /// whose `step_id` is absent or empty.
+    step: ?[]const u8 = null,
 };
 
 pub const PolicyWorker = struct {
@@ -35,9 +39,12 @@ pub const PolicyWorker = struct {
         const owned = try gpa.alloc(Rule, rules.len);
         errdefer gpa.free(owned);
         var copied: usize = 0;
-        errdefer for (owned[0..copied]) |r| gpa.free(@constCast(r.tool));
+        errdefer for (owned[0..copied]) |r| freeRule(gpa, r);
         for (rules, 0..) |r, i| {
-            owned[i] = .{ .tool = try gpa.dupe(u8, r.tool), .verdict = r.verdict };
+            const tool = try gpa.dupe(u8, r.tool);
+            errdefer gpa.free(tool);
+            const step: ?[]const u8 = if (r.step) |s| try gpa.dupe(u8, s) else null;
+            owned[i] = .{ .tool = tool, .verdict = r.verdict, .step = step };
             copied += 1;
         }
         self.* = .{
@@ -52,10 +59,15 @@ pub const PolicyWorker = struct {
 
     pub fn stop(self: *PolicyWorker) void {
         self.worker.stop();
-        for (self.rules) |r| self.gpa.free(@constCast(r.tool));
+        for (self.rules) |r| freeRule(self.gpa, r);
         self.gpa.free(self.rules);
         const gpa = self.gpa;
         gpa.destroy(self);
+    }
+
+    fn freeRule(gpa: std.mem.Allocator, r: Rule) void {
+        gpa.free(@constCast(r.tool));
+        if (r.step) |s| gpa.free(@constCast(s));
     }
 
     fn handler(ctx: ?*anyopaque, arena: std.mem.Allocator, request_json: []const u8) error{ Failed, OutOfMemory }![]const u8 {
@@ -70,7 +82,10 @@ pub const PolicyWorker = struct {
             return reply(arena, .deny, "malformed request");
         const function_id = strField(root.object, "function_id") orelse "";
 
+        const step_id = strField(root.object, "step_id") orelse "";
+
         for (self.rules) |r| {
+            if (r.step) |sp| if (!matches(sp, step_id)) continue;
             if (matches(r.tool, tool) or matches(r.tool, function_id)) {
                 return replyRule(arena, r.verdict, r.tool);
             }
@@ -255,5 +270,71 @@ test "no leaks under repeated checks" {
     while (i < 50) : (i += 1) {
         const res = try h.caller.call("zygos::policy::check", "{\"tool\":\"b-tool\",\"function_id\":\"x\"}");
         res.deinit(testing.allocator);
+    }
+}
+
+test "rule with step matches only that step" {
+    var h = try Harness.init(testing.allocator);
+    defer h.deinit();
+    const pw = try PolicyWorker.start(testing.allocator, &h.actor, &h.registry, &.{
+        .{ .tool = "bash", .step = "architect", .verdict = .allow },
+        .{ .tool = "bash", .step = "review*", .verdict = .ask },
+    });
+    defer pw.stop();
+
+    const hit = try check(h, "{\"tool\":\"bash\",\"function_id\":\"zygos::tools::bash\",\"step_id\":\"architect\"}");
+    defer testing.allocator.free(hit.verdict);
+    defer testing.allocator.free(hit.reason);
+    try testing.expectEqualStrings("allow", hit.verdict);
+
+    const glob = try check(h, "{\"tool\":\"bash\",\"function_id\":\"zygos::tools::bash\",\"step_id\":\"review-2\"}");
+    defer testing.allocator.free(glob.verdict);
+    defer testing.allocator.free(glob.reason);
+    try testing.expectEqualStrings("ask", glob.verdict);
+
+    const miss = try check(h, "{\"tool\":\"bash\",\"function_id\":\"zygos::tools::bash\",\"step_id\":\"exec\"}");
+    defer testing.allocator.free(miss.verdict);
+    defer testing.allocator.free(miss.reason);
+    try testing.expectEqualStrings("deny", miss.verdict);
+    try testing.expectEqualStrings("no rule matched", miss.reason);
+}
+
+test "rule without step matches every step" {
+    var h = try Harness.init(testing.allocator);
+    defer h.deinit();
+    const pw = try PolicyWorker.start(testing.allocator, &h.actor, &h.registry, &.{
+        .{ .tool = "bash", .verdict = .allow },
+    });
+    defer pw.stop();
+
+    inline for (.{
+        "{\"tool\":\"bash\",\"function_id\":\"f\",\"step_id\":\"architect\"}",
+        "{\"tool\":\"bash\",\"function_id\":\"f\",\"step_id\":\"\"}",
+        "{\"tool\":\"bash\",\"function_id\":\"f\"}",
+    }) |request| {
+        const r = try check(h, request);
+        defer testing.allocator.free(r.verdict);
+        defer testing.allocator.free(r.reason);
+        try testing.expectEqualStrings("allow", r.verdict);
+    }
+}
+
+test "step-scoped rule does not match a request without step_id" {
+    var h = try Harness.init(testing.allocator);
+    defer h.deinit();
+    const pw = try PolicyWorker.start(testing.allocator, &h.actor, &h.registry, &.{
+        .{ .tool = "bash", .step = "architect", .verdict = .allow },
+        .{ .tool = "bash", .step = "*", .verdict = .allow },
+    });
+    defer pw.stop();
+
+    inline for (.{
+        "{\"tool\":\"bash\",\"function_id\":\"f\"}",
+        "{\"tool\":\"bash\",\"function_id\":\"f\",\"step_id\":\"\"}",
+    }) |request| {
+        const r = try check(h, request);
+        defer testing.allocator.free(r.verdict);
+        defer testing.allocator.free(r.reason);
+        try testing.expectEqualStrings("deny", r.verdict);
     }
 }

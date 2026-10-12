@@ -233,11 +233,13 @@ pub const TurnOrchestrator = struct {
         policy_fn: []const u8,
         tool_name: []const u8,
         function_id: []const u8,
+        step_id: []const u8,
         input: json.Value,
     ) error{OutOfMemory}!PolicyDecision {
-        const preq = try std.fmt.allocPrint(arena, "{{\"tool\":{f},\"function_id\":{f},\"input\":{s}}}", .{
+        const preq = try std.fmt.allocPrint(arena, "{{\"tool\":{f},\"function_id\":{f},\"step_id\":{f},\"input\":{s}}}", .{
             json.fmt(tool_name, .{}),
             json.fmt(function_id, .{}),
+            json.fmt(step_id, .{}),
             try rawJson(arena, input),
         });
         const res = self.worker.call(policy_fn, preq) catch |err| switch (err) {
@@ -639,7 +641,7 @@ fn runTurn(self: *TurnOrchestrator, arena: std.mem.Allocator, request_json: []co
                     // U1 policy gate — only an explicit verdict dispatches.
                     var ask = route.requires_approval;
                     if (policy_fn) |pf| {
-                        switch (try self.checkPolicy(arena, pf, tool_name, route.function_id, input)) {
+                        switch (try self.checkPolicy(arena, pf, tool_name, route.function_id, step_id, input)) {
                             .allow => {},
                             .ask => ask = true,
                             .deny => |reason| {
@@ -1595,6 +1597,34 @@ test "web_fetch dispatch consults policy with URL riding the policy request inpu
     defer h.tool.mutex.unlock();
     try testing.expectEqual(@as(usize, 1), h.tool.calls);
     try testing.expect(std.mem.indexOf(u8, h.tool.last_input.?, "https://example.com/page") != null);
+}
+
+test "the policy request carries step_id" {
+    var h = try Harness.init(testing.allocator, &.{ web_fetch_tool_use, end_turn_msg });
+    defer h.deinit();
+    const rp = try RecordingPolicy.start(testing.allocator, &h.actor, &h.registry);
+    defer rp.stop();
+
+    const req =
+        \\{"model":"fake-1","system":"you are a test","max_steps":4,
+        \\ "provider_function":"zygos::provider::fake::messages",
+        \\ "policy_function":"zygos::policy::check",
+        \\ "step_id":"architect",
+        \\ "messages":[{"role":"user","content":"fetch it"}],
+        \\ "tools":[{"name":"web_fetch","function_id":"test::tool::run"}]}
+    ;
+    const res = try h.runTurnCall(req);
+    defer res.deinit(testing.allocator);
+    try testing.expect(res == .ok);
+
+    rp.mutex.lock();
+    defer rp.mutex.unlock();
+    try testing.expect(rp.last_request != null);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        rp.last_request.?,
+        "\"tool\":\"web_fetch\",\"function_id\":\"test::tool::run\",\"step_id\":\"architect\",\"input\":",
+    ) != null);
 }
 
 /// A tool whose handler makes a bus call of its own before replying — the
