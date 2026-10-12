@@ -17,6 +17,12 @@ no console answers it, and Harbor's verifier judges the workspace. The
 planning root lives under the agent log directory, outside the workspace.
 Both approved catalog rows are uploaded (`deepseek-flash`, `glm-flash`) so a
 route table may send steps to either; keys enter only through the exec env.
+
+A `zygos.zon` may carry `.steps` (the mission pipeline). Each step's
+`.definition` file is uploaded next to the uploaded `zygos.zon` at the same
+relative path, so the path resolves inside the container, and
+`mission-run.json` records the pipeline (id, definition path, definition
+SHA-256, tools) for the report to check against the arm and the trace.
 """
 
 from __future__ import annotations
@@ -79,6 +85,8 @@ max_tokens = 8192
 temperature = 0.7
 """
 MISSION_KEY_ENVS = ("DEEPSEEK_API_KEY", "Z_AI_API_KEY")
+# Files the adapter puts in the agent directory itself; a step definition may not shadow them.
+MISSION_UPLOADED = ("zygos", "zygos.zon", "brief.md", "providers.toml")
 MISSION_BUDGET_TOKENS = 1_000_000
 DEEPSEEK_CATALOG = """[[providers]]
 name = "Deepseek Flash"
@@ -371,6 +379,8 @@ class ZygosAgent(BaseAgent):
         import hashlib
         import json
 
+        from eval.campaign import read_pipeline
+
         logs = Path(self.logs_dir)
         agent_dir = env_paths.agent_dir
         brief_text = mission_brief(task_id, instruction)
@@ -378,6 +388,31 @@ class ZygosAgent(BaseAgent):
         await environment.upload_file(source_path=logs / "brief.md", target_path=str(agent_dir / "brief.md"))
         (logs / "zygos.zon").write_bytes(config.read_bytes())
         await environment.upload_file(source_path=logs / "zygos.zon", target_path=str(agent_dir / "zygos.zon"))
+        # The pipeline is read once, from the same files that are uploaded.
+        # A `.definition` resolves relative to the .zon's directory, so each
+        # file lands next to the uploaded zygos.zon at the same relative path.
+        pipeline = read_pipeline(config)
+        made: set[str] = set()
+        for step in pipeline:
+            relative = step["definition"]
+            if relative is None:
+                continue
+            target = agent_dir / relative
+            parent = str(target.parent)
+            if parent not in made and parent != str(agent_dir):
+                made.add(parent)
+                prepared = await environment.exec(command=f"mkdir -p {shlex.quote(parent)}")
+                if prepared.return_code != 0:
+                    raise RuntimeError(f"could not create {parent} for step definition {relative}")
+            if relative in MISSION_UPLOADED or relative.split("/")[0] == "planning":
+                raise RuntimeError(f"step definition {relative} would overwrite a file the adapter owns")
+            data = (config.resolve().parent / relative).read_bytes()
+            if hashlib.sha256(data).hexdigest() != step["definition_sha256"]:
+                raise RuntimeError(f"step definition {relative} changed while the run was starting")
+            staged = logs / relative
+            staged.parent.mkdir(parents=True, exist_ok=True)
+            staged.write_bytes(data)
+            await environment.upload_file(source_path=staged, target_path=str(target))
         planning = agent_dir / "planning"
         binary = str(agent_dir / "zygos")
         command = " && ".join([
@@ -421,6 +456,9 @@ class ZygosAgent(BaseAgent):
             "task_id": task_id,
             "config_sha256": hashlib.sha256(config.read_bytes()).hexdigest(),
             "brief_sha256": hashlib.sha256(brief_text.encode("utf-8")).hexdigest(),
+            "pipeline": [
+                {k: s[k] for k in ("id", "definition", "definition_sha256", "tools")} for s in pipeline
+            ],
             "role_max_steps": step_cap,
             "exec_timeout_sec": timeout,
             "exit_code": result.return_code,

@@ -69,7 +69,8 @@ tests use Harbor's interpreter. All of `eval/test_campaign.py`,
   `--builds-dir/<git_sha>/`), and optional `config` (a `zygos.zon` path
   relative to the experiment file).
 - The arms must differ in `variable` and in nothing else. Identical trim,
-  identical config sha, identical build, or a second differing axis refuses
+  identical config sha and pipeline (mission definition files included),
+  identical build, or a second differing axis refuses
   the experiment. This is the "single variable" rule of the benchmark policy
   made executable.
 - `model.id` must be on the live allowlist. `key_env` is the variable the
@@ -163,8 +164,9 @@ Docker, or network — that is what `eval/test_campaign.py` checks.
 
 `"mode": "mission"` runs every task through the mission loop instead of
 the single headless turn, so a `zygos.zon` is exercised as a mission
-configuration: which model (and failover ladder) does each of the four
-steps, product-owner, planner, executor, verifier. Each arm must carry a
+configuration: which model (and failover ladder) does each step of the
+pipeline (by default product-owner, planner, executor, verifier), and,
+with `.steps`, which steps exist. Each arm must carry a
 `config`; `variable` is `config` or `build` (`trim` is task-only). The
 adapter (`ZYGOS_MODE=mission`) turns the instruction into a brief that
 passes the W1 lint (objective last, level-2 headings inside the instruction
@@ -179,7 +181,7 @@ cap and `ZYGOS_MISSION_TIMEOUT_MS` sits 45 s under the exec ceiling.
 Preflight additionally requires the key for every catalog slug any arm's
 route table names (`DEEPSEEK_API_KEY`, `Z_AI_API_KEY`); an unknown slug
 refuses. Evidence per job: `agent/mission-run.json` (config and brief
-hashes, step cap, exit code), `agent/mission.json` (the CLI's terminal
+hashes, pipeline, step cap, exit code), `agent/mission.json` (the CLI's terminal
 reply, or `state: lost` with stop `no_terminal_reply` when the process
 ended without one), `agent/zygos.zon`, and `agent/planning/events.jsonl`.
 Usage is the sum of the trace's usage lines, which carry no cache counts:
@@ -189,11 +191,56 @@ apply. The report adds mean role turns, mission states, and role failures.
 A lost terminal reply is a recorded stop, not a problem; a missing trace or
 `mission-run.json` is.
 
-Known limit (issue #7): the list and order of steps is fixed in the
-mission FSM. A mission-mode campaign compares who does each step, not
-which steps exist. `.context_strategy` and `.mcp_servers` in an arm's
-`zygos.zon` are honored by the mission (the mission CLI reads them), so a
-mission campaign can compare those too.
+**Pipeline.** A mission arm's `zygos.zon` may carry `.steps`
+(`docs/specs/mission.md`, "Pipeline config"), so a mission campaign can
+compare which steps exist, in what order, with which definitions and tools,
+as well as who does each one. Absent `.steps` is the default pipeline
+(`product-owner`, `planner`, `executor`, `verifier`; built-in prompts; tools
+on the executor only). `eval/campaign.py` reads the block with a strict
+parser of its own and refuses the experiment when it cannot parse it, when a
+step names an unknown key or no `.id`, or when a `.definition` is absolute,
+holds a `..` component, resolves (after symlinks) outside the `.zon`'s
+directory, or is unreadable, empty, or over 64 KiB. It does not repeat the
+binary's other boot checks (reserved ids, a missing executor, a verifier
+with tools); the mission refuses those at start and the job records the
+failure.
+
+- **Arm identity.** The definition files count. Each arm carries
+  `pipeline: [{"id","definition_sha256","tools"}]` (`definition_sha256` is
+  the SHA-256 of the file's raw bytes, null for a built-in), in
+  `report.json` and the report's arm table. Two arms with byte-identical
+  `.zon` files and different definition bytes are different arms.
+- **Single variable.** A differing pipeline (ids, order, definition hashes,
+  tools) is part of the `config` axis, alongside the `.zon`'s own SHA-256:
+  `variable: config` accepts it, `variable: build` refuses it as a second
+  differing axis, and arms identical in both refuse as "do not differ".
+- **Inspection.** The mission's first trace event is `pipeline`
+  (`{"ts":N,"event":"pipeline","steps":[{"id","definition_sha256","tools"}]}`).
+  Inspection finds it in `planning/events.jsonl` and compares `steps` with
+  the arm's pipeline. A missing event or any difference is a recorded
+  problem (`pipeline event missing`, `pipeline event differs from the arm`),
+  like the config SHA-256 check. `mission-run.json` carries the pipeline the
+  adapter uploaded (`id`, `definition`, `definition_sha256`, `tools`); a
+  difference from the arm is a problem too.
+- **Adapter.** Each `.definition` file is uploaded next to the uploaded
+  `zygos.zon` at the same relative path, so the path resolves inside the
+  container. A definition may not shadow a file the adapter owns
+  (`zygos`, `zygos.zon`, `brief.md`, `providers.toml`, `planning/`).
+- **Mission states.** The terminal reply and the metric use the mission's
+  states: `running`, `gating`, `done`, `failed`. A parked mission is
+  `gating`; the reply also carries `step` (string or null) and `step_index`.
+  The report's "Mission states" row counts them verbatim, and the arm table
+  adds a `pipeline` row.
+- **Step-count budget caveat.** Each step turn increments `role_turns_used`
+  against `max_role_turns` (`docs/specs/mission.md`, "Each step turn
+  increments `role_turns_used`…"), so a longer pipeline reaches the cap
+  sooner. An arm that adds steps spends part of the same budget on them;
+  read a lower pass rate or a `role_turns_exhausted` stop in that light, and
+  compare mean role turns before crediting or blaming the extra step.
+
+`.context_strategy` and `.mcp_servers` in an arm's `zygos.zon` are honored
+by the mission (the mission CLI reads them), so a mission campaign can
+compare those too.
 
 Experiments: `eval/experiments/mission-smoke.json` (one task, one repeat,
 to prove the path) and `eval/experiments/mission-routing.json` (the
@@ -204,7 +251,8 @@ executor step on GLM Flash) with route tables under
 ## What this does not do
 
 A task-mode campaign (`mode: task`) runs one headless turn and honors only
-the route table; a `zygos.zon` carrying `.context_strategy` or
-`.mcp_servers` refuses there. It does not choose a dollar cap or expand the
+the route table; a `zygos.zon` carrying `.context_strategy`,
+`.mcp_servers` or `.steps` refuses there (the binary refuses it; the
+campaign still reads `.steps` into the arm identity). It does not choose a dollar cap or expand the
 task set; both remain operator decisions recorded in
 `docs/benchmark-policy.md`.

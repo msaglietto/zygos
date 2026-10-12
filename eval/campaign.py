@@ -26,6 +26,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -36,7 +37,7 @@ from collections import Counter
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime, timezone
 from decimal import Decimal
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 REPO = Path(__file__).resolve().parents[1]
 DATASET = "terminal-bench/terminal-bench-2-1"
@@ -75,6 +76,188 @@ def write_json(path: Path, value) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Mission pipeline (`.steps` in a zygos.zon)
+# ---------------------------------------------------------------------------
+
+DEFAULT_STEP_IDS = ("product-owner", "planner", "executor", "verifier")
+STEP_KEYS = ("id", "definition", "tools")
+MAX_DEFINITION_BYTES = 64 * 1024
+
+_ZON_TOKEN = re.compile(
+    r'(?P<space>\s+)|(?P<comment>//[^\n]*)|(?P<string>"(?:[^"\\\n]|\\.)*")'
+    r"|(?P<word>[A-Za-z_][A-Za-z0-9_]*)|(?P<number>-?[0-9][A-Za-z0-9_.]*)|(?P<punct>[{}=,.])"
+)
+
+
+def default_pipeline() -> list[dict]:
+    """The pipeline a zygos.zon without `.steps` runs: built-in prompts, tools on the executor."""
+    return [{"id": i, "definition": None, "definition_sha256": None, "tools": i == "executor"} for i in DEFAULT_STEP_IDS]
+
+
+def pipeline_identity(steps: list[dict]) -> list[dict]:
+    """What an arm's identity and the trace's `pipeline` event carry per step."""
+    return [{"id": s["id"], "definition_sha256": s["definition_sha256"], "tools": s["tools"]} for s in steps]
+
+
+def _zon_tokens(text: str) -> list[tuple[str, str]] | None:
+    """Tokens of a zon file, comments dropped; None when something is not one of
+    the few shapes the pipeline parser knows (so the caller can decide)."""
+    tokens: list[tuple[str, str]] = []
+    position = 0
+    while position < len(text):
+        match = _ZON_TOKEN.match(text, position)
+        if match is None:
+            return None
+        position = match.end()
+        if match.lastgroup not in ("space", "comment"):
+            tokens.append((match.lastgroup, match.group()))
+    return tokens
+
+
+class _StepsParser:
+    """Strict reader for the one value shape `.steps` may take: a tuple of
+    structs whose fields are strings or bools. Anything else refuses."""
+
+    def __init__(self, tokens: list[tuple[str, str]], where: str):
+        self.tokens = tokens
+        self.where = where
+
+    def fail(self, why: str):
+        raise CampaignError(f"{self.where}: .steps {why}")
+
+    def peek(self, at: int, kind: str, text: str | None = None) -> bool:
+        return at < len(self.tokens) and self.tokens[at][0] == kind and (text is None or self.tokens[at][1] == text)
+
+    def value(self, at: int):
+        """-> (value, next). Struct elements come back as [(name | None, value)]."""
+        if at >= len(self.tokens):
+            self.fail("ends inside a value")
+        kind, text = self.tokens[at]
+        if kind == "string":
+            body = text[1:-1]
+            if "\\" in body:
+                body = re.sub(r"\\(.)", lambda m: m.group(1) if m.group(1) in '\\"' else self.fail("has an unsupported string escape"), body)
+            return body, at + 1
+        if kind == "word" and text in ("true", "false"):
+            return text == "true", at + 1
+        if self.peek(at, "punct", ".") and self.peek(at + 1, "punct", "{"):
+            return self.struct(at)
+        self.fail(f"has an unreadable value near {text!r}")
+
+    def struct(self, at: int):
+        at += 2  # `.{`
+        items: list[tuple[str | None, object]] = []
+        while not self.peek(at, "punct", "}"):
+            name = None
+            if self.peek(at, "punct", ".") and self.peek(at + 1, "word") and self.peek(at + 2, "punct", "="):
+                name = self.tokens[at + 1][1]
+                at += 3
+            value, at = self.value(at)
+            items.append((name, value))
+            if self.peek(at, "punct", ","):
+                at += 1
+            elif not self.peek(at, "punct", "}"):
+                self.fail("is missing a comma or a closing brace")
+        return items, at + 1
+
+
+def _steps_entries(tokens: list[tuple[str, str]], where: str) -> list[dict] | None:
+    """The raw `.steps` entries (id/definition/tools as written), or None when
+    the root struct has no `.steps` field. Only a top-level field counts."""
+    if len(tokens) < 2 or tokens[0][1] != "." or tokens[1][1] != "{":
+        return None
+    depth, at, found = 0, 0, None
+    while at < len(tokens):
+        text = tokens[at][1]
+        if tokens[at][0] == "punct" and text == "{":
+            depth += 1
+        elif tokens[at][0] == "punct" and text == "}":
+            depth -= 1
+        elif (depth == 1 and text == "." and at + 2 < len(tokens)
+              and tokens[at + 1] == ("word", "steps") and tokens[at + 2][1] == "="):
+            if found is not None:
+                raise CampaignError(f"{where}: .steps appears twice")
+            found = at + 3
+        at += 1
+    if depth != 0:
+        raise CampaignError(f"{where}: unbalanced braces, so .steps cannot be trusted")
+    if found is None:
+        return None
+    parser = _StepsParser(tokens, where)
+    value, _ = parser.value(found)
+    if not isinstance(value, list):
+        parser.fail("must be a list of step entries")
+    if not value:
+        parser.fail("is empty")
+    entries = []
+    for index, (name, entry) in enumerate(value):
+        if name is not None or not isinstance(entry, list):
+            parser.fail(f"entry {index} must be a struct")
+        fields: dict = {}
+        for key, field in entry:
+            if key not in STEP_KEYS:
+                parser.fail(f"entry {index} has unknown key {key!r}")
+            if key in fields:
+                parser.fail(f"entry {index} repeats key {key!r}")
+            wanted = bool if key == "tools" else str
+            if not isinstance(field, wanted):
+                parser.fail(f"entry {index}: .{key} must be a {'bool' if key == 'tools' else 'string'}")
+            fields[key] = field
+        if not fields.get("id"):
+            parser.fail(f"entry {index} has no .id")
+        entries.append(fields)
+    return entries
+
+
+def read_pipeline(zon_path: Path) -> list[dict]:
+    """The pipeline a zygos.zon pins: `[{"id","definition","definition_sha256","tools"}]`.
+
+    Absent `.steps` is the default pipeline. A `.steps` block this reader cannot
+    parse, or a definition that is unreadable, empty, over 64 KiB, absolute,
+    holds a `..` component, or resolves outside the file's directory, refuses
+    the experiment. It does not repeat the binary's other boot checks (reserved
+    ids, an executor, a verifier without tools); the mission refuses those.
+    """
+    zon_path = Path(zon_path)
+    text = zon_path.read_text(encoding="utf-8")
+    where = str(zon_path)
+    tokens = _zon_tokens(text)
+    if tokens is None:
+        if re.search(r"\bsteps\b", text):
+            raise CampaignError(f"{where}: cannot tokenize the file, so its .steps cannot be read")
+        return default_pipeline()
+    entries = _steps_entries(tokens, where)
+    if entries is None:
+        return default_pipeline()
+    base = zon_path.resolve().parent
+    steps = []
+    for index, entry in enumerate(entries):
+        relative = entry.get("definition")
+        digest = None
+        if relative is not None:
+            parts = PurePosixPath(relative).parts
+            if not relative or relative.startswith("/") or ".." in parts:
+                raise CampaignError(f"{where}: steps[{index}]: definition path {relative!r} must be relative with no '..'")
+            target = (base / relative).resolve()
+            if not target.is_relative_to(base):
+                raise CampaignError(f"{where}: steps[{index}]: definition {relative!r} resolves outside the config directory")
+            try:
+                data = target.read_bytes()
+            except OSError as exc:
+                raise CampaignError(f"{where}: steps[{index}]: definition {relative!r} is unreadable: {exc.strerror}") from exc
+            if not data.strip() or len(data) > MAX_DEFINITION_BYTES:
+                raise CampaignError(f"{where}: steps[{index}]: definition {relative!r} is empty or over {MAX_DEFINITION_BYTES} bytes")
+            digest = hashlib.sha256(data).hexdigest()
+        steps.append({
+            "id": entry["id"],
+            "definition": relative,
+            "definition_sha256": digest,
+            "tools": entry.get("tools", entry["id"] == "executor"),
+        })
+    return steps
+
+
+# ---------------------------------------------------------------------------
 # Experiment definition
 # ---------------------------------------------------------------------------
 
@@ -101,6 +284,9 @@ class Arm:
                 raise CampaignError(f"arm {self.name}: config {config} is not a file")
             self.config_path = path
             self.config_sha256 = sha256_file(path)
+        # The pipeline the config pins. Definition files are part of the arm:
+        # the zon bytes name them, but only their own bytes say what ran.
+        self.pipeline: list[dict] = read_pipeline(self.config_path) if self.config_path else default_pipeline()
         # Set by `Experiment.locate_builds`.
         self.binary: Path | None = None
 
@@ -112,13 +298,20 @@ class Arm:
             "binary_sha256": self.binary_sha256,
             "config": str(self.config_path) if self.config_path else None,
             "config_sha256": self.config_sha256,
+            "pipeline": pipeline_identity(self.pipeline),
         }
+
+    def definition_hashes(self) -> list[str | None]:
+        return [s["definition_sha256"] for s in self.pipeline]
 
     def variable_value(self, variable: str) -> str:
         if variable == "trim":
             return self.trim
         if variable == "config":
-            return self.config_sha256 or "none"
+            hashes = [h for h in self.definition_hashes() if h]
+            if not hashes:
+                return self.config_sha256 or "none"
+            return f"{self.config_sha256}+{hashlib.sha256(' '.join(hashes).encode()).hexdigest()[:12]}"
         return self.git_sha
 
 
@@ -209,7 +402,8 @@ class Experiment:
         a, b = self.baseline, self.candidate
         same = {
             "trim": a.trim == b.trim,
-            "config": a.config_sha256 == b.config_sha256,
+            # Part of the config axis: the zon and the definition files it names.
+            "config": a.config_sha256 == b.config_sha256 and pipeline_identity(a.pipeline) == pipeline_identity(b.pipeline),
             "build": a.git_sha == b.git_sha and a.binary_sha256 == b.binary_sha256,
         }
         if same[self.variable]:
@@ -545,6 +739,14 @@ def inspect_mission(exp: Experiment, jobs_dir: Path, arm: Arm, record: dict, age
             record["problems"].append(f"uploaded route table sha256 {actual} differs from the arm")
     else:
         record["problems"].append("uploaded route table missing")
+    uploaded_pipeline = run.get("pipeline")
+    if uploaded_pipeline is not None:
+        try:
+            uploaded_matches = pipeline_identity(uploaded_pipeline) == pipeline_identity(arm.pipeline)
+        except (KeyError, TypeError):
+            uploaded_matches = False
+        if not uploaded_matches:
+            record["problems"].append("uploaded pipeline in mission-run.json differs from the arm")
     if run.get("role_max_steps") != exp.step_cap:
         record["problems"].append(f"role_max_steps is {run.get('role_max_steps')!r}, expected {exp.step_cap}")
 
@@ -570,12 +772,25 @@ def inspect_mission(exp: Experiment, jobs_dir: Path, arm: Arm, record: dict, age
         record["turn_stop"] = reply.get("stop")
     record["role_turns"] = reply.get("role_turns")
     record["tasks_done"] = reply.get("tasks_done")
+    record["mission_step"] = reply.get("step")
+    record["mission_step_index"] = reply.get("step_index")
 
     events_path = agent_dir / "planning" / "events.jsonl"
     if not events_path.is_file():
         record["problems"].append("planning/events.jsonl missing")
         return record
     events = read_events(events_path)
+    # The mission pins its pipeline and says so in its first trace event, so
+    # the run that was measured is the one the arm names. Presence and
+    # content are checked, not position.
+    pipeline = next((e for e in events if e.get("event") == "pipeline"), None)
+    if pipeline is None:
+        record["problems"].append("pipeline event missing")
+    elif pipeline.get("steps") != pipeline_identity(arm.pipeline):
+        record["problems"].append(
+            f"pipeline event differs from the arm: trace {json.dumps(pipeline.get('steps'), separators=(',', ':'))}"
+            f", expected {json.dumps(pipeline_identity(arm.pipeline), separators=(',', ':'))}"
+        )
     usage = [e for e in events if e.get("event") == "usage"]
     trial = {
         "input_tokens": sum(int(e.get("input_tokens", 0)) for e in usage),
@@ -1021,6 +1236,13 @@ def render_markdown(exp: Experiment, report: dict) -> str:
     ]
     for label, key in rows:
         lines.append(f"| {label} | `{base['arm'][key] or 'none'}` | `{cand['arm'][key] or 'none'}` |")
+    if exp.mode == "mission":
+        def pipeline_cell(arm_report: dict) -> str:
+            return " > ".join(
+                s["id"] + (f":{s['definition_sha256'][:8]}" if s["definition_sha256"] else "")
+                for s in arm_report["arm"]["pipeline"]
+            )
+        lines.append(f"| pipeline | `{pipeline_cell(base)}` | `{pipeline_cell(cand)}` |")
     lines += ["", "## Results", "", f"| Metric | {exp.baseline.name} | {exp.candidate.name} |", "|---|---:|---:|"]
     metrics = [
         ("Task-runs recorded / expected", lambda s: f"{s['recorded_task_runs']} / {s['expected_task_runs']}"),

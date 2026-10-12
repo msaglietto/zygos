@@ -242,7 +242,7 @@ class TrimContract(unittest.IsolatedAsyncioTestCase):
                     return SimpleNamespace(return_code=0)
                 return SimpleNamespace(
                     return_code=1,
-                    stdout='log line\n{"state":"gating","stop":"none","paused":true,"role_turns":4,"tasks_done":2}\n',
+                    stdout='log line\n{"state":"gating","step":null,"step_index":4,"stop":"none","paused":true,"role_turns":4,"tasks_done":2}\n',
                     stderr="mission: deepseek-fixture\n",
                 )
 
@@ -288,12 +288,78 @@ class TrimContract(unittest.IsolatedAsyncioTestCase):
             run = json.loads((logs / "mission-run.json").read_text())
             self.assertEqual(run["mode"], "mission")
             self.assertEqual(run["exit_code"], 1)
+            self.assertEqual([s["id"] for s in run["pipeline"]], ["product-owner", "planner", "executor", "verifier"])
+            self.assertEqual([s["tools"] for s in run["pipeline"]], [False, False, True, False])
+            self.assertTrue(all(s["definition"] is None and s["definition_sha256"] is None for s in run["pipeline"]))
             self.assertEqual(run["config_sha256"], __import__("hashlib").sha256(zon.encode()).hexdigest())
             for path in logs.iterdir():
                 if path.is_file():
                     self.assertNotIn("deepseek-fixture", path.read_text(errors="ignore"), path)
                     self.assertNotIn("glm-fixture", path.read_text(errors="ignore"), path)
             self.assertEqual((logs / "exit-code.txt").read_text(), "1")
+
+    async def test_mission_mode_uploads_step_definitions_and_records_the_pipeline(self):
+        class MissionEnvironment(Environment):
+            def __init__(self):
+                super().__init__()
+                self.uploads = {}
+                self.order = []
+
+            async def upload_file(self, **kwargs):
+                self.uploads[kwargs["target_path"]] = Path(kwargs["source_path"]).read_bytes()
+                self.order.append(("upload", kwargs["target_path"]))
+
+            async def exec(self, **kwargs):
+                self.calls.append(kwargs)
+                self.order.append(("exec", kwargs["command"]))
+                if "mission start" not in kwargs["command"]:
+                    return SimpleNamespace(return_code=0)
+                return SimpleNamespace(
+                    return_code=0,
+                    stdout='{"state":"done","step":null,"step_index":3,"stop":"completed","role_turns":3,"tasks_done":1}\n',
+                    stderr="",
+                )
+
+        zon = (
+            '.{ .default = .{ .{ .provider_function = "zygos::providers::deepseek-flash", .model = "deepseek/deepseek-v4.1-flash" } },\n'
+            '   .steps = .{ .{ .id = "architect", .definition = "agents/architect.md", .tools = true },\n'
+            '               .{ .id = "executor" }, .{ .id = "verifier" } } }\n'
+        )
+        definition = b"You are the architect.\n"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            arm = root / "arm"
+            (arm / "agents").mkdir(parents=True)
+            (arm / "zygos.zon").write_text(zon)
+            (arm / "agents" / "architect.md").write_bytes(definition)
+            logs = root / "logs"
+            logs.mkdir()
+            binary = root / "binary"
+            binary.write_bytes(b"offline-binary")
+            values = {
+                "DEEPSEEK_API_KEY": "deepseek-fixture", "ZYGOS_TASK_ID": "fix-git",
+                "ZYGOS_MODE": "mission", "ZYGOS_CONFIG": str(arm / "zygos.zon"), "ZYGOS_LINUX_BIN": str(binary),
+            }
+            with patch.dict(os.environ, values, clear=True):
+                environment = MissionEnvironment()
+                agent = ZygosAgent(logs_dir=logs, model_name="deepseek/deepseek-v4.1-flash")
+                await agent.setup(environment)
+                await agent.run("Fix the repo.", environment, None)
+            # Next to zygos.zon, same relative path, so `.definition` resolves in the container.
+            self.assertEqual(environment.uploads["/logs/agent/zygos.zon"], zon.encode())
+            self.assertEqual(environment.uploads["/logs/agent/agents/architect.md"], definition)
+            order = environment.order
+            made = order.index(("exec", "mkdir -p /logs/agent/agents"))
+            self.assertLess(made, order.index(("upload", "/logs/agent/agents/architect.md")))
+            import hashlib
+            import json
+            run = json.loads((logs / "mission-run.json").read_text())
+            self.assertEqual(run["pipeline"], [
+                {"id": "architect", "definition": "agents/architect.md",
+                 "definition_sha256": hashlib.sha256(definition).hexdigest(), "tools": True},
+                {"id": "executor", "definition": None, "definition_sha256": None, "tools": True},
+                {"id": "verifier", "definition": None, "definition_sha256": None, "tools": False},
+            ])
 
     async def test_mission_mode_without_config_or_terminal_reply(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -305,9 +371,9 @@ class TrimContract(unittest.IsolatedAsyncioTestCase):
                     await agent.run("x", environment, None)
             self.assertEqual(environment.calls, [])
         self.assertIsNone(terminal_reply("mission: errored: timeout\n"))
-        self.assertEqual(terminal_reply('{"state":"done","stop":"completed"}\n')["stop"], "completed")
+        self.assertEqual(terminal_reply('{"state":"done","step":null,"step_index":4,"stop":"completed"}\n')["stop"], "completed")
         # The console gate prompt has no newline, so the reply shares its line.
-        prompt = 'approve mission::complete: fix it? [y/N] {"state":"gating","stop":"none","paused":true,"role_turns":5,"tasks_done":2}\n'
+        prompt = 'approve mission::complete: fix it? [y/N] {"state":"gating","step":null,"step_index":4,"stop":"none","paused":true,"role_turns":5,"tasks_done":2}\n'
         self.assertTrue(terminal_reply(prompt)["paused"])
 
     def test_mission_brief_demotes_level_two_headings_only(self):
