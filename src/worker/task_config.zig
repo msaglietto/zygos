@@ -189,6 +189,16 @@ test "parse: an unsupported mission setting refuses, malformed ZON is a parse er
     ));
 }
 
+test "task --config refuses a file carrying .steps" {
+    const with_steps: [:0]const u8 =
+        \\.{
+        \\    .default = .{ .{ .provider_function = "zygos::providers::deepseek-flash", .model = "m" } },
+        \\    .steps = .{ .{ .id = "executor" } },
+        \\}
+    ;
+    try testing.expectError(error.UnsupportedSetting, TaskZon.parse(testing.allocator, with_steps));
+}
+
 test "parse: no ladder for the task step refuses" {
     try testing.expectError(error.NoTaskRoute, TaskZon.parse(testing.allocator, ".{}"));
     try testing.expectError(error.NoTaskRoute, TaskZon.parse(testing.allocator,

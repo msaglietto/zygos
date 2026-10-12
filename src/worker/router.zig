@@ -148,6 +148,23 @@ test "parse: routes + default from ZON text" {
     try testing.expectEqualStrings("claude-opus", cfg.data.routes[0].attempts[0].model);
 }
 
+test "router parse keeps ignoring .steps" {
+    const zon: [:0]const u8 =
+        \\.{
+        \\    .default = .{ .{ .provider_function = "zygos::providers::x", .model = "m" } },
+        \\    .steps = .{
+        \\        .{ .id = "architect", .definition = "agents/architect.md", .tools = true },
+        \\        .{ .id = "executor", .unknown = 1 },
+        \\    },
+        \\}
+    ;
+    var cfg = try Config.parse(testing.allocator, zon);
+    defer cfg.deinit();
+    try testing.expectEqual(@as(usize, 1), cfg.data.default.len);
+    try testing.expectEqualStrings("m", cfg.data.default[0].model);
+    try testing.expectEqual(@as(usize, 0), cfg.data.routes.len);
+}
+
 test "malformed ZON is a parse error, no leaks" {
     try testing.expectError(error.ParseZon, Config.parse(testing.allocator, ".{ .routes = 42 }"));
 }

@@ -12,6 +12,7 @@ const json = std.json;
 const zygos = @import("zygos");
 const req_mod = @import("mission/req.zig");
 const view_mod = @import("mission/view.zig");
+const steps_mod = @import("mission/steps.zig");
 
 const StartParams = req_mod.StartParams;
 const buildStartRequest = req_mod.buildStartRequest;
@@ -136,6 +137,18 @@ pub fn run(gpa: std.mem.Allocator, args: *std.process.Args.Iterator) u8 {
     const ctx_cfg = zygos.context.Config.parse(gpa, zon_text) catch {
         eprint("mission: invalid .context_strategy in {s}\n", .{zon_path});
         return 2;
+    };
+
+    // .steps: strict parse, validation and definition pinning all happen
+    // here, so a bad pipeline exits 2 before any worker or turn starts. A
+    // file with no .steps leaves the field off the start request.
+    const steps: ?[]const zygos.mission.pipeline.Step = switch (steps_mod.resolve(gpa, gpa, zon_path, zon_text) catch return oom()) {
+        .absent => null,
+        .ok => |s| s,
+        .refused => |reason| {
+            eprint("mission: invalid .steps in {s}: {s}\n", .{ zon_path, reason });
+            return 2;
+        },
     };
 
     // ---- kernel + roster (the e2e/m3 wiring, catalog + manual approvals) ----
@@ -433,6 +446,7 @@ pub fn run(gpa: std.mem.Allocator, args: *std.process.Args.Iterator) u8 {
                 .ctx_max_tokens = ctx_cfg.max_tokens,
                 .role_max_steps = tm.role_max_steps,
                 .max_role_turns = tm.max_role_turns,
+                .steps = steps,
             }) catch return oom();
             const qres = caller.call("zygos::missions::start", qreq) catch {
                 eprint("mission {s}: bus call failed\n", .{mid});
@@ -467,6 +481,7 @@ pub fn run(gpa: std.mem.Allocator, args: *std.process.Args.Iterator) u8 {
         .ctx_max_tokens = ctx_cfg.max_tokens,
         .role_max_steps = tm.role_max_steps,
         .max_role_turns = tm.max_role_turns,
+        .steps = steps,
     }) catch return oom();
 
     // M7 net hardening: SIGINT (cron kill, Ctrl-C) lands as a clean abort —

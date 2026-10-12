@@ -32,6 +32,7 @@ const log = std.log.scoped(.mission);
 
 pub const fsm = @import("mission/fsm.zig");
 pub const model = @import("mission/model.zig");
+pub const pipeline = @import("mission/pipeline.zig");
 
 pub const State = fsm.State;
 pub const Event = fsm.Event;
@@ -335,6 +336,14 @@ fn runMission(self: *MissionOrchestrator, arena: std.mem.Allocator, request_json
             ),
         }
     }
+
+    // The pipeline is validated at parse time; an invalid list refuses the
+    // start with the pipeline's reason and never starts the FSM.
+    if (p.steps_refusal) |reason| return std.fmt.allocPrint(
+        arena,
+        "{{\"refused\":true,\"reason\":\"invalid_steps\",\"detail\":{f}}}",
+        .{json.fmt(reason, .{})},
+    );
 
     // .context_strategy on the start request (from zygos.zon at boot):
     // {"kind":"substrate"|"recall"|"thread","max_tokens":N}. Absent ⇒
@@ -1019,6 +1028,12 @@ fn controlTarget(arena: std.mem.Allocator, request_json: []const u8) ?[]const u8
 // ===========================================================================
 
 const testing = std.testing;
+
+// Pure submodules are discovered only when something analyzes them.
+test {
+    testing.refAllDecls(fsm);
+    testing.refAllDecls(pipeline);
+}
 
 // -- Driver: scripted providers over the real bus -----------------------------
 
@@ -1831,6 +1846,34 @@ test "a malformed brief refuses the mission without starting the FSM" {
     // Fail closed: no mission record was persisted.
     try testing.expectError(error.NotFound, h.store().load(testing.allocator));
     // No provider turn ever ran.
+    try testing.expectEqual(@as(usize, 0), h.provider.callCount());
+}
+
+test "an invalid steps list refuses the start before anything is persisted or run" {
+    var h = try Harness.init(testing.allocator, &.{});
+    defer h.deinit();
+
+    const cases = [_]struct { steps: []const u8, reason: []const u8 }{
+        .{ .steps = "[]", .reason = "steps: empty" },
+        .{ .steps = "[{\"id\":\"planner\"}]", .reason = "steps: no executor" },
+        .{ .steps = "[{\"id\":\"architect\",\"system\":\"x\",\"definition_sha256\":\"00\"},{\"id\":\"executor\"}]", .reason = "steps[0]: definition hash mismatch" },
+    };
+    for (cases) |c| {
+        const extra = try std.fmt.allocPrint(
+            testing.allocator,
+            ",\"objective\":\"seed: gizmo\",\"steps\":{s}",
+            .{c.steps},
+        );
+        defer testing.allocator.free(extra);
+        const req = try h.startReq(testing.allocator, extra);
+        defer testing.allocator.free(req);
+        const res = try h.caller.call("zygos::missions::start", req);
+        defer res.deinit(testing.allocator);
+        try testing.expect(res == .ok);
+        try testing.expect(std.mem.indexOf(u8, res.ok, "\"refused\":true") != null);
+        try testing.expect(std.mem.indexOf(u8, res.ok, c.reason) != null);
+    }
+    try testing.expectError(error.NotFound, h.store().load(testing.allocator));
     try testing.expectEqual(@as(usize, 0), h.provider.callCount());
 }
 
