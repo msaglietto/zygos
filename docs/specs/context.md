@@ -23,6 +23,22 @@ the default budget (32k tokens); an unknown kind refuses (fail closed).
 - `Diag` carries the exact failure message for `error.Failed` (the driver
   surfaces it verbatim as mission detail).
 
+## Clipping and step ids
+
+- **Shared clip rule** (`context.fit`, used by the substrate spine and so
+  by every strategy composed over it): when the assembled content would
+  exceed `max_tokens`, the older artifacts are clipped first (the oldest are
+  cut at a clip marker, or dropped when too little room remains).
+  MISSION.md, the operator brief and the current task are never dropped. If
+  that never-dropped part alone exceeds the budget, the seam still returns
+  `error.BudgetExceeded`.
+- **Step ids are free-form.** A `StepRef` role is the pipeline step's id;
+  an id that is not one of the four built-ins is a custom step and gets the
+  artifacts-as-context spine. A repeated id is told apart by
+  `StepRef.step_index`. The recall strategy's absorb ids carry it
+  (`outcome:<role>:<step_index>:<task_index>`): one entry per position, and
+  a retry replaces its own.
+
 ## Strategies
 
 - **substrate** (`context_substrate.zig`) — the baseline: today's

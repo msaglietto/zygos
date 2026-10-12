@@ -214,13 +214,8 @@ fn statusHandler(
     const self: *MissionOrchestrator = @ptrCast(@alignCast(ctx.?));
     const mid = controlTarget(arena, request_json) orelse return error.Failed;
 
-    const snap = self.registry.status(mid) orelse return error.Failed;
-    return std.fmt.allocPrint(
-        arena,
-        "{{\"state\":\"{t}\",\"stop\":\"{t}\",\"role_turns\":{d},\"task_index\":{d}," ++
-            "\"fail_count\":{d},\"gate_denials\":{d}}}",
-        .{ snap.state, snap.stop, snap.role_turns_used, snap.task_index, snap.fail_count, snap.gate_denials },
-    );
+    const snap = (try self.registry.status(arena, mid)) orelse return error.Failed;
+    return out_mod.replyStatus(arena, snap);
 }
 
 fn abortHandler(
@@ -254,11 +249,12 @@ fn listHandler(
     for (entries, 0..) |entry, i| {
         if (i != 0) w.writeAll(",") catch return error.OutOfMemory;
         w.print(
-            "{{\"mission_id\":{f},\"state\":\"{t}\",\"stop\":\"{t}\"," ++
+            "{{\"mission_id\":{f},\"state\":\"{t}\",\"step\":{f},\"step_index\":{d},\"stop\":\"{t}\"," ++
                 "\"role_turns\":{d},\"task_index\":{d},\"paused\":{}}}",
             .{
-                json.fmt(entry.mission_id, .{}), entry.snap.state,      entry.snap.stop,
-                entry.snap.role_turns_used,      entry.snap.task_index, entry.snap.paused,
+                json.fmt(entry.mission_id, .{}), entry.snap.state,  json.fmt(entry.snap.step, .{}),
+                entry.snap.step_index,           entry.snap.stop,   entry.snap.role_turns_used,
+                entry.snap.task_index,           entry.snap.paused,
             },
         ) catch return error.OutOfMemory;
     }
@@ -444,6 +440,10 @@ fn runMission(self: *MissionOrchestrator, arena: std.mem.Allocator, request_json
     const ctl = try self.track(p.mission_id);
     defer self.untrack(p.mission_id);
 
+    // First event of the run, before any mission state event; terminal and
+    // refused resumes returned above and emit nothing.
+    try trace_mod.emit(arena, cfg.trace_path, try out_mod.pipelineEvent(arena, m.pipeline));
+
     // Preserve intake criteria independently of model-authored MISSION.md.
     // Resume uses the original artifact, never a replacement request brief.
     // A fresh start owns BRIEF.md: roles treat it as authoritative, so a
@@ -545,9 +545,7 @@ fn runMission(self: *MissionOrchestrator, arena: std.mem.Allocator, request_json
 /// The step id a (state, index) pair points at; null at gating and done, and
 /// for an index past the list.
 fn stepNameAt(m: *const Mission, state: State, step_index: usize) ?[]const u8 {
-    if (state != .running and state != .failed) return null;
-    if (step_index >= m.pipeline.len) return null;
-    return m.pipeline[step_index].id;
+    return model.stepIdAt(m.pipeline, state, step_index);
 }
 
 /// "running (executor)", "gating", "done" — the phase log's vocabulary.
@@ -1865,7 +1863,7 @@ test "unanswered gate deny (resolved:false) parks at gating; resume + approve co
 
     // Parked, not terminal, not reworked: verified work stays done.
     try testing.expect(std.mem.indexOf(u8, res.ok, "\"paused\":true") != null);
-    try testing.expect(std.mem.indexOf(u8, res.ok, "\"state\":\"gating\"") != null);
+    try testing.expect(std.mem.indexOf(u8, res.ok, "\"state\":\"gating\",\"step\":null,\"step_index\":4,") != null);
     var parked = try h.store().load(testing.allocator);
     defer parked.deinit(testing.allocator);
     try testing.expectEqual(State.gating, parked.state);
@@ -2318,7 +2316,7 @@ test "pause parks durably at a role boundary; the substrate resumes to done" {
     // boundary parked the run with the state persisted.
     try testing.expect(ctx.res == .ok);
     try testing.expect(std.mem.indexOf(u8, ctx.res.ok, "\"paused\":true") != null);
-    try testing.expect(std.mem.indexOf(u8, ctx.res.ok, "\"state\":\"running\"") != null);
+    try testing.expect(std.mem.startsWith(u8, ctx.res.ok, "{\"state\":\"running\",\"step\":\"executor\",\"step_index\":2,"));
     var parked = try h.store().load(testing.allocator);
     defer parked.deinit(testing.allocator);
     try testing.expectEqual(State.running, parked.state);
@@ -2586,6 +2584,148 @@ test "carried M3: status reflects a live mission; unknown mission_id errors" {
     const abort_gone = try ctl_worker.call("zygos::missions::abort", "{\"mission_id\":\"nope\"}");
     defer abort_gone.deinit(testing.allocator);
     try testing.expect(std.mem.indexOf(u8, abort_gone.ok, "false") != null);
+}
+
+test "status reports state, step and step_index" {
+    var h = try Harness.init(testing.allocator, &.{ po_ok, plan2, exec_ok, exec_ok, verify_pass });
+    defer h.deinit();
+    const approvals = try approval_mod.ApprovalWorker.start(testing.allocator, &h.actor, &h.registry, .auto_approve);
+    defer approvals.stop();
+    h.provider.park_at = 2; // park the first executor turn
+    const ctl_worker = try inproc.Worker.spawn(testing.allocator, &h.actor, &h.registry, "test-control");
+    defer ctl_worker.stop();
+
+    const req = try h.startReq(testing.allocator, seed_and_gate);
+    defer testing.allocator.free(req);
+    var ctx: StartCtx = .{ .h = h, .req = req };
+    const t = try std.Thread.spawn(.{}, StartCtx.run, .{&ctx});
+
+    // Running, mid-pipeline: the live run is inside the executor.
+    h.provider.entered.wait();
+    const live = try ctl_worker.call("zygos::missions::status", "{\"mission_id\":\"m-1\"}");
+    defer live.deinit(testing.allocator);
+    try testing.expectEqualStrings(
+        "{\"state\":\"running\",\"step\":\"executor\",\"step_index\":2,\"stop\":\"none\"," ++
+            "\"role_turns\":2,\"task_index\":0,\"fail_count\":0,\"gate_denials\":0}",
+        live.ok,
+    );
+    const listed = try ctl_worker.call("zygos::missions::list", "{}");
+    defer listed.deinit(testing.allocator);
+    try testing.expect(std.mem.indexOf(u8, listed.ok, "\"state\":\"running\",\"step\":\"executor\",\"step_index\":2,") != null);
+    h.provider.release.set();
+    t.join();
+    ctx.res.deinit(testing.allocator);
+
+    // The remaining states, published through the same control block a run
+    // updates after each persist (live runs untrack on exit).
+    const steps = &pipeline.default_pipeline;
+    const cases = [_]struct { m: Mission, want: []const u8 }{
+        .{
+            .m = .{ .mission_id = "s-gating", .state = .gating, .pipeline = steps, .step_index = 4 },
+            .want = "{\"state\":\"gating\",\"step\":null,\"step_index\":4,\"stop\":\"none\"," ++
+                "\"role_turns\":0,\"task_index\":0,\"fail_count\":0,\"gate_denials\":0}",
+        },
+        .{
+            .m = .{ .mission_id = "s-done", .state = .done, .stop = .completed, .pipeline = steps, .step_index = 4 },
+            .want = "{\"state\":\"done\",\"step\":null,\"step_index\":4,\"stop\":\"completed\"," ++
+                "\"role_turns\":0,\"task_index\":0,\"fail_count\":0,\"gate_denials\":0}",
+        },
+        .{
+            .m = .{ .mission_id = "s-failed", .state = .failed, .stop = .role_failed, .pipeline = steps, .step_index = 1, .fail_count = 2 },
+            .want = "{\"state\":\"failed\",\"step\":\"planner\",\"step_index\":1,\"stop\":\"role_failed\"," ++
+                "\"role_turns\":0,\"task_index\":0,\"fail_count\":2,\"gate_denials\":0}",
+        },
+        .{
+            .m = .{ .mission_id = "s-gate-failed", .state = .failed, .stop = .gate_failed, .pipeline = steps, .step_index = 4 },
+            .want = "{\"state\":\"failed\",\"step\":null,\"step_index\":4,\"stop\":\"gate_failed\"," ++
+                "\"role_turns\":0,\"task_index\":0,\"fail_count\":0,\"gate_denials\":0}",
+        },
+    };
+    for (cases) |c| {
+        const ctl = try h.orch.registry.track(c.m.mission_id);
+        defer h.orch.registry.untrack(c.m.mission_id);
+        h.orch.registry.updateSnapshot(ctl, &c.m);
+        const body = try std.fmt.allocPrint(testing.allocator, "{{\"mission_id\":\"{s}\"}}", .{c.m.mission_id});
+        defer testing.allocator.free(body);
+        const res = try ctl_worker.call("zygos::missions::status", body);
+        defer res.deinit(testing.allocator);
+        try testing.expectEqualStrings(c.want, res.ok);
+    }
+}
+
+test "the first trace event is pipeline with the pinned ids, hashes and tools; a resume that proceeds emits it too" {
+    const def = "You are the architect. Design before building.";
+    const sha = pipeline.sha256Hex(def);
+    const steps_json = try std.fmt.allocPrint(testing.allocator, ",\"steps\":[" ++
+        "{{\"id\":\"architect\",\"system\":\"{s}\",\"definition_sha256\":\"{s}\",\"tools\":true}}," ++
+        "{{\"id\":\"executor\"}},{{\"id\":\"verifier\"}}]", .{ def, sha });
+    defer testing.allocator.free(steps_json);
+    const extra = try std.mem.concat(testing.allocator, u8, &.{ seed_and_gate, steps_json });
+    defer testing.allocator.free(extra);
+
+    {
+        var h = try Harness.init(testing.allocator, &.{ roleText("DESIGN"), exec_ok, verify_pass });
+        defer h.deinit();
+        const approvals = try approval_mod.ApprovalWorker.start(testing.allocator, &h.actor, &h.registry, .auto_approve);
+        defer approvals.stop();
+        var tr = try runTraced(h, extra);
+        defer tr.deinit();
+        try expectTerminal(tr.res.ok, "done", "completed");
+
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const first_line = tr.trace[0..std.mem.indexOfScalar(u8, tr.trace, '\n').?];
+        const first = try json.parseFromSliceLeaky(json.Value, arena, first_line, .{});
+        try testing.expectEqualStrings("pipeline", first.object.get("event").?.string);
+        const evsteps = first.object.get("steps").?.array.items;
+        try testing.expectEqual(@as(usize, 3), evsteps.len);
+        try testing.expectEqualStrings("architect", evsteps[0].object.get("id").?.string);
+        try testing.expectEqualStrings(&sha, evsteps[0].object.get("definition_sha256").?.string);
+        try testing.expect(evsteps[0].object.get("tools").?.bool);
+        try testing.expectEqualStrings("executor", evsteps[1].object.get("id").?.string);
+        try testing.expect(evsteps[1].object.get("definition_sha256").? == .null);
+        try testing.expect(evsteps[1].object.get("tools").?.bool);
+        try testing.expectEqualStrings("verifier", evsteps[2].object.get("id").?.string);
+        try testing.expect(!evsteps[2].object.get("tools").?.bool);
+        // Exactly one, and ahead of every mission state event.
+        try expectSeq(&.{"pipeline"}, try traceField(arena, tr.trace, "pipeline", "event"));
+        try testing.expect(std.mem.indexOf(u8, tr.trace, "\"event\":\"mission\"").? > first_line.len);
+    }
+
+    // A resume that proceeds starts its own run with the same envelope.
+    var h = try Harness.init(testing.allocator, &.{ exec_ok, verify_pass });
+    defer h.deinit();
+    const approvals = try approval_mod.ApprovalWorker.start(testing.allocator, &h.actor, &h.registry, .auto_approve);
+    defer approvals.stop();
+    const pinned = [_]pipeline.Step{
+        .{ .id = "architect", .kind = .custom, .system = null, .definition_sha256 = &sha, .tools = true },
+        .{ .id = "executor", .kind = .executor, .system = null, .definition_sha256 = null, .tools = true },
+        .{ .id = "verifier", .kind = .verifier, .system = null, .definition_sha256 = null, .tools = false },
+    };
+    var tasks = [_]Task{.{ .desc = "build the gizmo", .done = false }};
+    try h.store().save(testing.allocator, &.{
+        .mission_id = "m-1",
+        .state = .running,
+        .pipeline = &pinned,
+        .step_index = 1,
+        .objective = "Ship the gizmo",
+        .acceptance = "ships",
+        .tasks = &tasks,
+    });
+    try h.store().writeArtifact(testing.allocator, "MISSION.md", "# Mission\n\nShip the gizmo\n");
+    try h.store().writeArtifact(testing.allocator, "PLAN.md", "# Plan\n\n- [ ] build\n");
+    const rextra = try std.mem.concat(testing.allocator, u8, &.{ ",\"resume\":true", extra[std.mem.indexOf(u8, extra, ",\"gate_function\"").?..] });
+    defer testing.allocator.free(rextra);
+    var tr = try runTraced(h, rextra);
+    defer tr.deinit();
+    try expectTerminal(tr.res.ok, "done", "completed");
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const first_line = tr.trace[0..std.mem.indexOfScalar(u8, tr.trace, '\n').?];
+    try testing.expect(std.mem.indexOf(u8, first_line, "\"event\":\"pipeline\",\"steps\":[{\"id\":\"architect\",\"definition_sha256\":\"") != null);
+    try expectSeq(&.{"pipeline"}, try traceField(arena, tr.trace, "pipeline", "event"));
 }
 
 test "resume mid-flight runs only the remaining roles" {

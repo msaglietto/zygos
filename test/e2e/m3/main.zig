@@ -212,6 +212,7 @@ pub fn main(init: std.process.Init) !void {
     const seeded: zygos.mission.Mission = .{
         .mission_id = "m3-resume",
         .state = .running,
+        .pipeline = &zygos.mission.pipeline.default_pipeline,
         .step_index = 2,
         .objective = "Ship the gizmo",
         .acceptance = "greeting written and count run",

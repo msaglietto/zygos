@@ -9,6 +9,7 @@ const std = @import("std");
 const sync = @import("../../kernel/sync.zig");
 const fsm = @import("fsm.zig");
 const model = @import("model.zig");
+const pipeline = @import("pipeline.zig");
 
 pub const Control = struct {
     aborted: bool = false,
@@ -18,6 +19,10 @@ pub const Control = struct {
     steer: ?[]u8 = null,
     state: fsm.State = .running,
     stop: model.StopReason = .none,
+    /// Borrowed from the run's arena, which outlives this block (the run
+    /// untracks before it returns); readers copy ids out under the lock.
+    pipeline: []const pipeline.Step = &.{},
+    step_index: usize = 0,
     task_index: usize = 0,
     fail_count: usize = 0,
     gate_denials: usize = 0,
@@ -29,6 +34,9 @@ pub const Snapshot = struct {
     state: fsm.State,
     stop: model.StopReason,
     paused: bool,
+    /// Cursor as reported: null `step` and the list length at gating and done.
+    step: ?[]const u8,
+    step_index: usize,
     task_index: usize,
     fail_count: usize,
     gate_denials: usize,
@@ -109,6 +117,8 @@ pub const Registry = struct {
         defer self.mutex.unlock();
         ctl.state = m.state;
         ctl.stop = m.stop;
+        ctl.pipeline = m.pipeline;
+        ctl.step_index = m.step_index;
         ctl.task_index = m.task_index;
         ctl.fail_count = m.fail_count;
         ctl.gate_denials = m.gate_denials;
@@ -148,11 +158,12 @@ pub const Registry = struct {
         return true;
     }
 
-    pub fn status(self: *Registry, mission_id: []const u8) ?Snapshot {
+    /// The step id in the snapshot is copied into `arena`.
+    pub fn status(self: *Registry, arena: std.mem.Allocator, mission_id: []const u8) error{OutOfMemory}!?Snapshot {
         self.mutex.lock();
         defer self.mutex.unlock();
         const ctl = self.live.get(mission_id) orelse return null;
-        return snapshotLocked(ctl);
+        return try snapshotLocked(arena, ctl);
     }
 
     /// Arena-owned snapshot of every live mission (M6 dashboard data).
@@ -165,17 +176,20 @@ pub const Registry = struct {
         while (it.next()) |kv| : (i += 1) {
             out[i] = .{
                 .mission_id = try arena.dupe(u8, kv.key_ptr.*),
-                .snap = snapshotLocked(kv.value_ptr.*),
+                .snap = try snapshotLocked(arena, kv.value_ptr.*),
             };
         }
         return out;
     }
 
-    fn snapshotLocked(ctl: *const Control) Snapshot {
+    fn snapshotLocked(arena: std.mem.Allocator, ctl: *const Control) error{OutOfMemory}!Snapshot {
+        const id = model.stepIdAt(ctl.pipeline, ctl.state, ctl.step_index);
         return .{
             .state = ctl.state,
             .stop = ctl.stop,
             .paused = ctl.paused,
+            .step = if (id) |i| try arena.dupe(u8, i) else null,
+            .step_index = model.cursorAt(ctl.pipeline.len, ctl.state, ctl.step_index),
             .task_index = ctl.task_index,
             .fail_count = ctl.fail_count,
             .gate_denials = ctl.gate_denials,
@@ -216,12 +230,14 @@ test "putSteer last-write-wins; takeSteer consumes and clears" {
 }
 
 test "control mutations against an unknown mission report false" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
     var reg = Registry.init(testing.allocator);
     defer reg.deinit();
     try testing.expect(!reg.markAborted("nope"));
     try testing.expect(!reg.markPaused("nope", true));
     try testing.expect(!(try reg.putSteer("nope", "text")));
-    try testing.expectEqual(@as(?Snapshot, null), reg.status("nope"));
+    try testing.expectEqual(@as(?Snapshot, null), try reg.status(arena_state.allocator(), "nope"));
 }
 
 test "abort and pause flags round-trip through the polling reads" {
@@ -255,10 +271,14 @@ test "updateSnapshot publishes persisted state into status and snapshotAll" {
         .fail_count = 1,
         .gate_denials = 3,
         .role_turns_used = 7,
+        .pipeline = &pipeline.default_pipeline,
+        .step_index = 4,
     };
     reg.updateSnapshot(ctl, &m);
 
-    const snap = reg.status("m-1").?;
+    const snap = (try reg.status(arena_state.allocator(), "m-1")).?;
+    try testing.expectEqual(@as(?[]const u8, null), snap.step);
+    try testing.expectEqual(@as(usize, 4), snap.step_index);
     try testing.expectEqual(fsm.State.gating, snap.state);
     try testing.expectEqual(@as(usize, 2), snap.task_index);
     try testing.expectEqual(@as(usize, 1), snap.fail_count);

@@ -81,6 +81,17 @@ pub const Mission = struct {
         gpa.free(self.tasks);
     }
 
+    /// The step id the cursor points at; null at gating and done and for an
+    /// index past the list. A failed mission keeps the step that failed.
+    pub fn stepId(self: *const Mission) ?[]const u8 {
+        return stepIdAt(self.pipeline, self.state, self.step_index);
+    }
+
+    /// The reported cursor: the list length at gating and done.
+    pub fn cursor(self: *const Mission) usize {
+        return cursorAt(self.pipeline.len, self.state, self.step_index);
+    }
+
     pub fn tasksDone(self: *const Mission) usize {
         var n: usize = 0;
         for (self.tasks) |t| {
@@ -89,6 +100,19 @@ pub const Mission = struct {
         return n;
     }
 };
+
+pub fn stepIdAt(steps: []const pipeline.Step, state: State, step_index: usize) ?[]const u8 {
+    if (state != .running and state != .failed) return null;
+    if (step_index >= steps.len) return null;
+    return steps[step_index].id;
+}
+
+pub fn cursorAt(pipeline_len: usize, state: State, step_index: usize) usize {
+    return switch (state) {
+        .gating, .done => pipeline_len,
+        .running, .failed => step_index,
+    };
+}
 
 /// Snapshot a mission into an arena (status/list read a copy, never the live
 /// record). Task results and steer are in-memory-only and are not carried;
