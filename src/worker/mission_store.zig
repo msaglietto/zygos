@@ -632,7 +632,7 @@ test "load defaults exec_fail_count to 0 for pre-retry substrates" {
     try testing.expectEqual(@as(usize, 1), got.fail_count);
 }
 
-test "save is atomic: no tmp residue, overwrite replaces cleanly" {
+test "save is atomic: no .tmp residue, overwrite replaces cleanly" {
     var t = TestRoot.init();
     defer t.deinit();
     const root = try t.path();
