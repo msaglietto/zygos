@@ -56,7 +56,7 @@ const reserved_ids = [_][]const u8{ "task", "tessera-capture" };
 
 const max_id_len = 32;
 
-fn validId(id: []const u8) bool {
+pub fn validId(id: []const u8) bool {
     if (id.len == 0 or id.len > max_id_len) return false;
     for (id) |c| {
         if (!(std.ascii.isLower(c) or std.ascii.isDigit(c) or c == '-')) return false;
@@ -124,6 +124,24 @@ pub const default_pipeline = [_]Step{
 pub fn defaultSteps(arena: std.mem.Allocator) error{OutOfMemory}![]Step {
     return arena.dupe(Step, &default_pipeline);
 }
+
+/// Resume's pin check: the pipeline a mission started under against the one
+/// the resume request carries. Ids, definition hashes and tools, in order.
+/// The kind derives from the id and the definition text is not persisted,
+/// so neither is compared. Any difference is a different pipeline.
+pub fn samePipeline(pinned: []const Step, requested: []const Step) bool {
+    if (pinned.len != requested.len) return false;
+    for (pinned, requested) |a, b| {
+        if (!std.mem.eql(u8, a.id, b.id)) return false;
+        if (a.tools != b.tools) return false;
+        if (a.definition_sha256 == null or b.definition_sha256 == null) {
+            if (a.definition_sha256 != null or b.definition_sha256 != null) return false;
+        } else if (!std.mem.eql(u8, a.definition_sha256.?, b.definition_sha256.?)) return false;
+    }
+    return true;
+}
+
+pub const pipeline_changed_detail = "pipeline changed since start";
 
 pub const DefinitionPathError = error{DefinitionPath};
 
@@ -1582,4 +1600,36 @@ test "input artifacts: known kinds get step-*, custom gets everything so far, a 
     // A feedback fix task carries its text in the task itself.
     const fb = try feedbackTask(arena, "boom");
     try expectNames(&.{ "step-architect-1.md", "step-reviewer-1.md" }, try inputArtifacts(arena, &steps, 4, runs, fb.desc));
+}
+
+test "samePipeline compares ids, definition hashes and tools in order" {
+    const a = [_]Step{
+        .{ .id = "architect", .kind = .custom, .system = "text", .definition_sha256 = "aa", .tools = true },
+        .{ .id = "executor", .kind = .executor, .system = null, .definition_sha256 = null, .tools = true },
+    };
+    try testing.expect(samePipeline(&a, &a));
+    try testing.expect(samePipeline(&default_pipeline, &default_pipeline));
+    // The pinned text is not part of the identity (the store never has it).
+    var no_text = a;
+    no_text[0].system = null;
+    try testing.expect(samePipeline(&no_text, &a));
+
+    var other_id = a;
+    other_id[1].id = "builder";
+    try testing.expect(!samePipeline(&a, &other_id));
+    var other_sha = a;
+    other_sha[0].definition_sha256 = "bb";
+    try testing.expect(!samePipeline(&a, &other_sha));
+    var lost_sha = a;
+    lost_sha[0].definition_sha256 = null;
+    try testing.expect(!samePipeline(&a, &lost_sha));
+    try testing.expect(!samePipeline(&lost_sha, &a));
+    var other_tools = a;
+    other_tools[0].tools = false;
+    try testing.expect(!samePipeline(&a, &other_tools));
+    const swapped = [_]Step{ a[1], a[0] };
+    try testing.expect(!samePipeline(&a, &swapped));
+    try testing.expect(!samePipeline(&a, a[0..1]));
+    try testing.expect(!samePipeline(a[0..1], &a));
+    try testing.expect(!samePipeline(&a, &default_pipeline));
 }

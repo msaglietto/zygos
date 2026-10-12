@@ -322,3 +322,21 @@ test "a zon path without a directory resolves against the current directory" {
     const got = try resolve(testing.allocator, arena, "zygos.zon", try zonWith(arena, "build.zig"));
     try testing.expect(got.ok[0].system.?.len > 0);
 }
+
+test "resolving again after the definition file changed pins the new hash (what a resume compares)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    const zon_path = try fx.path(arena, "cfg/zygos.zon");
+    const zon = try zonWith(arena, "agents/architect.md");
+
+    try fx.write(arena, "cfg/agents/architect.md", "You are the architect.");
+    const first = (try resolve(testing.allocator, arena, zon_path, zon)).ok;
+    try fx.write(arena, "cfg/agents/architect.md", "You are a stricter architect.");
+    const second = (try resolve(testing.allocator, arena, zon_path, zon)).ok;
+
+    try testing.expect(pipeline.samePipeline(first, first));
+    try testing.expect(!pipeline.samePipeline(first, second));
+}

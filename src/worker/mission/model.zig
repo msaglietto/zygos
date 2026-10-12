@@ -62,8 +62,14 @@ pub const Mission = struct {
     mission_versions: usize = 0,
     plan_versions: usize = 0,
 
-    /// Only for gpa-owned missions (mission_store.load).
+    /// Only for gpa-owned missions (mission_store.load), whose `pipeline`
+    /// is a deep copy: ids and hashes are freed with the list.
     pub fn deinit(self: *Mission, gpa: std.mem.Allocator) void {
+        for (self.pipeline) |st| {
+            gpa.free(st.id);
+            if (st.definition_sha256) |h| gpa.free(h);
+        }
+        gpa.free(self.pipeline);
         for (self.step_runs.items) |r| gpa.free(r.id);
         gpa.free(self.step_runs.items);
         gpa.free(self.mission_id);
@@ -182,7 +188,11 @@ test "deinit releases a gpa-owned mission (leak-checked)" {
     tasks[0] = .{ .desc = try gpa.dupe(u8, "t") };
     const runs = try gpa.alloc(pipeline.RunCount, 1);
     runs[0] = .{ .id = try gpa.dupe(u8, "executor"), .count = 1 };
+    const steps = try gpa.alloc(pipeline.Step, 2);
+    steps[0] = .{ .id = try gpa.dupe(u8, "architect"), .kind = .custom, .system = null, .definition_sha256 = try gpa.dupe(u8, "ab"), .tools = false };
+    steps[1] = .{ .id = try gpa.dupe(u8, "executor"), .kind = .executor, .system = null, .definition_sha256 = null, .tools = true };
     var m: Mission = .{
+        .pipeline = steps,
         .step_runs = .{ .items = runs },
         .mission_id = try gpa.dupe(u8, "m"),
         .detail = try gpa.dupe(u8, "d"),

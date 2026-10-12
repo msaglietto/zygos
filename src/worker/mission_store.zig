@@ -190,17 +190,32 @@ fn serialize(gpa: std.mem.Allocator, m: *const mission_mod.Mission) StoreError![
         }) catch return error.OutOfMemory;
     }
 
+    var pins: std.Io.Writer.Allocating = .init(gpa);
+    defer pins.deinit();
+    for (m.pipeline, 0..) |step, i| {
+        // The definition text is not persisted: the CLI re-reads and re-pins
+        // it at resume, and only its hash must match.
+        pins.writer.print("{s}{{\"id\":{f},\"definition_sha256\":", .{ if (i == 0) "" else ",", json.fmt(step.id, .{}) }) catch
+            return error.OutOfMemory;
+        if (step.definition_sha256) |sha| {
+            pins.writer.print("{f}", .{json.fmt(sha, .{})}) catch return error.OutOfMemory;
+        } else {
+            pins.writer.writeAll("null") catch return error.OutOfMemory;
+        }
+        pins.writer.print(",\"tools\":{}}}", .{step.tools}) catch return error.OutOfMemory;
+    }
+
     return std.fmt.allocPrint(gpa, "{{\"mission_id\":{f},\"state\":\"{t}\",\"stop\":\"{t}\"," ++
         "\"detail\":{f},\"objective\":{f},\"acceptance\":{f},\"feedback\":{f}," ++
         "\"tasks\":[{s}],\"task_index\":{d},\"fail_count\":{d},\"exec_fail_count\":{d}," ++
         "\"gate_denials\":{d},\"role_turns_used\":{d},\"step_index\":{d}," ++
-        "\"step_runs\":[{s}],\"mission_versions\":{d},\"plan_versions\":{d}}}", .{
+        "\"pipeline\":[{s}],\"step_runs\":[{s}],\"mission_versions\":{d},\"plan_versions\":{d}}}", .{
         json.fmt(m.mission_id, .{}), m.state,                    m.stop,
         json.fmt(m.detail, .{}),     json.fmt(m.objective, .{}), json.fmt(m.acceptance, .{}),
         json.fmt(m.feedback, .{}),   tasks_json,                 m.task_index,
         m.fail_count,                m.exec_fail_count,          m.gate_denials,
-        m.role_turns_used,           m.step_index,               runs.written(),
-        m.mission_versions,          m.plan_versions,
+        m.role_turns_used,           m.step_index,               pins.written(),
+        runs.written(),              m.mission_versions,         m.plan_versions,
     }) catch return error.OutOfMemory;
 }
 
@@ -227,6 +242,61 @@ fn optUintField(obj: json.ObjectMap, key: []const u8) StoreError!usize {
     return uintField(obj, key);
 }
 
+/// The pinned pipeline, gpa-owned. No `pipeline` key is a legacy file: the
+/// default four. A present list must be non-empty, with valid ids and every
+/// field typed; anything else is Corrupt (fail closed — a resume compares
+/// this against the request).
+fn loadPipeline(gpa: std.mem.Allocator, val: ?json.Value) StoreError![]pipeline_mod.Step {
+    const pinned = val orelse return ownSteps(gpa, &pipeline_mod.default_pipeline);
+    if (pinned != .array or pinned.array.items.len == 0) return error.Corrupt;
+    const borrowed = gpa.alloc(pipeline_mod.Step, pinned.array.items.len) catch return error.OutOfMemory;
+    defer gpa.free(borrowed);
+    for (pinned.array.items, borrowed) |item, *out| {
+        if (item != .object) return error.Corrupt;
+        const id = strField(item.object, "id") orelse return error.Corrupt;
+        if (!pipeline_mod.validId(id)) return error.Corrupt;
+        const tools = item.object.get("tools") orelse return error.Corrupt;
+        if (tools != .bool) return error.Corrupt;
+        const sha = item.object.get("definition_sha256") orelse return error.Corrupt;
+        if (sha != .null and (sha != .string or sha.string.len == 0)) return error.Corrupt;
+        out.* = .{
+            .id = id,
+            .kind = pipeline_mod.kindOf(id),
+            .system = null,
+            .definition_sha256 = if (sha == .string) sha.string else null,
+            .tools = tools.bool,
+        };
+    }
+    return ownSteps(gpa, borrowed);
+}
+
+/// Deep copy into gpa-owned steps. `system` stays null: the definition text
+/// is never stored.
+fn ownSteps(gpa: std.mem.Allocator, src: []const pipeline_mod.Step) StoreError![]pipeline_mod.Step {
+    const steps = gpa.alloc(pipeline_mod.Step, src.len) catch return error.OutOfMemory;
+    var built: usize = 0;
+    errdefer {
+        for (steps[0..built]) |st| freeStep(gpa, st);
+        gpa.free(steps);
+    }
+    for (src, steps) |step, *out| {
+        const id = gpa.dupe(u8, step.id) catch return error.OutOfMemory;
+        errdefer gpa.free(id);
+        const sha: ?[]const u8 = if (step.definition_sha256) |h|
+            gpa.dupe(u8, h) catch return error.OutOfMemory
+        else
+            null;
+        out.* = .{ .id = id, .kind = step.kind, .system = null, .definition_sha256 = sha, .tools = step.tools };
+        built += 1;
+    }
+    return steps;
+}
+
+fn freeStep(gpa: std.mem.Allocator, st: pipeline_mod.Step) void {
+    gpa.free(st.id);
+    if (st.definition_sha256) |h| gpa.free(h);
+}
+
 fn deserialize(gpa: std.mem.Allocator, bytes: []const u8) StoreError!mission_mod.Mission {
     var arena_inst = std.heap.ArenaAllocator.init(gpa);
     defer arena_inst.deinit();
@@ -249,6 +319,11 @@ fn deserialize(gpa: std.mem.Allocator, bytes: []const u8) StoreError!mission_mod
             if (strField(item.object, "id") == null) return error.Corrupt;
             _ = try uintField(item.object, "count");
         }
+    }
+    const steps = try loadPipeline(gpa, obj.get("pipeline"));
+    errdefer {
+        for (steps) |st| freeStep(gpa, st);
+        gpa.free(steps);
     }
     const stop = std.meta.stringToEnum(mission_mod.StopReason, strField(obj, "stop") orelse
         return error.Corrupt) orelse return error.Corrupt;
@@ -312,6 +387,7 @@ fn deserialize(gpa: std.mem.Allocator, bytes: []const u8) StoreError!mission_mod
     return .{
         .mission_id = mission_id,
         .state = state,
+        .pipeline = steps,
         .step_index = step_index,
         .step_runs = .{ .items = run_items },
         .mission_versions = try optUintField(obj, "mission_versions"),
@@ -373,6 +449,7 @@ fn sampleMission() mission_mod.Mission {
     return .{
         .mission_id = "m-rt",
         .state = .running,
+        .pipeline = &sample_pipeline,
         .step_index = 2,
         .step_runs = .{ .items = @constCast(&sample_runs) },
         .mission_versions = 3,
@@ -390,6 +467,11 @@ fn sampleMission() mission_mod.Mission {
         .role_turns_used = 5,
     };
 }
+const sample_pipeline = [_]pipeline_mod.Step{
+    .{ .id = "architect", .kind = .custom, .system = null, .definition_sha256 = "ab12" ** 16, .tools = true },
+    .{ .id = "executor", .kind = .executor, .system = null, .definition_sha256 = null, .tools = true },
+    .{ .id = "verifier", .kind = .verifier, .system = null, .definition_sha256 = null, .tools = false },
+};
 const sample_runs = [_]pipeline_mod.RunCount{
     .{ .id = "product-owner", .count = 2 },
     .{ .id = "architect", .count = 1 },
@@ -399,7 +481,7 @@ const sample_tasks = [_]mission_mod.Task{
     .{ .desc = "test it", .done = false },
 };
 
-test "save then load round-trips every Mission field" {
+test "save→load round-trips every Mission field including pipeline, step_index, step_runs and version counters" {
     var t = TestRoot.init();
     defer t.deinit();
     const store = Store.init(try t.path());
@@ -431,9 +513,50 @@ test "save then load round-trips every Mission field" {
     try testing.expectEqual(m.plan_versions, got.plan_versions);
     try testing.expectEqual(m.step_runs.items.len, got.step_runs.items.len);
     for (m.step_runs.items) |want| try testing.expectEqual(want.count, got.step_runs.get(want.id));
+    try testing.expectEqual(m.pipeline.len, got.pipeline.len);
+    for (m.pipeline, got.pipeline) |want, have| {
+        try testing.expectEqualStrings(want.id, have.id);
+        try testing.expectEqual(want.kind, have.kind);
+        try testing.expectEqual(want.tools, have.tools);
+        // The definition text is never persisted: the CLI re-pins it.
+        try testing.expect(have.system == null);
+        if (want.definition_sha256) |sha| {
+            try testing.expectEqualStrings(sha, have.definition_sha256.?);
+        } else {
+            try testing.expect(have.definition_sha256 == null);
+        }
+    }
+    try testing.expect(pipeline_mod.samePipeline(m.pipeline, got.pipeline));
 }
 
-test "legacy state names load as running with the default pipeline's cursor" {
+test "an empty or malformed pipeline is Corrupt" {
+    var t = TestRoot.init();
+    defer t.deinit();
+    const store = Store.init(try t.path());
+    const head =
+        \\{"mission_id":"m","state":"running","stop":"none","detail":"","objective":"x",
+        \\ "acceptance":"","feedback":"","tasks":[],"task_index":0,"fail_count":0,
+        \\ "gate_denials":0,"role_turns_used":0,"pipeline":
+    ;
+    const bad = [_][]const u8{
+        "[]}",
+        "{}}",
+        "[{\"definition_sha256\":null,\"tools\":true}]}",
+        "[{\"id\":\"BAD ID\",\"definition_sha256\":null,\"tools\":true}]}",
+        "[{\"id\":\"a/b\",\"definition_sha256\":null,\"tools\":true}]}",
+        "[{\"id\":\"executor\",\"definition_sha256\":null}]}",
+        "[{\"id\":\"executor\",\"definition_sha256\":3,\"tools\":true}]}",
+        "[{\"id\":\"executor\",\"tools\":true}]}",
+    };
+    for (bad) |tail| {
+        const text = try std.mem.concat(testing.allocator, u8, &.{ head, tail });
+        defer testing.allocator.free(text);
+        try store.writeArtifact(testing.allocator, state_file, text);
+        try testing.expectError(error.Corrupt, store.load(testing.allocator));
+    }
+}
+
+test "a legacy mission.json loads as the default pipeline with its state mapped onto the cursor" {
     var t = TestRoot.init();
     defer t.deinit();
     const store = Store.init(try t.path());
@@ -462,6 +585,8 @@ test "legacy state names load as running with the default pipeline's cursor" {
         try testing.expectEqual(@as(usize, 0), got.step_runs.items.len);
         try testing.expectEqual(@as(usize, 0), got.mission_versions);
         try testing.expectEqual(@as(usize, 0), got.plan_versions);
+        try testing.expect(pipeline_mod.samePipeline(&pipeline_mod.default_pipeline, got.pipeline));
+        try testing.expectEqual(@as(usize, 0), got.exec_fail_count);
     }
 }
 
@@ -564,7 +689,7 @@ test "concurrent writeAtomic to one root publish exactly one writer's bytes" {
     for (bytes) |ch| try std.testing.expectEqual(first, ch);
 }
 
-test "artifacts land under the planning root; root auto-created; separators rejected" {
+test "artifacts land under the planning root; new artifact names accepted; separators rejected" {
     var t = TestRoot.init();
     defer t.deinit();
     // A planning root that does not exist yet — save/write must create it.
@@ -577,7 +702,17 @@ test "artifacts land under the planning root; root auto-created; separators reje
     defer testing.allocator.free(got);
     try testing.expectEqualStrings("# Mission\n\nship it\n", got);
 
+    // The pipeline's artifact names are all bare filenames.
+    for ([_][]const u8{ "MISSION-2.md", "PLAN-3.md", "EXEC.md", "step-architect-1.md", "REJECTED-architect.md" }) |name| {
+        try store.writeArtifact(testing.allocator, name, name);
+        const back = try store.readArtifact(testing.allocator, name);
+        defer testing.allocator.free(back);
+        try testing.expectEqualStrings(name, back);
+    }
+
     try testing.expectError(error.BadName, store.writeArtifact(testing.allocator, "a/b.md", "x"));
+    try testing.expectError(error.BadName, store.writeArtifact(testing.allocator, "a\\b.md", "x"));
+    try testing.expectError(error.BadName, store.readArtifact(testing.allocator, "step-a/../b.md"));
     try testing.expectError(error.BadName, store.writeArtifact(testing.allocator, "..", "x"));
     try testing.expectError(error.BadName, store.writeArtifact(testing.allocator, "", "x"));
     try testing.expectError(error.NotFound, store.readArtifact(testing.allocator, "PLAN.md"));

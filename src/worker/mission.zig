@@ -413,10 +413,19 @@ fn runMission(self: *MissionOrchestrator, arena: std.mem.Allocator, request_json
         };
         defer loaded.deinit(self.gpa);
         if (!std.mem.eql(u8, loaded.mission_id, p.mission_id)) return error.MalformedRequest;
+        // The pin check comes first, terminal states included: a resume under
+        // a different pipeline is refused with nothing run or persisted.
+        if (!pipeline.samePipeline(loaded.pipeline, p.steps)) return std.fmt.allocPrint(
+            arena,
+            "{{\"refused\":true,\"reason\":\"pipeline_changed\",\"detail\":{f}}}",
+            .{json.fmt(pipeline.pipeline_changed_detail, .{})},
+        );
         m = try cloneToArena(arena, &loaded);
+        // The request's steps carry the pinned definition text the store
+        // does not keep; `loaded` is freed on return, so detach first.
+        m.pipeline = p.steps;
         // Resuming a terminal mission is idempotent: report, run nothing.
         if (m.state == .done or m.state == .failed) return replyTerminal(arena, &m);
-        m.pipeline = p.steps;
         // A running cursor outside the pipeline is a different pipeline's
         // state: fail closed. The gate sits past the last step by definition.
         if (m.state == .gating) {
@@ -2126,7 +2135,7 @@ test "resumed roles keep the persisted operator brief instead of replacement int
     const original = good_brief ++ "\nOriginal acceptance: 2 -3 8 must print 7.\n";
     try h.store().writeArtifact(testing.allocator, "BRIEF.md", original);
     try h.store().writeArtifact(testing.allocator, "MISSION.md", "Generated acceptance: ship the gizmo.\n");
-    try h.store().save(testing.allocator, &.{ .mission_id = "m-1", .state = .running, .step_index = 1, .objective = "gizmo", .acceptance = "generated" });
+    try h.store().save(testing.allocator, &.{ .mission_id = "m-1", .state = .running, .pipeline = &pipeline.default_pipeline, .step_index = 1, .objective = "gizmo", .acceptance = "generated" });
     const req = try h.startReq(testing.allocator, ",\"resume\":true,\"gate_function\":\"test::gate::request\"");
     defer testing.allocator.free(req);
     const res = try h.caller.call("zygos::missions::start", req);
@@ -2594,6 +2603,7 @@ test "resume mid-flight runs only the remaining roles" {
     const seeded: Mission = .{
         .mission_id = "m-1",
         .state = .running,
+        .pipeline = &pipeline.default_pipeline,
         .step_index = 2,
         .objective = "Ship the gizmo",
         .acceptance = "the gizmo ships",
@@ -2631,6 +2641,7 @@ test "carried M3: terminal resume runs no turn" {
         .mission_id = "m-1",
         .state = .done,
         .stop = .completed,
+        .pipeline = &pipeline.default_pipeline,
         .objective = "Ship the gizmo",
         .role_turns_used = 7,
     };
@@ -3238,4 +3249,133 @@ test "a mission resumed from a legacy state file continues from the mapped curso
     // Only the verifier ran: the legacy `verifying` state maps to step 3,
     // and a missing EXEC.md does not stop it.
     try testing.expectEqual(@as(usize, 1), h.provider.callCount());
+}
+
+fn expectRefusedChanged(payload: []const u8) !void {
+    var p = try json.parseFromSlice(json.Value, testing.allocator, payload, .{});
+    defer p.deinit();
+    try testing.expect(p.value.object.get("refused").?.bool);
+    try testing.expectEqualStrings("pipeline_changed", p.value.object.get("reason").?.string);
+    try testing.expectEqualStrings("pipeline changed since start", p.value.object.get("detail").?.string);
+}
+
+fn changedPipelineRefuses() !void {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var h = try Harness.init(testing.allocator, &.{ exec_ok, verify_pass });
+    defer h.deinit();
+    const approvals = try approval_mod.ApprovalWorker.start(testing.allocator, &h.actor, &h.registry, .auto_approve);
+    defer approvals.stop();
+
+    // A mission pinned to architect → executor → verifier, killed at the
+    // executor with its second task pending.
+    const def = "You are the architect.";
+    const sha = pipeline.sha256Hex(def);
+    const pinned = [_]pipeline.Step{
+        .{ .id = "architect", .kind = .custom, .system = null, .definition_sha256 = &sha, .tools = false },
+        .{ .id = "executor", .kind = .executor, .system = null, .definition_sha256 = null, .tools = true },
+        .{ .id = "verifier", .kind = .verifier, .system = null, .definition_sha256 = null, .tools = false },
+    };
+    var tasks = [_]Task{
+        .{ .desc = "build the gizmo", .done = true },
+        .{ .desc = "test the gizmo", .done = false },
+    };
+    const seeded: Mission = .{
+        .mission_id = "m-1",
+        .state = .running,
+        .pipeline = &pinned,
+        .step_index = 1,
+        .objective = "Ship the gizmo",
+        .acceptance = "the gizmo ships",
+        .tasks = &tasks,
+        .task_index = 1,
+        .role_turns_used = 3,
+    };
+    try h.store().save(testing.allocator, &seeded);
+    try h.store().writeArtifact(testing.allocator, "MISSION.md", "# Mission\n\nShip the gizmo\n");
+    try h.store().writeArtifact(testing.allocator, "PLAN.md", "# Plan\n\n- [x] build\n- [ ] test\n");
+    const before = try h.store().readArtifact(testing.allocator, "mission.json");
+    defer testing.allocator.free(before);
+
+    const other_sha = pipeline.sha256Hex("You are a different architect.");
+    const resume_gate = ",\"resume\":true,\"gate_function\":\"zygos::approvals::request\"";
+    const changed = [_][]const u8{
+        // Different ids.
+        try std.fmt.allocPrint(arena, ",\"steps\":[{{\"id\":\"designer\",\"system\":\"{s}\",\"definition_sha256\":\"{s}\"}}," ++
+            "{{\"id\":\"executor\"}},{{\"id\":\"verifier\"}}]", .{ def, sha }),
+        // Same ids, edited definition.
+        try std.fmt.allocPrint(arena, ",\"steps\":[{{\"id\":\"architect\",\"system\":\"You are a different architect.\"," ++
+            "\"definition_sha256\":\"{s}\"}},{{\"id\":\"executor\"}},{{\"id\":\"verifier\"}}]", .{other_sha}),
+        // Same ids and definition, tools flipped on the architect.
+        try std.fmt.allocPrint(arena, ",\"steps\":[{{\"id\":\"architect\",\"system\":\"{s}\",\"definition_sha256\":\"{s}\"," ++
+            "\"tools\":true}},{{\"id\":\"executor\"}},{{\"id\":\"verifier\"}}]", .{ def, sha }),
+        // Tools dropped from the executor.
+        try std.fmt.allocPrint(arena, ",\"steps\":[{{\"id\":\"architect\",\"system\":\"{s}\",\"definition_sha256\":\"{s}\"}}," ++
+            "{{\"id\":\"executor\",\"tools\":false}},{{\"id\":\"verifier\"}}]", .{ def, sha }),
+        // A step removed.
+        try std.fmt.allocPrint(arena, ",\"steps\":[{{\"id\":\"architect\",\"system\":\"{s}\",\"definition_sha256\":\"{s}\"}}," ++
+            "{{\"id\":\"executor\"}}]", .{ def, sha }),
+        // No steps at all: the default pipeline is not the pinned one.
+        "",
+    };
+    for (changed) |steps| {
+        const extra = try std.mem.concat(testing.allocator, u8, &.{ resume_gate, steps });
+        defer testing.allocator.free(extra);
+        const req = try h.startReq(testing.allocator, extra);
+        defer testing.allocator.free(req);
+        const res = try h.caller.call("zygos::missions::start", req);
+        defer res.deinit(testing.allocator);
+        try testing.expect(res == .ok);
+        try expectRefusedChanged(res.ok);
+    }
+    // Fail closed: nothing ran and nothing was written.
+    try testing.expectEqual(@as(usize, 0), h.provider.callCount());
+    const after = try h.store().readArtifact(testing.allocator, "mission.json");
+    defer testing.allocator.free(after);
+    try testing.expectEqualStrings(before, after);
+
+    // The unchanged pipeline resumes at the executor and finishes.
+    const same = try std.fmt.allocPrint(testing.allocator, "{s},\"steps\":[{{\"id\":\"architect\",\"system\":\"{s}\"," ++
+        "\"definition_sha256\":\"{s}\"}},{{\"id\":\"executor\"}},{{\"id\":\"verifier\"}}]", .{ resume_gate, def, sha });
+    defer testing.allocator.free(same);
+    const ok_req = try h.startReq(testing.allocator, same);
+    defer testing.allocator.free(ok_req);
+    const ok_res = try h.caller.call("zygos::missions::start", ok_req);
+    defer ok_res.deinit(testing.allocator);
+    try expectTerminal(ok_res.ok, "done", "completed");
+    try testing.expectEqual(@as(usize, 2), h.provider.callCount());
+}
+
+test "resume with a changed pipeline refuses; a legacy state file resumes under the default pipeline" {
+    try changedPipelineRefuses();
+    try legacyFileResumes();
+}
+
+fn legacyFileResumes() !void {
+    var h = try Harness.init(testing.allocator, &.{ exec_ok, verify_pass });
+    defer h.deinit();
+    const approvals = try approval_mod.ApprovalWorker.start(testing.allocator, &h.actor, &h.registry, .auto_approve);
+    defer approvals.stop();
+    try h.store().writeArtifact(testing.allocator, "MISSION.md", "# Mission\n\nShip the gizmo\n");
+    try h.store().writeArtifact(testing.allocator, "PLAN.md", "# Plan\n\n- [x] build\n- [ ] test\n");
+    try h.store().writeArtifact(testing.allocator, "mission.json",
+        \\{"mission_id":"m-1","state":"executing","stop":"none","detail":"","objective":"Ship the gizmo",
+        \\ "acceptance":"ships","feedback":"","tasks":[{"desc":"build","done":true},{"desc":"test","done":false}],
+        \\ "task_index":1,"fail_count":0,"gate_denials":0,"role_turns_used":3}
+    );
+
+    // Absent steps and an explicit default list both match a legacy file.
+    const req = try h.startReq(testing.allocator, ",\"resume\":true,\"gate_function\":\"zygos::approvals::request\"," ++
+        "\"steps\":[{\"id\":\"product-owner\"},{\"id\":\"planner\"},{\"id\":\"executor\"},{\"id\":\"verifier\"}]");
+    defer testing.allocator.free(req);
+    const res = try h.caller.call("zygos::missions::start", req);
+    defer res.deinit(testing.allocator);
+    try expectTerminal(res.ok, "done", "completed");
+    try testing.expectEqual(@as(usize, 2), h.provider.callCount());
+
+    // The rewritten file now carries the pinned pipeline.
+    var m = try h.store().load(testing.allocator);
+    defer m.deinit(testing.allocator);
+    try testing.expect(pipeline.samePipeline(&pipeline.default_pipeline, m.pipeline));
 }
