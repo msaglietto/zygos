@@ -1,7 +1,7 @@
 # Spec: `zygos.zon` `.policy` — operator config for mission policy rules (issue #12)
 
-> **Status: target contract for issue #12, pending Mauricio's ratification.**
-> The code on `master` still seeds the hard-coded allow list
+> **Status: target contract for issue #12, not implemented yet.** The code
+> on `master` still seeds the hard-coded allow list
 > (`mission_boot.policySeed`) and ignores a `.policy` key. The
 > implementation PR follows this spec test-first.
 
@@ -131,8 +131,9 @@ Decisions in that table:
   The MCP names exist only after the MCP children have spawned and
   answered `tools/list`, which needs the kernel up. So this row refuses
   after kernel boot and the MCP handshake but before
-  `zygos::missions::start` is invoked: exit 2, no turn, no `mission.json`
-  written. Consequences, accepted:
+  `zygos::missions::start` is invoked: exit 2, no turn, and the mission
+  store is not written (a resume's existing `mission.json` is left as it
+  was). Consequences, accepted:
   - `read_file` and `write_file` are on the bus but never offered to
     mission steps, so a rule naming them refuses.
   - `zygos::mcp::*` refuses when the file has no `.mcp_servers`. The
@@ -147,6 +148,10 @@ Decisions in that table:
   everything it would) are accepted too: first match wins is documented.
 - **Duplicate keys** inside one entry fail ZON generation and refuse as
   `policy: malformed`.
+- **ZON syntax errors** refuse as `policy: malformed` in the module. In the
+  CLI the router's parse reads the file first, so a syntax error still
+  exits 2 earlier as `mission: cannot parse route table <path>`; the
+  `.policy` parser only ever sees a syntactically valid file there.
 
 ## Resume
 
@@ -164,8 +169,9 @@ visible because every run of the loop traces its effective list (below).
 only on `{"approved":true}`. Anything else yields the `approval_denied`
 tool result and the turn continues (U1, U2).
 
-- **Console runs.** The approval worker runs `.manual` with
-  `ZYGOS_APPROVAL_TIMEOUT_MS` (default 300 s). The console or TUI prompts;
+- **Console runs.** The mission CLI starts the approval worker `.manual`
+  with `ZYGOS_APPROVAL_TIMEOUT_MS` (CLI default 300 s; timeout ⇒
+  `approved:false`). The console or TUI prompts;
   stdin EOF stops prompting, and every later ask times out to deny.
 - **Headless and campaign runs stay non-interactive.** The Harbor adapter
   provides no console and sets `ZYGOS_APPROVAL_TIMEOUT_MS=1000`, so each
