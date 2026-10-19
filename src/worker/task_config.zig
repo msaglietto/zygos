@@ -199,6 +199,16 @@ test "task --config refuses a file carrying .steps" {
     try testing.expectError(error.UnsupportedSetting, TaskZon.parse(testing.allocator, with_steps));
 }
 
+test "task --config refuses .policy as UnsupportedSetting" {
+    const with_policy: [:0]const u8 =
+        \\.{
+        \\    .default = .{ .{ .provider_function = "zygos::providers::deepseek-flash", .model = "m" } },
+        \\    .policy = .{ .{ .tool = "bash", .verdict = .allow } },
+        \\}
+    ;
+    try testing.expectError(error.UnsupportedSetting, TaskZon.parse(testing.allocator, with_policy));
+}
+
 test "parse: no ladder for the task step refuses" {
     try testing.expectError(error.NoTaskRoute, TaskZon.parse(testing.allocator, ".{}"));
     try testing.expectError(error.NoTaskRoute, TaskZon.parse(testing.allocator,
