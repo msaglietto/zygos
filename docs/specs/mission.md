@@ -241,11 +241,12 @@ caveat.
   `{"tool":"bash","function_id":"zygos::tools::bash","step_id":"architect","input":{...}}`.
   `policy.Rule` gains an optional `step` pattern; a rule without one
   matches every step.
-- **Known limit:** the mission CLI's policy seed (`mission_boot.policySeed`)
-  is hard-coded allow and has no operator config surface. So this issue
-  makes per-step rules *expressible* in the policy worker, but an operator
-  cannot yet configure them. A per-step policy config is a follow-up
-  issue.
+- **Operator config.** The mission CLI reads the rule list from
+  `zygos.zon` `.policy` and hands it to the policy worker; a present, valid
+  list replaces the hard-coded allow seed (`mission_boot.policySeed`),
+  which governs only when `.policy` is absent. The start request carries
+  the effective list as `policy`, so the trace records it. See
+  `docs/specs/policy-config.md`.
 
 ## Store (V2) — `src/worker/mission_store.zig`
 
@@ -327,6 +328,9 @@ Registers `zygos::missions::{start,status,abort}`.
    {"id":"architect","system":"<pinned definition text>",
     "definition_sha256":"<hex>","tools":true},
    {"id":"executor"}, {"id":"verifier"}],
+ "policy":{"source":"config",                      // optional; absent ⇒ no policy event
+   "rules":[{"tool":"bash","verdict":"deny","step":"architect"},
+            {"tool":"bash","verdict":"allow","step":null}]},
  "router_function":"zygos::models::resolve",
  "provider_function":"zygos::provider::fake::messages",
  "gate_function":"zygos::approvals::request",      // absent ⇒ done is unreachable
@@ -337,6 +341,9 @@ Registers `zygos::missions::{start,status,abort}`.
 
 The worker re-validates `steps` with `pipeline.validate` (except the file
 checks, which belong to the CLI) and refuses the start on any violation.
+`policy` is optional and informational: the driver does not interpret it,
+and a structurally malformed one refuses the start with reason
+`invalid_policy` (like `invalid_steps`).
 
 **Loop.** Run the step at the cursor, or the gate. Fire the event, apply
 the pipeline's cursor update, and persist the mission (`store.save`) after
@@ -350,8 +357,11 @@ The terminal reply is
 `{"state":"done|failed","step":"<id>"|null,"step_index":N,"stop":"...","detail":"...","role_turns":N,"tasks_done":K}`.
 
 **Mission-start trace.** The driver first emits a `pipeline` trace event
-with `[{"id","definition_sha256","tools"}]`, then the usual mission state
-events with the new state names plus `step` and `step_index`.
+with `[{"id","definition_sha256","tools"}]`; then, only when the request
+carries `policy`, a `policy` event with `{"source","rules"}`; then the usual
+mission state events with the new state names plus `step` and `step_index`.
+Both events are written on every run of the loop (fresh start and
+non-terminal resume).
 
 - **Resume.** `resume:true` loads `<planning_root>/mission.json` and
   compares its pinned `pipeline` (ids, definition hashes, tools) with the
@@ -455,8 +465,8 @@ Driver (scripted fake provider, or a request-recording provider where prompts mu
 
 ## Out of scope
 
-- Operator config for per-step policy rules (follow-up; see Tools and
-  policy).
+- Argument-aware policy rules and forwarding the step to the approval
+  prompt (`docs/specs/policy-config.md`, "Out of scope").
 - Per-occurrence model routes (routing stays one ladder per id).
 - Per-step turn budgets (`max_role_turns` stays one total per mission).
 - Multi-mission concurrency beyond independent mission_ids; mission queues.

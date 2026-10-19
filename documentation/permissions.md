@@ -9,10 +9,10 @@ Zygos has no accounts, roles in a token, or database row policies. Scope is the 
 | Operator | OS user who execs the binary | Everything the process can do: files, shell, network, vault, provider spend. |
 | Loopback peer | TCP to `127.0.0.1:port` | Register and invoke functions on a bare kernel after Origin admission and optional `ZYGOS_TOKEN` authentication. |
 | Mission model | Provider HTTP, routed by `step_id` | Emit text and tool calls. Tools run only after policy (and approval, if `ask`). |
-| Policy worker | In-process, rules from `policySeed` or a caller-supplied list | Return allow / deny / ask. Default when nothing matches is deny. |
+| Policy worker | In-process, rules from `zygos.zon` `.policy` when present, else `policySeed`, or a caller-supplied list | Return allow / deny / ask. Default when nothing matches is deny. |
 | Approver | TUI key, stdin line, or timeout | Approve or deny a parked ask or the completion gate. Timeout denies. |
 | MCP stdio client | Parent process of `mcp-gateway` | Call registered tessera tools. |
-| External MCP server | `zygos.zon` `.mcp_servers` argv | Its own tools, registered as `zygos::mcp::<server>::<tool>`, under the same policy seed (allow). |
+| External MCP server | `zygos.zon` `.mcp_servers` argv | Its own tools, registered as `zygos::mcp::<server>::<tool>`, under the same policy rules: the seed allows them, and a configured `.policy` must name them or they are denied. |
 | Cron | The crontab user | Same as the operator, non-interactively. |
 
 ## Resource × operation
@@ -28,7 +28,7 @@ Zygos has no accounts, roles in a token, or database row policies. Scope is the 
 | Shell | execute | `zygos::tools::bash` when policy allows | Policy deny or ask-timeout; local two-minute process-group deadline. Child env contains PATH/HOME/TZ/LANG/TERM/LC_* only. No path jail inside the command. |
 | URL | fetch | `zygos::tools::web_fetch` when policy allows | Non-http(s), missing host, non-2xx, oversize, non-text. Literal private/loopback/link-local hosts and localhost names are refused unless `ZYGOS_FETCH_ALLOW_PRIVATE=1`; DNS destinations and redirect targets are not screened. |
 | Search | query | `zygos::tools::web_search` when policy allows and an engine is configured | Unknown engine, missing searxng endpoint, missing brave key, malformed upstream JSON. |
-| Mission | start | CLI caller | Bad brief, unknown provider slug, existing substrate without resume or run-stamp, vault checkpoint failure, or unavailable planning-root lock. |
+| Mission | start | CLI caller | Bad brief, unknown provider slug, existing substrate without resume or run-stamp, malformed `.policy`, vault checkpoint failure, or unavailable planning-root lock. |
 | Mission | complete (`done`) | Gate approval | No gate, bad gate reply, deny, or unanswered timeout (parks). |
 | Mission | abort | `missions::abort` | Stops at the next role boundary. |
 | Budget scope | record / check | Turn driver | Over limit or unreachable checker stops the turn. |
@@ -39,13 +39,17 @@ Zygos has no accounts, roles in a token, or database row policies. Scope is the 
 
 Every check above is in process code. There is no database and no row-level security.
 
-Policy match is exact or prefix (`trailing *`) on `tool` or `function_id` (`policy.zig` `matches`). First match wins. The mission CLI does not ship a deny rule for bash.
+Policy match is exact or prefix (`trailing *`) on `tool` or `function_id` (`policy.zig` `matches`). First match wins. Without a `.policy` key in `zygos.zon`, the mission CLI seeds allow rules (`policySeed`) and ships no deny rule for bash.
+
+With a `.policy` key, the operator's ordered list is the whole policy: it replaces the seed, nothing is prepended or appended, and a tool no rule matches is denied. A rule may be scoped to a pipeline step. The CLI validates the list at boot and refuses a malformed one, a step pattern that matches no configured step, or a tool pattern that matches no offered tool. Every run of the loop writes the effective list to the trace as a `policy` event. The contract is `docs/specs/policy-config.md`.
+
+`deny` holds against the executor. `ask` does not: a same-user shell can append an approval to the control file (see below).
 
 A turn that omits `policy_function` does not consult the gate. That is the M1 auto path. Mission role turns set the policy function; a hand-rolled `turns::run` caller can forget it. The driver does not invent a default policy function.
 
 ## Remaining boundaries
 
-The mission seed still allows shell and web tools. A same-user shell can read
+Without `.policy`, the mission seed still allows shell and web tools. A same-user shell can read
 credentials from disk, use the network directly, and approve through
 `control.jsonl`; the completion gate is an orchestration check, not an
 independent human authorization boundary. A token stored under the same UID

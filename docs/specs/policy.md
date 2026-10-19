@@ -62,7 +62,7 @@ matched".
 Driver-side fail-closed tests live in `turn.zig` (see turn spec § policy),
 including `the policy request carries step_id`.
 
-**Known limit:** the mission CLI's policy seed (`mission_boot.policySeed`) is
-still hard-coded allow with no operator config surface (see mission.md
-"Known limit"). Per-step rules are expressible in the worker but not yet
-configurable by an operator.
+The mission CLI builds the rule list from the operator's `zygos.zon`
+`.policy` when present, else from its hard-coded allow seed
+(`mission_boot.policySeed`); see `docs/specs/policy-config.md`. The worker is
+the same either way.

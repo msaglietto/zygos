@@ -1,9 +1,10 @@
 # Spec: `zygos.zon` `.policy` — operator config for mission policy rules (issue #12)
 
-> **Status: target contract for issue #12, not implemented yet.** The code
-> on `master` still seeds the hard-coded allow list
-> (`mission_boot.policySeed`) and ignores a `.policy` key. The
-> implementation PR follows this spec test-first.
+> **Status: implemented (issue #12; GOAL.md U1 amendment ratified by
+> Mauricio 2026-10-19).** `src/worker/policy_config.zig` parses `.policy`.
+> A present, valid list replaces the hard-coded allow list
+> (`mission_boot.policySeed`), which still governs when `.policy` is
+> absent.
 
 Issue #7 made per-step rules expressible: every policy request carries the
 calling turn's `step_id`, and `policy.Rule` has an optional `step` pattern

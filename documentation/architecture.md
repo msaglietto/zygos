@@ -17,7 +17,7 @@ There are no user accounts, sessions, or row-level policies. Identity is the OS 
 
 1. **Operator process.** `zygos mission` reads env, `zygos.zon`, and `~/.agents/providers.toml` (or `AI_PROVIDERS_CONFIG`). It boots the kernel in-process and the default workers. The operator's uid is the privilege level of bash, file tools, and vault writes.
 2. **Loopback bus.** Bare `zygos` listens on `127.0.0.1` (`src/net/ws.zig` `Config.address`, port `ZYGOS_PORT` or 49134). The handshake rejects unallowlisted browser Origins and can require `ZYGOS_TOKEN` as a query token. Without the token, local script clients can register functions and invoke them. `main.zig` does not expose an address override.
-3. **Model tool calls.** The turn driver calls `zygos::policy::check` before a tool runs (`src/worker/turn.zig` `checkPolicy`). Missing worker, malformed verdict, or unknown verdict denies. The mission CLI seeds bash, `web_fetch`, `web_search`, and configured MCP tools as `allow` (`mission_boot.policySeed`). Per-call prompts require an `ask` rule. The completion gate is not independent of the same-user executor shell, which can write the control channel.
+3. **Model tool calls.** The turn driver calls `zygos::policy::check` before a tool runs (`src/worker/turn.zig` `checkPolicy`). Missing worker, malformed verdict, or unknown verdict denies. Without a `.policy` key in `zygos.zon`, the mission CLI seeds bash, `web_fetch`, `web_search`, and configured MCP tools as `allow` (`mission_boot.policySeed`); a present `.policy` replaces the seed. Per-call prompts require an `ask` rule. The completion gate is not independent of the same-user executor shell, which can write the control channel.
 4. **Completion gate.** Reaching `done` requires an affirmative approval. Unreachable gate, malformed reply, or no gate function cannot complete the mission. An unanswered deny (`resolved: false`) parks in `gating` instead of returning to rework.
 5. **Provider secrets.** Catalog entries resolve `key_env` to the process environment, with an inline `key` fallback (`src/config/providers.zig`). Tests use fixtures. The real catalog is not committed.
 
@@ -26,7 +26,7 @@ There are no user accounts, sessions, or row-level policies. Identity is the OS 
 | Boundary | What crosses | Enforcement |
 |---|---|---|
 | Local peer → kernel WebSocket | iii frames, function invokes | Loopback bind, Origin guard, optional shared token. |
-| Model → tool | tool name, JSON input | Policy worker, then approval if the verdict is `ask`. Default mission seed is allow. |
+| Model → tool | tool name, JSON input | Policy worker, then approval if the verdict is `ask`. Default mission seed is allow; `.policy` replaces it. |
 | File tools → filesystem | relative path | Lexical join under the workspace root (`tools_ops.Workspace.resolve`). Symlink targets are not re-checked. |
 | Bash → process | shell string | `cwd` is the workspace. The command itself is not jailed. |
 | web_fetch / web_search → network | URL or query | `http`/`https` only (`validateUrl`); partial literal-host screen for fetch, with explicit override. DNS/redirect targets remain unchecked. Search key injected at boot. |
