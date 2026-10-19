@@ -60,6 +60,12 @@ pub fn pipelineEvent(arena: std.mem.Allocator, steps: []const pipeline.Step) err
     return .{ .pipeline = .{ .steps = out } };
 }
 
+/// The `policy` trace event for the start request's policy record, written
+/// right after `pipeline`. The driver passes the record through verbatim.
+pub fn policyEvent(policy: TraceEvent.Policy) TraceEvent {
+    return .{ .policy = policy };
+}
+
 /// Wall-clock "YYYY-MM-DD HH:MM" (UTC). Continuity stamps are advisory
 /// prose, not ordering keys, so UTC without a zone suffix is acceptable.
 pub fn nowStamp() [16]u8 {
@@ -203,6 +209,18 @@ test "pipelineEvent lists id, hash and tools for every step" {
     try testing.expectEqualStrings("ab", ev.pipeline.steps[0].definition_sha256.?);
     try testing.expect(ev.pipeline.steps[0].tools);
     try testing.expect(ev.pipeline.steps[1].definition_sha256 == null);
+}
+
+test "policyEvent carries source and rules through unchanged" {
+    const rules = [_]TraceEvent.PolicyRule{
+        .{ .tool = "bash", .verdict = "deny", .step = "architect" },
+        .{ .tool = "bash", .verdict = "allow" },
+    };
+    const ev = policyEvent(.{ .source = "config", .rules = &rules });
+    try testing.expectEqualStrings("config", ev.policy.source);
+    try testing.expectEqual(@as(usize, 2), ev.policy.rules.len);
+    try testing.expectEqualStrings("architect", ev.policy.rules[0].step.?);
+    try testing.expect(ev.policy.rules[1].step == null);
 }
 
 test "nowStamp: fixed shape YYYY-MM-DD HH:MM" {
