@@ -191,6 +191,13 @@ fn renderLine(
                 if (st.definition_sha256) |h| try appendFmt(gpa, &w, "@{s}", .{h[0..@min(h.len, 8)]});
             }
         },
+        .policy => |p| {
+            try appendFmt(gpa, &w, "policy ({s}, {d} rules):", .{ p.source, p.rules.len });
+            for (p.rules) |r| {
+                try appendFmt(gpa, &w, " {s}={s}", .{ r.tool, r.verdict });
+                if (r.step) |st| try appendFmt(gpa, &w, "@{s}", .{st});
+            }
+        },
         .role_start => |r| try appendFmt(gpa, &w, "── role {s} (turn {d}, tools {s})", .{
             r.role, r.role_turn, if (r.tools) "on" else "off",
         }),
@@ -324,6 +331,18 @@ test "render pretty-prints every event kind and passes unknown lines through raw
     try testing.expect(std.mem.indexOf(u8, out, "✓ task 2/6 done") != null);
     // Timestamps render as wall clock, one per line.
     try testing.expect(std.mem.indexOf(u8, out, "02:13:20") != null); // 1752200000 UTC
+}
+
+test "trace text renders the policy line" {
+    const jsonl =
+        \\{"ts":1752200000000,"event":"policy","source":"config","rules":[{"tool":"bash","verdict":"deny","step":"architect"},{"tool":"bash","verdict":"allow","step":null},{"tool":"web_*","verdict":"ask","step":"research*"}]}
+        \\{"ts":1752200000100,"event":"policy","source":"config","rules":[]}
+        \\
+    ;
+    const out = try render(testing.allocator, jsonl);
+    defer testing.allocator.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "policy (config, 3 rules): bash=deny@architect bash=allow web_*=ask@research*\n") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "policy (config, 0 rules):\n") != null);
 }
 
 const SinkCapture = struct {

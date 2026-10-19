@@ -117,6 +117,16 @@ const Projector = struct {
                 }
                 try p.emit("CUSTOM", ts, ",\"name\":\"zygos.pipeline\",\"value\":{{\"steps\":[{s}]}}", .{steps.items}, .{});
             },
+            .policy => |pol| {
+                var rules: std.ArrayList(u8) = .empty;
+                for (pol.rules, 0..) |r, i| {
+                    if (i > 0) try rules.append(a, ',');
+                    try rules.print(a, "{{\"tool\":{f},\"verdict\":{f},\"step\":{f}}}", .{
+                        jstr(r.tool), jstr(r.verdict), json.fmt(r.step, .{}),
+                    });
+                }
+                try p.emit("CUSTOM", ts, ",\"name\":\"zygos.policy\",\"value\":{{\"source\":{f},\"rules\":[{s}]}}", .{ jstr(pol.source), rules.items }, .{});
+            },
             .role_start => |r| {
                 const id = try std.fmt.allocPrint(a, "{s}:{d}", .{ r.role, r.role_turn });
                 try p.emit(
@@ -763,6 +773,19 @@ test "project: steps follow the cursor, so running to running with a new step op
         \\{"type":"ACTIVITY_SNAPSHOT","timestamp":15,"messageId":"zygos.mission","activityType":"zygos.mission","content":{"state":"done","from":"gating","step":null,"step_index":4,"role_turns":3,"tasks_done":1,"tasks":1},"replace":true}
         \\{"type":"STEP_FINISHED","timestamp":15,"stepName":"done"}
         \\{"type":"RUN_FINISHED","timestamp":15,"threadId":"m3","runId":"m3:1","outcome":{"type":"success"},"result":{"state":"done"}}
+        \\
+    );
+}
+
+test "agui projects policy as zygos.policy custom event" {
+    try expectProjection("m6",
+        \\{"ts":40,"event":"policy","source":"config","rules":[{"tool":"bash","verdict":"deny","step":"architect"},{"tool":"a\"b","verdict":"allow","step":null}]}
+        \\{"ts":41,"event":"policy","source":"config","rules":[]}
+        \\
+    ,
+        \\{"type":"RUN_STARTED","timestamp":40,"threadId":"m6","runId":"m6:1","protocolVersion":"1.0"}
+        \\{"type":"CUSTOM","timestamp":40,"name":"zygos.policy","value":{"source":"config","rules":[{"tool":"bash","verdict":"deny","step":"architect"},{"tool":"a\"b","verdict":"allow","step":null}]}}
+        \\{"type":"CUSTOM","timestamp":41,"name":"zygos.policy","value":{"source":"config","rules":[]}}
         \\
     );
 }
