@@ -82,6 +82,9 @@ messages (the FSM's steering path, driver-exposed). The real openai-compat
 HTTP client lands in `src/net/` under the Z-02 amendment, exercised only by an
 env-gated manual smoke (`OPENAI_API_KEY`), never by `zig build test`.
 
+Amended 2026-10-19 (issue #12, **ratified by Mauricio 2026-10-19**): U1 above —
+see Amendments.
+
 ## Success criteria — milestone M3 (mission loop)
 
 M2 ratified and closed 2026-07-07 (all U1–U6 green; see README). M3 criteria
@@ -245,3 +248,12 @@ Append-only. Human-written.
     with its own id as `step_id` and a free-text reply (empty ⇒ the step fails).
     **V4** — resume also refuses when the current `.steps` (ids + definition
     hashes) differs from the one pinned in `mission.json`.
+- 2026-10-14 (drafted by an agent for issue #12, **ratified by Mauricio 2026-10-19**):
+  operator-configured policy rules. Contract: `docs/specs/policy-config.md`. Extends, not contradicts:
+  - **U1** — The mission CLI's rule table is operator config (`zygos.zon` `.policy`: ordered
+    `{tool, verdict, step?}` rules, first match wins). Absent ⇒ the built-in seed, unchanged.
+    Present ⇒ it replaces the seed. A malformed or unparseable block, a `step` matching no
+    configured step, or a `tool` matching no offered tool refuses boot (exit 2, before any
+    turn); it never falls back to the seed or to allow. No rule matched ⇒ deny. Missing worker,
+    malformed verdict, or handler error ⇒ deny, as before. Verified by `zig build test`
+    (policy-config tests + a per-step deny/allow mission driver test).
