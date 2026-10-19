@@ -43,6 +43,7 @@ pub const tessera_undo = @import("worker/tessera_undo.zig");
 pub const mcp_gateway = @import("worker/mcp/gateway.zig");
 pub const mcp_client = @import("worker/mcp/client.zig");
 pub const policy = @import("worker/policy.zig");
+pub const policy_config = @import("worker/policy_config.zig");
 pub const approval = @import("worker/approval.zig");
 pub const router = @import("worker/router.zig");
 pub const budget = @import("worker/budget.zig");
