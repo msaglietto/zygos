@@ -151,6 +151,21 @@ pub fn run(gpa: std.mem.Allocator, args: *std.process.Args.Iterator) u8 {
         },
     };
 
+    // .policy: strict parse and the step-id check run here, before the
+    // kernel boots. The tool check needs the MCP tool list and runs after
+    // the handshake. A refusal never falls back to the seed.
+    const step_ids: []const []const u8 = ids: {
+        const n = if (steps) |s| s.len else zygos.mission.pipeline.default_pipeline.len;
+        const ids = gpa.alloc([]const u8, n) catch return oom();
+        for (ids, 0..) |*id, i| id.* = if (steps) |s| s[i].id else zygos.mission.pipeline.default_pipeline[i].id;
+        break :ids ids;
+    };
+    const policy_resolved = zygos.policy_config.resolve(gpa, gpa, zon_text, step_ids) catch return oom();
+    if (policy_resolved == .refused) {
+        eprint("mission: invalid .policy in {s}: {s}\n", .{ zon_path, policy_resolved.refused });
+        return 2;
+    }
+
     // ---- kernel + roster (the e2e/m3 wiring, catalog + manual approvals) ----
     var registry = zygos.inproc.Registry.init(gpa, null);
     const tm = zygos.mission_boot.timeouts(env);
@@ -225,8 +240,22 @@ pub fn run(gpa: std.mem.Allocator, args: *std.process.Args.Iterator) u8 {
     // per-tool asks return with X5's tightening pass. Web tools (Y1) ride
     // the same policy gate with the URL in the policy request (Y2). MCP
     // tools are operator-configured, so they boot as allow too.
-    const mcp_names: []const []const u8 = if (mcp) |m| m.toolNames(gpa) catch return oom() else &.{};
-    const policy_rules = zygos.mission_boot.policySeed(gpa, mcp_names) catch return oom();
+    // An operator `.policy` replaces the seed; its tool patterns are checked
+    // against what steps are offered, and a refusal exits before the policy
+    // worker starts and before anything writes the mission store.
+    const mcp_refs: []const zygos.mcp_client.McpClientWorker.ToolRef = if (mcp) |m| m.toolRefs(gpa) catch return oom() else &.{};
+    const offered = gpa.alloc(zygos.policy_config.Offered, zygos.policy_config.base_offered.len + mcp_refs.len) catch return oom();
+    @memcpy(offered[0..zygos.policy_config.base_offered.len], &zygos.policy_config.base_offered);
+    for (mcp_refs, 0..) |r, i| offered[zygos.policy_config.base_offered.len + i] = .{ .name = r.name, .function_id = r.function_id };
+    const policy_rules: []const zygos.policy.Rule = switch (zygos.policy_config.effective(gpa, policy_resolved, offered) catch return oom()) {
+        .rules => |r| r,
+        .refused => |reason| {
+            eprint("mission: invalid .policy in {s}: {s}\n", .{ zon_path, reason });
+            return 2;
+        },
+    };
+    // Absent `.policy` leaves the start request without a policy field.
+    const start_policy: ?[]const zygos.policy.Rule = if (policy_resolved == .absent) null else policy_rules;
     const policy = zygos.policy.PolicyWorker.start(gpa, &actor, &registry, policy_rules) catch return boot_fail();
     _ = policy;
     const web = zygos.web_tools.WebToolsWorker.start(gpa, &actor, &registry, io_boot.io(), .{
@@ -447,6 +476,7 @@ pub fn run(gpa: std.mem.Allocator, args: *std.process.Args.Iterator) u8 {
                 .role_max_steps = tm.role_max_steps,
                 .max_role_turns = tm.max_role_turns,
                 .steps = steps,
+                .policy = start_policy,
             }) catch return oom();
             const qres = caller.call("zygos::missions::start", qreq) catch {
                 eprint("mission {s}: bus call failed\n", .{mid});
@@ -482,6 +512,7 @@ pub fn run(gpa: std.mem.Allocator, args: *std.process.Args.Iterator) u8 {
         .role_max_steps = tm.role_max_steps,
         .max_role_turns = tm.max_role_turns,
         .steps = steps,
+        .policy = start_policy,
     }) catch return oom();
 
     // M7 net hardening: SIGINT (cron kill, Ctrl-C) lands as a clean abort —

@@ -6,6 +6,13 @@ Reconstructed from git history on 2026-09-30. A commit that only added a library
 
 The agent that next changes operator-visible behavior adds the new heading in that same commit.
 
+## [5.1.0] - 2026-10-19
+
+### Added
+
+- `zygos.zon` `.policy` configures the mission policy rules: an ordered list of `{ .tool, .verdict, .step }` entries, where `.verdict` is `.allow`, `.deny` or `.ask` and `.step` is optional. The first matching rule wins and a call that matches none is denied. A configured list replaces the built-in seed, so a tool you do not list is denied. Without `.policy` nothing changes. The mission CLI exits 2 with `mission: invalid .policy in <path>: <reason>` naming the entry for an empty or malformed list, an unknown key, a bad tool, verdict or step pattern, a step that matches no configured step, or a tool that matches no offered tool. `zygos task --config` refuses a file carrying `.policy`.
+- A `policy` trace event records the effective rules at the start of each run, including a resume. `zygos mission trace` renders it, `--format agui` emits it as a `zygos.policy` custom event, and the campaign inspection reports `policy event missing` when an arm configured a policy and the trace has none.
+
 ## [5.0.0] - 2026-10-12
 
 ### Breaking
