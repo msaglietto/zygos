@@ -630,7 +630,7 @@ class PipelineContract(unittest.TestCase):
 
 
 POLICY_ZON = (
-    '.{ .policy = .{ .{ .tool = "bash", .verdict = .deny, .step = "architect" }, .{ .tool = "web_*", .verdict = .allow } },'
+    '.{ .policy = .{ .{ .tool = "bash", .verdict = .deny, .step = "executor" }, .{ .tool = "web_*", .verdict = .allow } },'
     " // .policy in a comment\n"
     '   .default = .{ .{ .model = "%s" } } }\n'
 )
@@ -694,6 +694,14 @@ class PolicyContract(unittest.TestCase):
             self.assertFalse(campaign.read_policy_presence(nested / "zygos.zon"))
             self.assertTrue(campaign.read_policy_presence(top / "zygos.zon"))
             self.assertFalse(campaign.read_policy_presence(absent / "zygos.zon"))
+
+    def test_policy_in_a_comment_or_string_is_not_a_policy(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            commented = write_arm_dir(root, "c", ".{ // .policy = .{}\n .default = .{} }\n", {})
+            quoted = write_arm_dir(root, "q", '.{ .x = ".policy = .{}" }\n', {})
+            self.assertFalse(campaign.read_policy_presence(commented / "zygos.zon"))
+            self.assertFalse(campaign.read_policy_presence(quoted / "zygos.zon"))
 
     def test_untokenizable_zon_mentioning_policy_refuses(self):
         with tempfile.TemporaryDirectory() as d:
