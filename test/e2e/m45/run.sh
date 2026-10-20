@@ -4,9 +4,11 @@
 # binary, catalog providers, console gate approved over piped stdin;
 # (2) seeded mid-flight substrate finished by `zygos mission resume`;
 # (3) a route table naming an unknown slug exits 2 before any kernel boot;
-# (8) a malformed `.policy` exits 2 before any kernel boot, and a `.policy`
-# rule naming no offered tool exits 2 after the handshake but before the
-# mission store is written.
+# (8) a malformed `.policy` exits 2 before any kernel boot (an MCP server
+# whose spawn leaves a marker proves it was never spawned), a `.policy` rule
+# naming no offered tool exits 2 after the handshake (same marker proves the
+# MCP server WAS spawned) but before the mission store is written, and a valid
+# `.policy` lands in the trace as a `policy` event right after `pipeline`.
 # No real network: the stub binds 127.0.0.1. Exits 0 only if all legs pass.
 set -euo pipefail
 cd "$(dirname "$0")/../../.."
@@ -220,10 +222,24 @@ set -e
 grep -q "MCP server handshake failed" "$TMP/err8.log" || { echo "M45 E2E FAIL leg7b: wrong error"; cat "$TMP/err8.log"; exit 1; }
 
 # ---- Leg 8 (policy-config): an invalid .policy refuses the mission (exit 2) ---
-# 8a: a malformed entry refuses before the kernel boots, so no trace exists.
+# Each of 8a/8b configures an MCP server through a wrapper that touches a marker
+# file and then execs the working stub from leg 7. The marker is the witness of
+# "the MCP server was spawned", so the refusal point is observable: absent for
+# a pre-boot refusal, present for a post-handshake one.
+cat > "$TMP/mcp-marker.sh" <<'EOF'
+#!/bin/sh
+touch "$1"
+shift
+exec "$@"
+EOF
+chmod +x "$TMP/mcp-marker.sh"
+
+# 8a: a malformed entry refuses before the kernel boots, so no trace exists and
+# the MCP server was never spawned.
 cat > "$TMP/zygos-policy-bad.zon" <<EOF
 .{
     .default = .{ .{ .provider_function = "zygos::providers::stub-one", .model = "stub-model-a" } },
+    .mcp_servers = .{ .{ .name = "stub", .argv = .{ "$TMP/mcp-marker.sh", "$TMP/mcp-spawned-8a", "$TMP/mcp-stub.sh" } } },
     .policy = .{ .{ .tool = "bash", .verdict = "allow" } },
 }
 EOF
@@ -236,12 +252,14 @@ set -e
 grep -q "invalid .policy" "$TMP/err9.log" || { echo "M45 E2E FAIL leg8a: wrong error"; cat "$TMP/err9.log"; exit 1; }
 grep -qF 'policy[0]: bad verdict' "$TMP/err9.log" || { echo "M45 E2E FAIL leg8a: reason does not name the entry"; cat "$TMP/err9.log"; exit 1; }
 [ ! -e "$TMP/planning9/events.jsonl" ] || { echo "M45 E2E FAIL leg8a: kernel booted (events.jsonl exists)"; exit 1; }
+[ ! -e "$TMP/mcp-spawned-8a" ] || { echo "M45 E2E FAIL leg8a: MCP server spawned before the refusal"; exit 1; }
 
 # 8b: a rule naming a tool no step is offered refuses after the handshake but
-# before the mission store is written.
+# before the mission store is written. The MCP server was spawned first.
 cat > "$TMP/zygos-policy-dead.zon" <<EOF
 .{
     .default = .{ .{ .provider_function = "zygos::providers::stub-one", .model = "stub-model-a" } },
+    .mcp_servers = .{ .{ .name = "stub", .argv = .{ "$TMP/mcp-marker.sh", "$TMP/mcp-spawned-8b", "$TMP/mcp-stub.sh" } } },
     .policy = .{ .{ .tool = "read_file", .verdict = .allow } },
 }
 EOF
@@ -252,9 +270,36 @@ set -e
 [ "$CODE" = "2" ] || { echo "M45 E2E FAIL leg8b: expected exit 2, got $CODE"; cat "$TMP/err10.log"; exit 1; }
 grep -q 'invalid .policy' "$TMP/err10.log" || { echo "M45 E2E FAIL leg8b: wrong error"; cat "$TMP/err10.log"; exit 1; }
 grep -qF 'policy[0]: tool "read_file" matches no offered tool' "$TMP/err10.log" || { echo "M45 E2E FAIL leg8b: wrong reason"; cat "$TMP/err10.log"; exit 1; }
+[ -e "$TMP/mcp-spawned-8b" ] || { echo "M45 E2E FAIL leg8b: MCP server was not spawned before the refusal"; exit 1; }
 [ ! -e "$TMP/planning10/events.jsonl" ] || { echo "M45 E2E FAIL leg8b: trace written before the refusal"; exit 1; }
 [ ! -e "$TMP/planning10/mission.json" ] || { echo "M45 E2E FAIL leg8b: mission store written before the refusal"; exit 1; }
 
+# 8c: a valid .policy runs the mission and the trace carries a `policy` event
+# right after `pipeline`, with the configured rules in file order. This proves
+# the CLI wires the rule list into the start request.
+cat > "$TMP/zygos-policy-ok.zon" <<EOF
+.{
+    .default = .{ .{ .provider_function = "zygos::providers::stub-one", .model = "stub-model-a" } },
+    .policy = .{
+        .{ .tool = "web_*", .verdict = .deny, .step = "verifier" },
+        .{ .tool = "bash", .verdict = .allow },
+    },
+}
+EOF
+mkdir -p "$TMP/ws8c"
+( cd "$TMP/ws8c" && printf 'y\ny\ny\n' | ZYGOS_CONFIG="$TMP/zygos-policy-ok.zon" "$BIN" mission start "$TMP/brief.md" --planning "$TMP/planning11" > "$TMP/out11.json" 2> "$TMP/err11.log" )
+grep -q '"state":"done"' "$TMP/out11.json" || { echo "M45 E2E FAIL leg8c: $(cat "$TMP/out11.json")"; cat "$TMP/err11.log"; exit 1; }
+[ -s "$TMP/planning11/events.jsonl" ] || { echo "M45 E2E FAIL leg8c: no events.jsonl"; exit 1; }
+sed -n 1p "$TMP/planning11/events.jsonl" | grep -q '"event":"pipeline"' || { echo "M45 E2E FAIL leg8c: first event is not pipeline"; head -2 "$TMP/planning11/events.jsonl"; exit 1; }
+POLICY_LINE=$(sed -n 2p "$TMP/planning11/events.jsonl")
+EXPECT='"event":"policy","source":"config","rules":[{"tool":"web_*","verdict":"deny","step":"verifier"},{"tool":"bash","verdict":"allow","step":null}]'
+case "$POLICY_LINE" in
+  *"$EXPECT"*) ;;
+  *) echo "M45 E2E FAIL leg8c: second event is not the configured policy"; echo "$POLICY_LINE"; exit 1 ;;
+esac
+# A mission with no .policy (leg 1) traces no policy event.
+! grep -q '"event":"policy"' "$TMP/planning/events.jsonl" || { echo "M45 E2E FAIL leg8c: absent .policy traced a policy event"; exit 1; }
+
 echo "--- LEDGER.md (leg 1, from the real binary) ---"
 cat "$TMP/planning/LEDGER.md"
-echo "M45 E2E OK: start→done, seeded resume→done, unknown-slug boot refusal, rerun refusal, vault checkpoint, trace, mcp, ledger compression, invalid .policy refusals"
+echo "M45 E2E OK: start→done, seeded resume→done, unknown-slug boot refusal, rerun refusal, vault checkpoint, trace, mcp, ledger compression, invalid .policy refusals, valid .policy traced"
