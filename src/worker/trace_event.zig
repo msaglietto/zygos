@@ -54,7 +54,8 @@ pub const TraceEvent = union(enum) {
     };
     /// Emitted right after `pipeline` when the start request carries the
     /// operator's policy rules (docs/specs/policy-config.md). The driver does
-    /// not interpret the rules; the event records what the worker enforces.
+    /// not interpret the rules: it echoes the start request's `policy` record,
+    /// which the CLI builds from the same rule list it hands PolicyWorker.
     pub const Policy = struct {
         source: []const u8 = "config",
         rules: []const PolicyRule = &.{},
