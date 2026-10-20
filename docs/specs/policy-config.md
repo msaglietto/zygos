@@ -224,8 +224,10 @@ resume; a terminal or refused resume writes neither):
 - **How it gets there.** The CLI passes the effective list on the
   `zygos::missions::start` request as an optional
   `"policy":{"source":"config","rules":[...]}`, built from the same slice it
-  hands `PolicyWorker.start`. The driver does not interpret it; it emits
-  the event and nothing else. Absent field ⇒ no event, so hand-rolled
+  hands `PolicyWorker.start`. The driver checks the field's shape and refuses a
+  structurally malformed one with `{"refused":true,"reason":"invalid_policy",...}`
+  before any store write; it does not enforce the rules. A well-formed field
+  is emitted as the event and nothing else. Absent field ⇒ no event, so hand-rolled
   callers and every existing driver test are unaffected. `source` is
   always `"config"` today; the field leaves room for other sources without
   a shape change.
