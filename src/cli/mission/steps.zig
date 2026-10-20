@@ -314,6 +314,33 @@ test "no .steps is absent, and the pure refusals come before any file is read" {
     try expectRefused("steps: malformed", try resolve(testing.allocator, arena, zon_path, ".{ .steps = .{ "));
 }
 
+test "steps parse ignores .policy" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    const zon_path = try fx.path(arena, "cfg/zygos.zon");
+
+    const got = try resolve(testing.allocator, arena, zon_path,
+        \\.{
+        \\    .steps = .{ .{ .id = "planner" }, .{ .id = "executor" } },
+        \\    .policy = .{ .{ .tool = "bash", .verdict = .deny }, .{ .tool = "*", .verdict = .allow } },
+        \\}
+    );
+    try testing.expect(got == .ok);
+    try testing.expectEqual(@as(usize, 2), got.ok.len);
+    try testing.expectEqualStrings("planner", got.ok[0].id);
+    try testing.expectEqualStrings("executor", got.ok[1].id);
+
+    // A malformed .policy is not this parser's business either.
+    const odd = try resolve(testing.allocator, arena, zon_path,
+        \\.{ .steps = .{ .{ .id = "executor" } }, .policy = 3 }
+    );
+    try testing.expect(odd == .ok);
+    try testing.expectEqual(@as(usize, 1), odd.ok.len);
+}
+
 test "a zon path without a directory resolves against the current directory" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
