@@ -209,6 +209,37 @@ def _steps_entries(tokens: list[tuple[str, str]], where: str) -> list[dict] | No
     return entries
 
 
+def read_policy_presence(zon_path: Path) -> bool:
+    """Whether a zygos.zon carries a depth-1 `.policy` key. Presence only: the
+    rules are the binary's to parse, and the trace's `policy` event is the
+    evidence that a binary new enough to honor them ran. A file this reader
+    cannot tokenize that mentions `policy` refuses the experiment, as for `.steps`."""
+    zon_path = Path(zon_path)
+    text = zon_path.read_text(encoding="utf-8")
+    where = str(zon_path)
+    tokens = _zon_tokens(text)
+    if tokens is None:
+        if re.search(r"\bpolicy\b", text):
+            raise CampaignError(f"{where}: cannot tokenize the file, so its .policy cannot be read")
+        return False
+    if len(tokens) < 2 or tokens[0][1] != "." or tokens[1][1] != "{":
+        return False
+    depth, found = 0, False
+    for at, (kind, text) in enumerate(tokens):
+        if kind == "punct" and text == "{":
+            depth += 1
+        elif kind == "punct" and text == "}":
+            depth -= 1
+        elif (depth == 1 and text == "." and at + 2 < len(tokens)
+              and tokens[at + 1] == ("word", "policy") and tokens[at + 2][1] == "="):
+            if found:
+                raise CampaignError(f"{where}: .policy appears twice")
+            found = True
+    if depth != 0:
+        raise CampaignError(f"{where}: unbalanced braces, so .policy cannot be trusted")
+    return found
+
+
 def read_pipeline(zon_path: Path) -> list[dict]:
     """The pipeline a zygos.zon pins: `[{"id","definition","definition_sha256","tools"}]`.
 
@@ -287,6 +318,8 @@ class Arm:
         # The pipeline the config pins. Definition files are part of the arm:
         # the zon bytes name them, but only their own bytes say what ran.
         self.pipeline: list[dict] = read_pipeline(self.config_path) if self.config_path else default_pipeline()
+        # `.policy` in the config: the trace must then carry a `policy` event.
+        self.has_policy: bool = read_policy_presence(self.config_path) if self.config_path else False
         # Set by `Experiment.locate_builds`.
         self.binary: Path | None = None
 
@@ -791,6 +824,10 @@ def inspect_mission(exp: Experiment, jobs_dir: Path, arm: Arm, record: dict, age
             f"pipeline event differs from the arm: trace {json.dumps(pipeline.get('steps'), separators=(',', ':'))}"
             f", expected {json.dumps(pipeline_identity(arm.pipeline), separators=(',', ':'))}"
         )
+    # A binary that predates `.policy` ignores the key and runs the seed, so
+    # the event is the only proof the arm's rules were in force.
+    if arm.has_policy and not any(e.get("event") == "policy" for e in events):
+        record["problems"].append("policy event missing")
     usage = [e for e in events if e.get("event") == "usage"]
     trial = {
         "input_tokens": sum(int(e.get("input_tokens", 0)) for e in usage),

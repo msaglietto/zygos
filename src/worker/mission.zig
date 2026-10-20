@@ -343,6 +343,14 @@ fn runMission(self: *MissionOrchestrator, arena: std.mem.Allocator, request_json
         .{json.fmt(reason, .{})},
     );
 
+    // A structurally malformed policy record is refused, not dropped: the
+    // trace must never claim a policy the start did not carry.
+    if (p.policy_refusal) |reason| return std.fmt.allocPrint(
+        arena,
+        "{{\"refused\":true,\"reason\":\"invalid_policy\",\"detail\":{f}}}",
+        .{json.fmt(reason, .{})},
+    );
+
     // .context_strategy on the start request (from zygos.zon at boot):
     // {"kind":"substrate"|"recall"|"thread","max_tokens":N}. Absent ⇒
     // substrate with the default budget; an unknown kind refuses the start.
@@ -443,6 +451,9 @@ fn runMission(self: *MissionOrchestrator, arena: std.mem.Allocator, request_json
     // First event of the run, before any mission state event; terminal and
     // refused resumes returned above and emit nothing.
     try trace_mod.emit(arena, cfg.trace_path, try out_mod.pipelineEvent(arena, m.pipeline));
+    // The effective policy rules, when the request carries them: recorded,
+    // not interpreted (the policy worker enforces). Absent ⇒ no event.
+    if (p.policy) |pol| try trace_mod.emit(arena, cfg.trace_path, out_mod.policyEvent(pol));
 
     // Preserve intake criteria independently of model-authored MISSION.md.
     // Resume uses the original artifact, never a replacement request brief.
@@ -3518,4 +3529,250 @@ fn legacyFileResumes() !void {
     var m = try h.store().load(testing.allocator);
     defer m.deinit(testing.allocator);
     try testing.expect(pipeline.samePipeline(&pipeline.default_pipeline, m.pipeline));
+}
+
+// -- Operator policy rules (docs/specs/policy-config.md test contract 11-17) --
+
+const policy_mod = @import("policy.zig");
+
+/// The start request's policy record, as the CLI builds it from the rules it
+/// hands the policy worker.
+const policy_field = ",\"policy\":{\"source\":\"config\",\"rules\":[" ++
+    "{\"tool\":\"bash\",\"verdict\":\"deny\",\"step\":\"architect\"}," ++
+    "{\"tool\":\"bash\",\"verdict\":\"allow\",\"step\":null}]}";
+
+const policy_line = "\"event\":\"policy\",\"source\":\"config\",\"rules\":[" ++
+    "{\"tool\":\"bash\",\"verdict\":\"deny\",\"step\":\"architect\"}," ++
+    "{\"tool\":\"bash\",\"verdict\":\"allow\",\"step\":null}]}";
+
+/// Every event name in an events.jsonl, in file order.
+fn eventNames(arena: std.mem.Allocator, text: []const u8) ![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        const v = try json.parseFromSliceLeaky(json.Value, arena, line, .{});
+        if (v != .object) continue;
+        const ev = v.object.get("event") orelse continue;
+        if (ev == .string) try out.append(arena, ev.string);
+    }
+    return out.items;
+}
+
+test "policy event follows pipeline when the start request carries policy" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    {
+        var h = try Harness.init(testing.allocator, &.{ po_ok, plan1, exec_ok, verify_pass });
+        defer h.deinit();
+        const approvals = try approval_mod.ApprovalWorker.start(testing.allocator, &h.actor, &h.registry, .auto_approve);
+        defer approvals.stop();
+        var tr = try runTraced(h, seed_and_gate ++ policy_field);
+        defer tr.deinit();
+        try expectTerminal(tr.res.ok, "done", "completed");
+
+        // pipeline, then policy, then the first mission state event.
+        const names = try eventNames(arena, tr.trace);
+        try testing.expect(names.len > 3);
+        try testing.expectEqualStrings("pipeline", names[0]);
+        try testing.expectEqualStrings("policy", names[1]);
+        try testing.expect(std.mem.indexOf(u8, tr.trace, "\"event\":\"mission\"").? > std.mem.indexOf(u8, tr.trace, policy_line).?);
+        try expectSeq(&.{"policy"}, try traceField(arena, tr.trace, "policy", "event"));
+        var lines = std.mem.splitScalar(u8, tr.trace, '\n');
+        _ = lines.next();
+        const second = lines.next().?;
+        try testing.expect(std.mem.indexOf(u8, second, policy_line) != null);
+    }
+
+    // A resume that proceeds starts its own run and traces its own list.
+    var h = try Harness.init(testing.allocator, &.{ exec_ok, verify_pass });
+    defer h.deinit();
+    const approvals = try approval_mod.ApprovalWorker.start(testing.allocator, &h.actor, &h.registry, .auto_approve);
+    defer approvals.stop();
+    var tasks = [_]Task{.{ .desc = "build the gizmo", .done = false }};
+    try h.store().save(testing.allocator, &.{
+        .mission_id = "m-1",
+        .state = .running,
+        .pipeline = &pipeline.default_pipeline,
+        .step_index = 2,
+        .objective = "Ship the gizmo",
+        .acceptance = "ships",
+        .tasks = &tasks,
+    });
+    try h.store().writeArtifact(testing.allocator, "MISSION.md", "# Mission\n\nShip the gizmo\n");
+    try h.store().writeArtifact(testing.allocator, "PLAN.md", "# Plan\n\n- [ ] build\n");
+    var tr = try runTraced(h, ",\"resume\":true,\"gate_function\":\"zygos::approvals::request\"" ++ policy_field);
+    defer tr.deinit();
+    try expectTerminal(tr.res.ok, "done", "completed");
+    const names = try eventNames(arena, tr.trace);
+    try testing.expectEqualStrings("pipeline", names[0]);
+    try testing.expectEqualStrings("policy", names[1]);
+    try testing.expect(std.mem.indexOf(u8, tr.trace, "\"event\":\"mission\"").? > std.mem.indexOf(u8, tr.trace, policy_line).?);
+    try expectSeq(&.{"policy"}, try traceField(arena, tr.trace, "policy", "event"));
+}
+
+test "no policy event when the start request carries none" {
+    var h = try Harness.init(testing.allocator, &.{ po_ok, plan1, exec_ok, verify_pass });
+    defer h.deinit();
+    const approvals = try approval_mod.ApprovalWorker.start(testing.allocator, &h.actor, &h.registry, .auto_approve);
+    defer approvals.stop();
+    var tr = try runTraced(h, seed_and_gate);
+    defer tr.deinit();
+    try expectTerminal(tr.res.ok, "done", "completed");
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const names = try eventNames(arena_state.allocator(), tr.trace);
+    try testing.expectEqualStrings("pipeline", names[0]);
+    for (names) |n| try testing.expect(!std.mem.eql(u8, n, "policy"));
+    try testing.expect(std.mem.indexOf(u8, tr.trace, "\"event\":\"policy\"") == null);
+}
+
+test "a structurally malformed policy refuses the start with invalid_policy" {
+    var h = try Harness.init(testing.allocator, &.{ po_ok, plan1, exec_ok, verify_pass });
+    defer h.deinit();
+    const approvals = try approval_mod.ApprovalWorker.start(testing.allocator, &h.actor, &h.registry, .auto_approve);
+    defer approvals.stop();
+
+    const tpath = try std.fmt.allocPrint(testing.allocator, "{s}/events.jsonl", .{h.root});
+    defer testing.allocator.free(tpath);
+    const bad = [_][]const u8{
+        ",\"policy\":\"config\"",
+        ",\"policy\":{\"source\":\"config\",\"rules\":\"bash\"}",
+        ",\"policy\":{\"source\":\"config\",\"rules\":[{\"tool\":\"bash\",\"verdict\":\"maybe\"}]}",
+    };
+    for (bad) |policy_json| {
+        const extra = try std.fmt.allocPrint(testing.allocator, "{s}{s},\"trace_path\":{f}", .{ seed_and_gate, policy_json, json.fmt(tpath, .{}) });
+        defer testing.allocator.free(extra);
+        const req = try h.startReq(testing.allocator, extra);
+        defer testing.allocator.free(req);
+        const res = try h.caller.call("zygos::missions::start", req);
+        defer res.deinit(testing.allocator);
+        try testing.expect(res == .ok);
+        try testing.expect(std.mem.indexOf(u8, res.ok, "\"refused\":true,\"reason\":\"invalid_policy\"") != null);
+        try testing.expect(std.mem.indexOf(u8, res.ok, "\"detail\":\"policy") != null);
+    }
+    // Nothing ran: no turn, no trace, no mission state.
+    try testing.expectEqual(@as(usize, 0), h.provider.callCount());
+    try testing.expect(trace_mod.readFile(testing.allocator, tpath) == null);
+    try testing.expectError(error.NotFound, h.store().readArtifact(testing.allocator, "mission.json"));
+}
+
+/// Stands in for the real bash tool on `zygos::tools::bash`: counts dispatches.
+const FakeBash = struct {
+    gpa: std.mem.Allocator,
+    worker: *inproc.Worker,
+    mutex: sync.Mutex = .{},
+    calls: usize = 0,
+
+    fn start(gpa: std.mem.Allocator, actor: *actor_mod.Actor, registry: *inproc.Registry) !*FakeBash {
+        const self = try gpa.create(FakeBash);
+        self.* = .{
+            .gpa = gpa,
+            .worker = try inproc.Worker.spawn(gpa, actor, registry, "fake-bash"),
+        };
+        try self.worker.registerFunction("zygos::tools::bash", self, &handler);
+        return self;
+    }
+
+    fn stop(self: *FakeBash) void {
+        self.worker.stop();
+        self.mutex.deinit();
+        const gpa = self.gpa;
+        gpa.destroy(self);
+    }
+
+    fn callCount(self: *FakeBash) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.calls;
+    }
+
+    fn handler(ctx: ?*anyopaque, arena: std.mem.Allocator, request_json: []const u8) error{ Failed, OutOfMemory }![]const u8 {
+        _ = request_json;
+        const self: *FakeBash = @ptrCast(@alignCast(ctx.?));
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.calls += 1;
+        return arena.dupe(u8, "{\"output\":\"ran\"}");
+    }
+};
+
+const bash_tools = ",\"tools\":[{\"name\":\"bash\",\"function_id\":\"zygos::tools::bash\"," ++
+    "\"input_schema\":{\"type\":\"object\"}}]";
+const bash_use =
+    \\{"stop_reason":"tool_use","content":[{"type":"tool_use","id":"toolu_1","name":"bash","input":{"command":"echo hi"}}]}
+;
+
+test "configured per-step deny blocks one step's tool call and allows another's" {
+    // Two tool-bearing steps; each wants bash once, then ends its turn.
+    var h = try Harness.init(testing.allocator, &.{
+        bash_use, roleText("design done"), bash_use, exec_ok, verify_pass,
+    });
+    defer h.deinit();
+    const approvals = try approval_mod.ApprovalWorker.start(testing.allocator, &h.actor, &h.registry, .auto_approve);
+    defer approvals.stop();
+    const bash = try FakeBash.start(testing.allocator, &h.actor, &h.registry);
+    defer bash.stop();
+    const pw = try policy_mod.PolicyWorker.start(testing.allocator, &h.actor, &h.registry, &.{
+        .{ .tool = "bash", .verdict = .deny, .step = "architect" },
+        .{ .tool = "bash", .verdict = .allow },
+    });
+    defer pw.stop();
+
+    var tr = try runTraced(h, seed_and_gate ++ bash_tools ++ policy_field ++
+        ",\"policy_function\":\"zygos::policy::check\"" ++
+        ",\"steps\":[{\"id\":\"architect\",\"system\":\"You design.\",\"tools\":true}," ++
+        "{\"id\":\"executor\"},{\"id\":\"verifier\"}]");
+    defer tr.deinit();
+    try expectTerminal(tr.res.ok, "done", "completed");
+
+    // Architect's call never reached the tool; the executor's did.
+    try testing.expectEqual(@as(usize, 1), bash.callCount());
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try expectSeq(&.{ "true", "false" }, try traceField(arena, tr.trace, "tool_result", "is_error"));
+    const outputs = try traceField(arena, tr.trace, "tool_result", "output");
+    try testing.expect(std.mem.startsWith(u8, outputs[0], "policy_denied"));
+    try testing.expectEqualStrings("{\"output\":\"ran\"}", outputs[1]);
+    // The architect's turn continued past the denial into its end_turn.
+    try testing.expect(std.mem.indexOf(u8, h.provider.requests.items[1], "policy_denied") != null);
+}
+
+test "configured ask with an unanswered approval denies and the turn continues" {
+    var h = try Harness.init(testing.allocator, &.{ bash_use, exec_ok, verify_pass });
+    defer h.deinit();
+    // Nobody answers: the manual approver times out to a denial. The gate
+    // runs on its own scripted worker so only the tool ask is unanswered.
+    const approvals = try approval_mod.ApprovalWorker.start(testing.allocator, &h.actor, &h.registry, .{ .manual = .{ .timeout_ms = 20 } });
+    defer approvals.stop();
+    const gate_worker = try FakeGate.start(testing.allocator, &h.actor, &h.registry, &.{"{\"approved\":true}"});
+    defer gate_worker.stop();
+    const bash = try FakeBash.start(testing.allocator, &h.actor, &h.registry);
+    defer bash.stop();
+    const pw = try policy_mod.PolicyWorker.start(testing.allocator, &h.actor, &h.registry, &.{
+        .{ .tool = "bash", .verdict = .ask },
+    });
+    defer pw.stop();
+
+    var tr = try runTraced(h, ",\"objective\":\"seed: gizmo\",\"gate_function\":\"test::gate::request\"" ++
+        bash_tools ++
+        ",\"policy_function\":\"zygos::policy::check\",\"approval_function\":\"zygos::approvals::request\"" ++
+        ",\"steps\":[{\"id\":\"executor\"},{\"id\":\"verifier\"}]");
+    defer tr.deinit();
+    try expectTerminal(tr.res.ok, "done", "completed");
+
+    try testing.expectEqual(@as(usize, 0), bash.callCount()); // never dispatched
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try expectSeq(&.{"approval_denied"}, try traceField(arena, tr.trace, "tool_result", "output"));
+    try expectSeq(&.{"true"}, try traceField(arena, tr.trace, "tool_result", "is_error"));
+    // The turn reached its next step (the denial went back to the model),
+    // and the mission moved on to the verifier.
+    try testing.expect(std.mem.indexOf(u8, h.provider.requests.items[1], "approval_denied") != null);
+    try expectSeq(&.{ "executor", "verifier" }, try traceField(arena, tr.trace, "role_start", "role"));
 }

@@ -41,6 +41,13 @@ zygos mission trace <planning-dir|events.jsonl|trial-agent-dir> [--format text|a
 - Route table: `ZYGOS_CONFIG` else `./zygos.zon` (`router.Config`); after
   parse, X2 `checkRoutes(catalog, config)` — an unknown
   `zygos::providers::<slug>` refuses to boot, exit 2.
+- Policy rules: the same `zygos.zon` may carry `.policy`, an ordered rule
+  list that replaces the seed (`docs/specs/policy-config.md`). A malformed
+  one refuses the run, exit 2, with
+  `mission: invalid .policy in <path>: <reason>`, before the kernel boots;
+  a rule naming a tool the mission is never offered refuses after the MCP
+  handshake and before `missions::start`. A refusal never falls back to the
+  seed.
 - Planning root: `--planning` else `./.planning`. Workspace root for
   `agent-tools`: the cwd.
 - Budget scope + limits, gates, escalation: from the brief frontmatter (the
@@ -49,9 +56,10 @@ zygos mission trace <planning-dir|events.jsonl|trial-agent-dir> [--format text|a
 ## Worker roster (the "default" slider position, per e2e/m3 + catalog)
 
 turn orchestrator, `CatalogBoot` provider instances, agent-tools, web-tools,
-policy (fail-closed; as built **bash boots as `allow`**, not `ask` — the
-per-tool ask deferral is noted in `cli/mission.zig`; web_fetch/web_search
-and configured MCP tools also boot `allow`), approval worker in `.manual`
+policy (fail-closed; rules from `.policy` when the file has one, else the
+seed: as built **bash boots as `allow`**, not `ask` — the per-tool ask
+deferral is noted in `cli/mission.zig`; web_fetch/web_search and configured
+MCP tools also boot `allow`), approval worker in `.manual`
 mode, router, budget, trim, mission orchestrator, MCP clients for any
 `.mcp_servers` entries in `zygos.zon` (a broken server refuses the run at
 boot). Missing pieces at boot are exit-2 errors, never silent omissions.

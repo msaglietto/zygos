@@ -93,13 +93,6 @@ pub const PolicyWorker = struct {
         return reply(arena, .deny, "no rule matched");
     }
 
-    fn matches(pattern: []const u8, name: []const u8) bool {
-        if (name.len == 0) return false;
-        if (std.mem.endsWith(u8, pattern, "*"))
-            return std.mem.startsWith(u8, name, pattern[0 .. pattern.len - 1]);
-        return std.mem.eql(u8, pattern, name);
-    }
-
     fn reply(arena: std.mem.Allocator, verdict: Verdict, reason: []const u8) error{OutOfMemory}![]const u8 {
         return std.fmt.allocPrint(arena, "{{\"verdict\":\"{t}\",\"reason\":{f}}}", .{
             verdict, json.fmt(reason, .{}),
@@ -111,6 +104,15 @@ pub const PolicyWorker = struct {
         return reply(arena, verdict, reason);
     }
 };
+
+/// The one pattern matcher for `Rule.tool` and `Rule.step`: an exact name or
+/// a prefix ending in one trailing '*'. An empty name never matches.
+pub fn matches(pattern: []const u8, name: []const u8) bool {
+    if (name.len == 0) return false;
+    if (std.mem.endsWith(u8, pattern, "*"))
+        return std.mem.startsWith(u8, name, pattern[0 .. pattern.len - 1]);
+    return std.mem.eql(u8, pattern, name);
+}
 
 const strField = jsonx.strField;
 

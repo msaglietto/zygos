@@ -37,6 +37,14 @@ const script = [
   tool('t-count7', 'bash', '{"command":"seq 1 500"}'),
   text('counted'),
   text('{"passed":true,"reason":"acceptance met"}'),
+  // Leg 8c (valid .policy traced): the same mission shape as leg 1.
+  text('{"objective":"Ship the gizmo","acceptance":"greeting written and count run"}'),
+  text('{"tasks":["write a greeting file","count to 500"]}'),
+  tool('t-greet8', 'bash', '{"command":"echo hello > greeting.txt"}'),
+  text('wrote the greeting'),
+  tool('t-count8', 'bash', '{"command":"seq 1 500"}'),
+  text('counted'),
+  text('{"passed":true,"reason":"acceptance met"}'),
 ];
 let i = 0;
 

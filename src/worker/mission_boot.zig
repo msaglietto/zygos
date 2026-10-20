@@ -9,6 +9,7 @@ const std = @import("std");
 const providers = @import("../config/providers.zig");
 const web_tools = @import("../net/web_tools.zig");
 const policy = @import("policy.zig");
+const policy_config = @import("policy_config.zig");
 const inproc = @import("../kernel/inproc.zig");
 
 pub const EnvPair = providers.EnvPair;
@@ -300,12 +301,7 @@ pub fn policySeed(
     gpa: std.mem.Allocator,
     mcp_tools: []const []const u8,
 ) error{OutOfMemory}![]policy.Rule {
-    var rules = try gpa.alloc(policy.Rule, 3 + mcp_tools.len);
-    rules[0] = .{ .tool = "bash", .verdict = .allow };
-    rules[1] = .{ .tool = "web_fetch", .verdict = .allow };
-    rules[2] = .{ .tool = "web_search", .verdict = .allow };
-    for (mcp_tools, 0..) |name, i| rules[3 + i] = .{ .tool = name, .verdict = .allow };
-    return rules;
+    return policy_config.seed(gpa, mcp_tools);
 }
 
 // ---------------------------------------------------------------------------

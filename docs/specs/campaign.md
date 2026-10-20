@@ -238,6 +238,19 @@ failure.
   read a lower pass rate or a `role_turns_exhausted` stop in that light, and
   compare mean role turns before crediting or blaming the extra step.
 
+**Policy.** A mission arm's `zygos.zon` may carry `.policy`
+(`docs/specs/policy-config.md`), so a campaign can compare which tool calls a
+step may make. It needs no new identity field: `config_sha256` covers the
+whole file, so arms that differ only in `.policy` differ on the `config`
+axis. Inspection has one check, to catch a binary that predates the
+feature (such a binary ignores `.policy` and would run the seed). The
+campaign finds a depth-1 `.policy` key with its ZON tokenizer, the same
+contract as `read_pipeline`; when the file cannot be tokenized and its text
+matches `\bpolicy\b`, the experiment refuses. For an arm with `.policy`,
+inspection requires a `policy` event in `planning/events.jsonl`; a missing
+one is the recorded problem `policy event missing`. An arm without
+`.policy` needs no event. The campaign does not parse or compare the rules.
+
 `.context_strategy` and `.mcp_servers` in an arm's `zygos.zon` are honored
 by the mission (the mission CLI reads them), so a mission campaign can
 compare those too.
@@ -252,7 +265,7 @@ executor step on GLM Flash) with route tables under
 
 A task-mode campaign (`mode: task`) runs one headless turn and honors only
 the route table; a `zygos.zon` carrying `.context_strategy`,
-`.mcp_servers` or `.steps` refuses there (the binary refuses it; the
+`.mcp_servers`, `.steps` or `.policy` refuses there (the binary refuses it; the
 campaign still reads `.steps` into the arm identity). It does not choose a dollar cap or expand the
 task set; both remain operator decisions recorded in
 `docs/benchmark-policy.md`.

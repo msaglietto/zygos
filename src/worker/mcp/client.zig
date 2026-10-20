@@ -326,6 +326,21 @@ pub const McpClientWorker = struct {
         return names;
     }
 
+    /// A tool as the policy sees it: the model-facing name and the bus
+    /// function id (`zygos::mcp::<server>::<tool>`).
+    pub const ToolRef = struct {
+        name: []const u8,
+        function_id: []const u8,
+    };
+
+    /// Name and function id of every registered tool. Slice is gpa-owned;
+    /// the strings borrow from the worker and live until `stop()`.
+    pub fn toolRefs(self: *McpClientWorker, gpa: std.mem.Allocator) error{OutOfMemory}![]const ToolRef {
+        const refs = try gpa.alloc(ToolRef, self.bindings.items.len);
+        for (self.bindings.items, 0..) |b, i| refs[i] = .{ .name = b.model_name, .function_id = b.function_id };
+        return refs;
+    }
+
     /// Bus request JSON = MCP tool arguments, verbatim. Failures follow the
     /// web_tools convention: structured `{"error":...}` payloads the model
     /// can read, never a silent drop.
@@ -544,6 +559,29 @@ test "worker registers zygos::mcp::<server>::<tool> and bridges tools/call over 
     try testing.expect(std.mem.indexOf(u8, entries, "\"description\":\"web search\"") != null);
     try testing.expect(std.mem.indexOf(u8, entries, "\"input_schema\":{") != null);
     try testing.expect(std.mem.indexOf(u8, entries, "\"required\":[\"q\"]") != null);
+}
+
+test "toolRefs pairs each model-facing name with its bus function id" {
+    var h = try WorkerHarness.init(testing.allocator);
+    defer h.deinit();
+
+    var ft: FakeTransport = .{ .gpa = testing.allocator, .script = &.{ init_reply, list_reply } };
+    defer ft.deinit();
+    var client = Client.init(testing.allocator, ft.transport());
+    defer client.deinit();
+
+    const mcp = try McpClientWorker.start(testing.allocator, &h.actor, &h.registry, &.{
+        .{ .name = "stub", .client = &client },
+    });
+    defer mcp.stop();
+
+    const refs = try mcp.toolRefs(testing.allocator);
+    defer testing.allocator.free(refs);
+    try testing.expectEqual(@as(usize, 2), refs.len);
+    try testing.expectEqualStrings("stub_search", refs[0].name);
+    try testing.expectEqualStrings("zygos::mcp::stub::search", refs[0].function_id);
+    try testing.expectEqualStrings("stub_fetch", refs[1].name);
+    try testing.expectEqualStrings("zygos::mcp::stub::fetch", refs[1].function_id);
 }
 
 test "worker maps MCP tool isError and dead transports to structured error payloads" {

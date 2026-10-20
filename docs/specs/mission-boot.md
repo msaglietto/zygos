@@ -26,7 +26,10 @@ fail-closed decision lives here, tested:
   over an existing `mission.json` refuses instead of clobbering;
   `--run-stamp` suffixes the planning root per scheduled invocation (Y3).
 - **Policy seeding** — `policySeed`: bash/web_fetch/web_search + configured
-  MCP tools, all `.allow` (the console gate is the human boundary).
+  MCP tools, all `.allow` (the console gate is the human boundary). The
+  seed applies only when `zygos.zon` has no `.policy`; a present `.policy`
+  is parsed by `policy_config.zig` and replaces it wholesale
+  (`docs/specs/policy-config.md`).
 - **Vault checkpoint** — `checkpointRequest`/`checkpointVerdict`: with
   `ZYGOS_VAULT_ROOT` set, a failed `zygos::tessera::checkpoint` refuses the
   run (fail closed) — never write into an unprotected vault.

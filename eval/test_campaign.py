@@ -51,6 +51,7 @@ if os.environ.get("ZYGOS_MODE") == "mission":
         for i in ("product-owner", "planner", "executor", "verifier")]
     events = [
         {"ts": 1, "event": "pipeline", "steps": pipeline},
+        *([{"ts": 1, "event": "policy", "source": "config", "rules": []}] if name in control.get("policy_events", []) else []),
         {"event": "mission", "from": "running", "to": "running", "step": "product-owner", "step_index": 0},
         {"event": "role_start", "role": "product-owner", "role_turn": 1},
         {"event": "step", "step": 1}, {"event": "usage", "step": 1, "input_tokens": tokens[0] - 1, "output_tokens": tokens[1]},
@@ -626,6 +627,104 @@ class PipelineContract(unittest.TestCase):
             self.assertEqual(report["arms"]["baseline"]["mission_states"], {"failed": 1, "done": 1})
             self.assertEqual(report["arms"]["candidate"]["mission_states"], {"gating": 2})
             self.assertIn('{"done": 1, "failed": 1}', (out / "report.md").read_text())
+
+
+POLICY_ZON = (
+    '.{ .policy = .{ .{ .tool = "bash", .verdict = .deny, .step = "executor" }, .{ .tool = "web_*", .verdict = .allow } },'
+    " // .policy in a comment\n"
+    '   .default = .{ .{ .model = "%s" } } }\n'
+)
+
+
+class PolicyContract(unittest.TestCase):
+    def run_with_policy(self, root: Path, with_event: bool, policy: bool = True):
+        zon = POLICY_ZON if policy else '.{ .default = .{ .{ .model = "%s" } } }\n'
+        write_arm_dir(root, "a", zon % "m1", {})
+        write_arm_dir(root, "b", zon % "m2", {})
+        fx = Fixture(root, variable="config", mode="mission")
+        PipelineContract.experiment_over(self, fx, "a", "b")
+        fx.set_control()
+        control = json.loads(fx.control.read_text())
+        if with_event:
+            control["policy_events"] = [f"{arm}-r1-{task}" for arm in ("baseline", "candidate") for task in fx.tasks]
+        fx.control.write_text(json.dumps(control))
+        result, jobs = fx.run()
+        # A problem stops the campaign (exit 4); the missing event is one.
+        expected = 0 if with_event or not policy else 4
+        self.assertEqual(result.returncode, expected, result.stderr + result.stdout)
+        return fx, jobs
+
+    def test_policy_arm_without_policy_event_is_a_problem(self):
+        with tempfile.TemporaryDirectory() as d:
+            fx, jobs = self.run_with_policy(Path(d), with_event=False)
+            result, out = fx.report(jobs)
+            report = json.loads((out / "report.json").read_text())
+            self.assertEqual(report["verdict"], "inconclusive")
+            self.assertIn("policy event missing", report["matched"][0]["baseline"]["problems"])
+            self.assertIn("policy event missing", report["matched"][0]["candidate"]["problems"])
+
+    def test_policy_arm_with_policy_event_is_not_a_problem(self):
+        with tempfile.TemporaryDirectory() as d:
+            fx, jobs = self.run_with_policy(Path(d), with_event=True)
+            result, out = fx.report(jobs)
+            report = json.loads((out / "report.json").read_text())
+            self.assertEqual(report["arms"]["baseline"]["problems"], 0)
+            self.assertEqual(report["arms"]["candidate"]["problems"], 0)
+
+    def test_arm_without_policy_needs_no_policy_event(self):
+        with tempfile.TemporaryDirectory() as d:
+            # A stray policy event on an arm without .policy is not a problem either.
+            fx, jobs = self.run_with_policy(Path(d), with_event=True, policy=False)
+            result, out = fx.report(jobs)
+            report = json.loads((out / "report.json").read_text())
+            self.assertEqual(report["arms"]["baseline"]["problems"], 0)
+            self.assertEqual(report["arms"]["candidate"]["problems"], 0)
+        with tempfile.TemporaryDirectory() as d:
+            fx, jobs = self.run_with_policy(Path(d), with_event=False, policy=False)
+            result, out = fx.report(jobs)
+            report = json.loads((out / "report.json").read_text())
+            self.assertEqual(report["arms"]["baseline"]["problems"], 0)
+
+    def test_policy_is_detected_only_at_depth_one(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            nested = write_arm_dir(root, "n", '.{ .default = .{ .{ .policy = "x" } } }\n', {})
+            top = write_arm_dir(root, "t", POLICY_ZON % "m", {})
+            absent = write_arm_dir(root, "z", '.{ .default = .{} }\n', {})
+            self.assertFalse(campaign.read_policy_presence(nested / "zygos.zon"))
+            self.assertTrue(campaign.read_policy_presence(top / "zygos.zon"))
+            self.assertFalse(campaign.read_policy_presence(absent / "zygos.zon"))
+
+    def test_policy_in_a_comment_or_string_is_not_a_policy(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            commented = write_arm_dir(root, "c", ".{ // .policy = .{}\n .default = .{} }\n", {})
+            quoted = write_arm_dir(root, "q", '.{ .x = ".policy = .{}" }\n', {})
+            self.assertFalse(campaign.read_policy_presence(commented / "zygos.zon"))
+            self.assertFalse(campaign.read_policy_presence(quoted / "zygos.zon"))
+
+    def test_untokenizable_zon_mentioning_policy_refuses(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            bad = write_arm_dir(root, "bad", '.{ .policy = .{ .{ .tool = "bash", .verdict = @"deny" } } }\n', {})
+            with self.assertRaisesRegex(campaign.CampaignError, r"cannot tokenize the file, so its \.policy cannot be read"):
+                campaign.read_policy_presence(bad / "zygos.zon")
+            with self.assertRaisesRegex(campaign.CampaignError, "cannot tokenize"):
+                campaign.Arm(
+                    {"name": "x", "build": {"git_sha": "a" * 40, "binary_sha256": "b" * 64}, "config": "bad/zygos.zon"}, root)
+            # Untokenizable without the word policy is not this check's business.
+            quiet = write_arm_dir(root, "quiet", '.{ .default = @"x" }\n', {})
+            self.assertFalse(campaign.read_policy_presence(quiet / "zygos.zon"))
+
+    def test_duplicate_or_unbalanced_policy_refuses(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            twice = write_arm_dir(root, "twice", '.{ .policy = .{}, .policy = .{} }\n', {})
+            with self.assertRaisesRegex(campaign.CampaignError, r"\.policy appears twice"):
+                campaign.read_policy_presence(twice / "zygos.zon")
+            open_ = write_arm_dir(root, "open", '.{ .policy = .{ }\n', {})
+            with self.assertRaisesRegex(campaign.CampaignError, "unbalanced braces"):
+                campaign.read_policy_presence(open_ / "zygos.zon")
 
 
 class ReportContract(unittest.TestCase):

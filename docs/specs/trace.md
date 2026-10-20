@@ -8,7 +8,7 @@ role boundaries, provider steps, tool calls/results, usage, task edges.
 `TraceEvent` is a tagged union shared by emitters (mission/turn drivers via
 `trace.emit`) and consumers (JSONL renderer, TUI model): adding a variant
 breaks every exhaustive switch at compile time instead of silently dropping.
-Variants: `mission`, `pipeline`, `role_start`, `role_end`, `task_start`,
+Variants: `mission`, `pipeline`, `policy`, `role_start`, `role_end`, `task_start`,
 `task_done`, `step`, `tool_call`, `tool_result`, `usage`, `turn_end`, `steer`.
 
 ### Mission events
@@ -17,6 +17,13 @@ Variants: `mission`, `pipeline`, `role_start`, `role_end`, `task_start`,
   event: `{"ts":<ms>,"event":"pipeline","steps":[{"id":"architect","definition_sha256":"<hex>"|null,"tools":true},...]}`.
   `definition_sha256` is null for a step with a built-in prompt. Ids are
   arbitrary strings from the config.
+- `policy`, emitted right after `pipeline` and before the first `mission`
+  event, only when the start request carries a `policy` field (that is,
+  when `zygos.zon` has `.policy`), and again on every run of the loop:
+  `{"ts":<ms>,"event":"policy","source":"config","rules":[{"tool":"bash","verdict":"deny","step":"architect"},{"tool":"bash","verdict":"allow","step":null}]}`.
+  `step` is null for a rule that matches every step. Absent event ⇒ the
+  built-in seed governed, as in every pre-#12 trace. Parsed tolerantly like
+  `pipeline` (`docs/specs/policy-config.md`, "Visibility").
 - `mission` carries the state names `running`, `gating`, `done`, `failed`
   in `from` and `to`, plus the cursor after the transition: `step` (the
   step id; null at `gating` and `done`) and `step_index`. The driver emits
@@ -49,8 +56,10 @@ Variants: `mission`, `pipeline`, `role_start`, `role_end`, `task_start`,
 - `render()` (the `zygos mission trace` view) passes unknown or unparseable
   lines through raw — the renderer must never hide evidence. A `mission`
   line renders as `mission running → running [step executor #2] (...)`
-  (`[step - #4]` at gating), and the `pipeline` line lists
-  `id[+tools][@hash8]` per step.
+  (`[step - #4]` at gating), the `pipeline` line lists
+  `id[+tools][@hash8]` per step, and the `policy` line reads
+  `policy (config, 3 rules): bash=deny@architect bash=allow web_*=ask@research*`
+  (`tool=verdict[@step]` per rule, in order).
 
 ## AG-UI projection (`agui.zig`)
 
@@ -72,8 +81,9 @@ exhaustive `switch` over `TraceEvent` in `Projector.apply`.
   refreshes the `zygos.mission` activity snapshot (`state`, `from`, `step`,
   `step_index`, counters). A `planner` step starting clears the shown plan.
   The `pipeline` event becomes `CUSTOM` `zygos.pipeline` with
-  `value.steps` (`id`, `definition_sha256`, `tools`). Logs that predate the
-  cursor fall back to one step per state name.
+  `value.steps` (`id`, `definition_sha256`, `tools`). The `policy` event
+  becomes `CUSTOM` `zygos.policy` with `value` `{"source","rules"}`. Logs
+  that predate the cursor fall back to one step per state name.
 - Lines `parse()` rejects are skipped. A mission log ends in `RUN_FINISHED`
   only at `done` and `RUN_ERROR` only at `failed`. A task log ends on its
   `turn_end`. A live or truncated log ends without either, because AG-UI

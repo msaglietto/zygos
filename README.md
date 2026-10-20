@@ -172,6 +172,21 @@ To add MCP tools, list servers in the same file. Zygos spawns each one over stdi
 }
 ```
 
+### Policy
+
+Without a `.policy` key, a mission allows `bash`, `web_fetch`, `web_search`, and every MCP tool. Add `.policy` to the same file to decide per tool, and per pipeline step, what the model may call. Rules are checked in file order, the first match wins, and a tool no rule matches is denied. A present `.policy` replaces the default allow list; it is not added to it.
+
+```zon
+.policy = .{
+    .{ .tool = "bash", .verdict = .deny, .step = "architect" },
+    .{ .tool = "bash", .verdict = .allow },
+    .{ .tool = "web_*", .verdict = .ask, .step = "research*" },
+    .{ .tool = "zygos::mcp::tavily::*", .verdict = .allow },
+},
+```
+
+`.verdict` is `.allow`, `.deny`, or `.ask`. `.tool` is an exact name or a prefix ending in `*`, matched against the model-facing name and the function id. `.step` is optional and takes the same patterns over step ids. A malformed list, a step that matches no configured step, or a tool the mission is never offered refuses the run with exit 2 and `mission: invalid .policy in <path>: <reason>`. `ask` waits for a console answer and denies on timeout; it is not a boundary against the executor's shell. `zygos task --config` refuses `.policy`. The contract is [docs/specs/policy-config.md](docs/specs/policy-config.md).
+
 ## While it is running
 
 ```bash
@@ -189,7 +204,7 @@ zygos mission dashboard <dir>
 
 `dashboard <dir>` prints one status line per mission substrate under that directory.
 
-`trace` renders `events.jsonl`. The file is the record: mission transitions, which provider and model handled each step, and every tool call. If the file cannot be written, the mission still runs.
+`trace` renders `events.jsonl`. The file is the record: mission transitions, which provider and model handled each step, and every tool call. When the config has `.policy`, the effective rule list is written as a `policy` event right after the pipeline, so a run shows which rules governed it. No `policy` event means the default allow list did. If the file cannot be written, the mission still runs.
 
 ```bash
 zygos mission trace .planning

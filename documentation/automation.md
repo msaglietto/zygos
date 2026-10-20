@@ -18,7 +18,7 @@ The product is the automation. This file is the line between what a model propos
 | Agent-owned suggestions | Plan tasks, tool-call arguments, verifier verdict text. The driver decides whether they execute. |
 | Controls | Completion gate. `missions::abort`. Approval timeout deny. `ZYGOS_BUDGET_MAX_TOKENS` / brief budget. `ZYGOS_MAX_ROLE_TURNS`, `ZYGOS_ROLE_MAX_STEPS`. Stream idle and invoke timeouts. |
 
-Default mission policy allows bash and both web tools. A prompt-injected page can ask the executor to run a shell command, and the process will, unless the operator changed the rule to `ask` or `deny`. That is the current contract, not a hidden path.
+Without a `.policy` key in `zygos.zon`, the mission policy allows bash and both web tools. A prompt-injected page can ask the executor to run a shell command, and the process will, unless the operator set a `.policy` rule to `ask` or `deny`. A present `.policy` replaces that default, so a tool it does not name is denied, and a rule can be scoped to one pipeline step (`docs/specs/policy-config.md`). The default is the current contract, not a hidden path.
 
 ## Tessera capture
 

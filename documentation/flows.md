@@ -18,11 +18,11 @@ Actors: **operator** (the OS user), **kernel** (bus), **model** (a provider work
   1. Parse argv (`mission_boot.parseArgs`). Usage errors exit 2.
   2. Load provider catalog. Unknown route slug refuses boot before the kernel runs (X2).
   3. W1 brief lint (`worker/brief.zig`). A failing lint returns a structured refusal and does not start the FSM.
-  4. Boot workers: tools, policy (`policySeed`: bash / web_fetch / web_search / MCP names = allow), web tools, approvals, router, budget, trim, orchestrator. Optional MCP children; spawn or handshake failure exits 2.
+  4. Boot workers: tools, policy (rules from `.policy` in `zygos.zon` when present, else `policySeed`: bash / web_fetch / web_search / MCP names = allow), web tools, approvals, router, budget, trim, orchestrator. Optional MCP children; spawn or handshake failure exits 2. A malformed `.policy` exits 2 before the kernel boots; a rule naming a tool no step is offered exits 2 after the MCP handshake.
   5. `budget::configure` with `budgetMaxTokens`: `ZYGOS_BUDGET_MAX_TOKENS` if set, else the brief's `budget.max_tokens`, else 1_000_000.
   6. If `ZYGOS_VAULT_ROOT` is set, `tessera::checkpoint`. Failure exits 2.
-  7. `missions::start` runs the pipeline: state `running` while a cursor walks the steps (by default product-owner, planner, executor, verifier), then `gating`, then `done` or `failed`. The first trace line is a `pipeline` event. Each step run is one turn with its own `step_id`.
-- **Authz.** Boot refusal is the deny case for bad config, bad brief, unknown provider, or a vault that cannot be checkpointed. Tool calls during the mission use flow 3. Completion uses flow 4.
+  7. `missions::start` runs the pipeline: state `running` while a cursor walks the steps (by default product-owner, planner, executor, verifier), then `gating`, then `done` or `failed`. The first trace line is a `pipeline` event, followed by a `policy` event when `.policy` is present. Each step run is one turn with its own `step_id`.
+- **Authz.** Boot refusal is the deny case for bad config (including a malformed `.policy`), bad brief, unknown provider, or a vault that cannot be checkpointed. Tool calls during the mission use flow 3. Completion uses flow 4.
 - **Side effects.** `.planning/` writes (atomic tmp+rename). Workspace file writes and bash. Optional vault notes. `events.jsonl`. Provider HTTP calls. Search/fetch HTTP calls.
 
 `mission resume` sets `resume:true` and does not re-run earlier roles. A fresh start over an existing substrate refuses unless `--run-stamp` or resume (`refuseStart`).
@@ -31,7 +31,7 @@ Actors: **operator** (the OS user), **kernel** (bus), **model** (a provider work
 
 - **Precondition.** A role turn is in `dispatching` and the model emitted a tool call. Executor is the role that receives tools.
 - **Sequence.** Driver resolves the tool function on the bus. If the turn has a `policy_function`, `checkPolicy` runs first with tool name, function id, and the raw input (the URL is inside that JSON for web tools). `allow` dispatches. `ask` calls `approvals::request` and blocks in `awaiting_approval`. `deny`, bus error, malformed verdict, or unknown verdict becomes an `is_error` tool result and the turn continues. Tool output passes `zygos::output::compress` when the seam is wired. Usage is recorded on the budget scope.
-- **Authz.** The policy worker's own default is deny when no rule matches (`policy.zig`). The mission seed overrides that for the named tools by installing allow rules. A turn with no `policy_function` is the M1 path and does not consult policy.
+- **Authz.** The policy worker's own default is deny when no rule matches (`policy.zig`). Without `.policy`, the mission seed overrides that for the named tools by installing allow rules. With `.policy`, the operator's ordered list is the only rule set and a tool it does not name is denied. A turn with no `policy_function` is the M1 path and does not consult policy.
 - **Deny case.** Denied tool does not run. Unreachable budget check stops the turn with `stop:"budget_exhausted"`.
 - **Side effects.** Whatever the tool does (shell, files, HTTP, MCP). Trim stats and budget counters update.
 

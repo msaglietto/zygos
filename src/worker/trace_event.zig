@@ -13,6 +13,7 @@ const json = std.json;
 pub const TraceEvent = union(enum) {
     mission: Mission,
     pipeline: Pipeline,
+    policy: Policy,
     role_start: RoleStart,
     role_end: RoleEnd,
     task_start: Task,
@@ -50,6 +51,21 @@ pub const TraceEvent = union(enum) {
         id: []const u8 = "?",
         definition_sha256: ?[]const u8 = null,
         tools: bool = false,
+    };
+    /// Emitted right after `pipeline` when the start request carries the
+    /// operator's policy rules (docs/specs/policy-config.md). The driver does
+    /// not interpret the rules: it echoes the start request's `policy` record,
+    /// which the CLI builds from the same rule list it hands PolicyWorker.
+    pub const Policy = struct {
+        source: []const u8 = "config",
+        rules: []const PolicyRule = &.{},
+    };
+    /// `verdict` stays a string: a trace line is a record, not a contract the
+    /// reader enforces, so an unknown verdict from a foreign line still renders.
+    pub const PolicyRule = struct {
+        tool: []const u8 = "?",
+        verdict: []const u8 = "?",
+        step: ?[]const u8 = null,
     };
     pub const RoleStart = struct {
         role: []const u8 = "?",
@@ -108,6 +124,7 @@ pub fn body(arena: std.mem.Allocator, ev: TraceEvent) error{OutOfMemory}![]const
     return switch (ev) {
         .mission => |m| missionBody(arena, m),
         .pipeline => |p| pipelineBody(arena, p),
+        .policy => |p| policyBody(arena, p),
         .role_start => |r| std.fmt.allocPrint(
             arena,
             "\"event\":\"role_start\",\"role\":{f},\"role_turn\":{d},\"tools\":{},\"content\":{f}",
@@ -189,6 +206,26 @@ fn pipelineBody(arena: std.mem.Allocator, p: TraceEvent.Pipeline) error{OutOfMem
     return w.items;
 }
 
+fn policyBody(arena: std.mem.Allocator, p: TraceEvent.Policy) error{OutOfMemory}![]const u8 {
+    var w: std.ArrayList(u8) = .empty;
+    try w.appendSlice(arena, try std.fmt.allocPrint(
+        arena,
+        "\"event\":\"policy\",\"source\":{f},\"rules\":[",
+        .{json.fmt(p.source, .{})},
+    ));
+    for (p.rules, 0..) |r, i| {
+        if (i > 0) try w.append(arena, ',');
+        const entry = try std.fmt.allocPrint(
+            arena,
+            "{{\"tool\":{f},\"verdict\":{f},\"step\":{f}}}",
+            .{ json.fmt(r.tool, .{}), json.fmt(r.verdict, .{}), json.fmt(r.step, .{}) },
+        );
+        try w.appendSlice(arena, entry);
+    }
+    try w.append(arena, ']');
+    return w.items;
+}
+
 fn taskBody(arena: std.mem.Allocator, comptime name: []const u8, t: TraceEvent.Task) error{OutOfMemory}![]const u8 {
     return std.fmt.allocPrint(
         arena,
@@ -219,6 +256,9 @@ pub fn parse(arena: std.mem.Allocator, line: []const u8) ?Parsed {
         .tasks = int(obj, "tasks"),
     } } else if (std.mem.eql(u8, name, "pipeline")) .{ .pipeline = .{
         .steps = parsePipelineSteps(arena, obj),
+    } } else if (std.mem.eql(u8, name, "policy")) .{ .policy = .{
+        .source = str(obj, "source") orelse "config",
+        .rules = parsePolicyRules(arena, obj),
     } } else if (std.mem.eql(u8, name, "role_start")) .{ .role_start = .{
         .role = str(obj, "role") orelse "?",
         .role_turn = int(obj, "role_turn"),
@@ -284,6 +324,23 @@ fn parsePipelineSteps(arena: std.mem.Allocator, obj: json.ObjectMap) []const Tra
     return list.items;
 }
 
+/// Tolerant like `parsePipelineSteps`: a missing or non-array `rules` reads
+/// as empty; entries that are not objects are skipped.
+fn parsePolicyRules(arena: std.mem.Allocator, obj: json.ObjectMap) []const TraceEvent.PolicyRule {
+    const v = obj.get("rules") orelse return &.{};
+    if (v != .array) return &.{};
+    var list: std.ArrayList(TraceEvent.PolicyRule) = .empty;
+    for (v.array.items) |item| {
+        if (item != .object) continue;
+        list.append(arena, .{
+            .tool = str(item.object, "tool") orelse "?",
+            .verdict = str(item.object, "verdict") orelse "?",
+            .step = str(item.object, "step"),
+        }) catch return &.{};
+    }
+    return list.items;
+}
+
 fn parseTask(obj: json.ObjectMap) TraceEvent.Task {
     return .{
         .index = int(obj, "index"),
@@ -343,6 +400,15 @@ test "body: every variant serializes byte-identical to the legacy emitters" {
         \\"event":"pipeline","steps":[]
     , .{ .pipeline = .{} });
     try expectBody(
+        \\"event":"policy","source":"config","rules":[{"tool":"bash","verdict":"deny","step":"architect"},{"tool":"bash","verdict":"allow","step":null}]
+    , .{ .policy = .{ .rules = &.{
+        .{ .tool = "bash", .verdict = "deny", .step = "architect" },
+        .{ .tool = "bash", .verdict = "allow" },
+    } } });
+    try expectBody(
+        \\"event":"policy","source":"config","rules":[]
+    , .{ .policy = .{} });
+    try expectBody(
         \\"event":"role_start","role":"executor","role_turn":3,"tools":true,"content":"Objective: ship"
     , .{ .role_start = .{ .role = "executor", .role_turn = 3, .tools = true, .content = "Objective: ship" } });
     try expectBody(
@@ -391,6 +457,11 @@ test "parse: body round-trips through a full line for every variant" {
             .{ .id = "executor" },
         } } },
         .{ .pipeline = .{} },
+        .{ .policy = .{ .rules = &.{
+            .{ .tool = "bash", .verdict = "deny", .step = "architect" },
+            .{ .tool = "web_*", .verdict = "ask", .step = null },
+        } } },
+        .{ .policy = .{} },
         .{ .role_start = .{ .role = "planner", .role_turn = 1, .tools = false, .content = "hi" } },
         .{ .role_end = .{ .role = "planner", .outcome = "failed", .reason = "why" } },
         .{ .task_start = .{ .index = 1, .total = 2, .desc = "d" } },
@@ -443,4 +514,38 @@ test "parse: a malformed pipeline event reads tolerant defaults" {
     try testing.expect(odd.event.pipeline.steps[0].tools);
     try testing.expectEqualStrings("x", odd.event.pipeline.steps[1].id);
     try testing.expect(odd.event.pipeline.steps[1].definition_sha256 == null);
+}
+
+test "policy event round-trips through trace_event" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const ev: TraceEvent = .{ .policy = .{ .source = "config", .rules = &.{
+        .{ .tool = "bash", .verdict = "deny", .step = "architect" },
+        .{ .tool = "bash", .verdict = "allow" },
+        .{ .tool = "a\"b", .verdict = "ask", .step = "research*" },
+    } } };
+    const line = try std.fmt.allocPrint(arena, "{{\"ts\":7,{s}}}", .{try body(arena, ev)});
+    const parsed = parse(arena, line) orelse return error.ParseFailed;
+    try testing.expectEqual(@as(i64, 7), parsed.ts);
+    try testing.expectEqualDeep(ev, parsed.event);
+    try testing.expect(parsed.event.policy.rules[1].step == null);
+}
+
+test "parse: a malformed policy event reads tolerant defaults" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const bare = parse(arena, "{\"event\":\"policy\"}") orelse return error.ParseFailed;
+    try testing.expectEqualStrings("config", bare.event.policy.source);
+    try testing.expectEqual(@as(usize, 0), bare.event.policy.rules.len);
+    const wrong = parse(arena, "{\"event\":\"policy\",\"rules\":\"x\"}") orelse return error.ParseFailed;
+    try testing.expectEqual(@as(usize, 0), wrong.event.policy.rules.len);
+    const odd = parse(arena, "{\"event\":\"policy\",\"rules\":[7,{\"verdict\":\"deny\"},{\"tool\":\"x\",\"step\":3}]}") orelse return error.ParseFailed;
+    try testing.expectEqual(@as(usize, 2), odd.event.policy.rules.len);
+    try testing.expectEqualStrings("?", odd.event.policy.rules[0].tool);
+    try testing.expectEqualStrings("deny", odd.event.policy.rules[0].verdict);
+    try testing.expectEqualStrings("x", odd.event.policy.rules[1].tool);
+    try testing.expectEqualStrings("?", odd.event.policy.rules[1].verdict);
+    try testing.expect(odd.event.policy.rules[1].step == null);
 }

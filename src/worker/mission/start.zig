@@ -8,6 +8,8 @@ const json = std.json;
 const jsonx = @import("../jsonx.zig");
 const context = @import("../context.zig");
 const pipeline = @import("pipeline.zig");
+const policy_mod = @import("../policy.zig");
+const trace_event = @import("../trace_event.zig");
 
 const strField = jsonx.strField;
 const uintFieldOr = jsonx.uintFieldOr;
@@ -42,6 +44,14 @@ pub const step_id_key = "id";
 pub const step_system_key = "system";
 pub const step_sha256_key = "definition_sha256";
 pub const step_tools_key = "tools";
+pub const policy_key = "policy";
+pub const policy_source_key = "source";
+pub const policy_rules_key = "rules";
+pub const policy_tool_key = "tool";
+pub const policy_verdict_key = "verdict";
+pub const policy_step_key = "step";
+/// The only source today: the operator's `zygos.zon` `.policy`.
+pub const policy_source_config = "config";
 
 pub const StartParams = struct {
     mission_id: []const u8,
@@ -58,6 +68,9 @@ pub const StartParams = struct {
     /// The CLI-pinned pipeline. Null (no `.steps` in zygos.zon) omits the
     /// field, which the worker reads as the default pipeline.
     steps: ?[]const pipeline.Step = null,
+    /// The effective policy rules the CLI handed the policy worker. Null (no
+    /// `.policy` in zygos.zon) omits the field: no `policy` trace event.
+    policy: ?[]const policy_mod.Rule = null,
 };
 
 pub const Parsed = struct {
@@ -86,6 +99,11 @@ pub const Parsed = struct {
     steps: []const pipeline.Step,
     /// `pipeline.validate` reason; the orchestrator refuses the start.
     steps_refusal: ?[]const u8,
+    /// The request's policy record, uninterpreted; null when the request
+    /// carries none. Meaningless when `policy_refusal` is set.
+    policy: ?trace_event.TraceEvent.Policy,
+    /// Structural reason; the orchestrator refuses the start.
+    policy_refusal: ?[]const u8,
 };
 
 /// The brief's `## Objective` section body when present, else the whole text.
@@ -122,9 +140,31 @@ fn stepsFragment(gpa: std.mem.Allocator, steps: ?[]const pipeline.Step) error{Ou
     return out.toOwnedSlice() catch error.OutOfMemory;
 }
 
+/// `,"policy":{"source":"config","rules":[...]}` for a configured list, ""
+/// when none. Verdicts ride as their tag names.
+fn policyFragment(gpa: std.mem.Allocator, rules: ?[]const policy_mod.Rule) error{OutOfMemory}![]u8 {
+    const list = rules orelse return gpa.dupe(u8, "");
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    errdefer out.deinit();
+    const w = &out.writer;
+    w.print(",\"{s}\":{{\"{s}\":\"{s}\",\"{s}\":[", .{ policy_key, policy_source_key, policy_source_config, policy_rules_key }) catch return error.OutOfMemory;
+    for (list, 0..) |r, i| {
+        if (i > 0) w.writeByte(',') catch return error.OutOfMemory;
+        w.print("{{\"{s}\":{f},\"{s}\":\"{t}\",\"{s}\":{f}}}", .{
+            policy_tool_key,    json.fmt(r.tool, .{}),
+            policy_verdict_key, r.verdict,
+            policy_step_key,    json.fmt(r.step, .{}),
+        }) catch return error.OutOfMemory;
+    }
+    w.writeAll("]}") catch return error.OutOfMemory;
+    return out.toOwnedSlice() catch error.OutOfMemory;
+}
+
 pub fn build(gpa: std.mem.Allocator, p: StartParams) error{OutOfMemory}![]u8 {
     const steps_json = try stepsFragment(gpa, p.steps);
     defer gpa.free(steps_json);
+    const policy_json = try policyFragment(gpa, p.policy);
+    defer gpa.free(policy_json);
     const resume_json: []const u8 = if (p.resume_flag)
         ",\"" ++ resume_key ++ "\":true"
     else
@@ -138,7 +178,7 @@ pub fn build(gpa: std.mem.Allocator, p: StartParams) error{OutOfMemory}![]u8 {
         \\ "{s}":"zygos::approvals::request",
         \\ "{s}":{f},"{s}":{f},
         \\ "{s}":{{"{s}":"{t}","{s}":{d}}},
-        \\ "{s}":{d},"{s}":{d}{s}{s},
+        \\ "{s}":{d},"{s}":{d}{s}{s}{s},
         \\ "{s}":[
         \\  {{"name":"bash","function_id":"zygos::tools::bash",
         \\   "description":{f},
@@ -153,21 +193,22 @@ pub fn build(gpa: std.mem.Allocator, p: StartParams) error{OutOfMemory}![]u8 {
         \\   "input_schema":{{"type":"object","properties":{{"url":{{"type":"string",
         \\    "description":"the absolute http(s) URL to fetch"}}}},"required":["url"]}}}}{s}]}}
     , .{
-        mission_id_key,             json.fmt(p.mission_id, .{}),
-        planning_root_key,          json.fmt(p.planning, .{}),
-        objective_key,              json.fmt(extractObjective(p.brief_text), .{}),
-        brief_key,                  json.fmt(p.brief_text, .{}),
-        router_function_key,        gate_function_key,
-        policy_function_key,        approval_function_key,
-        budget_scope_key,           json.fmt(p.mission_id, .{}),
-        trace_path_key,             json.fmt(p.trace_path, .{}),
-        context_strategy_key,       kind_key,
-        p.ctx_kind,                 max_tokens_key,
-        p.ctx_max_tokens,           role_max_steps_key,
-        p.role_max_steps,           max_role_turns_key,
-        p.max_role_turns,           resume_json,
-        steps_json,                 tools_key,
-        json.fmt(p.bash_desc, .{}), p.mcp_entries,
+        mission_id_key,       json.fmt(p.mission_id, .{}),
+        planning_root_key,    json.fmt(p.planning, .{}),
+        objective_key,        json.fmt(extractObjective(p.brief_text), .{}),
+        brief_key,            json.fmt(p.brief_text, .{}),
+        router_function_key,  gate_function_key,
+        policy_function_key,  approval_function_key,
+        budget_scope_key,     json.fmt(p.mission_id, .{}),
+        trace_path_key,       json.fmt(p.trace_path, .{}),
+        context_strategy_key, kind_key,
+        p.ctx_kind,           max_tokens_key,
+        p.ctx_max_tokens,     role_max_steps_key,
+        p.role_max_steps,     max_role_turns_key,
+        p.max_role_turns,     resume_json,
+        steps_json,           policy_json,
+        tools_key,            json.fmt(p.bash_desc, .{}),
+        p.mcp_entries,
     });
 }
 
@@ -217,6 +258,44 @@ fn parseSteps(arena: std.mem.Allocator, obj: json.ObjectMap) error{OutOfMemory}!
     };
 }
 
+const PolicyResult = union(enum) {
+    absent,
+    policy: trace_event.TraceEvent.Policy,
+    refused: []const u8,
+};
+
+fn policyRefusedAt(arena: std.mem.Allocator, index: usize, what: []const u8) error{OutOfMemory}!PolicyResult {
+    return .{ .refused = try std.fmt.allocPrint(arena, "policy[{d}]: {s}", .{ index, what }) };
+}
+
+/// The driver does not interpret the rules (the policy worker enforces
+/// them), but a structurally malformed record must not be traced as if it
+/// were the policy in force: refuse the start instead of dropping it.
+fn parsePolicy(arena: std.mem.Allocator, obj: json.ObjectMap) error{OutOfMemory}!PolicyResult {
+    const v = obj.get(policy_key) orelse return .absent;
+    if (v != .object) return .{ .refused = "policy: malformed" };
+    const source: []const u8 = if (v.object.get(policy_source_key)) |sv| blk: {
+        if (sv != .string) return .{ .refused = "policy: malformed" };
+        break :blk sv.string;
+    } else policy_source_config;
+    const rv = v.object.get(policy_rules_key) orelse return .{ .refused = "policy: malformed" };
+    if (rv != .array) return .{ .refused = "policy: malformed" };
+    const rules = try arena.alloc(trace_event.TraceEvent.PolicyRule, rv.array.items.len);
+    for (rules, rv.array.items, 0..) |*rule, item, i| {
+        if (item != .object) return policyRefusedAt(arena, i, "malformed");
+        const tool = strField(item.object, policy_tool_key) orelse return policyRefusedAt(arena, i, "bad tool");
+        const verdict = strField(item.object, policy_verdict_key) orelse return policyRefusedAt(arena, i, "bad verdict");
+        if (std.meta.stringToEnum(policy_mod.Verdict, verdict) == null) return policyRefusedAt(arena, i, "bad verdict");
+        const step: ?[]const u8 = if (item.object.get(policy_step_key)) |sv| switch (sv) {
+            .string => |t| t,
+            .null => null,
+            else => return policyRefusedAt(arena, i, "bad step"),
+        } else null;
+        rule.* = .{ .tool = tool, .verdict = verdict, .step = step };
+    }
+    return .{ .policy = .{ .source = source, .rules = rules } };
+}
+
 pub fn parse(arena: std.mem.Allocator, request_json: []const u8) ParseError!Parsed {
     const root = json.parseFromSliceLeaky(json.Value, arena, request_json, .{}) catch
         return error.MalformedRequest;
@@ -247,6 +326,7 @@ pub fn parse(arena: std.mem.Allocator, request_json: []const u8) ParseError!Pars
     };
 
     const steps_result = try parseSteps(arena, obj);
+    const policy_result = try parsePolicy(arena, obj);
 
     const provider_function = strField(obj, provider_function_key);
     const router_function = strField(obj, router_function_key);
@@ -283,6 +363,14 @@ pub fn parse(arena: std.mem.Allocator, request_json: []const u8) ParseError!Pars
         .steps_refusal = switch (steps_result) {
             .steps => null,
             .refused => |reason| reason,
+        },
+        .policy = switch (policy_result) {
+            .policy => |pol| pol,
+            .absent, .refused => null,
+        },
+        .policy_refusal = switch (policy_result) {
+            .refused => |reason| reason,
+            .absent, .policy => null,
         },
     };
 }
@@ -541,4 +629,128 @@ test "steps: wrongly typed values refuse instead of being ignored" {
     try expectStepsRefusal("steps[0]: no definition",
         \\,"steps":[{"id":"architect","system":5},{"id":"executor"}]
     );
+}
+
+const policy_rules = [_]policy_mod.Rule{
+    .{ .tool = "bash", .verdict = .deny, .step = "architect" },
+    .{ .tool = "bash", .verdict = .allow },
+    .{ .tool = "web_*", .verdict = .ask, .step = "research*" },
+};
+
+test "start round-trips the effective policy rules" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var params = steps_params;
+    params.policy = &policy_rules;
+    const body = try build(arena, params);
+    try testing.expect(std.mem.indexOf(u8, body,
+        \\"policy":{"source":"config","rules":[{"tool":"bash","verdict":"deny","step":"architect"},{"tool":"bash","verdict":"allow","step":null},{"tool":"web_*","verdict":"ask","step":"research*"}]}
+    ) != null);
+
+    const p = try parse(arena, body);
+    try testing.expect(p.policy_refusal == null);
+    const pol = p.policy orelse return error.TestExpectedPolicy;
+    try testing.expectEqualStrings("config", pol.source);
+    try testing.expectEqual(@as(usize, 3), pol.rules.len);
+    for (policy_rules, pol.rules) |want, got| {
+        try testing.expectEqualStrings(want.tool, got.tool);
+        try testing.expectEqualStrings(@tagName(want.verdict), got.verdict);
+        try testing.expectEqualStrings(want.step orelse "", got.step orelse "");
+        try testing.expectEqual(want.step == null, got.step == null);
+    }
+    // The other fields still ride the same body.
+    try testing.expectEqualStrings("m-steps", p.mission_id);
+    try testing.expectEqualStrings("zygos::policy::check", p.policy_function.?);
+}
+
+test "absent policy leaves the request bytes as they were" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const without = try build(arena, steps_params);
+    try testing.expect(std.mem.indexOf(u8, without, "\"policy\":") == null);
+    const p = try parse(arena, without);
+    try testing.expect(p.policy == null);
+    try testing.expect(p.policy_refusal == null);
+
+    // Only the policy fragment differs when rules are present.
+    var params = steps_params;
+    params.policy = &policy_rules;
+    const with = try build(arena, params);
+    const frag = try policyFragment(arena, &policy_rules);
+    const at = std.mem.indexOf(u8, with, frag) orelse return error.TestExpectedFragment;
+    const stitched = try std.mem.concat(arena, u8, &.{ with[0..at], with[at + frag.len ..] });
+    try testing.expectEqualStrings(without, stitched);
+
+    // An empty list is still a present policy: the event records "no rules".
+    params.policy = &.{};
+    const empty = try parse(arena, try build(arena, params));
+    try testing.expectEqual(@as(usize, 0), empty.policy.?.rules.len);
+}
+
+fn expectPolicyRefusal(want: []const u8, policy_json: []const u8) !void {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const p = try parse(arena, try minimalRequest(arena, policy_json));
+    try testing.expectEqualStrings(want, p.policy_refusal orelse return error.TestExpectedRefusal);
+    try testing.expect(p.policy == null);
+}
+
+test "policy: a structurally malformed field refuses instead of being dropped" {
+    try expectPolicyRefusal("policy: malformed",
+        \\,"policy":"config"
+    );
+    try expectPolicyRefusal("policy: malformed",
+        \\,"policy":null
+    );
+    try expectPolicyRefusal("policy: malformed",
+        \\,"policy":[]
+    );
+    try expectPolicyRefusal("policy: malformed",
+        \\,"policy":{"source":"config"}
+    );
+    try expectPolicyRefusal("policy: malformed",
+        \\,"policy":{"source":"config","rules":"bash"}
+    );
+    try expectPolicyRefusal("policy: malformed",
+        \\,"policy":{"source":7,"rules":[]}
+    );
+    try expectPolicyRefusal("policy[0]: malformed",
+        \\,"policy":{"source":"config","rules":["bash"]}
+    );
+    try expectPolicyRefusal("policy[1]: bad tool",
+        \\,"policy":{"source":"config","rules":[{"tool":"bash","verdict":"allow"},{"verdict":"allow"}]}
+    );
+    try expectPolicyRefusal("policy[0]: bad tool",
+        \\,"policy":{"source":"config","rules":[{"tool":7,"verdict":"allow"}]}
+    );
+    try expectPolicyRefusal("policy[0]: bad verdict",
+        \\,"policy":{"source":"config","rules":[{"tool":"bash"}]}
+    );
+    try expectPolicyRefusal("policy[0]: bad verdict",
+        \\,"policy":{"source":"config","rules":[{"tool":"bash","verdict":"maybe"}]}
+    );
+    try expectPolicyRefusal("policy[0]: bad verdict",
+        \\,"policy":{"source":"config","rules":[{"tool":"bash","verdict":true}]}
+    );
+    try expectPolicyRefusal("policy[0]: bad step",
+        \\,"policy":{"source":"config","rules":[{"tool":"bash","verdict":"deny","step":7}]}
+    );
+}
+
+test "policy: a missing source reads as config; a null step is no step" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const p = try parse(arena, try minimalRequest(arena,
+        \\,"policy":{"rules":[{"tool":"bash","verdict":"deny","step":null},{"tool":"x","verdict":"ask"}]}
+    ));
+    try testing.expect(p.policy_refusal == null);
+    try testing.expectEqualStrings("config", p.policy.?.source);
+    try testing.expect(p.policy.?.rules[0].step == null);
+    try testing.expect(p.policy.?.rules[1].step == null);
 }
