@@ -6,6 +6,12 @@ Reconstructed from git history on 2026-09-30. A commit that only added a library
 
 The agent that next changes operator-visible behavior adds the new heading in that same commit.
 
+## [5.1.1] - 2026-10-20
+
+### Fixed
+
+- Commands the `bash` tool runs get `/dev/null` as stdin instead of the zygos process's stdin. Before, a command that read stdin (`cat`, `read`, a git `core.fsmonitor` hook) blocked until the shell deadline, and under `zygos mission` it read from the same stdin as the operator's approval answers and control lines. Tessera checkpoint and undo git calls also run with `GIT_TERMINAL_PROMPT=0` and `--no-pager`, and a git call past its deadline now logs a warning naming the command.
+
 ## [5.1.0] - 2026-10-19
 
 ### Added

@@ -19,6 +19,7 @@ const c = std.c;
 extern "c" fn pipe(fds: *[2]c.fd_t) c_int;
 extern "c" fn fork() c.pid_t;
 extern "c" fn setpgid(pid: c.pid_t, pgid: c.pid_t) c_int;
+extern "c" fn dup(old: c.fd_t) c_int;
 extern "c" fn dup2(old: c.fd_t, new: c.fd_t) c_int;
 extern "c" fn close(fd: c.fd_t) c_int;
 extern "c" fn execve(path: [*:0]const u8, argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*:0]const u8) c_int;
@@ -191,6 +192,7 @@ pub const BashResult = struct {
 
 /// Run `sh -c command` with cwd = workspace root, stderr folded into stdout.
 /// The child env is the `keepEnvName` allowlist — secrets never ride along.
+/// Child stdin is /dev/null: a reader sees EOF, never the zygos process's stdin.
 pub fn bash(gpa: std.mem.Allocator, ws: Workspace, command: []const u8) OpsError!BashResult {
     const quoted_root = try shQuote(gpa, ws.root);
     defer gpa.free(quoted_root);
@@ -205,10 +207,18 @@ pub fn bash(gpa: std.mem.Allocator, ws: Workspace, command: []const u8) OpsError
 
     var fds: [2]c.fd_t = undefined;
     if (pipe(&fds) != 0) return error.ExecFailed;
+    // Opened before fork: open() is not on the child's async-signal-safe path.
+    const devnull = c.open("/dev/null", .{ .ACCMODE = .RDONLY, .CLOEXEC = true });
+    if (devnull < 0) {
+        _ = close(fds[0]);
+        _ = close(fds[1]);
+        return error.ExecFailed;
+    }
     const pid = fork();
     if (pid < 0) {
         _ = close(fds[0]);
         _ = close(fds[1]);
+        _ = close(devnull);
         return error.ExecFailed;
     }
     if (pid == 0) {
@@ -216,6 +226,7 @@ pub fn bash(gpa: std.mem.Allocator, ws: Workspace, command: []const u8) OpsError
         // Only the child sets its group; competing parent/child calls can
         // fail in the child on macOS. Cleanup also kills pid before reap.
         if (setpgid(0, 0) != 0) _exit(127);
+        _ = dup2(devnull, 0);
         _ = dup2(fds[1], 1);
         _ = dup2(fds[1], 2);
         _ = close(fds[0]);
@@ -225,6 +236,7 @@ pub fn bash(gpa: std.mem.Allocator, ws: Workspace, command: []const u8) OpsError
         _exit(127);
     }
     _ = close(fds[1]);
+    _ = close(devnull);
     defer _ = close(fds[0]);
     // Every return, including allocation/read failure, kills descendants
     // holding the pipe and reaps the shell before the handler exits.
@@ -329,6 +341,40 @@ const TestWs = struct {
     }
 };
 
+/// Test support: fd 0 becomes a pipe nobody writes to or closes, so a reader of
+/// stdin blocks forever. Makes the stdin tests independent of how the runner
+/// was launched (a `< /dev/null` launch would otherwise let the old behaviour
+/// pass). Process-wide: do not run two at once.
+pub const HeldStdin = struct {
+    /// Duplicate of the original fd 0, or -1 if it was closed.
+    saved: c.fd_t,
+    write_end: c.fd_t,
+
+    pub fn begin() error{HoldStdinFailed}!HeldStdin {
+        var fds: [2]c.fd_t = undefined;
+        if (pipe(&fds) != 0) return error.HoldStdinFailed;
+        const saved = dup(0); // -1 when fd 0 is closed
+        if (dup2(fds[0], 0) < 0) {
+            if (saved >= 0) _ = close(saved);
+            _ = close(fds[0]);
+            _ = close(fds[1]);
+            return error.HoldStdinFailed;
+        }
+        _ = close(fds[0]);
+        return .{ .saved = saved, .write_end = fds[1] };
+    }
+
+    pub fn end(self: HeldStdin) void {
+        if (self.saved >= 0) {
+            _ = dup2(self.saved, 0);
+            _ = close(self.saved);
+        } else {
+            _ = close(0);
+        }
+        _ = close(self.write_end);
+    }
+};
+
 test "resolve: plain relative path lands under root" {
     var t = try TestWs.init();
     defer t.deinit();
@@ -413,6 +459,24 @@ test "bash: deadline stops a silent command and reaps it" {
     var ws = Workspace.init("/tmp");
     ws.shell_timeout_ms = 20;
     try testing.expectError(error.ExecFailed, bash(testing.allocator, ws, "sleep 0.2"));
+}
+
+test "bash: child stdin is /dev/null — a stdin reader sees EOF, not the parent's stdin" {
+    var t = try TestWs.init();
+    defer t.deinit();
+    var ws = try t.workspace();
+    ws.shell_timeout_ms = 5_000;
+
+    const held = try HeldStdin.begin();
+    defer held.end();
+
+    const r = bash(testing.allocator, ws, "cat; echo done") catch |err| {
+        std.debug.print("bash child blocked on inherited stdin until the {d} ms deadline: {s}\n", .{ ws.shell_timeout_ms, @errorName(err) });
+        return err;
+    };
+    defer testing.allocator.free(r.output);
+    try testing.expectEqual(@as(i32, 0), r.exit_code);
+    try testing.expectEqualStrings("done\n", r.output);
 }
 
 test "bash: child env is scrubbed — secrets dropped, PATH kept" {
