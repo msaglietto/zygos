@@ -126,14 +126,26 @@ pub const WriterQueue = struct {
 
 const testing = std.testing;
 
+fn sleepMs(ms: u32) void {
+    var interval: std.c.timespec = .{
+        .sec = @intCast(ms / 1000),
+        .nsec = @intCast((ms % 1000) * std.time.ns_per_ms),
+    };
+    var rem: std.c.timespec = undefined;
+    _ = std.c.nanosleep(&interval, &rem);
+}
+
 const RecSink = struct {
     gpa: std.mem.Allocator,
     mutex: sync.Mutex = .{},
     frames: std.ArrayList([]u8) = .empty,
     fail: bool = false,
+    /// Slept before the mutex is taken, so `count()` never blocks on it.
+    delay_ms: u32 = 0,
 
     fn write(ctx: *anyopaque, frame: []const u8) error{Disconnected}!void {
         const self: *RecSink = @ptrCast(@alignCast(ctx));
+        if (self.delay_ms > 0) sleepMs(self.delay_ms);
         self.mutex.lock();
         defer self.mutex.unlock();
         if (self.fail) return error.Disconnected;
@@ -157,6 +169,42 @@ const RecSink = struct {
         self.mutex.deinit();
     }
 };
+
+fn monotonicMs() i64 {
+    var ts: std.c.timespec = undefined;
+    if (std.c.clock_gettime(.MONOTONIC, &ts) != 0) @panic("clock_gettime(MONOTONIC) failed");
+    return @as(i64, @intCast(ts.sec)) * 1000 + @divTrunc(@as(i64, @intCast(ts.nsec)), std.time.ns_per_ms);
+}
+
+const wait_deadline_ms = 5000;
+
+// The sink is slower than any count-based wait, so these tests exercise a late writer every run.
+const slow_sink_ms = 100;
+
+/// Polls `done(ctx)` until it holds or `wait_deadline_ms` pass on the
+/// monotonic clock. A deadline, unlike a count of yields, holds however late
+/// the writer thread is scheduled. On timeout it reports `what` and returns;
+/// the caller's assertions then fail.
+fn waitFor(ctx: anytype, comptime done: fn (@TypeOf(ctx)) bool, what: []const u8) void {
+    const deadline = monotonicMs() + wait_deadline_ms;
+    while (!done(ctx)) {
+        if (monotonicMs() >= deadline) {
+            std.debug.print("writer_queue test: {s} not seen within {d} ms\n", .{ what, wait_deadline_ms });
+            return;
+        }
+        sleepMs(1);
+    }
+}
+
+fn twoFramesRecorded(rec: *RecSink) bool {
+    return rec.count() >= 2;
+}
+
+fn queueClosed(q: *WriterQueue) bool {
+    q.mutex.lock();
+    defer q.mutex.unlock();
+    return q.closed;
+}
 
 test "push preserves order; pop drains FIFO without a thread" {
     var rec = RecSink{ .gpa = testing.allocator };
@@ -191,7 +239,7 @@ test "a full queue refuses with QueueFull instead of blocking the pusher" {
 }
 
 test "the writer thread drains pushes through the sink in order" {
-    var rec = RecSink{ .gpa = testing.allocator };
+    var rec = RecSink{ .gpa = testing.allocator, .delay_ms = slow_sink_ms };
     defer rec.deinit();
     var q = WriterQueue.init(testing.allocator, rec.sink());
     try q.start();
@@ -199,29 +247,21 @@ test "the writer thread drains pushes through the sink in order" {
 
     try q.push("a");
     try q.push("b");
-    var spins: usize = 0;
-    while (rec.count() < 2 and spins < 500) : (spins += 1) std.Thread.yield() catch {};
+    waitFor(&rec, twoFramesRecorded, "both frames recorded");
     try testing.expectEqual(@as(usize, 2), rec.count());
     try testing.expectEqualStrings("a", rec.frames.items[0]);
     try testing.expectEqualStrings("b", rec.frames.items[1]);
 }
 
 test "a disconnected sink closes the queue; pushes then fail fast with Closed" {
-    var rec = RecSink{ .gpa = testing.allocator, .fail = true };
+    var rec = RecSink{ .gpa = testing.allocator, .fail = true, .delay_ms = slow_sink_ms };
     defer rec.deinit();
     var q = WriterQueue.init(testing.allocator, rec.sink());
     try q.start();
     defer q.deinit();
 
     try q.push("doomed");
-    var spins: usize = 0;
-    while (spins < 500) : (spins += 1) {
-        q.mutex.lock();
-        const closed = q.closed;
-        q.mutex.unlock();
-        if (closed) break;
-        std.Thread.yield() catch {};
-    }
+    waitFor(&q, queueClosed, "queue closed after Disconnected");
     try testing.expectError(error.Closed, q.push("after-close"));
 }
 
