@@ -3,7 +3,7 @@
 Safety net for vault writes: a checkpoint snapshots the vault before a write;
 one-call undo restores the last snapshot. Shell-out to the system `git` binary
 (no new dependency — the `new_dependency` gate stays closed). Reuses
-`tools_ops.bash` (popen, workspace-confined, output-capped) for execution.
+`tools_ops.bash` (fork/exec with a scrubbed env, workspace cwd, output-capped) for execution.
 
 ## Shadow repo layout
 

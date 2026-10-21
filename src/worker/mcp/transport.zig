@@ -1,11 +1,12 @@
 //! Line-oriented transports for MCP clients: the Transport vtable the
 //! JSON-RPC client talks through, and the child-process implementation
-//! (fork/exec + pipes; libc like tools_ops' popen). Protocol logic lives in
-//! client.zig — this file never parses JSON.
+//! (fork/exec + close-on-exec pipes under `fork_guard.lock`, libc-backed).
+//! Protocol logic lives in client.zig — this file never parses JSON.
 
 const std = @import("std");
 const c = std.c;
 const sync = @import("../../kernel/sync.zig");
+const fork_guard = @import("../fork_guard.zig");
 
 pub const TransportError = error{ Io, OutOfMemory };
 
@@ -30,8 +31,6 @@ pub const Transport = struct {
 
 extern "c" fn fork() c.pid_t;
 extern "c" fn execvp(file: [*:0]const u8, argv: [*:null]const ?[*:0]const u8) c_int;
-extern "c" fn dup2(old_fd: c_int, new_fd: c_int) c_int;
-extern "c" fn pipe(fds: *[2]c_int) c_int;
 extern "c" fn waitpid(pid: c.pid_t, status: ?*c_int, options: c_int) c.pid_t;
 extern "c" fn kill(pid: c.pid_t, sig: c_int) c_int;
 extern "c" fn fdopen(fd: c_int, mode: [*:0]const u8) ?*c.FILE;
@@ -63,15 +62,6 @@ pub const ChildProcess = struct {
     /// to ours (server logs stay visible).
     pub fn spawn(gpa: std.mem.Allocator, argv: []const []const u8) error{ OutOfMemory, SpawnFailed }!*ChildProcess {
         std.debug.assert(argv.len > 0);
-        var in_pipe: [2]c_int = undefined; // us → child stdin
-        var out_pipe: [2]c_int = undefined; // child stdout → us
-        if (pipe(&in_pipe) != 0) return error.SpawnFailed;
-        if (pipe(&out_pipe) != 0) {
-            _ = close(in_pipe[0]);
-            _ = close(in_pipe[1]);
-            return error.SpawnFailed;
-        }
-
         const argz = try gpa.alloc(?[*:0]const u8, argv.len + 1);
         defer gpa.free(argz);
         var owned: usize = 0;
@@ -82,8 +72,26 @@ pub const ChildProcess = struct {
         }
         argz[argv.len] = null;
 
+        // Both pipes are close-on-exec and created and forked under the
+        // process-wide fork lock: our ends never leak into a bash command or
+        // another server, and theirs never leak into this one.
+        var in_pipe: [2]c_int = undefined; // us → child stdin
+        var out_pipe: [2]c_int = undefined; // child stdout → us
+        fork_guard.lock.lock();
+        fork_guard.cloexecPipe(&in_pipe) catch {
+            fork_guard.lock.unlock();
+            return error.SpawnFailed;
+        };
+        fork_guard.cloexecPipe(&out_pipe) catch {
+            fork_guard.lock.unlock();
+            _ = close(in_pipe[0]);
+            _ = close(in_pipe[1]);
+            return error.SpawnFailed;
+        };
+
         const pid = fork();
         if (pid < 0) {
+            fork_guard.lock.unlock();
             _ = close(in_pipe[0]);
             _ = close(in_pipe[1]);
             _ = close(out_pipe[0]);
@@ -91,16 +99,17 @@ pub const ChildProcess = struct {
             return error.SpawnFailed;
         }
         if (pid == 0) {
-            // Child: only async-signal-safe calls until exec.
-            _ = dup2(in_pipe[0], 0);
-            _ = dup2(out_pipe[1], 1);
-            _ = close(in_pipe[0]);
-            _ = close(in_pipe[1]);
-            _ = close(out_pipe[0]);
-            _ = close(out_pipe[1]);
+            // Child: only async-signal-safe calls until exec, and it never
+            // touches the fork lock. Stdin first: the pipes may sit on fds
+            // 0-3 when we were started with stdio closed. No closes after:
+            // every pipe end is close-on-exec, and closing one could close
+            // the stream just installed.
+            if (!fork_guard.moveFd(in_pipe[0], 0)) _exit(127);
+            if (!fork_guard.moveFd(out_pipe[1], 1)) _exit(127);
             _ = execvp(argz[0].?, @ptrCast(argz.ptr));
             _exit(127);
         }
+        fork_guard.lock.unlock();
         _ = close(in_pipe[0]);
         _ = close(out_pipe[1]);
 
@@ -259,4 +268,28 @@ test "child-process transport: NUL cannot evade the line cap" {
     const child = try ChildProcess.spawn(testing.allocator, &.{ "/bin/sh", "-c", "printf '\\000hidden\\n'" });
     defer child.stop();
     try testing.expectError(error.Io, child.transport().readLine(testing.allocator));
+}
+
+test "child-process transport: parent pipe ends are close-on-exec" {
+    const child = try ChildProcess.spawn(testing.allocator, &.{"cat"});
+    defer child.stop();
+    const want: c_int = c.FD_CLOEXEC;
+    try testing.expectEqual(want, c.fcntl(fileno(child.to_child), c.F.GETFD) & want);
+    try testing.expectEqual(want, c.fcntl(fileno(child.from_child), c.F.GETFD) & want);
+}
+
+fn stdinOnFdZeroBody() bool {
+    const gpa = std.heap.page_allocator;
+    const child = ChildProcess.spawn(gpa, &.{"cat"}) catch return false;
+    child.read_timeout_ms = 3000;
+    const t = child.transport();
+    defer child.stop();
+    t.writeLine("ping") catch return false;
+    const line = (t.readLine(gpa) catch return false) orelse return false;
+    defer gpa.free(line);
+    return std.mem.eql(u8, line, "ping");
+}
+
+test "child-process transport: stdin pipe landing on fd 0 survives into the child" {
+    try testing.expect(fork_guard.runInChildWithClosed(&.{ 0, 1 }, &stdinOnFdZeroBody));
 }

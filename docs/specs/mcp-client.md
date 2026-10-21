@@ -34,6 +34,11 @@ ride the same policy/trim/budget gates as native tools.
   Teardown escalates TERM to KILL after 250 ms if the child does not exit.
   A blocked write or endless unmatched notifications still need a whole-RPC
   deadline; the read deadline does not provide that stronger guarantee.
+- The child's two pipes are close-on-exec and are created and forked under
+  the process-wide fork lock (`src/worker/fork_guard.zig`, the same lock
+  `tools_ops.bash` takes), so the transport's ends never leak into a bash
+  command and a bash pipe never leaks into the server. A zygos started with
+  fd 0 or 1 closed still gives the server working stdin and stdout.
 
 E2E leg 2 of `test/e2e/m4/run.sh` drives a real client against
 `zygos mcp-gateway` over stdio (zygos talking to zygos).
