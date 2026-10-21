@@ -133,7 +133,7 @@ pub const UndoWorker = struct {
             error.OutOfMemory => error.OutOfMemory,
             else => {
                 std.log.scoped(.tessera_undo).warn(
-                    "git call failed to run or exceeded its {d} ms deadline: {s}",
+                    "shadow command failed to run or exceeded its {d} ms deadline: {s}",
                     .{ self.ws.shell_timeout_ms, command },
                 );
                 return error.Failed;
@@ -198,11 +198,8 @@ const testing = std.testing;
 
 extern "c" fn realpath(path: [*:0]const u8, resolved: [*]u8) ?[*:0]u8;
 
-fn monotonicNs() i128 {
-    var ts: std.c.timespec = undefined;
-    _ = std.c.clock_gettime(.MONOTONIC, &ts);
-    return @as(i128, ts.sec) * std.time.ns_per_s + ts.nsec;
-}
+/// Deadline for the worker under test and for the harness's own shell calls.
+const git_test_timeout_ms = 10_000;
 
 const Harness = struct {
     registry: inproc.Registry,
@@ -224,6 +221,7 @@ const Harness = struct {
         const resolved = realpath(rel, &self.root_buf) orelse return error.RealpathFailed;
         self.root = std.mem.span(resolved);
         self.ws = ops.Workspace.init(self.root);
+        self.ws.shell_timeout_ms = git_test_timeout_ms;
 
         // Minimal vault content so first add/commit has something real.
         try ops.writeFile(gpa, self.ws, "note.txt", "original\n");
@@ -233,9 +231,9 @@ const Harness = struct {
         self.kernel = try std.Thread.spawn(.{}, actor_mod.Actor.run, .{&self.actor});
         self.undo = try UndoWorker.start(gpa, &self.actor, &self.registry, .{
             .root = self.root,
-            // The stall in #15 was 9 tests times the 120 s default deadline; a
-            // recurrence must fail in seconds.
-            .git_timeout_ms = 10_000,
+            // Short deadline: a stuck git call fails its test fast instead of
+            // holding the suite for the 120 s default.
+            .git_timeout_ms = git_test_timeout_ms,
         });
         self.caller = try inproc.Worker.spawn(gpa, &self.actor, &self.registry, "test-caller");
         return self;
@@ -527,12 +525,12 @@ test "a git call past its deadline fails the handler (fail closed)" {
     defer testing.allocator.free(chmod.output);
     try testing.expectEqual(@as(i32, 0), chmod.exit_code);
 
-    const started = monotonicNs();
+    const started = ops.monotonicMs();
     const second = try h.checkpoint("{}");
     defer second.deinit(testing.allocator);
-    const elapsed_ns = monotonicNs() - started;
+    const elapsed_ms = ops.monotonicMs() - started;
 
     try testing.expect(second == .err);
     try testing.expectEqualStrings("handler_failed", second.err);
-    try testing.expect(elapsed_ns < 10 * std.time.ns_per_s);
+    try testing.expect(elapsed_ms < git_test_timeout_ms);
 }

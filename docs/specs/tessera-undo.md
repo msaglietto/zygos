@@ -9,7 +9,8 @@ one-call undo restores the last snapshot. Shell-out to the system `git` binary
 
 A bare-ish shadow repo lives INSIDE the vault root at `.zygos-shadow/`
 (a git dir, not a worktree checkout). Every git call is
-`git --git-dir=<root>/.zygos-shadow --work-tree=<root> ...` so the vault never
+`GIT_TERMINAL_PROMPT=0 git --no-pager --git-dir=<root>/.zygos-shadow --work-tree=<root> ...`
+(the env is scrubbed, so the no-prompt switch rides the command line) so the vault never
 gains a visible `.git` and never collides with a user repo above or below it.
 On first checkpoint: `init`, then write `.zygos-shadow/info/exclude` containing
 `.zygos-shadow/` so the shadow never tracks itself. Commits use
@@ -20,7 +21,7 @@ Handlers serialize on a mutex — two concurrent checkpoints must not interleave
 
 ## Worker
 
-`OrientWorker` shape: `Config { root: []const u8 }`, `start`/`stop`, handlers
+`OrientWorker` shape: `Config { root: []const u8, git_timeout_ms: u32 = 120_000 }`, `start`/`stop`, handlers
 `error{Failed,OutOfMemory}![]const u8`.
 
 ### `zygos::tessera::checkpoint`
@@ -32,7 +33,9 @@ may pass through); empty/absent ⇒ `"checkpoint"`.
 1. Shadow repo missing ⇒ init + exclude file.
 2. `add -A` then `commit --allow-empty -m "<label>"`.
 3. `rev-parse HEAD` ⇒ reply `{"checkpoint_id":"<sha>"}`.
-Any git failure (non-zero exit) ⇒ error.Failed.
+Any git failure (non-zero exit) ⇒ error.Failed. A call that fails to run or
+passes `git_timeout_ms` also fails the handler (error.Failed, fail closed, never
+success) and logs a warning naming the command.
 
 ### `zygos::tessera::undo`
 
@@ -60,6 +63,9 @@ the M3 e2e bash tool).
 7. `label with shell metacharacters is sanitized (commit succeeds, message stripped)`
 8. `.zygos-shadow/ itself is never tracked nor cleaned`
 9. `no leaks`
+10. `gitCommand: every git call disables terminal prompts and the pager`
+11. `a git hook that reads stdin cannot stall checkpoint` (fsmonitor hook, stdin held open)
+12. `a git call past its deadline fails the handler (fail closed)`
 
 ## Seam (wired elsewhere, not in this module)
 

@@ -178,7 +178,7 @@ pub fn writeFile(gpa: std.mem.Allocator, ws: Workspace, rel_path: []const u8, co
     }
 }
 
-fn monotonicMs() i64 {
+pub fn monotonicMs() i64 {
     var ts: c.timespec = undefined;
     if (c.clock_gettime(.MONOTONIC, &ts) != 0) return 0;
     return @as(i64, @intCast(ts.sec)) * 1000 + @divTrunc(@as(i64, @intCast(ts.nsec)), std.time.ns_per_ms);
@@ -226,10 +226,13 @@ pub fn bash(gpa: std.mem.Allocator, ws: Workspace, command: []const u8) OpsError
         // Only the child sets its group; competing parent/child calls can
         // fail in the child on macOS. Cleanup also kills pid before reap.
         if (setpgid(0, 0) != 0) _exit(127);
-        _ = dup2(devnull, 0);
+        // Read end first: with fd 0 closed at startup pipe() can hand out
+        // fds[0] == 0, and closing it after the dup2 would close /dev/null.
+        _ = close(fds[0]);
+        // Fail closed: never exec with the inherited stdin.
+        if (dup2(devnull, 0) < 0) _exit(127);
         _ = dup2(fds[1], 1);
         _ = dup2(fds[1], 2);
-        _ = close(fds[0]);
         _ = close(fds[1]);
         const argv = [_:null]?[*:0]const u8{ "sh", "-c", full_z.ptr };
         _ = execve("/bin/sh", @ptrCast(&argv), @ptrCast(envp.ptr));
@@ -346,16 +349,21 @@ const TestWs = struct {
 /// was launched (a `< /dev/null` launch would otherwise let the old behaviour
 /// pass). Process-wide: do not run two at once.
 pub const HeldStdin = struct {
-    /// Duplicate of the original fd 0, or -1 if it was closed.
+    /// Duplicate of the original fd 0.
     saved: c.fd_t,
     write_end: c.fd_t,
 
     pub fn begin() error{HoldStdinFailed}!HeldStdin {
+        // dup before pipe: a failure here leaves nothing to unwind.
+        const saved = dup(0);
+        if (saved < 0) return error.HoldStdinFailed;
         var fds: [2]c.fd_t = undefined;
-        if (pipe(&fds) != 0) return error.HoldStdinFailed;
-        const saved = dup(0); // -1 when fd 0 is closed
+        if (pipe(&fds) != 0) {
+            _ = close(saved);
+            return error.HoldStdinFailed;
+        }
         if (dup2(fds[0], 0) < 0) {
-            if (saved >= 0) _ = close(saved);
+            _ = close(saved);
             _ = close(fds[0]);
             _ = close(fds[1]);
             return error.HoldStdinFailed;
@@ -365,12 +373,8 @@ pub const HeldStdin = struct {
     }
 
     pub fn end(self: HeldStdin) void {
-        if (self.saved >= 0) {
-            _ = dup2(self.saved, 0);
-            _ = close(self.saved);
-        } else {
-            _ = close(0);
-        }
+        _ = dup2(self.saved, 0);
+        _ = close(self.saved);
         _ = close(self.write_end);
     }
 };
