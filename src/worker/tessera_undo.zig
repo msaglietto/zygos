@@ -12,6 +12,10 @@ const ops = @import("tools_ops.zig");
 
 pub const Config = struct {
     root: []const u8,
+    /// Deadline for each git call. A call past it fails the handler (fail
+    /// closed, never success). Missions call with a 1 h bus timeout, so the
+    /// default stays at the shell's own 120 s.
+    git_timeout_ms: u32 = 120_000,
 };
 
 pub const UndoWorker = struct {
@@ -35,6 +39,7 @@ pub const UndoWorker = struct {
             .config = config,
             .ws = ops.Workspace.init(config.root),
         };
+        self.ws.shell_timeout_ms = config.git_timeout_ms;
         errdefer self.worker.stop();
         try self.worker.registerFunction("zygos::tessera::checkpoint", self, &checkpointHandler);
         try self.worker.registerFunction("zygos::tessera::undo", self, &undoHandler);
@@ -58,13 +63,13 @@ pub const UndoWorker = struct {
         try self.ensureShadow();
         try self.gitOk("add -A");
         // -c flags must precede the subcommand; label is already shell-safe.
-        const commit_cmd = std.fmt.allocPrint(
+        const commit_args = std.fmt.allocPrint(
             self.gpa,
-            "git -c user.name=zygos -c user.email=zygos@local --git-dir=.zygos-shadow --work-tree=. commit --allow-empty -m '{s}'",
+            "-c user.name=zygos -c user.email=zygos@local commit --allow-empty -m '{s}'",
             .{label},
         ) catch return error.OutOfMemory;
-        defer self.gpa.free(commit_cmd);
-        try self.shellOk(commit_cmd);
+        defer self.gpa.free(commit_args);
+        try self.gitOk(commit_args);
 
         const sha = try self.gitOut(arena, "rev-parse HEAD");
         return std.fmt.allocPrint(arena, "{{\"checkpoint_id\":{f}}}", .{json.fmt(sha, .{})});
@@ -103,21 +108,13 @@ pub const UndoWorker = struct {
     }
 
     fn gitOk(self: *UndoWorker, args: []const u8) error{ Failed, OutOfMemory }!void {
-        const cmd = std.fmt.allocPrint(
-            self.gpa,
-            "git --git-dir=.zygos-shadow --work-tree=. {s}",
-            .{args},
-        ) catch return error.OutOfMemory;
+        const cmd = try gitCommand(self.gpa, args);
         defer self.gpa.free(cmd);
         try self.shellOk(cmd);
     }
 
     fn gitOut(self: *UndoWorker, arena: std.mem.Allocator, args: []const u8) error{ Failed, OutOfMemory }![]const u8 {
-        const cmd = std.fmt.allocPrint(
-            self.gpa,
-            "git --git-dir=.zygos-shadow --work-tree=. {s}",
-            .{args},
-        ) catch return error.OutOfMemory;
+        const cmd = try gitCommand(self.gpa, args);
         defer self.gpa.free(cmd);
         const r = try self.shell(cmd);
         defer self.gpa.free(r.output);
@@ -134,10 +131,26 @@ pub const UndoWorker = struct {
     fn shell(self: *UndoWorker, command: []const u8) error{ Failed, OutOfMemory }!ops.BashResult {
         return ops.bash(self.gpa, self.ws, command) catch |err| switch (err) {
             error.OutOfMemory => error.OutOfMemory,
-            else => error.Failed,
+            else => {
+                std.log.scoped(.tessera_undo).warn(
+                    "shadow command failed to run or exceeded its {d} ms deadline: {s}",
+                    .{ self.ws.shell_timeout_ms, command },
+                );
+                return error.Failed;
+            },
         };
     }
 };
+
+/// One shell line for every shadow-repo git call. bash scrubs the env, so the
+/// no-prompt switch rides the command string; --no-pager keeps output direct.
+fn gitCommand(gpa: std.mem.Allocator, args: []const u8) error{OutOfMemory}![]u8 {
+    return std.fmt.allocPrint(
+        gpa,
+        "GIT_TERMINAL_PROMPT=0 git --no-pager --git-dir=.zygos-shadow --work-tree=. {s}",
+        .{args},
+    );
+}
 
 /// Label rides a shell command line: keep only [A-Za-z0-9 ._-], cap 80.
 /// Empty/absent input ⇒ "checkpoint".
@@ -185,6 +198,9 @@ const testing = std.testing;
 
 extern "c" fn realpath(path: [*:0]const u8, resolved: [*]u8) ?[*:0]u8;
 
+/// Deadline for the worker under test and for the harness's own shell calls.
+const git_test_timeout_ms = 10_000;
+
 const Harness = struct {
     registry: inproc.Registry,
     actor: actor_mod.Actor,
@@ -205,6 +221,7 @@ const Harness = struct {
         const resolved = realpath(rel, &self.root_buf) orelse return error.RealpathFailed;
         self.root = std.mem.span(resolved);
         self.ws = ops.Workspace.init(self.root);
+        self.ws.shell_timeout_ms = git_test_timeout_ms;
 
         // Minimal vault content so first add/commit has something real.
         try ops.writeFile(gpa, self.ws, "note.txt", "original\n");
@@ -212,7 +229,12 @@ const Harness = struct {
         self.registry = inproc.Registry.init(gpa, null);
         self.actor = try actor_mod.Actor.init(gpa, .{}, self.registry.outbound());
         self.kernel = try std.Thread.spawn(.{}, actor_mod.Actor.run, .{&self.actor});
-        self.undo = try UndoWorker.start(gpa, &self.actor, &self.registry, .{ .root = self.root });
+        self.undo = try UndoWorker.start(gpa, &self.actor, &self.registry, .{
+            .root = self.root,
+            // Short deadline: a stuck git call fails its test fast instead of
+            // holding the suite for the 120 s default.
+            .git_timeout_ms = git_test_timeout_ms,
+        });
         self.caller = try inproc.Worker.spawn(gpa, &self.actor, &self.registry, "test-caller");
         return self;
     }
@@ -247,6 +269,13 @@ const Harness = struct {
 
     fn bash(self: *Harness, cmd: []const u8) !ops.BashResult {
         return ops.bash(testing.allocator, self.ws, cmd);
+    }
+
+    /// Run a shadow-repo git call the way the worker builds it.
+    fn git(self: *Harness, args: []const u8) !ops.BashResult {
+        const cmd = try gitCommand(testing.allocator, args);
+        defer testing.allocator.free(cmd);
+        return self.bash(cmd);
     }
 };
 
@@ -401,7 +430,7 @@ test "label with shell metacharacters is sanitized (commit succeeds, message str
     defer res.deinit(testing.allocator);
     try testing.expect(res == .ok);
 
-    const log = try h.bash("git --git-dir=.zygos-shadow --work-tree=. log -1 --format=%s");
+    const log = try h.git("log -1 --format=%s");
     defer testing.allocator.free(log.output);
     try testing.expectEqual(@as(i32, 0), log.exit_code);
     const msg = trimTrailingWs(log.output);
@@ -419,7 +448,7 @@ test ".zygos-shadow/ itself is never tracked nor cleaned" {
     defer cp.deinit(testing.allocator);
     try testing.expect(cp == .ok);
 
-    const ls = try h.bash("git --git-dir=.zygos-shadow --work-tree=. ls-files");
+    const ls = try h.git("ls-files");
     defer testing.allocator.free(ls.output);
     try testing.expectEqual(@as(i32, 0), ls.exit_code);
     try testing.expect(std.mem.indexOf(u8, ls.output, ".zygos-shadow") == null);
@@ -446,4 +475,62 @@ test "no leaks" {
         const und = try h.undoCall();
         und.deinit(testing.allocator);
     }
+}
+
+test "gitCommand: every git call disables terminal prompts and the pager" {
+    const cmd = try gitCommand(testing.allocator, "ls-files");
+    defer testing.allocator.free(cmd);
+    try testing.expect(std.mem.startsWith(u8, cmd, "GIT_TERMINAL_PROMPT=0 git --no-pager "));
+    try testing.expect(std.mem.endsWith(u8, cmd, "ls-files"));
+}
+
+test "a git hook that reads stdin cannot stall checkpoint" {
+    var h = try Harness.init(testing.allocator);
+    defer h.deinit();
+
+    const first = try h.checkpoint("{}");
+    defer first.deinit(testing.allocator);
+    try testing.expect(first == .ok);
+
+    // Git hands pre-commit and friends /dev/null; the fsmonitor hook is run
+    // with whatever stdin git itself has, so it is the one that can block.
+    try ops.writeFile(testing.allocator, h.ws, ".zygos-shadow/fsmonitor.sh", "#!/bin/sh\ncat >/dev/null\n");
+    const config = try h.git("config core.fsmonitor 'sh .zygos-shadow/fsmonitor.sh'");
+    defer testing.allocator.free(config.output);
+    try testing.expectEqual(@as(i32, 0), config.exit_code);
+
+    const held = try ops.HeldStdin.begin();
+    defer held.end();
+
+    const second = try h.checkpoint("{}");
+    defer second.deinit(testing.allocator);
+    if (second != .ok) {
+        std.debug.print("checkpoint failed: a git hook blocked on stdin until the {d} ms deadline\n", .{h.undo.ws.shell_timeout_ms});
+    }
+    try testing.expect(second == .ok);
+}
+
+test "a git call past its deadline fails the handler (fail closed)" {
+    var h = try Harness.init(testing.allocator);
+    defer h.deinit();
+
+    const first = try h.checkpoint("{}");
+    defer first.deinit(testing.allocator);
+    try testing.expect(first == .ok);
+    // Shrink the deadline only now: the first checkpoint needs the full 10 s.
+    h.undo.ws.shell_timeout_ms = 300;
+
+    try ops.writeFile(testing.allocator, h.ws, ".zygos-shadow/hooks/pre-commit", "#!/bin/sh\nsleep 30\n");
+    const chmod = try h.bash("chmod +x .zygos-shadow/hooks/pre-commit");
+    defer testing.allocator.free(chmod.output);
+    try testing.expectEqual(@as(i32, 0), chmod.exit_code);
+
+    const started = ops.monotonicMs();
+    const second = try h.checkpoint("{}");
+    defer second.deinit(testing.allocator);
+    const elapsed_ms = ops.monotonicMs() - started;
+
+    try testing.expect(second == .err);
+    try testing.expectEqualStrings("handler_failed", second.err);
+    try testing.expect(elapsed_ms < git_test_timeout_ms);
 }
