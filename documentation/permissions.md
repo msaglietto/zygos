@@ -25,7 +25,7 @@ Zygos has no accounts, roles in a token, or database row policies. Scope is the 
 | Trigger binding | register / GC | Registrant | Connection-owned bindings die with the connection. Durable bindings survive. |
 | Channel | take | Holder of the access key | Single consumer. Wrong key does not take. |
 | Workspace file | read / write | `zygos::tools::{read_file,write_file}` | Absolute path, empty path, or lexical `..` escape → `PathEscapesWorkspace`. Symlink to an outside target is not rejected. |
-| Shell | execute | `zygos::tools::bash` when policy allows | Policy deny or ask-timeout; local two-minute process-group deadline. Child env contains PATH/HOME/TZ/LANG/TERM/LC_* only. No path jail inside the command. |
+| Shell | execute | `zygos::tools::bash` when policy allows | Policy deny or ask-timeout; local two-minute process-group deadline. Child env contains PATH/HOME/TZ/LANG/TERM/LC_* only; stdin is `/dev/null`, and its output pipe is close-on-exec and forked under the process-wide fork lock, so no concurrent command or MCP server holds it open. No path jail inside the command. |
 | URL | fetch | `zygos::tools::web_fetch` when policy allows | Non-http(s), missing host, non-2xx, oversize, non-text. Literal private/loopback/link-local hosts and localhost names are refused unless `ZYGOS_FETCH_ALLOW_PRIVATE=1`; DNS destinations and redirect targets are not screened. |
 | Search | query | `zygos::tools::web_search` when policy allows and an engine is configured | Unknown engine, missing searxng endpoint, missing brave key, malformed upstream JSON. |
 | Mission | start | CLI caller | Bad brief, unknown provider slug, existing substrate without resume or run-stamp, malformed `.policy`, vault checkpoint failure, or unavailable planning-root lock. |

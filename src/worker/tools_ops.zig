@@ -10,7 +10,9 @@
 //! the kernel invocation timeout independently bounds the bus call.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const c = std.c;
+const fork_guard = @import("fork_guard.zig");
 
 // popen is not used: bash needs an env-scrubbed child (secrets stay out of
 // model-reachable output), and popen offers no env control. libc-backed
@@ -184,6 +186,11 @@ pub fn monotonicMs() i64 {
     return @as(i64, @intCast(ts.sec)) * 1000 + @divTrunc(@as(i64, @intCast(ts.nsec)), std.time.ns_per_ms);
 }
 
+/// Test-only seam, one-shot: `bash` runs and clears it in the parent right
+/// after a successful fork, before closing its pipe write end. Always null in
+/// release builds (the call is compiled out).
+pub var after_fork_hook: std.atomic.Value(?*const fn () void) = .init(null);
+
 pub const BashResult = struct {
     exit_code: i32,
     /// Combined stdout+stderr, truncated at `output_cap`. Owned.
@@ -193,6 +200,10 @@ pub const BashResult = struct {
 /// Run `sh -c command` with cwd = workspace root, stderr folded into stdout.
 /// The child env is the `keepEnvName` allowlist — secrets never ride along.
 /// Child stdin is /dev/null: a reader sees EOF, never the zygos process's stdin.
+/// The output pipe is close-on-exec and forked under `fork_guard.lock`, so a
+/// concurrent command's shell never holds this call's write end and EOF means
+/// this command's own descendants closed it. A zygos started with fd 0, 1 or 2
+/// closed still gets the child's stdio right.
 pub fn bash(gpa: std.mem.Allocator, ws: Workspace, command: []const u8) OpsError!BashResult {
     const quoted_root = try shQuote(gpa, ws.root);
     defer gpa.free(quoted_root);
@@ -205,39 +216,53 @@ pub fn bash(gpa: std.mem.Allocator, ws: Workspace, command: []const u8) OpsError
     const envp = try scrubbedEnv(gpa);
     defer gpa.free(envp);
 
+    // The pipe is close-on-exec and is created and forked under the
+    // process-wide fork lock, so no concurrent fork can hand its write end to
+    // another command's shell (see fork_guard).
+    fork_guard.lock.lock();
     var fds: [2]c.fd_t = undefined;
-    if (pipe(&fds) != 0) return error.ExecFailed;
+    fork_guard.cloexecPipe(&fds) catch {
+        fork_guard.lock.unlock();
+        return error.ExecFailed;
+    };
     // Opened before fork: open() is not on the child's async-signal-safe path.
     const devnull = c.open("/dev/null", .{ .ACCMODE = .RDONLY, .CLOEXEC = true });
     if (devnull < 0) {
+        fork_guard.lock.unlock();
         _ = close(fds[0]);
         _ = close(fds[1]);
         return error.ExecFailed;
     }
     const pid = fork();
     if (pid < 0) {
+        fork_guard.lock.unlock();
         _ = close(fds[0]);
         _ = close(fds[1]);
         _ = close(devnull);
         return error.ExecFailed;
     }
     if (pid == 0) {
-        // Child: only async-signal-safe calls before execve.
+        // Child: only async-signal-safe calls before execve, and it never
+        // touches the fork lock.
         // Only the child sets its group; competing parent/child calls can
         // fail in the child on macOS. Cleanup also kills pid before reap.
         if (setpgid(0, 0) != 0) _exit(127);
         // Read end first: with fd 0 closed at startup pipe() can hand out
         // fds[0] == 0, and closing it after the dup2 would close /dev/null.
         _ = close(fds[0]);
-        // Fail closed: never exec with the inherited stdin.
-        if (dup2(devnull, 0) < 0) _exit(127);
-        _ = dup2(fds[1], 1);
-        _ = dup2(fds[1], 2);
-        _ = close(fds[1]);
+        // Fail closed: never exec with the inherited stdin or a broken stdout.
+        // No close(fds[1]) afterwards: it is close-on-exec and goes away at
+        // execve, and when it landed on fd 1 or 2 moveFd cleared that flag,
+        // so closing it would close the stream just installed.
+        if (!fork_guard.moveFd(devnull, 0)) _exit(127);
+        if (!fork_guard.moveFd(fds[1], 1)) _exit(127);
+        if (!fork_guard.moveFd(fds[1], 2)) _exit(127);
         const argv = [_:null]?[*:0]const u8{ "sh", "-c", full_z.ptr };
         _ = execve("/bin/sh", @ptrCast(&argv), @ptrCast(envp.ptr));
         _exit(127);
     }
+    fork_guard.lock.unlock();
+    if (builtin.is_test) if (after_fork_hook.swap(null, .acq_rel)) |hook| hook();
     _ = close(fds[1]);
     _ = close(devnull);
     defer _ = close(fds[0]);
@@ -555,4 +580,97 @@ test "countLines: empty is zero, a trailing newline is not an extra line" {
     try testing.expectEqual(@as(u64, 1), countLines("alpha"));
     try testing.expectEqual(@as(u64, 3), countLines("alpha\nbeta\ngamma\n"));
     try testing.expectEqual(@as(u64, 3), countLines("alpha\nbeta\ngamma"));
+}
+
+var conc_ws: Workspace = undefined;
+var conc_thread: ?std.Thread = null;
+var conc_t0: i64 = 0;
+var conc_b_out: ?[]u8 = null;
+var conc_b_started: bool = false;
+
+fn concBashB() void {
+    const r = bash(testing.allocator, conc_ws, "touch b-started; i=0; while [ ! -f a-done ] && [ $i -lt 80 ]; do sleep 0.05; i=$((i+1)); done") catch return;
+    conc_b_out = r.output;
+}
+
+fn concHook() void {
+    conc_thread = std.Thread.spawn(.{}, concBashB, .{}) catch return;
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = std.fmt.bufPrintZ(&buf, "{s}/b-started", .{conc_ws.root}) catch return;
+    const give_up = monotonicMs() + 5000;
+    while (monotonicMs() < give_up) {
+        const fd = c.open(path, .{ .ACCMODE = .RDONLY });
+        if (fd >= 0) {
+            _ = close(fd);
+            conc_b_started = true;
+            break;
+        }
+        var no_fds: [0]c.pollfd = .{};
+        _ = c.poll(&no_fds, 0, 5);
+    }
+    conc_t0 = monotonicMs();
+}
+
+test "bash: a concurrent call's child does not hold a short call's output pipe open" {
+    var t = try TestWs.init();
+    defer t.deinit();
+    conc_ws = try t.workspace();
+    conc_thread = null;
+    conc_b_out = null;
+    conc_b_started = false;
+    conc_t0 = 0;
+    after_fork_hook.store(&concHook, .release);
+
+    const a = try bash(testing.allocator, conc_ws, "echo ok");
+    const returned_at = monotonicMs();
+    defer testing.allocator.free(a.output);
+
+    // Release B whatever happens next, so the join below cannot wait out its cap.
+    try writeFile(testing.allocator, conc_ws, "a-done", "");
+    if (conc_thread) |th| th.join();
+    if (conc_b_out) |o| testing.allocator.free(o);
+
+    if (conc_t0 == 0) {
+        std.debug.print("after_fork_hook never ran: the seam is missing from bash\n", .{});
+    }
+    try testing.expect(conc_t0 != 0);
+    if (!conc_b_started) {
+        std.debug.print("concurrent bash call B never started within 5 s; the race was not exercised\n", .{});
+    }
+    try testing.expect(conc_b_started);
+    const waited = returned_at - conc_t0;
+
+    try testing.expectEqual(@as(i32, 0), a.exit_code);
+    try testing.expectEqualStrings("ok\n", a.output);
+    if (waited >= 1000) {
+        std.debug.print("short bash call waited {d} ms for EOF: a concurrent child held its pipe write end\n", .{waited});
+    }
+    try testing.expect(waited < 1000);
+}
+
+var low_fd_ws: Workspace = undefined;
+
+fn lowFdBody() bool {
+    const r = bash(std.heap.page_allocator, low_fd_ws, "echo out; echo err >&2") catch return false;
+    return r.exit_code == 0 and std.mem.eql(u8, r.output, "out\nerr\n");
+}
+
+test "bash: pipe write end landing on fd 1 still becomes the child's stdout" {
+    var t = try TestWs.init();
+    defer t.deinit();
+    low_fd_ws = try t.workspace();
+    try testing.expect(fork_guard.runInChildWithClosed(&.{ 0, 1 }, &lowFdBody));
+}
+
+fn lowFdCdFailureBody() bool {
+    // `cd` runs outside the `( ... ) 2>&1` group, so its diagnostic reaches the
+    // pipe only if the shell's own fd 2 is the pipe write end.
+    const ws = Workspace.init("/zygos-no-such-workspace-root");
+    const r = bash(std.heap.page_allocator, ws, "echo unreachable") catch return false;
+    // bash and dash word the error differently; both name the path.
+    return r.exit_code != 0 and std.mem.indexOf(u8, r.output, "zygos-no-such-workspace-root") != null;
+}
+
+test "bash: pipe write end landing on fd 2 still becomes the shell's stderr (a failing cd reaches the output)" {
+    try testing.expect(fork_guard.runInChildWithClosed(&.{ 0, 2 }, &lowFdCdFailureBody));
 }

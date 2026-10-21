@@ -52,6 +52,7 @@ pub const openai = @import("worker/openai.zig");
 pub const sse = @import("worker/sse.zig");
 pub const tools = @import("worker/tools.zig");
 pub const tools_ops = @import("worker/tools_ops.zig");
+pub const fork_guard = @import("worker/fork_guard.zig");
 pub const trial = @import("worker/trial.zig");
 pub const task = @import("worker/task.zig");
 pub const task_config = @import("worker/task_config.zig");

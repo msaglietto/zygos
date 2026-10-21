@@ -6,6 +6,12 @@ Reconstructed from git history on 2026-09-30. A commit that only added a library
 
 The agent that next changes operator-visible behavior adds the new heading in that same commit.
 
+## [5.1.2] - 2026-10-21
+
+### Fixed
+
+- Two bash commands running at the same time no longer delay each other's result. Before, a command's output pipe could leak into the shell of another command that started in the same instant, and the first command did not finish until that other command exited or hit the two-minute deadline. MCP server pipes no longer leak into bash commands either, and bash pipes no longer leak into a concurrently started MCP server. A zygos started with file descriptor 0, 1 or 2 closed still gives bash commands working stdin, stdout and stderr, and MCP servers working stdin and stdout.
+
 ## [5.1.1] - 2026-10-20
 
 ### Fixed
