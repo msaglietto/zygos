@@ -40,6 +40,9 @@ pub const Options = struct {
     /// SSRF screen escape hatch (ZYGOS_FETCH_ALLOW_PRIVATE=1): allows
     /// loopback/private hosts — localhost stubs, self-hosted mirrors.
     allow_private_hosts: bool = false,
+    /// Redirects web_fetch follows by hand; each hop is screened like the
+    /// original URL. One more refuses with TooManyRedirects.
+    max_redirects: usize = 3,
 };
 
 pub const html = @import("web/html.zig");
@@ -168,27 +171,83 @@ pub fn fetchHostBlocked(url: []const u8) bool {
 // Worker
 // ---------------------------------------------------------------------------
 
+pub const TransportRequest = struct {
+    url: []const u8,
+    headers: []const std.http.Header = &.{},
+    max_bytes: usize,
+    /// Screened addresses to dial, in order. Empty: std.http resolves the host
+    /// itself. The URL's host name still drives TLS verification and `Host`.
+    dial: []const std.Io.net.IpAddress = &.{},
+    /// false: a 3xx comes back as `HttpBody.redirect` instead of being followed.
+    follow_redirects: bool = true,
+};
+
 /// Injection seam for the HTTP leg: unit tests swap in a socket-free fake to
-/// exercise the retry path; real runs use `defaultTransport` (httpGet).
+/// exercise the retry and redirect paths; real runs use `defaultTransport`
+/// (httpGet).
 pub const Transport = *const fn (
     ctx: ?*anyopaque,
     gpa: std.mem.Allocator,
     io: std.Io,
-    url: []const u8,
-    headers: []const std.http.Header,
-    max_bytes: usize,
+    req: TransportRequest,
 ) HttpGetError!HttpBody;
 
 fn defaultTransport(
     ctx: ?*anyopaque,
     gpa: std.mem.Allocator,
     io: std.Io,
-    url: []const u8,
-    headers: []const std.http.Header,
-    max_bytes: usize,
+    req: TransportRequest,
 ) HttpGetError!HttpBody {
     _ = ctx;
-    return httpGet(gpa, io, url, headers, max_bytes);
+    return httpGet(gpa, io, req);
+}
+
+pub const ResolveError = error{ResolveFailed};
+
+/// Injection seam for name resolution: writes the answer into `out` and
+/// returns how many entries it wrote. Every answer must be returned or the
+/// call must fail; silently dropping one would let it escape the screen.
+pub const Resolver = *const fn (
+    ctx: ?*anyopaque,
+    io: std.Io,
+    host: []const u8,
+    port: u16,
+    out: []std.Io.net.IpAddress,
+) ResolveError!usize;
+
+fn defaultResolver(
+    ctx: ?*anyopaque,
+    io: std.Io,
+    host: []const u8,
+    port: u16,
+    out: []std.Io.net.IpAddress,
+) ResolveError!usize {
+    _ = ctx;
+    const HostName = std.Io.net.HostName;
+    const name = HostName.init(host) catch return error.ResolveFailed;
+    var buf: [32]HostName.LookupResult = undefined;
+    var queue: std.Io.Queue(HostName.LookupResult) = .init(&buf);
+    var lookup = io.async(HostName.lookup, .{ name, io, &queue, HostName.LookupOptions{ .port = port } });
+    var n: usize = 0;
+    var overflow = false;
+    while (queue.getOne(io)) |result| switch (result) {
+        .address => |addr| {
+            if (n < out.len) {
+                out[n] = addr;
+                n += 1;
+            } else overflow = true;
+        },
+        .canonical_name => {},
+    } else |err| switch (err) {
+        error.Canceled => {
+            lookup.cancel(io) catch {};
+            return error.ResolveFailed;
+        },
+        error.Closed => {},
+    }
+    lookup.await(io) catch return error.ResolveFailed;
+    if (overflow or n == 0) return error.ResolveFailed;
+    return n;
 }
 
 pub const WebToolsWorker = struct {
@@ -201,6 +260,9 @@ pub const WebToolsWorker = struct {
     search_retry_delay_ms: u64,
     transport: Transport = defaultTransport,
     transport_ctx: ?*anyopaque = null,
+    resolver: Resolver = defaultResolver,
+    resolver_ctx: ?*anyopaque = null,
+    max_redirects: usize,
     /// SSRF screen escape hatch (ZYGOS_FETCH_ALLOW_PRIVATE=1): localhost
     /// stubs and self-hosted mirrors need it; default is screen-on.
     allow_private_hosts: bool = false,
@@ -231,6 +293,7 @@ pub const WebToolsWorker = struct {
             .max_text_bytes = opts.max_text_bytes,
             .search_retry_max = opts.search_retry_max,
             .search_retry_delay_ms = opts.search_retry_delay_ms,
+            .max_redirects = opts.max_redirects,
             .search = null,
         };
         errdefer self.worker.stop();
@@ -273,7 +336,7 @@ pub const WebToolsWorker = struct {
         if (!self.allow_private_hosts and fetchHostBlocked(url))
             return errorReply(arena, "PrivateHost");
 
-        const body = self.transport(self.transport_ctx, self.gpa, self.io, url, &.{}, self.max_fetch_bytes) catch |err| switch (err) {
+        const body = self.transport(self.transport_ctx, self.gpa, self.io, .{ .url = url, .max_bytes = self.max_fetch_bytes }) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.HttpFailed => {
                 log.warn("web_fetch {s}: transport failure", .{url});
@@ -287,6 +350,7 @@ pub const WebToolsWorker = struct {
         };
         defer self.gpa.free(body.bytes);
         defer self.gpa.free(body.content_type);
+        defer if (body.redirect) |r| self.gpa.free(r);
 
         if (!isTextContentType(body.content_type)) return errorReply(arena, "NonTextContent");
 
@@ -327,7 +391,7 @@ pub const WebToolsWorker = struct {
 
         var attempt: usize = 0;
         const body = while (true) {
-            break self.transport(self.transport_ctx, self.gpa, self.io, url, headers, self.max_fetch_bytes) catch |err| switch (err) {
+            break self.transport(self.transport_ctx, self.gpa, self.io, .{ .url = url, .headers = headers, .max_bytes = self.max_fetch_bytes }) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.HttpFailed => {
                     log.warn("web_search \"{s}\": transport failure", .{query});
@@ -354,6 +418,7 @@ pub const WebToolsWorker = struct {
         };
         defer self.gpa.free(body.bytes);
         defer self.gpa.free(body.content_type);
+        defer if (body.redirect) |r| self.gpa.free(r);
 
         const results = switch (sc.engine) {
             .brave => parseBraveResults(arena, body.bytes),
@@ -376,6 +441,10 @@ const HttpGetError = error{ OutOfMemory, HttpFailed, NonTextContent } || error{H
 const HttpBody = struct {
     bytes: []u8,
     content_type: []u8,
+    /// Raw `Location` of a 3xx the transport did not follow (empty when the
+    /// response carried none). Set only when `follow_redirects` was false; then
+    /// `bytes` and `content_type` are empty. All three are gpa-owned.
+    redirect: ?[]u8 = null,
 };
 
 /// Sentinel: `error.HttpStatus` is raised with the numeric code stashed in
@@ -386,25 +455,53 @@ threadlocal var last_http_status: u16 = 0;
 fn httpGet(
     gpa: std.mem.Allocator,
     io: std.Io,
-    url: []const u8,
-    headers: []const std.http.Header,
-    max_bytes: usize,
+    request: TransportRequest,
 ) HttpGetError!HttpBody {
-    const uri = std.Uri.parse(url) catch return error.HttpFailed;
+    const uri = std.Uri.parse(request.url) catch return error.HttpFailed;
 
+    // Pooled connections (pinned or not) are released by `http_req.deinit` and
+    // destroyed by `client.deinit`.
     var client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer client.deinit();
 
-    var req = client.request(.GET, uri, .{
-        .extra_headers = headers,
-        .redirect_behavior = @enumFromInt(3),
-    }) catch return error.HttpFailed;
-    defer req.deinit();
+    const pinned: ?*std.http.Client.Connection = if (request.dial.len == 0)
+        null
+    else
+        try dialPinned(&client, io, uri, request.dial);
 
-    req.sendBodiless() catch return error.HttpFailed;
+    const redirect_behavior: std.http.Client.Request.RedirectBehavior =
+        if (request.follow_redirects) @enumFromInt(3) else .unhandled;
+    var http_req = client.request(.GET, uri, .{
+        .extra_headers = request.headers,
+        .redirect_behavior = redirect_behavior,
+        .connection = pinned,
+    }) catch {
+        if (pinned) |c| {
+            c.closing = true;
+            client.connection_pool.release(c, io);
+        }
+        return error.HttpFailed;
+    };
+    defer http_req.deinit();
+
+    http_req.sendBodiless() catch return error.HttpFailed;
 
     var redirect_buf: [8 * 1024]u8 = undefined;
-    var response = req.receiveHead(&redirect_buf) catch return error.HttpFailed;
+    var response = http_req.receiveHead(&redirect_buf) catch return error.HttpFailed;
+
+    // Same classification std.http uses when it follows: 3xx except 304.
+    if (!request.follow_redirects and response.head.status.class() == .redirect and
+        response.head.status != .not_modified)
+    {
+        const location = try gpa.dupe(u8, response.head.location orelse "");
+        errdefer gpa.free(location);
+        const bytes = try gpa.alloc(u8, 0);
+        errdefer gpa.free(bytes);
+        const ct = try gpa.alloc(u8, 0);
+        // The redirect body is never read; closing keeps `deinit` from draining it.
+        http_req.connection.?.closing = true;
+        return .{ .bytes = bytes, .content_type = ct, .redirect = location };
+    }
 
     if (response.head.status.class() != .success) {
         last_http_status = @intFromEnum(response.head.status);
@@ -423,16 +520,86 @@ fn httpGet(
     while (true) {
         const n = reader.readSliceShort(&chunk) catch return error.HttpFailed;
         if (n == 0) break;
-        const take = @min(n, max_bytes -| list.items.len);
+        const take = @min(n, request.max_bytes -| list.items.len);
         if (take > 0) list.appendSlice(gpa, chunk[0..take]) catch return error.OutOfMemory;
         // Past the cap we stop reading further bytes into the buffer; the
         // connection is dropped on req.deinit.
-        if (list.items.len >= max_bytes) break;
+        if (list.items.len >= request.max_bytes) break;
     }
 
     return .{
         .bytes = list.toOwnedSlice(gpa) catch return error.OutOfMemory,
         .content_type = ct,
+    };
+}
+
+/// Opens the connection to the first of `dial` that accepts. std.http would
+/// otherwise resolve the URL's host again at connect time, which lets a second
+/// DNS answer bypass the screen. The URL's own host stays the TLS server name,
+/// certificate subject and pool key. `dial` entries are numeric, so the lookup
+/// std runs on them is a parse, not a DNS query.
+fn dialPinned(
+    client: *std.http.Client,
+    io: std.Io,
+    uri: std.Uri,
+    dial: []const std.Io.net.IpAddress,
+) error{ HttpFailed, OutOfMemory }!*std.http.Client.Connection {
+    const HostName = std.Io.net.HostName;
+    const protocol = std.http.Client.Protocol.fromUri(uri) orelse return error.HttpFailed;
+    var host_buf: [HostName.max_len]u8 = undefined;
+    const real = uri.getHost(&host_buf) catch return error.HttpFailed;
+    const port: u16 = uri.port orelse switch (protocol) {
+        .plain => 80,
+        .tls => 443,
+    };
+    // A bracketed IPv6 literal verifies as the bare address.
+    var verify = real.bytes;
+    if (verify.len >= 2 and verify[0] == '[' and verify[verify.len - 1] == ']')
+        verify = verify[1 .. verify.len - 1];
+
+    if (protocol == .tls) try primeCaBundle(client, io);
+
+    for (dial) |addr| {
+        var text_buf: [48]u8 = undefined;
+        const text = ipText(&text_buf, addr);
+        return client.connectTcpOptions(.{
+            .host = .{ .bytes = text },
+            .port = port,
+            .protocol = protocol,
+            .proxied_host = .{ .bytes = verify },
+            .proxied_port = port,
+        }) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => continue,
+        };
+    }
+    return error.HttpFailed;
+}
+
+/// `Client.request` loads the CA bundle and stamps `client.now` only when it
+/// opens the connection itself. A pre-opened connection needs both first: TLS
+/// setup asserts `now` and reads the bundle.
+fn primeCaBundle(client: *std.http.Client, io: std.Io) error{HttpFailed}!void {
+    if (comptime std.http.Client.disable_tls) return error.HttpFailed;
+    var bundle: std.crypto.Certificate.Bundle = .empty;
+    defer bundle.deinit(client.allocator);
+    const now = std.Io.Clock.real.now(io);
+    bundle.rescan(client.allocator, io, now) catch return error.HttpFailed;
+    client.ca_bundle_lock.lock(io) catch return error.HttpFailed;
+    defer client.ca_bundle_lock.unlock(io);
+    client.now = now;
+    std.mem.swap(std.crypto.Certificate.Bundle, &client.ca_bundle, &bundle);
+}
+
+/// Canonical numeric text without a port; IPv6 as eight hex groups.
+fn ipText(buf: *[48]u8, addr: std.Io.net.IpAddress) []const u8 {
+    return switch (addr) {
+        .ip4 => |a| std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}", .{ a.bytes[0], a.bytes[1], a.bytes[2], a.bytes[3] }) catch unreachable,
+        .ip6 => |a| blk: {
+            var g: [8]u16 = undefined;
+            for (&g, 0..) |*w, i| w.* = std.mem.readInt(u16, a.bytes[i * 2 ..][0..2], .big);
+            break :blk std.fmt.bufPrint(buf, "{x}:{x}:{x}:{x}:{x}:{x}:{x}:{x}", .{ g[0], g[1], g[2], g[3], g[4], g[5], g[6], g[7] }) catch unreachable;
+        },
     };
 }
 
@@ -579,14 +746,10 @@ test "web_fetch: private host refuses with PrivateHost before the transport; the
             ctx: ?*anyopaque,
             gpa: std.mem.Allocator,
             io: std.Io,
-            url: []const u8,
-            headers: []const std.http.Header,
-            max_bytes: usize,
+            req: TransportRequest,
         ) HttpGetError!HttpBody {
             _ = io;
-            _ = url;
-            _ = headers;
-            _ = max_bytes;
+            _ = req;
             const self: *@This() = @ptrCast(@alignCast(ctx.?));
             self.calls += 1;
             return .{
@@ -623,6 +786,20 @@ const fixture_brave =
     \\]}}
 ;
 
+fn offlineResolver(
+    ctx: ?*anyopaque,
+    io: std.Io,
+    host: []const u8,
+    port: u16,
+    out: []std.Io.net.IpAddress,
+) ResolveError!usize {
+    _ = ctx;
+    _ = io;
+    _ = host;
+    out[0] = .{ .ip4 = .{ .bytes = .{ 93, 184, 216, 34 }, .port = port } };
+    return 1;
+}
+
 const Harness = struct {
     registry: inproc.Registry,
     actor: actor_mod.Actor,
@@ -641,6 +818,8 @@ const Harness = struct {
         self.kernel = try std.Thread.spawn(.{}, actor_mod.Actor.run, .{&self.actor});
         self.caller = try inproc.Worker.spawn(gpa, &self.actor, &self.registry, "test-caller");
         self.worker = try WebToolsWorker.start(gpa, &self.actor, &self.registry, self.io_backing.io(), opts);
+        // No test may reach real DNS: every name answers with one public address.
+        self.worker.resolver = offlineResolver;
         return self;
     }
 
@@ -716,14 +895,10 @@ const FakeTransport = struct {
         ctx: ?*anyopaque,
         gpa: std.mem.Allocator,
         io: std.Io,
-        url: []const u8,
-        headers: []const std.http.Header,
-        max_bytes: usize,
+        req: TransportRequest,
     ) HttpGetError!HttpBody {
         _ = io;
-        _ = url;
-        _ = headers;
-        _ = max_bytes;
+        _ = req;
         const self: *FakeTransport = @ptrCast(@alignCast(ctx.?));
         const step = self.script[@min(self.calls, self.script.len - 1)];
         self.calls += 1;
@@ -791,14 +966,10 @@ test "fetch rides the transport seam" {
             ctx: ?*anyopaque,
             gpa: std.mem.Allocator,
             io: std.Io,
-            url: []const u8,
-            headers: []const std.http.Header,
-            max_bytes: usize,
+            req: TransportRequest,
         ) HttpGetError!HttpBody {
             _ = io;
-            _ = url;
-            _ = headers;
-            _ = max_bytes;
+            _ = req;
             const self: *@This() = @ptrCast(@alignCast(ctx.?));
             self.calls += 1;
             return .{
