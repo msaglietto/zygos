@@ -5,6 +5,10 @@
 //! (html/URL/JSON) is fixture-tested; the HTTP leg compiles but is never
 //! exercised by `zig build test` — bus tests fail closed on invalid input
 //! before any socket opens.
+//!
+//! `web_fetch` screens the URL, every redirect hop (followed here, never by
+//! std.http) and every address a host name resolves to, then dials only the
+//! addresses it screened.
 
 const std = @import("std");
 const jsonx = @import("../worker/jsonx.zig");
@@ -37,8 +41,9 @@ pub const Options = struct {
     /// get one polite retry; every other status still fails closed at once.
     search_retry_max: usize = 1,
     search_retry_delay_ms: u64 = 1100,
-    /// SSRF screen escape hatch (ZYGOS_FETCH_ALLOW_PRIVATE=1): allows
-    /// loopback/private hosts — localhost stubs, self-hosted mirrors.
+    /// SSRF screen escape hatch (ZYGOS_FETCH_ALLOW_PRIVATE=1): bypasses the
+    /// whole screen (literal, DNS answers, redirect hops) — localhost stubs,
+    /// self-hosted mirrors.
     allow_private_hosts: bool = false,
     /// Redirects web_fetch follows by hand; each hop is screened like the
     /// original URL. One more refuses with TooManyRedirects.
@@ -62,30 +67,64 @@ pub const ValidateError = error{InvalidUrl};
 // Pure layer
 // ---------------------------------------------------------------------------
 
-/// https/http only. Rejects file:, ftp:, and anything Uri.parse rejects.
+/// https/http only. Rejects file:, ftp:, and anything Uri.parse rejects. Every
+/// hop and both screen modes pass through here, so the host bound lives here:
+/// `std.Uri.getHost` treats an encoded host longer than `HostName.max_len` as
+/// unreachable and aborts the process, and Uri.parse does not bound it.
 pub fn validateUrl(url: []const u8) ValidateError!void {
     const uri = std.Uri.parse(url) catch return error.InvalidUrl;
     if (!(std.ascii.eqlIgnoreCase(uri.scheme, "http") or std.ascii.eqlIgnoreCase(uri.scheme, "https")))
         return error.InvalidUrl;
     // A fetchable URL needs a host; bare "http:" / scheme-only garbage fails.
-    if (uri.host == null) return error.InvalidUrl;
+    const host = uri.host orelse return error.InvalidUrl;
+    // The decoded host is never longer than its encoded text.
+    const text = switch (host) {
+        .raw => |s| s,
+        .percent_encoded => |s| s,
+    };
+    if (text.len > std.Io.net.HostName.max_len) return error.InvalidUrl;
 }
 
 // ---------------------------------------------------------------------------
 // SSRF screen (fetch-time; validateUrl above is scheme admission only)
 // ---------------------------------------------------------------------------
 
-/// Default-refused host classes: loopback (name and literal), link-local,
-/// private ranges, unspecified, multicast, the RFC 6598 shared range, and
-/// their IPv6 forms (incl. v4-mapped). Prompt-injected content must not
-/// aim web_fetch at internal services or cloud metadata. DNS names other
-/// than localhost pass — resolve-then-rebind is documented out of scope.
+/// Literal screen on the URL's host text. Default-refused classes: loopback
+/// (name and literal), link-local, private ranges, unspecified, multicast, the
+/// RFC 6598 shared range, `192.0.0.0/24` and `198.18.0.0/15`, and their IPv6
+/// forms (v4-mapped, NAT64 `64:ff9b::/96` and 6to4 `2002::/16` included), plus
+/// IPv6 `0000::/8`, local-use NAT64 `64:ff9b:1::/48` and discard `100::/64`.
+/// Prompt-injected content must not aim
+/// web_fetch at internal services or cloud metadata. A DNS name other than
+/// localhost passes here: `fetchHandler` resolves it and screens every answer
+/// with `addressBlocked`, and the connection dials the screened addresses, so
+/// a second DNS answer cannot redirect it.
 pub fn hostBlocked(host_text: []const u8) bool {
     // IPv6 literals arrive bracketed in the authority: [::1], [fe80::1].
-    if (host_text.len >= 2 and host_text[0] == '[' and host_text[host_text.len - 1] == ']')
-        return v6Blocked(host_text[1 .. host_text.len - 1]);
+    if (unbracket(host_text)) |inner| return v6Blocked(inner);
     if (parseIpv4(host_text)) |b| return isBlockedV4(b[0], b[1], b[2], b[3]);
     return isLocalName(host_text);
+}
+
+/// The one classifier for resolved answers and literals alike. IPv6 embeds
+/// IPv4 in several forms, each screened as the embedded address: v4-mapped
+/// `::ffff:0:0/96`, NAT64 `64:ff9b::/96` and 6to4 `2002::/16`.
+pub fn addressBlocked(addr: std.Io.net.IpAddress) bool {
+    return switch (addr) {
+        .ip4 => |a| isBlockedV4(a.bytes[0], a.bytes[1], a.bytes[2], a.bytes[3]),
+        .ip6 => |a| v6BytesBlocked(a.bytes),
+    };
+}
+
+/// The address inside a bracketed IPv6 authority host (`[::1]`), else null.
+fn unbracket(host: []const u8) ?[]const u8 {
+    if (host.len >= 2 and host[0] == '[' and host[host.len - 1] == ']') return host[1 .. host.len - 1];
+    return null;
+}
+
+/// Port a URL without an explicit one connects to.
+fn defaultPort(scheme: []const u8) u16 {
+    return if (std.ascii.eqlIgnoreCase(scheme, "https")) 443 else 80;
 }
 
 fn isLocalName(name: []const u8) bool {
@@ -95,13 +134,13 @@ fn isLocalName(name: []const u8) bool {
 }
 
 fn isBlockedV4(a: u8, b: u8, c: u8, d: u8) bool {
-    _ = c;
     _ = d;
     return switch (a) {
         0, 10, 127 => true, // this-network, private, loopback
         169 => b == 254, // link-local 169.254.0.0/16 (incl. metadata 169.254.169.254)
         172 => b >= 16 and b <= 31, // private 172.16.0.0/12
-        192 => b == 168, // private 192.168.0.0/16
+        192 => b == 168 or (b == 0 and c == 0), // private 192.168.0.0/16, IETF protocol 192.0.0.0/24
+        198 => b == 18 or b == 19, // benchmarking 198.18.0.0/15
         100 => b >= 64 and b <= 127, // RFC 6598 shared
         224...255 => true, // multicast + reserved
         else => false,
@@ -130,29 +169,39 @@ fn parseIpv4(s: []const u8) ?[4]u8 {
 }
 
 fn v6Blocked(s: []const u8) bool {
-    if (s.len == 0) return true;
-    if (std.mem.eql(u8, s, "::1") or std.mem.eql(u8, s, "::")) return true;
-    // v4-mapped ::ffff:a.b.c.d — screen the embedded v4.
-    if (std.mem.startsWith(u8, s, "::ffff:")) {
-        if (parseIpv4(s["::ffff:".len..])) |b| return isBlockedV4(b[0], b[1], b[2], b[3]);
-        return true; // unparseable mapped form: fail closed
-    }
-    // fe80::/10 (fe8x-febx), fc00::/7 (fc/fd), ff00::/8, and any other
-    // "::"-prefixed special form — conservative fail closed.
-    if (startsWithHex(s, "fe8") or startsWithHex(s, "fe9") or
-        startsWithHex(s, "fea") or startsWithHex(s, "feb")) return true;
-    if (startsWithHex(s, "fc") or startsWithHex(s, "fd")) return true;
-    if (startsWithHex(s, "ff")) return true;
-    if (std.mem.startsWith(u8, s, "::")) return true;
-    return false;
+    const addr = std.Io.net.Ip6Address.parse(s, 0) catch return true; // unparseable: fail closed
+    return v6BytesBlocked(addr.bytes);
 }
 
-fn startsWithHex(s: []const u8, prefix: []const u8) bool {
-    if (s.len < prefix.len) return false;
-    for (s[0..prefix.len], prefix) |a, b| {
-        if (std.ascii.toLower(a) != std.ascii.toLower(b)) return false;
-    }
-    return true;
+fn v6BytesBlocked(b: [16]u8) bool {
+    const embedded = struct {
+        fn blocked(v4: *const [4]u8) bool {
+            return isBlockedV4(v4[0], v4[1], v4[2], v4[3]);
+        }
+    }.blocked;
+    // ::ffff:0:0/96 v4-mapped.
+    if (std.mem.allEqual(u8, b[0..10], 0) and b[10] == 0xff and b[11] == 0xff)
+        return embedded(b[12..16]);
+    // 64:ff9b::/96 NAT64 well-known prefix. Both embedded forms come before
+    // the 0000::/8 refusal below, which would otherwise take a public embedded
+    // address along with them.
+    if (b[0] == 0x00 and b[1] == 0x64 and b[2] == 0xff and b[3] == 0x9b and
+        std.mem.allEqual(u8, b[4..12], 0)) return embedded(b[12..16]);
+    // 64:ff9b:1::/48 local-use NAT64 (RFC 8215): operator-chosen embedding.
+    if (b[0] == 0x00 and b[1] == 0x64 and b[2] == 0xff and b[3] == 0x9b and
+        b[4] == 0x00 and b[5] == 0x01) return true;
+    // 0000::/8: unspecified, loopback, v4-compatible, SIIT ::ffff:0:0:0/96 and
+    // every other literal that opens with a zero byte.
+    if (b[0] == 0x00) return true;
+    // 100::/64 discard-only.
+    if (b[0] == 0x01 and b[1] == 0x00 and std.mem.allEqual(u8, b[2..8], 0)) return true;
+    // 2002::/16 6to4.
+    if (b[0] == 0x20 and b[1] == 0x02) return embedded(b[2..6]);
+    if (b[0] == 0xfe and (b[1] & 0xc0) == 0x80) return true; // fe80::/10 link-local
+    if (b[0] == 0xfe and (b[1] & 0xc0) == 0xc0) return true; // fec0::/10 site-local
+    if ((b[0] & 0xfe) == 0xfc) return true; // fc00::/7 unique-local
+    if (b[0] == 0xff) return true; // ff00::/8 multicast
+    return false;
 }
 
 /// True when `url`'s host class is refused by the screen. Unparseable or
@@ -165,6 +214,51 @@ pub fn fetchHostBlocked(url: []const u8) bool {
         .percent_encoded => |s| s,
     };
     return hostBlocked(text);
+}
+
+const ScreenError = error{ PrivateHost, ResolveFailed };
+
+/// Most addresses one host may resolve to; a longer answer is refused rather
+/// than truncated, because a dropped address is an unscreened one.
+const dial_max = 32;
+
+const max_location_bytes = 8 * 1024;
+
+/// Resolves a raw `Location` against the hop that issued it and returns the
+/// next URL without its fragment. The result is not yet admitted: the hop loop
+/// runs `validateUrl` and the screen on it like on the original URL.
+fn resolveRedirect(
+    arena: std.mem.Allocator,
+    base_url: []const u8,
+    location: []const u8,
+) error{ OutOfMemory, InvalidRedirect }![]const u8 {
+    if (location.len == 0 or location.len > max_location_bytes) return error.InvalidRedirect;
+    // resolveInPlace falls back to reading a malformed absolute URI such as
+    // "http://" as a relative path; a scheme-prefixed Location must parse whole.
+    if (hasScheme(location)) _ = std.Uri.parse(location) catch return error.InvalidRedirect;
+    const base = std.Uri.parse(base_url) catch return error.InvalidRedirect;
+    // resolveInPlace copies nothing itself: the Location sits at the front of
+    // the buffer and a merged path is built after it.
+    const buf = try arena.alloc(u8, location.len * 2 + base_url.len + 8);
+    @memcpy(buf[0..location.len], location);
+    var aux: []u8 = buf;
+    const next = base.resolveInPlace(location.len, &aux) catch return error.InvalidRedirect;
+    return std.fmt.allocPrint(arena, "{f}", .{next.fmt(.{
+        .scheme = true,
+        .authentication = true,
+        .authority = true,
+        .path = true,
+        .query = true,
+    })});
+}
+
+fn hasScheme(s: []const u8) bool {
+    const colon = std.mem.indexOfScalar(u8, s, ':') orelse return false;
+    if (colon == 0 or !std.ascii.isAlphabetic(s[0])) return false;
+    for (s[1..colon]) |c| {
+        if (!(std.ascii.isAlphanumeric(c) or c == '+' or c == '-' or c == '.')) return false;
+    }
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -225,9 +319,13 @@ fn defaultResolver(
     _ = ctx;
     const HostName = std.Io.net.HostName;
     const name = HostName.init(host) catch return error.ResolveFailed;
-    var buf: [32]HostName.LookupResult = undefined;
+    var buf: [dial_max]HostName.LookupResult = undefined;
     var queue: std.Io.Queue(HostName.LookupResult) = .init(&buf);
-    var lookup = io.async(HostName.lookup, .{ name, io, &queue, HostName.LookupOptions{ .port = port } });
+    // `async` may run the lookup inline, and a lookup that puts more answers
+    // than the queue holds then blocks with no consumer. The drain loop below
+    // has to run beside it, so an Io that cannot is a failed resolve.
+    var lookup = io.concurrent(HostName.lookup, .{ name, io, &queue, HostName.LookupOptions{ .port = port } }) catch
+        return error.ResolveFailed;
     var n: usize = 0;
     var overflow = false;
     while (queue.getOne(io)) |result| switch (result) {
@@ -241,6 +339,9 @@ fn defaultResolver(
     } else |err| switch (err) {
         error.Canceled => {
             lookup.cancel(io) catch {};
+            // The failure is ours to report, but the caller's cancelation
+            // request must still be seen at its next cancelation point.
+            io.recancel();
             return error.ResolveFailed;
         },
         error.Closed => {},
@@ -263,8 +364,9 @@ pub const WebToolsWorker = struct {
     resolver: Resolver = defaultResolver,
     resolver_ctx: ?*anyopaque = null,
     max_redirects: usize,
-    /// SSRF screen escape hatch (ZYGOS_FETCH_ALLOW_PRIVATE=1): localhost
-    /// stubs and self-hosted mirrors need it; default is screen-on.
+    /// SSRF screen escape hatch (ZYGOS_FETCH_ALLOW_PRIVATE=1): bypasses the
+    /// whole screen (literal, DNS answers, redirect hops) — localhost stubs,
+    /// self-hosted mirrors. Default is screen-on.
     allow_private_hosts: bool = false,
     /// Owned deep copy of search config, or null when search is unconfigured.
     search: ?OwnedSearch,
@@ -294,6 +396,7 @@ pub const WebToolsWorker = struct {
             .search_retry_max = opts.search_retry_max,
             .search_retry_delay_ms = opts.search_retry_delay_ms,
             .max_redirects = opts.max_redirects,
+            .allow_private_hosts = opts.allow_private_hosts,
             .search = null,
         };
         errdefer self.worker.stop();
@@ -328,29 +431,64 @@ pub const WebToolsWorker = struct {
         const obj = try parseObject(arena, request_json);
         const url = strField(obj, "url") orelse return error.Failed;
 
-        validateUrl(url) catch return errorReply(arena, "InvalidUrl");
+        // Each hop is screened like the original URL and fetched with the
+        // transport's own redirect handling off, so std.http never follows a
+        // Location this worker has not seen. The escape hatch
+        // (ZYGOS_FETCH_ALLOW_PRIVATE=1) skips the screen but still hand-follows
+        // under the same cap.
+        var current: []const u8 = url;
+        var redirects: usize = 0;
+        const body = while (true) {
+            validateUrl(current) catch |err| switch (err) {
+                error.InvalidUrl => {
+                    if (redirects > 0) log.warn("web_fetch {s}: invalid redirect target", .{current});
+                    return errorReply(arena, if (redirects == 0) "InvalidUrl" else "InvalidRedirect");
+                },
+            };
 
-        // SSRF screen: private/loopback/link-local hosts refuse (structured,
-        // fail closed) unless the operator allowed them (localhost stubs,
-        // self-hosted mirrors — ZYGOS_FETCH_ALLOW_PRIVATE=1).
-        if (!self.allow_private_hosts and fetchHostBlocked(url))
-            return errorReply(arena, "PrivateHost");
+            var dial_buf: [dial_max]std.Io.net.IpAddress = undefined;
+            const dial: []const std.Io.net.IpAddress = if (self.allow_private_hosts)
+                &.{}
+            else
+                self.screenDial(current, &dial_buf) catch |err| {
+                    log.warn("web_fetch {s}: refused ({s}) at redirect {d}", .{ current, @errorName(err), redirects });
+                    return errorReply(arena, @errorName(err));
+                };
 
-        const body = self.transport(self.transport_ctx, self.gpa, self.io, .{ .url = url, .max_bytes = self.max_fetch_bytes }) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.HttpFailed => {
-                log.warn("web_fetch {s}: transport failure", .{url});
-                return errorReply(arena, "HttpFailed");
-            },
-            error.NonTextContent => return errorReply(arena, "NonTextContent"),
-            error.HttpStatus => {
-                log.warn("web_fetch {s}: HTTP {d}", .{ url, last_http_status });
-                return statusReply(arena);
-            },
+            const hop_reply = self.transport(self.transport_ctx, self.gpa, self.io, .{
+                .url = current,
+                .max_bytes = self.max_fetch_bytes,
+                .dial = dial,
+                .follow_redirects = false,
+            }) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.HttpFailed => {
+                    log.warn("web_fetch {s}: transport failure", .{current});
+                    return errorReply(arena, "HttpFailed");
+                },
+                error.NonTextContent => return errorReply(arena, "NonTextContent"),
+                error.HttpStatus => {
+                    log.warn("web_fetch {s}: HTTP {d}", .{ current, last_http_status });
+                    return statusReply(arena);
+                },
+            };
+            const location = hop_reply.redirect orelse break hop_reply;
+            defer self.freeBody(hop_reply);
+
+            if (redirects >= self.max_redirects) {
+                log.warn("web_fetch {s}: redirect limit {d} exceeded", .{ current, self.max_redirects });
+                return errorReply(arena, "TooManyRedirects");
+            }
+            current = resolveRedirect(arena, current, location) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.InvalidRedirect => {
+                    log.warn("web_fetch {s}: unusable redirect Location", .{current});
+                    return errorReply(arena, "InvalidRedirect");
+                },
+            };
+            redirects += 1;
         };
-        defer self.gpa.free(body.bytes);
-        defer self.gpa.free(body.content_type);
-        defer if (body.redirect) |r| self.gpa.free(r);
+        defer self.freeBody(body);
 
         if (!isTextContentType(body.content_type)) return errorReply(arena, "NonTextContent");
 
@@ -364,6 +502,45 @@ pub const WebToolsWorker = struct {
             json.fmt(converted.text, .{}),
             converted.truncated,
         });
+    }
+
+    fn freeBody(self: *WebToolsWorker, body: HttpBody) void {
+        self.gpa.free(body.bytes);
+        self.gpa.free(body.content_type);
+        if (body.redirect) |r| self.gpa.free(r);
+    }
+
+    /// Addresses the transport may dial for `url`: the literal itself, or every
+    /// resolved answer. Any blocked address refuses the whole URL, and a name
+    /// that does not resolve refuses too, so nothing is left for std.http to
+    /// resolve again.
+    fn screenDial(
+        self: *WebToolsWorker,
+        url: []const u8,
+        out: *[dial_max]std.Io.net.IpAddress,
+    ) ScreenError![]const std.Io.net.IpAddress {
+        if (fetchHostBlocked(url)) return error.PrivateHost;
+        const uri = std.Uri.parse(url) catch return error.PrivateHost;
+        const port: u16 = uri.port orelse defaultPort(uri.scheme);
+        var host_buf: [std.Io.net.HostName.max_len]u8 = undefined;
+        // The decoded host is the one std.http connects to; `%31%32%37.0.0.1`
+        // is 127.0.0.1 only after decoding, so it is screened again here.
+        const host = (uri.getHost(&host_buf) catch return error.ResolveFailed).bytes;
+        if (hostBlocked(host)) return error.PrivateHost;
+
+        var n: usize = 1;
+        if (unbracket(host)) |inner| {
+            out[0] = std.Io.net.IpAddress.parseIp6(inner, port) catch return error.PrivateHost;
+        } else if (parseIpv4(host)) |b| {
+            out[0] = .{ .ip4 = .{ .bytes = b, .port = port } };
+        } else {
+            n = self.resolver(self.resolver_ctx, self.io, host, port, out) catch return error.ResolveFailed;
+            if (n == 0 or n > out.len) return error.ResolveFailed;
+        }
+        for (out[0..n]) |addr| {
+            if (addressBlocked(addr)) return error.PrivateHost;
+        }
+        return out[0..n];
     }
 
     fn searchHandler(ctx: ?*anyopaque, arena: std.mem.Allocator, request_json: []const u8) error{ Failed, OutOfMemory }![]const u8 {
@@ -416,9 +593,7 @@ pub const WebToolsWorker = struct {
                 },
             };
         };
-        defer self.gpa.free(body.bytes);
-        defer self.gpa.free(body.content_type);
-        defer if (body.redirect) |r| self.gpa.free(r);
+        defer self.freeBody(body);
 
         const results = switch (sc.engine) {
             .brave => parseBraveResults(arena, body.bytes),
@@ -547,15 +722,10 @@ fn dialPinned(
     const HostName = std.Io.net.HostName;
     const protocol = std.http.Client.Protocol.fromUri(uri) orelse return error.HttpFailed;
     var host_buf: [HostName.max_len]u8 = undefined;
-    const real = uri.getHost(&host_buf) catch return error.HttpFailed;
-    const port: u16 = uri.port orelse switch (protocol) {
-        .plain => 80,
-        .tls => 443,
-    };
+    const url_host = uri.getHost(&host_buf) catch return error.HttpFailed;
+    const port: u16 = uri.port orelse defaultPort(uri.scheme);
     // A bracketed IPv6 literal verifies as the bare address.
-    var verify = real.bytes;
-    if (verify.len >= 2 and verify[0] == '[' and verify[verify.len - 1] == ']')
-        verify = verify[1 .. verify.len - 1];
+    const tls_name = unbracket(url_host.bytes) orelse url_host.bytes;
 
     if (protocol == .tls) try primeCaBundle(client, io);
 
@@ -566,10 +736,15 @@ fn dialPinned(
             .host = .{ .bytes = text },
             .port = port,
             .protocol = protocol,
-            .proxied_host = .{ .bytes = verify },
+            .proxied_host = .{ .bytes = tls_name },
             .proxied_port = port,
         }) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
+            error.Canceled => {
+                // Fail closed, but re-arm the caller's cancelation request.
+                io.recancel();
+                return error.HttpFailed;
+            },
             else => continue,
         };
     }
@@ -1024,4 +1199,565 @@ test "no leaks across handler loops" {
         const c = try h.caller.call("zygos::tools::web_fetch", "\"nope\"");
         c.deinit(testing.allocator);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Redirect-hop and DNS screen tests (scripted transport + resolver; no sockets)
+// ---------------------------------------------------------------------------
+
+const IpAddress = std.Io.net.IpAddress;
+
+fn testIp(text: []const u8) IpAddress {
+    return IpAddress.parse(text, 0) catch unreachable;
+}
+
+fn withPort(addr: IpAddress, port: u16) IpAddress {
+    var c = addr;
+    switch (c) {
+        .ip4 => |*a| a.port = port,
+        .ip6 => |*a| a.port = port,
+    }
+    return c;
+}
+
+/// Replays per-call steps and records what each call was asked to fetch.
+const HopFake = struct {
+    steps: []const Step,
+    calls: usize = 0,
+    url_buf: [max_rec][160]u8 = undefined,
+    url_len: [max_rec]usize = @splat(0),
+    dial_first: [max_rec]?IpAddress = @splat(null),
+    dial_len: [max_rec]usize = @splat(0),
+    follow: [max_rec]bool = @splat(true),
+
+    const max_rec = 8;
+    const Step = union(enum) { redirect: []const u8, body: []const u8 };
+
+    fn url(self: *const HopFake, i: usize) []const u8 {
+        return self.url_buf[i][0..self.url_len[i]];
+    }
+
+    fn transport(
+        ctx: ?*anyopaque,
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        req: TransportRequest,
+    ) HttpGetError!HttpBody {
+        _ = io;
+        const self: *HopFake = @ptrCast(@alignCast(ctx.?));
+        const i = self.calls;
+        self.calls += 1;
+        if (i < max_rec) {
+            const n = @min(req.url.len, self.url_buf[i].len);
+            @memcpy(self.url_buf[i][0..n], req.url[0..n]);
+            self.url_len[i] = n;
+            self.dial_len[i] = req.dial.len;
+            self.dial_first[i] = if (req.dial.len > 0) req.dial[0] else null;
+            self.follow[i] = req.follow_redirects;
+        }
+        switch (self.steps[@min(i, self.steps.len - 1)]) {
+            .redirect => |loc| {
+                const location = try gpa.dupe(u8, loc);
+                errdefer gpa.free(location);
+                const bytes = try gpa.alloc(u8, 0);
+                errdefer gpa.free(bytes);
+                const ct = try gpa.alloc(u8, 0);
+                return .{ .bytes = bytes, .content_type = ct, .redirect = location };
+            },
+            .body => |b| {
+                const bytes = try gpa.dupe(u8, b);
+                errdefer gpa.free(bytes);
+                const ct = try gpa.dupe(u8, "text/html; charset=utf-8");
+                return .{ .bytes = bytes, .content_type = ct };
+            },
+        }
+    }
+};
+
+/// Scripted resolver: host name to answer or failure; unknown names fail.
+const FakeDns = struct {
+    entries: []const Entry,
+    calls: usize = 0,
+
+    const Entry = struct {
+        host: []const u8,
+        addrs: []const IpAddress = &.{},
+        fail: bool = false,
+    };
+
+    fn resolve(
+        ctx: ?*anyopaque,
+        io: std.Io,
+        host: []const u8,
+        port: u16,
+        out: []IpAddress,
+    ) ResolveError!usize {
+        _ = io;
+        const self: *FakeDns = @ptrCast(@alignCast(ctx.?));
+        self.calls += 1;
+        for (self.entries) |e| {
+            if (!std.ascii.eqlIgnoreCase(e.host, host)) continue;
+            if (e.fail or e.addrs.len > out.len) return error.ResolveFailed;
+            for (e.addrs, 0..) |a, i| out[i] = withPort(a, port);
+            return e.addrs.len;
+        }
+        return error.ResolveFailed;
+    }
+};
+
+const public_example = [_]IpAddress{.{ .ip4 = .{ .bytes = .{ 93, 184, 216, 34 }, .port = 0 } }};
+const public_other = [_]IpAddress{.{ .ip4 = .{ .bytes = .{ 203, 0, 114, 7 }, .port = 0 } }};
+const private_10 = [_]IpAddress{.{ .ip4 = .{ .bytes = .{ 10, 0, 0, 1 }, .port = 0 } }};
+
+fn expectReplyHas(res: anytype, needle: []const u8) !void {
+    try testing.expect(res == .ok);
+    if (std.mem.indexOf(u8, res.ok, needle) == null) {
+        std.debug.print("reply {s} lacks {s}\n", .{ res.ok, needle });
+        return error.TestExpectedEqual;
+    }
+}
+
+test "web_fetch: public → 302 → 169.254.169.254 refuses PrivateHost at the hop" {
+    var h = try Harness.init(testing.allocator, .{});
+    defer h.deinit();
+    var fake = HopFake{ .steps = &.{
+        .{ .redirect = "http://169.254.169.254/latest/meta-data" },
+        .{ .body = "<p>metadata</p>" },
+    } };
+    h.worker.transport = HopFake.transport;
+    h.worker.transport_ctx = &fake;
+
+    const res = try h.caller.call("zygos::tools::web_fetch", "{\"url\":\"https://example.com/\"}");
+    defer res.deinit(testing.allocator);
+    try expectReplyHas(res, "PrivateHost");
+    try testing.expectEqual(@as(usize, 1), fake.calls);
+}
+
+test "web_fetch: public → 302 → name resolving private refuses PrivateHost at the hop" {
+    var h = try Harness.init(testing.allocator, .{});
+    defer h.deinit();
+    var fake = HopFake{ .steps = &.{
+        .{ .redirect = "http://rebind.example/" },
+        .{ .body = "<p>internal</p>" },
+    } };
+    var dns = FakeDns{ .entries = &.{
+        .{ .host = "example.com", .addrs = &public_example },
+        .{ .host = "rebind.example", .addrs = &private_10 },
+    } };
+    h.worker.transport = HopFake.transport;
+    h.worker.transport_ctx = &fake;
+    h.worker.resolver = FakeDns.resolve;
+    h.worker.resolver_ctx = &dns;
+
+    const res = try h.caller.call("zygos::tools::web_fetch", "{\"url\":\"https://example.com/\"}");
+    defer res.deinit(testing.allocator);
+    try expectReplyHas(res, "PrivateHost");
+    try testing.expectEqual(@as(usize, 1), fake.calls);
+    try testing.expectEqual(@as(usize, 2), dns.calls);
+}
+
+test "web_fetch: public → 302 → public is followed and every hop is dialed at its screened address" {
+    var h = try Harness.init(testing.allocator, .{});
+    defer h.deinit();
+    var dns = FakeDns{ .entries = &.{
+        .{ .host = "example.com", .addrs = &public_example },
+        .{ .host = "other.example", .addrs = &public_other },
+    } };
+    h.worker.transport = HopFake.transport;
+    h.worker.resolver = FakeDns.resolve;
+    h.worker.resolver_ctx = &dns;
+
+    // Relative Location resolves against the hop that issued it.
+    var rel = HopFake{ .steps = &.{
+        .{ .redirect = "/next" },
+        .{ .body = "<html><body><p>relative landing</p></body></html>" },
+    } };
+    h.worker.transport_ctx = &rel;
+    const res = try h.caller.call("zygos::tools::web_fetch", "{\"url\":\"https://example.com/start\"}");
+    defer res.deinit(testing.allocator);
+    try expectReplyHas(res, "relative landing");
+    try expectReplyHas(res, "\"url\":\"https://example.com/start\"");
+    try testing.expectEqual(@as(usize, 2), rel.calls);
+    try testing.expectEqualStrings("https://example.com/start", rel.url(0));
+    try testing.expectEqualStrings("https://example.com/next", rel.url(1));
+    for (0..2) |i| {
+        try testing.expect(!rel.follow[i]);
+        try testing.expectEqual(@as(usize, 1), rel.dial_len[i]);
+        try testing.expectEqualSlices(u8, &.{ 93, 184, 216, 34 }, &rel.dial_first[i].?.ip4.bytes);
+        try testing.expectEqual(@as(u16, 443), rel.dial_first[i].?.ip4.port);
+    }
+
+    // Absolute Location to another host: that host's own answer is dialed.
+    var abs = HopFake{ .steps = &.{
+        .{ .redirect = "http://other.example:8080/abs?q=1#frag" },
+        .{ .body = "<html><body><p>absolute landing</p></body></html>" },
+    } };
+    h.worker.transport_ctx = &abs;
+    const res2 = try h.caller.call("zygos::tools::web_fetch", "{\"url\":\"https://example.com/\"}");
+    defer res2.deinit(testing.allocator);
+    try expectReplyHas(res2, "absolute landing");
+    try testing.expectEqualStrings("http://other.example:8080/abs?q=1", abs.url(1));
+    try testing.expectEqualSlices(u8, &.{ 203, 0, 114, 7 }, &abs.dial_first[1].?.ip4.bytes);
+    try testing.expectEqual(@as(u16, 8080), abs.dial_first[1].?.ip4.port);
+}
+
+test "web_fetch: exactly max_redirects hops succeed; one more refuses TooManyRedirects" {
+    var h = try Harness.init(testing.allocator, .{});
+    defer h.deinit();
+
+    var forever = HopFake{ .steps = &.{.{ .redirect = "/loop" }} };
+    h.worker.transport = HopFake.transport;
+    h.worker.transport_ctx = &forever;
+    const res = try h.caller.call("zygos::tools::web_fetch", "{\"url\":\"https://example.com/\"}");
+    defer res.deinit(testing.allocator);
+    try expectReplyHas(res, "TooManyRedirects");
+    try testing.expectEqual(@as(usize, 4), forever.calls); // original + 3 followed
+
+    var chain = HopFake{ .steps = &.{
+        .{ .redirect = "/a" },
+        .{ .redirect = "/b" },
+        .{ .redirect = "/c" },
+        .{ .body = "<html><body><p>end of chain</p></body></html>" },
+    } };
+    h.worker.transport_ctx = &chain;
+    const res2 = try h.caller.call("zygos::tools::web_fetch", "{\"url\":\"https://example.com/\"}");
+    defer res2.deinit(testing.allocator);
+    try expectReplyHas(res2, "end of chain");
+    try testing.expectEqual(@as(usize, 4), chain.calls);
+
+    // The cap is the worker's setting, not a constant.
+    h.worker.max_redirects = 1;
+    var two = HopFake{ .steps = &.{.{ .redirect = "/loop" }} };
+    h.worker.transport_ctx = &two;
+    const res3 = try h.caller.call("zygos::tools::web_fetch", "{\"url\":\"https://example.com/\"}");
+    defer res3.deinit(testing.allocator);
+    try expectReplyHas(res3, "TooManyRedirects");
+    try testing.expectEqual(@as(usize, 2), two.calls);
+}
+
+test "web_fetch: missing, non-http(s), or unresolvable Location refuses InvalidRedirect" {
+    var h = try Harness.init(testing.allocator, .{});
+    defer h.deinit();
+    h.worker.transport = HopFake.transport;
+
+    const locations = [_][]const u8{
+        "",
+        "file:///etc/passwd",
+        "ftp://x/",
+        "javascript:alert(1)",
+        "http://",
+        "http:///nohost",
+    };
+    for (locations) |loc| {
+        var fake = HopFake{ .steps = &.{ .{ .redirect = loc }, .{ .body = "<p>unreached</p>" } } };
+        h.worker.transport_ctx = &fake;
+        const res = try h.caller.call("zygos::tools::web_fetch", "{\"url\":\"https://example.com/\"}");
+        defer res.deinit(testing.allocator);
+        expectReplyHas(res, "InvalidRedirect") catch |err| {
+            std.debug.print("Location {s}\n", .{loc});
+            return err;
+        };
+        try testing.expectEqual(@as(usize, 1), fake.calls);
+    }
+
+    // An oversized Location never reaches the parser.
+    const huge = "/" ++ "a" ** 9000;
+    var fake = HopFake{ .steps = &.{ .{ .redirect = huge }, .{ .body = "<p>unreached</p>" } } };
+    h.worker.transport_ctx = &fake;
+    const res = try h.caller.call("zygos::tools::web_fetch", "{\"url\":\"https://example.com/\"}");
+    defer res.deinit(testing.allocator);
+    try expectReplyHas(res, "InvalidRedirect");
+    try testing.expectEqual(@as(usize, 1), fake.calls);
+}
+
+test "web_fetch: name resolving to a blocked class refuses PrivateHost before the transport" {
+    var h = try Harness.init(testing.allocator, .{});
+    defer h.deinit();
+    h.worker.transport = HopFake.transport;
+    h.worker.resolver = FakeDns.resolve;
+
+    const blocked = [_][]const u8{
+        "10.0.0.1",
+        "::1",
+        "fe80::1",
+        "64:ff9b::a9fe:a9fe", // NAT64 of 169.254.169.254
+        "64:ff9b::",
+        "2002:a9fe:a9fe::", // 6to4 of 169.254.169.254
+        "::ffff:127.0.0.1",
+    };
+    for (blocked) |text| {
+        const addrs = [_]IpAddress{testIp(text)};
+        var dns = FakeDns{ .entries = &.{.{ .host = "blocked.example", .addrs = &addrs }} };
+        var fake = HopFake{ .steps = &.{.{ .body = "<p>internal</p>" }} };
+        h.worker.resolver_ctx = &dns;
+        h.worker.transport_ctx = &fake;
+        const res = try h.caller.call("zygos::tools::web_fetch", "{\"url\":\"https://blocked.example/\"}");
+        defer res.deinit(testing.allocator);
+        expectReplyHas(res, "PrivateHost") catch |err| {
+            std.debug.print("answer {s}\n", .{text});
+            return err;
+        };
+        try testing.expectEqual(@as(usize, 0), fake.calls);
+        try testing.expectEqual(@as(usize, 1), dns.calls);
+    }
+}
+
+test "web_fetch: a name with one public and one private address refuses PrivateHost" {
+    var h = try Harness.init(testing.allocator, .{});
+    defer h.deinit();
+    const mixed = [_]IpAddress{ testIp("93.184.216.34"), testIp("10.0.0.1") };
+    var dns = FakeDns{ .entries = &.{.{ .host = "mixed.example", .addrs = &mixed }} };
+    var fake = HopFake{ .steps = &.{.{ .body = "<p>internal</p>" }} };
+    h.worker.transport = HopFake.transport;
+    h.worker.transport_ctx = &fake;
+    h.worker.resolver = FakeDns.resolve;
+    h.worker.resolver_ctx = &dns;
+
+    const res = try h.caller.call("zygos::tools::web_fetch", "{\"url\":\"https://mixed.example/\"}");
+    defer res.deinit(testing.allocator);
+    try expectReplyHas(res, "PrivateHost");
+    try testing.expectEqual(@as(usize, 0), fake.calls);
+}
+
+test "web_fetch: resolver error or empty answer refuses ResolveFailed and never fetches" {
+    var h = try Harness.init(testing.allocator, .{});
+    defer h.deinit();
+    var dns = FakeDns{ .entries = &.{
+        .{ .host = "broken.example", .fail = true },
+        .{ .host = "empty.example", .addrs = &.{} },
+    } };
+    var fake = HopFake{ .steps = &.{.{ .body = "<p>unreached</p>" }} };
+    h.worker.transport = HopFake.transport;
+    h.worker.transport_ctx = &fake;
+    h.worker.resolver = FakeDns.resolve;
+    h.worker.resolver_ctx = &dns;
+
+    for ([_][]const u8{
+        "{\"url\":\"https://broken.example/\"}",
+        "{\"url\":\"https://empty.example/\"}",
+        "{\"url\":\"https://unknown.example/\"}",
+    }) |request| {
+        const res = try h.caller.call("zygos::tools::web_fetch", request);
+        defer res.deinit(testing.allocator);
+        try expectReplyHas(res, "ResolveFailed");
+    }
+    try testing.expectEqual(@as(usize, 0), fake.calls);
+    try testing.expectEqual(@as(usize, 3), dns.calls);
+}
+
+test "web_fetch: ZYGOS_FETCH_ALLOW_PRIVATE bypasses hop and DNS screens" {
+    var h = try Harness.init(testing.allocator, .{ .allow_private_hosts = true });
+    defer h.deinit();
+    var dns = FakeDns{ .entries = &.{.{ .host = "private.example", .addrs = &private_10 }} };
+    h.worker.transport = HopFake.transport;
+    h.worker.resolver = FakeDns.resolve;
+    h.worker.resolver_ctx = &dns;
+
+    // A private-resolving name fetches; std resolves it (empty dial).
+    var direct = HopFake{ .steps = &.{.{ .body = "<html><body><p>mirror</p></body></html>" }} };
+    h.worker.transport_ctx = &direct;
+    const res = try h.caller.call("zygos::tools::web_fetch", "{\"url\":\"http://private.example/\"}");
+    defer res.deinit(testing.allocator);
+    try expectReplyHas(res, "mirror");
+    try testing.expectEqual(@as(usize, 0), dns.calls);
+    try testing.expectEqual(@as(usize, 0), direct.dial_len[0]);
+    try testing.expect(!direct.follow[0]);
+
+    // A redirect to the metadata address is hand-followed.
+    var hop = HopFake{ .steps = &.{
+        .{ .redirect = "http://169.254.169.254/latest" },
+        .{ .body = "<html><body><p>metadata</p></body></html>" },
+    } };
+    h.worker.transport_ctx = &hop;
+    const res2 = try h.caller.call("zygos::tools::web_fetch", "{\"url\":\"https://example.com/\"}");
+    defer res2.deinit(testing.allocator);
+    try expectReplyHas(res2, "metadata");
+    try testing.expectEqual(@as(usize, 2), hop.calls);
+    try testing.expectEqualStrings("http://169.254.169.254/latest", hop.url(1));
+    try testing.expectEqual(@as(usize, 0), hop.dial_len[1]);
+    try testing.expectEqual(@as(usize, 0), dns.calls);
+
+    // The hop cap still applies.
+    var forever = HopFake{ .steps = &.{.{ .redirect = "http://10.0.0.1/loop" }} };
+    h.worker.transport_ctx = &forever;
+    const res3 = try h.caller.call("zygos::tools::web_fetch", "{\"url\":\"https://example.com/\"}");
+    defer res3.deinit(testing.allocator);
+    try expectReplyHas(res3, "TooManyRedirects");
+    try testing.expectEqual(@as(usize, 4), forever.calls);
+}
+
+test "web_fetch: public literal hosts dial themselves and skip the resolver" {
+    var h = try Harness.init(testing.allocator, .{});
+    defer h.deinit();
+    var dns = FakeDns{ .entries = &.{} };
+    h.worker.transport = HopFake.transport;
+    h.worker.resolver = FakeDns.resolve;
+    h.worker.resolver_ctx = &dns;
+
+    var v4 = HopFake{ .steps = &.{.{ .body = "<p>v4</p>" }} };
+    h.worker.transport_ctx = &v4;
+    const res = try h.caller.call("zygos::tools::web_fetch", "{\"url\":\"http://8.8.8.8/x\"}");
+    defer res.deinit(testing.allocator);
+    try expectReplyHas(res, "v4");
+    try testing.expectEqualSlices(u8, &.{ 8, 8, 8, 8 }, &v4.dial_first[0].?.ip4.bytes);
+    try testing.expectEqual(@as(u16, 80), v4.dial_first[0].?.ip4.port);
+
+    var v6 = HopFake{ .steps = &.{.{ .body = "<p>v6</p>" }} };
+    h.worker.transport_ctx = &v6;
+    const res2 = try h.caller.call("zygos::tools::web_fetch", "{\"url\":\"https://[2606:4700::6810:85e5]/x\"}");
+    defer res2.deinit(testing.allocator);
+    try expectReplyHas(res2, "v6");
+    const want = testIp("2606:4700::6810:85e5");
+    try testing.expectEqualSlices(u8, &want.ip6.bytes, &v6.dial_first[0].?.ip6.bytes);
+    try testing.expectEqual(@as(u16, 443), v6.dial_first[0].?.ip6.port);
+    try testing.expectEqual(@as(usize, 0), dns.calls);
+}
+
+test "web_fetch: percent-encoded private host refuses PrivateHost before the transport" {
+    var h = try Harness.init(testing.allocator, .{});
+    defer h.deinit();
+    var fake = HopFake{ .steps = &.{.{ .body = "<p>internal</p>" }} };
+    h.worker.transport = HopFake.transport;
+    h.worker.transport_ctx = &fake;
+
+    for ([_][]const u8{
+        "{\"url\":\"http://%31%32%37.0.0.1/\"}",
+        "{\"url\":\"http://%6Cocalhost/\"}",
+    }) |request| {
+        const res = try h.caller.call("zygos::tools::web_fetch", request);
+        defer res.deinit(testing.allocator);
+        try expectReplyHas(res, "PrivateHost");
+    }
+    try testing.expectEqual(@as(usize, 0), fake.calls);
+}
+
+test "addressBlocked: v4, v6, v4-mapped, NAT64 and 6to4 embedded private classes; public pass" {
+    const blocked = [_][]const u8{
+        "0.0.0.0",                "10.0.0.1",           "127.0.0.1",       "169.254.169.254",
+        "172.16.0.1",             "192.168.1.1",        "100.64.0.1",      "224.0.0.1",
+        "255.255.255.255",        "::",                 "::1",             "::102:304",
+        "fe80::1",                "febf::1",            "fec0::1",         "fc00::1",
+        "fd12:3456::1",           "ff02::1",            "::ffff:10.0.0.1", "::ffff:127.0.0.1",
+        "::ffff:169.254.169.254", "64:ff9b::a9fe:a9fe", "64:ff9b::a00:1",  "64:ff9b::",
+        "2002:a9fe:a9fe::",       "2002:7f00:1::",      "2002:a00:1::1",
+    };
+    for (blocked) |text| {
+        testing.expect(addressBlocked(testIp(text))) catch |err| {
+            std.debug.print("expected blocked: {s}\n", .{text});
+            return err;
+        };
+    }
+    const public = [_][]const u8{
+        "8.8.8.8",          "93.184.216.34",  "172.32.0.1",     "2606:4700::6810:85e5",
+        "64:ff9b::808:808", "2002:808:808::", "::ffff:8.8.8.8", "2001:4860:4860::8888",
+    };
+    for (public) |text| {
+        testing.expect(!addressBlocked(testIp(text))) catch |err| {
+            std.debug.print("expected public: {s}\n", .{text});
+            return err;
+        };
+    }
+}
+
+test "SSRF screen literals: NAT64, 6to4 and expanded loopback forms are blocked" {
+    try testing.expect(fetchHostBlocked("http://[64:ff9b::a9fe:a9fe]/x"));
+    try testing.expect(fetchHostBlocked("http://[2002:a9fe:a9fe::1]/x"));
+    try testing.expect(fetchHostBlocked("http://[0:0:0:0:0:0:0:1]/x"));
+    try testing.expect(fetchHostBlocked("http://[0:0:0:0:0:ffff:7f00:1]/x"));
+    try testing.expect(fetchHostBlocked("http://[::FFFF:10.0.0.1]/x"));
+    try testing.expect(fetchHostBlocked("http://[not:an:address]/x")); // unparseable: fail closed
+    try testing.expect(!fetchHostBlocked("http://[64:ff9b::808:808]/x"));
+    try testing.expect(!fetchHostBlocked("http://[2002:808:808::1]/x"));
+}
+
+test "validateUrl: a host longer than HostName.max_len is refused; a 255-byte host passes" {
+    const max = std.Io.net.HostName.max_len;
+    // Raw and percent-encoded forms: the encoded text is what Uri keeps, and
+    // std.Uri.getHost asserts it fits a max_len buffer once decoded.
+    try testing.expectError(error.InvalidUrl, validateUrl("http://%61" ++ "a" ** 300 ++ "/"));
+    try testing.expectError(error.InvalidUrl, validateUrl("http://" ++ "a" ** (max + 1) ++ "/"));
+    try testing.expectError(error.InvalidUrl, validateUrl("https://[" ++ "1" ** (max + 1) ++ "]/"));
+    try validateUrl("http://" ++ "a" ** max ++ "/");
+    try validateUrl("http://" ++ "%61" ** (max / 3) ++ "/");
+}
+
+test "web_fetch: over-long host refuses InvalidUrl without crashing, screen on and off" {
+    var h = try Harness.init(testing.allocator, .{});
+    defer h.deinit();
+    var fake = HopFake{ .steps = &.{.{ .body = "<p>unreached</p>" }} };
+    h.worker.transport = HopFake.transport;
+    h.worker.transport_ctx = &fake;
+
+    const request = "{\"url\":\"http://%61" ++ "a" ** 300 ++ "/\"}";
+    const res = try h.caller.call("zygos::tools::web_fetch", request);
+    defer res.deinit(testing.allocator);
+    try expectReplyHas(res, "InvalidUrl");
+
+    h.worker.allow_private_hosts = true;
+    const res2 = try h.caller.call("zygos::tools::web_fetch", request);
+    defer res2.deinit(testing.allocator);
+    try expectReplyHas(res2, "InvalidUrl");
+    try testing.expectEqual(@as(usize, 0), fake.calls);
+}
+
+// Pins `resolveRedirect` refusing a `Location` whose host is over-long. std's
+// `resolveInPlace` already rejects such a host, so the redirect path never
+// reached the crash that `validateUrl` guards on the request URL.
+test "web_fetch: a redirect to an over-long host refuses InvalidRedirect, screen on and off" {
+    var h = try Harness.init(testing.allocator, .{});
+    defer h.deinit();
+    h.worker.transport = HopFake.transport;
+
+    const loc = "http://%61" ++ "a" ** 300 ++ "/";
+    for ([_]bool{ false, true }) |allow| {
+        h.worker.allow_private_hosts = allow;
+        var fake = HopFake{ .steps = &.{ .{ .redirect = loc }, .{ .body = "<p>unreached</p>" } } };
+        h.worker.transport_ctx = &fake;
+        const res = try h.caller.call("zygos::tools::web_fetch", "{\"url\":\"https://example.com/\"}");
+        defer res.deinit(testing.allocator);
+        try expectReplyHas(res, "InvalidRedirect");
+        try testing.expectEqual(@as(usize, 1), fake.calls);
+    }
+}
+
+test "addressBlocked: 0000::/8, local-use NAT64, discard and benchmark ranges blocked" {
+    // A literal whose first byte is zero, but not in ::/96.
+    try testing.expect(fetchHostBlocked("http://[::1:0:0:1]/x"));
+    const blocked = [_][]const u8{
+        "::1:0:0:1", "0:0:0:0:ffff:0:7f00:1", // SIIT ::ffff:0:0:0/96
+        "64:ff9b:1::a9fe:a9fe", "64:ff9b:1:ffff::1", // local-use NAT64 64:ff9b:1::/48
+        "100::1", "100::ffff:ffff:ffff:ffff", // discard 100::/64
+        "198.18.0.1", "198.19.255.255", // benchmarking 198.18.0.0/15
+        "192.0.0.170", "192.0.0.0", // IETF protocol assignments 192.0.0.0/24
+    };
+    for (blocked) |text| {
+        testing.expect(addressBlocked(testIp(text))) catch |err| {
+            std.debug.print("expected blocked: {s}\n", .{text});
+            return err;
+        };
+    }
+    const public = [_][]const u8{
+        "198.20.0.1", "198.17.255.255", "192.0.1.1", "64:ff9b::808:808", "100:0:0:1::1",
+    };
+    for (public) |text| {
+        testing.expect(!addressBlocked(testIp(text))) catch |err| {
+            std.debug.print("expected public: {s}\n", .{text});
+            return err;
+        };
+    }
+}
+
+test "defaultResolver: an Io without concurrency refuses ResolveFailed instead of looking up inline" {
+    var out: [dial_max]IpAddress = undefined;
+    try testing.expectError(error.ResolveFailed, defaultResolver(null, std.Io.failing, "example.com", 80, &out));
+}
+
+test "defaultResolver: an address literal resolves through the concurrent lookup" {
+    var backing = std.Io.Threaded.init(testing.allocator, .{});
+    defer backing.deinit();
+    var out: [dial_max]IpAddress = undefined;
+    const n = try defaultResolver(null, backing.io(), "127.0.0.1", 8080, &out);
+    try testing.expectEqual(@as(usize, 1), n);
+    try testing.expectEqualSlices(u8, &.{ 127, 0, 0, 1 }, &out[0].ip4.bytes);
+    try testing.expectEqual(@as(u16, 8080), out[0].ip4.port);
 }
