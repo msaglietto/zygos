@@ -30,7 +30,7 @@ Integer knobs go through `mission_boot.envInt`. A missing variable uses the defa
 | `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `ANTHROPIC_API_KEY`, `ZYGOS_SMOKE_MODEL` | `test/e2e/*/`, `test/smoke/` | smoke process | env | rotate at the provider | Not read by `zig build test`. |
 | `ZYGOS_TOKEN` | bare kernel handshake | server | optional env secret | rotate locally | Requires `?token=` on worker URLs. Treat connection URLs as secret-bearing. |
 | `ZYGOS_ALLOW_ORIGIN` | bare kernel browser admission | server | comma-separated exact Origin values; empty denies browsers | n/a | Does not authenticate local script clients. |
-| `ZYGOS_FETCH_ALLOW_PRIVATE` | mission web fetch | server | `1` or `true`; default screen enabled | n/a | Allows literal private hosts. Screening does not cover DNS or redirect targets. |
+| `ZYGOS_FETCH_ALLOW_PRIVATE` | mission web fetch | server | `1` or `true`; default screen enabled | n/a | Allows private hosts as literals, by DNS resolution, and on redirect hops. Bypasses the whole `web_fetch` screen; the redirect cap still applies. |
 | `HOME` | default catalog path | server | env | n/a | Absence with no `AI_PROVIDERS_CONFIG` refuses mission boot. |
 
 ## Files that hold secrets or transcripts

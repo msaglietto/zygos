@@ -26,7 +26,7 @@ Zygos has no accounts, roles in a token, or database row policies. Scope is the 
 | Channel | take | Holder of the access key | Single consumer. Wrong key does not take. |
 | Workspace file | read / write | `zygos::tools::{read_file,write_file}` | Absolute path, empty path, or lexical `..` escape → `PathEscapesWorkspace`. Symlink to an outside target is not rejected. |
 | Shell | execute | `zygos::tools::bash` when policy allows | Policy deny or ask-timeout; local two-minute process-group deadline. Child env contains PATH/HOME/TZ/LANG/TERM/LC_* only; stdin is `/dev/null`, and its output pipe is close-on-exec and forked under the process-wide fork lock, so no concurrent command or MCP server holds it open. No path jail inside the command. |
-| URL | fetch | `zygos::tools::web_fetch` when policy allows | Non-http(s), missing host, non-2xx, oversize, non-text. Literal private/loopback/link-local hosts and localhost names are refused unless `ZYGOS_FETCH_ALLOW_PRIVATE=1`; DNS destinations and redirect targets are not screened. |
+| URL | fetch | `zygos::tools::web_fetch` when policy allows | Non-http(s), missing host, non-2xx, oversize, non-text. The host, every resolved address, and every redirect hop are screened; private, loopback, link-local, reserved, and localhost destinations refuse `PrivateHost` (also `InvalidRedirect`, `TooManyRedirects`, `ResolveFailed`) unless `ZYGOS_FETCH_ALLOW_PRIVATE=1`. |
 | Search | query | `zygos::tools::web_search` when policy allows and an engine is configured | Unknown engine, missing searxng endpoint, missing brave key, malformed upstream JSON. |
 | Mission | start | CLI caller | Bad brief, unknown provider slug, existing substrate without resume or run-stamp, malformed `.policy`, vault checkpoint failure, or unavailable planning-root lock. |
 | Mission | complete (`done`) | Gate approval | No gate, bad gate reply, deny, or unanswered timeout (parks). |
@@ -56,8 +56,13 @@ independent human authorization boundary. A token stored under the same UID
 would not fix this. Changing isolation or the default policy is a separate
 maintainer contract decision.
 
-The web host screen is partial defense in depth: DNS can resolve an ordinary
-name to a private address, expanded IPv6 spellings are not comprehensively
-classified, and HTTP redirects currently follow without a new screen. Do not
-rely on it as an SSRF boundary. The explicit private-host escape hatch is only
-for intentional local endpoints. Search destinations remain operator config.
+The `web_fetch` host screen is defense in depth for that one tool. It resolves
+the host name, refuses the request if any answer is private, loopback,
+link-local, or reserved (IPv4-embedding IPv6 forms are judged by the embedded
+address), dials the address it checked, and applies the same screen to each of
+up to three redirect hops. It does not cover the shell or MCP servers, which
+can reach the network directly. The system resolver and hosts file are trusted
+to answer; the screen judges the answer, not the resolver. Teredo and other
+IPv6 transition forms are not decoded. The explicit private-host escape hatch
+is only for intentional local endpoints. Search destinations remain operator
+config.

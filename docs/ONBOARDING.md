@@ -90,7 +90,7 @@ The WebSocket gateway and the HTTP legs that speak to model providers.
 | `anthropic.zig`, `openai.zig` | Streaming HTTP/SSE. Unit tests drive the SSE pump. Live HTTP is an env-gated smoke. |
 | `stream_guard.zig` | Idle watchdog for a blocking provider stream. |
 | `ticker.zig` | Posts `.tick` so a headless kernel still sweeps invocation, trigger, and channel deadlines. |
-| `web_tools.zig` | `zygos::tools::web_search` and `web_fetch`. URL and SSRF screening run before any socket opens in `zig build test`. |
+| `web_tools.zig` | `zygos::tools::web_search` and `web_fetch`. URL and SSRF screening, including DNS and redirect hops (through resolver and transport seams), run before any socket opens in `zig build test`. |
 | `web/search.zig`, `web/html.zig` | Neutral search records, and HTML stripped and capped for token cost. |
 
 ### 4. Harness workers

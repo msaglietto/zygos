@@ -66,9 +66,10 @@ package fingerprint remain unchanged.
   completion approvals. Allowed MCP tools can have comparable filesystem
   privileges. The completion gate is an orchestration check, not independent
   human authorization.
-- Fetch screening covers recognized literal private hosts and localhost.
-  DNS/private aliases, expanded IPv6 variants, and redirects are not a complete
-  SSRF defense; direct shell networking also bypasses this screen.
+- Fetch screening covers the literal host, every resolved address, and every
+  redirect hop, and dials the screened address. It is not a complete SSRF
+  defense: direct shell and MCP networking bypass it, search endpoints are
+  operator config, the system resolver is trusted, and Teredo is not decoded.
 - Atomic writers fsync file data, but do not fsync parent directories.
   Power-loss durability and concurrent read/modify/write vault updates are not
   guaranteed by the temp-file uniqueness fix.

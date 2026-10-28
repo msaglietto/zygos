@@ -29,7 +29,7 @@ There are no user accounts, sessions, or row-level policies. Identity is the OS 
 | Model → tool | tool name, JSON input | Policy worker, then approval if the verdict is `ask`. Default mission seed is allow; `.policy` replaces it. |
 | File tools → filesystem | relative path | Lexical join under the workspace root (`tools_ops.Workspace.resolve`). Symlink targets are not re-checked. |
 | Bash → process | shell string | `cwd` is the workspace. The command itself is not jailed. |
-| web_fetch / web_search → network | URL or query | `http`/`https` only (`validateUrl`); partial literal-host screen for fetch, with explicit override. DNS/redirect targets remain unchecked. Search key injected at boot. |
+| web_fetch / web_search → network | URL or query | `http`/`https` only (`validateUrl`); fetch screens the literal host, every resolved address, and every redirect hop, then dials the screened address. Explicit override. Search endpoint and key are operator config. |
 | MCP child → bus | JSON-RPC tools | Operator argv from `zygos.zon`. Spawn failure refuses boot. |
 | Mission → vault | notes under `ZYGOS_VAULT_ROOT` | Checkpoint before write; checkpoint failure refuses the run. |
 | Cron → CLI | a local command | Same binary, stdin from `/dev/null`. Approvals time out and deny. |
@@ -39,7 +39,7 @@ There are no user accounts, sessions, or row-level policies. Identity is the OS 
 - Loopback bus is unauthenticated unless `ZYGOS_TOKEN` is set. A local process can invoke any registered function, including tools if those workers are running. Bare `zygos` does not boot the tool workers; `zygos mission` does, in-process, and does not open the WebSocket for them.
 - File-tool confinement is lexical. `tools_ops.zig` states symlink escapes are deferred. `open` follows links.
 - Bash is a shell with workspace `cwd`, not a sandbox. Default policy allows it. The running mission treats `<planning>/control.jsonl` as attach commands, including approve (`src/cli/mission.zig` `controlLoop`). The executor can append that file. `mission attach` uses the same file.
-- `web_fetch` rejects recognized literal private addresses and localhost unless explicitly allowed. DNS/private-address aliases and redirect targets remain unscreened. Size caps apply (`max_fetch_bytes`, `max_text_bytes`).
+- `web_fetch` resolves the host, refuses private, loopback, link-local, and reserved addresses on the original URL and on each of up to three redirect hops, and dials the address it checked, unless explicitly allowed. The shell and MCP children bypass this screen, the system resolver is trusted, and Teredo is not decoded. Size caps apply (`max_fetch_bytes`, `max_text_bytes`).
 - `events.jsonl` stores tool inputs and clipped outputs (README, "How a mission runs"). A fetched page or a command that prints a secret lands in that file. Emission is fail-open.
 - Malformed integer env knobs (`envInt`) fall back to the compiled default. A typo does not refuse boot.
 - `docs/ARCHITECTURE.md` still sketches post-M0 work in the future tense. Milestone contracts are `GOAL.md`. Do not treat the sketch as the list of what is unbuilt.
