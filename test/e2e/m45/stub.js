@@ -45,6 +45,14 @@ const script = [
   tool('t-count8', 'bash', '{"command":"seq 1 500"}'),
   text('counted'),
   text('{"passed":true,"reason":"acceptance met"}'),
+  // Leg 9 (policy ask approved once, rejected once): one task, two bash calls
+  // in the executor step. Keyed by position, like every leg: it runs last.
+  text('{"objective":"Ship the gizmo","acceptance":"both commands attempted"}'),
+  text('{"tasks":["run two commands"]}'),
+  tool('t-ask1', 'bash', '{"command":"echo approved-run"}'),
+  tool('t-ask2', 'bash', '{"command":"echo rejected-run"}'),
+  text('ran the commands'),
+  text('{"passed":true,"reason":"acceptance met"}'),
 ];
 let i = 0;
 
