@@ -28,7 +28,9 @@ test thread) answers via `zygos::approvals::resolve`.
   callers can tell "a human said no" from "nobody answered" (the mission
   gate parks on the latter).
 - `zygos::approvals::resolve` — `{"id":"a-1","approved":true}` →
-  `{"resolved":true}`; unknown id → `{"resolved":false}`. Unchanged.
+  `{"resolved":true}`; unknown id → `{"resolved":false}`. The first decision
+  wins: a resolve for a request already resolved or cancelled (but not yet
+  woken) also replies `{"resolved":false}` and changes nothing.
 - `zygos::approvals::pending` — `{}` →
 
   ```json
@@ -161,13 +163,13 @@ Turn side (`turn.zig`):
 24. `requires_approval without an ask verdict asks with reason "tool requires approval"`
 25. `only outcome allowed_once dispatches (approved:true with outcome rejected does not)`
 26. `missing, unknown, non-string or contradictory outcome denies`
-27. `unparseable approval reply denies`
+27. `unparseable approval reply denies` (wrong-shape replies `[]`, `"x"`, `null`, `42`, `true` and a handler error: the bus rejects a non-JSON result frame before the turn sees it)
 
 Trace, AG-UI and CLI (`trace_event.zig`, `trace.zig`, `agui.zig`, `src/cli`):
 
-28. `approval_asked and approval_decided round-trip body() and parse()`
+28. `approval events round-trip through trace_event` (and `parse: malformed approval events read tolerant defaults`)
 29. `render shows both approval lines`
-30. `agui golden: zygos.approval_asked and zygos.approval_decided custom events`
+30. `agui projects approval events as zygos.approval custom events` (golden)
 31. `agui redacts a secret in approval_asked input`
 32. `console prompt renders tool, step and input`
 33. `console prompt caps a long input with a marker`
