@@ -83,9 +83,11 @@ the TUI scrubber first (escape sequences and C0/C1 controls dropped, any
 surviving newline becomes a space) because the input is model-controlled.
 The TUI approval band uses the same text (`cli/mission/approval_prompt.zig`).
 
-SIGINT aborts the mission and then calls `zygos::approvals::cancel`, so an
-ask parked at that moment replies outcome `cancelled` instead of waiting out
-the approval timeout. Everything else is unchanged: stdin EOF or
+SIGINT aborts the mission and then calls `zygos::approvals::cancel` every
+200 ms until the process exits, so an ask parked at that moment replies
+outcome `cancelled` instead of waiting out the approval timeout, and so does
+an ask the in-flight turn raises afterwards (the abort only lands at the next
+role boundary). Everything else is unchanged: stdin EOF or
 not-a-tty ⇒ stop prompting entirely and let the manual timeout deny
 (fail closed — an unattended mission can never self-approve a gate).
 

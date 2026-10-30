@@ -589,22 +589,30 @@ fn installSigint() void {
     _ = signal(2, &onSigint); // SIGINT
 }
 
-/// Detached: waits for the flag, aborts the mission over the bus once.
+/// Detached: waits for the flag, aborts the mission over the bus once, then
+/// keeps cancelling approval asks until the process exits.
 fn sigintWatch(gpa: std.mem.Allocator, worker: *zygos.inproc.Worker, mission_id: []const u8) void {
-    while (sigint_hits.load(.acquire) == 0) {
-        var interval: std.c.timespec = .{ .sec = 0, .nsec = 200 * std.time.ns_per_ms };
-        var rem: std.c.timespec = undefined;
-        _ = std.c.nanosleep(&interval, &rem);
-    }
+    while (sigint_hits.load(.acquire) == 0) sleepWatch();
     const req = std.fmt.allocPrint(gpa, "{{\"mission_id\":{f}}}", .{json.fmt(mission_id, .{})}) catch return;
     defer gpa.free(req);
     const res = worker.call("zygos::missions::abort", req) catch return;
     res.deinit(gpa);
     // A tool ask parked in the approval worker would otherwise hold the
     // aborted run until the approval timeout; wake it as outcome cancelled.
-    // Best effort: a missing function or a bus error changes nothing.
-    const cancelled = worker.call("zygos::approvals::cancel", "{}") catch return;
-    cancelled.deinit(gpa);
+    // The abort only lands at the next role boundary, so the in-flight turn
+    // may raise more asks first: keep cancelling for the rest of the process.
+    // Best effort: a missing function or a bus error ends the loop.
+    while (true) {
+        const cancelled = worker.call("zygos::approvals::cancel", "{}") catch return;
+        cancelled.deinit(gpa);
+        sleepWatch();
+    }
+}
+
+fn sleepWatch() void {
+    var interval: std.c.timespec = .{ .sec = 0, .nsec = 200 * std.time.ns_per_ms };
+    var rem: std.c.timespec = undefined;
+    _ = std.c.nanosleep(&interval, &rem);
 }
 
 fn usage() u8 {
