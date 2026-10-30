@@ -17,7 +17,78 @@ Request `{"url":"https://..."}`; reply `{"url":..., "text":..., "truncated":bool
   reply.
 - Size caps: read at most `max_fetch_bytes` (option, default 512 KiB) off the
   wire; emit at most `max_text_bytes` (default 64 KiB) with `truncated:true`.
-- Non-2xx ⇒ error reply naming the status. Redirects: follow ≤ 3.
+- Non-2xx ⇒ error reply naming the status.
+- Redirects: std.http does not follow them. `web_fetch` follows up to
+  `max_redirects` (option, default 3) by hand, and screens every hop (see
+  "SSRF screen"). The cap is a structured refusal, not a silent truncation.
+- Host refusals and redirect refusals are tool-result errors of the shape
+  `{"error":"<Name>"}`: `PrivateHost`, `InvalidRedirect`, `TooManyRedirects`,
+  `ResolveFailed`.
+
+### SSRF screen
+
+The screen judges every address `web_fetch` is about to dial. It is a
+defense in depth, not a sandbox (see "Remaining limits").
+
+1. **Literal screen.** The original URL passes `validateUrl` (http/https
+   with a host of at most 255 bytes, `HostName.max_len`, counted on the
+   encoded text), then the host screen. A literal IPv4 or IPv6 host is
+   classified as parsed. `localhost` and `*.localhost` are refused. An IPv6
+   literal that does not parse fails closed. The host is screened again
+   after percent-decoding, since that is the host std.http would connect to
+   (`%31%32%37.0.0.1` is `127.0.0.1`).
+2. **Hop loop.** On a 3xx the transport returns `HttpBody.redirect` with the
+   `Location` value. `web_fetch` resolves it against the current URL
+   (relative allowed), then runs the same `validateUrl` and host screen on
+   the result before the next request. It repeats up to `max_redirects`
+   times.
+3. **Resolve, screen, dial.** A host name is resolved before any connection.
+   If any resolved address is in a blocked class, the fetch refuses
+   `PrivateHost`. Otherwise the transport dials a screened address itself
+   (`connectTcpOptions` with the IP as the dial host). The real name stays
+   the TLS SNI and certificate name and the `Host` header. A second DNS
+   answer cannot steer the socket, so the rebinding window between screen
+   and connect is closed for `web_fetch`. Literal hosts are dialed as parsed.
+4. **Blocked classes.**
+   - IPv4: `0/8`, `10/8`, `127/8`, `169.254/16` (includes the cloud metadata
+     address `169.254.169.254`), `172.16/12`, `192.168/16`, `192.0.0.0/24`
+     (IETF protocol assignments), `198.18/15` (benchmarking), `100.64/10`
+     (RFC 6598), and `224/4` and above (multicast, reserved).
+   - IPv6: `0000::/8` (any literal whose first byte is zero: unspecified,
+     loopback, v4-compatible, SIIT `::ffff:0:0:0/96`, and the rest of the
+     block), local-use NAT64 `64:ff9b:1::/48`, discard `100::/64`,
+     `fe80::/10`, `fec0::/10`, `fc00::/7`, `ff00::/8`.
+   - IPv6 forms that embed an IPv4 address are screened by the embedded
+     address: v4-mapped `::ffff:0:0/96`, NAT64 `64:ff9b::/96`, 6to4
+     `2002::/16`. These are classified before `0000::/8`, and NAT64 and
+     6to4 are not refused wholesale, so DNS64 networks keep working.
+   - Names: `localhost` and `*.localhost`.
+5. **Refusals** (all `{"error":"<Name>"}`):
+   - `InvalidUrl`: the URL is not http(s), has no host, or its host text
+     (raw or percent-encoded) is longer than 255 bytes. `std.Uri.getHost`
+     aborts the process on a longer encoded host, so `validateUrl` refuses
+     it first, on every hop and with the escape hatch on.
+   - `PrivateHost`: the original host or any hop host is blocked, by
+     literal or by resolution.
+   - `InvalidRedirect`: `Location` missing, unparseable or unresolvable,
+     longer than 8 KiB, not http(s), without a host, or with a host longer
+     than 255 bytes.
+   - `TooManyRedirects`: one more redirect than the cap (the fourth by
+     default).
+   - `ResolveFailed`: the name does not resolve, or resolves to no address.
+     It never falls through to a fetch.
+6. **Escape hatch.** `ZYGOS_FETCH_ALLOW_PRIVATE=1` (or `true`) sets
+   `allow_private_hosts` and bypasses the whole screen: literal, every hop,
+   and DNS. The resolver is not consulted and std.http resolves the host.
+   The redirect cap still applies. It is for intentional local endpoints.
+
+**Remaining limits.**
+- Search endpoints are operator config and are not screened.
+- The bash tool and MCP servers can reach the network directly and bypass
+  this screen.
+- The hosts file and the system resolver are trusted to answer. The screen
+  judges the answer, not the resolver.
+- Teredo (`2001::/32`) and other IPv6 transition forms are not decoded.
 
 ### HTML compression
 
@@ -67,17 +138,36 @@ Request `{"query":"...","count":5?}`; reply `{"results":[{"title","url","snippet
 
 `WebToolsWorker.start(gpa, actor, registry, io, opts: Options)` / `stop` —
 mirrors ToolsWorker. `Options{ search: ?SearchConfig, max_fetch_bytes,
-max_text_bytes, search_retry_max, search_retry_delay_ms }`. The HTTP leg is
-a `Transport` fn-pointer seam on the worker (default `httpGet`); tests swap
-in a socket-free scripted fake. Pure layer (pub, fixture-tested): `htmlToText(arena,
-bytes, max_out) {text, truncated}`, `parseBraveResults(arena, json_text)`,
-`parseSearxngResults(arena, json_text)`, `validateUrl(url)`.
+max_text_bytes, search_retry_max, search_retry_delay_ms,
+allow_private_hosts, max_redirects }`. `allow_private_hosts` defaults to
+false (the env override sets it). `max_redirects` defaults to 3.
+
+The HTTP leg is a `Transport` fn-pointer seam on the worker (default
+`httpGet`). It takes a `TransportRequest{ url, headers, max_bytes, dial,
+follow_redirects }` and may return `HttpBody.redirect` instead of a body.
+`dial` lists the screened addresses to connect to, tried in order (an empty
+slice lets std.http resolve the host: search, and `web_fetch` under the
+escape hatch). `follow_redirects` is false for `web_fetch` and true for
+`web_search`, whose redirect handling is unchanged.
+
+DNS is a `Resolver` fn-pointer seam on the worker. The default wraps
+`std.Io.net.HostName.lookup`, run with `io.concurrent` so the loop that
+drains the answers always runs beside it; an `Io` that cannot run it
+concurrently, or an answer longer than 32 addresses, is `ResolveFailed`. Tests swap in a scripted fake, so
+`zig build test` never resolves or opens a socket.
+
+Pure layer (pub, fixture-tested): `htmlToText(arena, bytes, max_out)
+{text, truncated}`, `parseBraveResults(arena, json_text)`,
+`parseSearxngResults(arena, json_text)`, `validateUrl(url)`,
+`hostBlocked(host_text)` (literal and name screen), `fetchHostBlocked(url)`
+(the literal screen applied to the original URL and each hop), `addressBlocked(addr)`
+(class check on a resolved address, including embedded IPv4).
 
 ## Test contract (RED first; no sockets)
 
 1. `htmlToText: tags/script/style stripped, entities decoded, blank runs collapsed`
 2. `htmlToText: max_text_bytes cap sets truncated`
-2a. `htmlToText: boilerplate elements (nav/header/footer/aside/form/svg/noscript) dropped whole`
+2a. `htmlToText: boilerplate elements dropped whole`
 2b. `htmlToText: comments and doctype dropped`
 2c. `htmlToText: block tags become newlines, headings get #, list items get -`
 2d. `htmlToText: nbsp and numeric entities decoded; unknown entity passes through`
@@ -92,6 +182,27 @@ bytes, max_out) {text, truncated}`, `parseBraveResults(arena, json_text)`,
 9. `search retries once on 429 and succeeds on the second attempt`
 10. `persistent 429 exhausts the retry budget and fails closed with the status`
 11. `non-429 status is never retried`
+12. `SSRF screen: loopback/private/link-local hosts blocked; public pass`
+13. `web_fetch: private host refuses with PrivateHost before the transport; the allow flag overrides`
+14. `web_fetch: public → 302 → 169.254.169.254 refuses PrivateHost at the hop`
+15. `web_fetch: public → 302 → name resolving private refuses PrivateHost at the hop`
+16. `web_fetch: public → 302 → public is followed and every hop is dialed at its screened address`
+17. `web_fetch: exactly max_redirects hops succeed; one more refuses TooManyRedirects`
+18. `web_fetch: missing, non-http(s), or unresolvable Location refuses InvalidRedirect`
+19. `web_fetch: name resolving to a blocked class refuses PrivateHost before the transport`
+20. `web_fetch: a name with one public and one private address refuses PrivateHost`
+21. `web_fetch: resolver error or empty answer refuses ResolveFailed and never fetches`
+22. `web_fetch: ZYGOS_FETCH_ALLOW_PRIVATE bypasses hop and DNS screens`
+23. `web_fetch: public literal hosts dial themselves and skip the resolver`
+24. `web_fetch: percent-encoded private host refuses PrivateHost before the transport`
+25. `addressBlocked: v4, v6, v4-mapped, NAT64 and 6to4 embedded private classes; public pass`
+26. `SSRF screen literals: NAT64, 6to4 and expanded loopback forms are blocked`
+27. `validateUrl: a host longer than HostName.max_len is refused; a 255-byte host passes`
+28. `web_fetch: over-long host refuses InvalidUrl without crashing, screen on and off`
+29. `web_fetch: a redirect to an over-long host refuses InvalidRedirect, screen on and off`
+30. `addressBlocked: 0000::/8, local-use NAT64, discard and benchmark ranges blocked`
+31. `defaultResolver: an Io without concurrency refuses ResolveFailed instead of looking up inline`
+32. `defaultResolver: an address literal resolves through the concurrent lookup`
 
 Y2 (in `worker/turn.zig`-level tests or here): a scripted turn dispatching
 `web_fetch` consults policy with the URL riding the policy request's

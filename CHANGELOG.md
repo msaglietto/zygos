@@ -6,6 +6,13 @@ Reconstructed from git history on 2026-09-30. A commit that only added a library
 
 The agent that next changes operator-visible behavior adds the new heading in that same commit.
 
+## [5.1.3] - 2026-10-28
+
+### Fixed
+
+- `web_fetch` screens every hop and every resolved address. It no longer lets std.http follow redirects: it follows up to three by hand, screens each `Location` like the original URL, and refuses a private hop with `PrivateHost`. A missing, non-http(s), or unparseable `Location` refuses with `InvalidRedirect`, and a fourth redirect refuses with `TooManyRedirects`. Host names are resolved before the fetch; if any answer is loopback, private, link-local, shared, multicast or unspecified (IPv6, v4-mapped, NAT64 `64:ff9b::/96` and 6to4 `2002::/16` forms included), or falls in the IPv6 `0000::/8` block, local-use NAT64 `64:ff9b:1::/48`, discard `100::/64`, or IPv4 `192.0.0.0/24` and `198.18.0.0/15`, the fetch refuses with `PrivateHost`. A name that does not resolve refuses with `ResolveFailed`. The connection dials the screened address and keeps the name for TLS and `Host`, so a second DNS answer cannot redirect it. A host written with percent-encoding (`%31%32%37.0.0.1`) is screened after decoding. A URL whose host is longer than 255 bytes (for example a long percent-encoded one) is refused with `InvalidUrl` instead of crashing the process.
+- `ZYGOS_FETCH_ALLOW_PRIVATE=1` now takes effect. Before, `zygos mission` read the variable but never passed it to the web tools worker, so private hosts stayed refused. Set, it bypasses the whole screen (literal hosts, resolved addresses, redirect hops); redirects are still followed by hand under the three-hop cap.
+
 ## [5.1.2] - 2026-10-21
 
 ### Fixed

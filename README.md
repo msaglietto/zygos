@@ -238,7 +238,7 @@ Ctrl-D detaches.
 | `brave` | The variable named by `ZYGOS_SEARCH_KEY_ENV` (default `BRAVE_API_KEY`). An unset key still boots; each search returns `MissingSearchKey`. |
 | `searxng` | `ZYGOS_SEARCH_ENDPOINT`. No key. |
 
-`web_fetch` accepts `http` and `https`. It refuses recognized literal private addresses and localhost unless `ZYGOS_FETCH_ALLOW_PRIVATE=1`.
+`web_fetch` accepts `http` and `https`. It resolves the host name, refuses private, loopback, link-local, and other reserved addresses (and localhost), and dials the address it checked. It follows up to three redirects itself and applies the same check to every hop. A refusal returns `PrivateHost`, `InvalidRedirect`, `TooManyRedirects`, or `ResolveFailed`. `ZYGOS_FETCH_ALLOW_PRIVATE=1` turns the check off for local endpoints. The `bash` tool and MCP servers are not covered by it.
 
 ### Knobs
 
