@@ -71,9 +71,21 @@ the vault before the mission runs** (Y5): checkpoint failure refuses the run
 ## Console approvals (fail closed)
 
 The approval worker runs `.manual` (deny on timeout). The binary runs a
-console loop: poll `zygos::approvals::pending`, print each pending
-`{id, tool, reason}` to stderr, read `y`/`n` from stdin (libc fd 0 — Z-02:
-no std.Io in main), resolve over `zygos::approvals::resolve`. stdin EOF or
+console loop: poll `zygos::approvals::pending`, print each pending ask to
+stderr, read `y`/`n` from stdin (libc fd 0 — Z-02: no std.Io in main),
+resolve over `zygos::approvals::resolve`. The prompt is one line:
+`approve <tool> [step <id>] <input json> (<reason>)? [y/N] `, for example
+`approve bash [step executor] {"command":"ls -la"} (policy ask: rule: bash)? [y/N] `.
+The step is omitted when the ask carries none, the input when it has none.
+The input's JSON text is capped at 400 bytes on a UTF-8 boundary with a
+`…[<n> bytes total]` marker (never cut silently), and every field passes
+the TUI scrubber first (escape sequences and C0/C1 controls dropped, any
+surviving newline becomes a space) because the input is model-controlled.
+The TUI approval band uses the same text (`cli/mission/approval_prompt.zig`).
+
+SIGINT aborts the mission and then calls `zygos::approvals::cancel`, so an
+ask parked at that moment replies outcome `cancelled` instead of waiting out
+the approval timeout. Everything else is unchanged: stdin EOF or
 not-a-tty ⇒ stop prompting entirely and let the manual timeout deny
 (fail closed — an unattended mission can never self-approve a gate).
 

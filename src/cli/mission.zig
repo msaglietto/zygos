@@ -13,6 +13,7 @@ const zygos = @import("zygos");
 const req_mod = @import("mission/req.zig");
 const view_mod = @import("mission/view.zig");
 const steps_mod = @import("mission/steps.zig");
+const approval_prompt = @import("mission/approval_prompt.zig");
 
 const StartParams = req_mod.StartParams;
 const buildStartRequest = req_mod.buildStartRequest;
@@ -599,6 +600,11 @@ fn sigintWatch(gpa: std.mem.Allocator, worker: *zygos.inproc.Worker, mission_id:
     defer gpa.free(req);
     const res = worker.call("zygos::missions::abort", req) catch return;
     res.deinit(gpa);
+    // A tool ask parked in the approval worker would otherwise hold the
+    // aborted run until the approval timeout; wake it as outcome cancelled.
+    // Best effort: a missing function or a bus error changes nothing.
+    const cancelled = worker.call("zygos::approvals::cancel", "{}") catch return;
+    cancelled.deinit(gpa);
 }
 
 fn usage() u8 {
@@ -870,9 +876,9 @@ fn consoleLoop(gpa: std.mem.Allocator, worker: *zygos.inproc.Worker) void {
             if (item != .object) continue;
             const id = strOf(item.object.get("id")) orelse continue;
             if (handled.contains(id)) continue;
-            const tool = strOf(item.object.get("tool")) orelse "?";
-            const reason = strOf(item.object.get("reason")) orelse "";
-            eprint("approve {s}: {s}? [y/N] ", .{ tool, reason });
+            const text = approval_prompt.display(gpa, item.object) catch return;
+            defer gpa.free(text);
+            eprint("approve {s}? [y/N] ", .{text});
 
             var line_buf: [64]u8 = undefined;
             const line = readStdinLine(&line_buf) orelse return; // EOF: fail closed
@@ -990,9 +996,7 @@ fn tuiApprovalLoop(
             if (item != .object) continue;
             const id = strOf(item.object.get("id")) orelse continue;
             if (handled.contains(id)) continue;
-            const tool = strOf(item.object.get("tool")) orelse "?";
-            const reason = strOf(item.object.get("reason")) orelse "";
-            const summary = std.fmt.allocPrint(gpa, "{s}: {s}", .{ tool, reason }) catch return;
+            const summary = approval_prompt.display(gpa, item.object) catch return;
             defer gpa.free(summary);
             ui.model.setPendingApproval(summary);
             current_id = gpa.dupe(u8, id) catch return;

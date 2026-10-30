@@ -19,6 +19,7 @@ const inproc = @import("../kernel/inproc.zig");
 const sync = @import("../kernel/sync.zig");
 const channel_mod = @import("../kernel/channel.zig");
 const trace_mod = @import("trace.zig");
+const approval_mod = @import("approval.zig");
 
 const log = std.log.scoped(.turn);
 
@@ -223,7 +224,8 @@ pub const TurnOrchestrator = struct {
         }
     }
 
-    const PolicyDecision = union(enum) { allow, ask, deny: []const u8 };
+    /// `ask` carries the policy's reason (empty when the verdict had none).
+    const PolicyDecision = union(enum) { allow, ask: []const u8, deny: []const u8 };
 
     /// U1 — fail closed: any bus error, malformed reply, or unknown verdict
     /// is a deny carrying the failure as its reason.
@@ -259,7 +261,10 @@ pub const TurnOrchestrator = struct {
                 const verdict = strField(root.object, "verdict") orelse
                     return .{ .deny = "malformed policy verdict" };
                 if (std.mem.eql(u8, verdict, "allow")) return .allow;
-                if (std.mem.eql(u8, verdict, "ask")) return .ask;
+                if (std.mem.eql(u8, verdict, "ask")) {
+                    const reason = strField(root.object, "reason") orelse "";
+                    return .{ .ask = try arena.dupe(u8, reason) };
+                }
                 if (std.mem.eql(u8, verdict, "deny")) {
                     const reason = strField(root.object, "reason") orelse "";
                     return .{ .deny = try arena.dupe(u8, reason) };
@@ -270,20 +275,31 @@ pub const TurnOrchestrator = struct {
     }
 
     /// U2 — no approval_function preserves M1 auto-approve (tested legacy);
-    /// with one, only an explicit {"approved":true} dispatches (fail closed).
+    /// with one, only a reply whose `outcome` is `"allowed_once"` AND whose
+    /// `approved` is true dispatches (fail closed): a missing, non-string or
+    /// unknown outcome, a contradiction, a malformed reply, a handler error
+    /// and a bus failure all deny (docs/specs/approval.md).
     fn requestApproval(
         self: *TurnOrchestrator,
         arena: std.mem.Allocator,
         approval_fn: ?[]const u8,
         tool_name: []const u8,
         input: json.Value,
+        step_id: []const u8,
+        reason: []const u8,
+        trace_path: ?[]const u8,
     ) error{OutOfMemory}!bool {
         const af = approval_fn orelse return true;
-        const areq = try std.fmt.allocPrint(arena, "{{\"tool\":{f},\"input\":{s},\"reason\":\"turn tool dispatch\"}}", .{
+        var areq: std.ArrayList(u8) = .empty;
+        try areq.print(arena, "{{\"tool\":{f},\"input\":{s},\"reason\":{f}", .{
             json.fmt(tool_name, .{}),
             try rawJson(arena, input),
+            json.fmt(reason, .{}),
         });
-        const res = self.worker.call(af, areq) catch |err| switch (err) {
+        if (step_id.len > 0) try areq.print(arena, ",\"step_id\":{f}", .{json.fmt(step_id, .{})});
+        if (trace_path) |tp| try areq.print(arena, ",\"trace_path\":{f}", .{json.fmt(tp, .{})});
+        try areq.append(arena, '}');
+        const res = self.worker.call(af, areq.items) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.Shutdown => return false,
         };
@@ -296,6 +312,10 @@ pub const TurnOrchestrator = struct {
                 defer self.gpa.free(payload);
                 const root = json.parseFromSliceLeaky(json.Value, arena, payload, .{}) catch return false;
                 if (root != .object) return false;
+                const ov = root.object.get("outcome") orelse return false;
+                if (ov != .string) return false;
+                const outcome = approval_mod.Outcome.parse(ov.string) orelse return false;
+                if (outcome != .allowed_once) return false;
                 const v = root.object.get("approved") orelse return false;
                 return v == .bool and v.bool;
             },
@@ -640,10 +660,17 @@ fn runTurn(self: *TurnOrchestrator, arena: std.mem.Allocator, request_json: []co
 
                     // U1 policy gate — only an explicit verdict dispatches.
                     var ask = route.requires_approval;
+                    var ask_reason: []const u8 = "tool requires approval";
                     if (policy_fn) |pf| {
                         switch (try self.checkPolicy(arena, pf, tool_name, route.function_id, step_id, input)) {
                             .allow => {},
-                            .ask => ask = true,
+                            .ask => |policy_reason| {
+                                ask = true;
+                                ask_reason = if (policy_reason.len == 0)
+                                    "policy ask"
+                                else
+                                    try std.fmt.allocPrint(arena, "policy ask: {s}", .{policy_reason});
+                            },
                             .deny => |reason| {
                                 const denied = try std.fmt.allocPrint(arena, "policy_denied: {s}", .{reason});
                                 try traceToolResult(arena, trace_path, steps, tool_name, denied, true);
@@ -655,7 +682,7 @@ fn runTurn(self: *TurnOrchestrator, arena: std.mem.Allocator, request_json: []co
 
                     if (ask) {
                         state = try Fsm.apply(state, .needs_approval); // → awaiting_approval
-                        if (try self.requestApproval(arena, approval_fn, tool_name, input)) {
+                        if (try self.requestApproval(arena, approval_fn, tool_name, input, step_id, ask_reason, trace_path)) {
                             state = try Fsm.apply(state, .approved); // → dispatching
                         } else {
                             state = try Fsm.apply(state, .denied); // → dispatching
@@ -1408,7 +1435,6 @@ test "no leaks under a multi-step turn" {
 // -- M2 driver: policy gate + approval + abort/steer (spec contract 13-25) ----
 
 const policy_mod = @import("policy.zig");
-const approval_mod = @import("approval.zig");
 
 /// baseRequest with extra top-level fields spliced in.
 fn requestWith(comptime top_extra: []const u8) []const u8 {
@@ -1485,6 +1511,226 @@ test "policy ask + approval deny yields approval_denied result, no dispatch" {
     h.tool.mutex.lock();
     defer h.tool.mutex.unlock();
     try testing.expectEqual(@as(usize, 0), h.tool.calls);
+}
+
+/// Approver double: answers every request with a canned reply (null = the
+/// handler fails) and keeps the last request so tests can read the wire form.
+const CannedApprover = struct {
+    gpa: std.mem.Allocator,
+    worker: *inproc.Worker,
+    reply: ?[]const u8,
+    mutex: sync.Mutex = .{},
+    calls: usize = 0,
+    last_request: ?[]u8 = null,
+
+    fn start(
+        gpa: std.mem.Allocator,
+        actor: *actor_mod.Actor,
+        registry: *inproc.Registry,
+        reply: ?[]const u8,
+    ) !*CannedApprover {
+        const self = try gpa.create(CannedApprover);
+        errdefer gpa.destroy(self);
+        self.* = .{
+            .gpa = gpa,
+            .worker = try inproc.Worker.spawn(gpa, actor, registry, "canned-approver"),
+            .reply = reply,
+        };
+        errdefer self.worker.stop();
+        try self.worker.registerFunction("zygos::approvals::request", self, &handler);
+        return self;
+    }
+
+    fn stop(self: *CannedApprover) void {
+        self.worker.stop();
+        if (self.last_request) |r| self.gpa.free(r);
+        self.mutex.deinit();
+        const gpa = self.gpa;
+        gpa.destroy(self);
+    }
+
+    fn handler(ctx: ?*anyopaque, arena: std.mem.Allocator, request_json: []const u8) error{ Failed, OutOfMemory }![]const u8 {
+        const self: *CannedApprover = @ptrCast(@alignCast(ctx.?));
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.calls += 1;
+        if (self.last_request) |r| self.gpa.free(r);
+        self.last_request = self.gpa.dupe(u8, request_json) catch null;
+        const reply = self.reply orelse return error.Failed;
+        return arena.dupe(u8, reply);
+    }
+};
+
+fn reqStr(root: json.Value, key: []const u8) ![]const u8 {
+    const v = root.object.get(key) orelse return error.MissingField;
+    if (v != .string) return error.MissingField;
+    return v.string;
+}
+
+const ask_runner_req = "\"policy_function\":\"zygos::policy::check\",\"approval_function\":\"zygos::approvals::request\",";
+
+/// One turn whose only tool call is policy-gated to `ask` and answered by a
+/// CannedApprover; returns how many times the tool dispatched.
+fn dispatchesAfterApproverReply(reply: ?[]const u8) !usize {
+    var h = try Harness.init(testing.allocator, &.{ tool_use_msg, end_turn_msg });
+    defer h.deinit();
+    const pw = try policy_mod.PolicyWorker.start(testing.allocator, &h.actor, &h.registry, &.{
+        .{ .tool = "runner", .verdict = .ask },
+    });
+    defer pw.stop();
+    const ca = try CannedApprover.start(testing.allocator, &h.actor, &h.registry, reply);
+    defer ca.stop();
+
+    const res = try h.runTurnCall(requestWith(ask_runner_req));
+    defer res.deinit(testing.allocator);
+    try testing.expect(res == .ok);
+    try testing.expect(std.mem.indexOf(u8, res.ok, "\"stop\":\"end_turn\"") != null);
+
+    h.tool.mutex.lock();
+    defer h.tool.mutex.unlock();
+    const calls = h.tool.calls;
+    // A denial is the unchanged is_error `approval_denied` tool_result.
+    try testing.expectEqual(calls == 0, std.mem.indexOf(u8, res.ok, "approval_denied") != null);
+    return calls;
+}
+
+test "approval request carries input, step_id, trace_path and the policy reason" {
+    var h = try Harness.init(testing.allocator, &.{ tool_use_msg, end_turn_msg });
+    defer h.deinit();
+    const pw = try policy_mod.PolicyWorker.start(testing.allocator, &h.actor, &h.registry, &.{
+        .{ .tool = "runner", .verdict = .ask },
+    });
+    defer pw.stop();
+    const ca = try CannedApprover.start(
+        testing.allocator,
+        &h.actor,
+        &h.registry,
+        "{\"approved\":true,\"id\":\"a-1\",\"outcome\":\"allowed_once\",\"resolved\":true}",
+    );
+    defer ca.stop();
+
+    const res = try h.runTurnCall(requestWith(
+        ask_runner_req ++ "\"step_id\":\"architect\",\"trace_path\":\"/nonexistent-zygos/events.jsonl\",",
+    ));
+    defer res.deinit(testing.allocator);
+    try testing.expect(res == .ok);
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    ca.mutex.lock();
+    defer ca.mutex.unlock();
+    const root = try json.parseFromSliceLeaky(json.Value, arena_state.allocator(), ca.last_request orelse return error.NoRequest, .{});
+    try testing.expectEqualStrings("runner", try reqStr(root, "tool"));
+    const input = root.object.get("input") orelse return error.MissingInput;
+    try testing.expect(input == .object);
+    try testing.expectEqualStrings("echo hi", input.object.get("command").?.string);
+    try testing.expectEqualStrings("architect", try reqStr(root, "step_id"));
+    try testing.expectEqualStrings("/nonexistent-zygos/events.jsonl", try reqStr(root, "trace_path"));
+    try testing.expectEqualStrings("policy ask: rule: runner", try reqStr(root, "reason"));
+}
+
+fn askWithoutReason(_: ?*anyopaque, arena: std.mem.Allocator, _: []const u8) error{ Failed, OutOfMemory }![]const u8 {
+    return arena.dupe(u8, "{\"verdict\":\"ask\"}");
+}
+
+test "an ask verdict without a reason asks with reason \"policy ask\"" {
+    var h = try Harness.init(testing.allocator, &.{ tool_use_msg, end_turn_msg });
+    defer h.deinit();
+    const quiet = try inproc.Worker.spawn(testing.allocator, &h.actor, &h.registry, "quiet-policy");
+    defer quiet.stop();
+    try quiet.registerFunction("zygos::policy::check", null, &askWithoutReason);
+    const ca = try CannedApprover.start(testing.allocator, &h.actor, &h.registry, "{\"approved\":false,\"outcome\":\"rejected\"}");
+    defer ca.stop();
+
+    const res = try h.runTurnCall(requestWith(ask_runner_req));
+    defer res.deinit(testing.allocator);
+    try testing.expect(res == .ok);
+
+    ca.mutex.lock();
+    defer ca.mutex.unlock();
+    try testing.expect(std.mem.indexOf(u8, ca.last_request.?, "\"reason\":\"policy ask\"") != null);
+}
+
+test "requires_approval without an ask verdict asks with reason \"tool requires approval\"" {
+    var h = try Harness.init(testing.allocator, &.{ tool_use_msg, end_turn_msg });
+    defer h.deinit();
+    const ca = try CannedApprover.start(
+        testing.allocator,
+        &h.actor,
+        &h.registry,
+        "{\"approved\":true,\"id\":\"a-1\",\"outcome\":\"allowed_once\",\"resolved\":true}",
+    );
+    defer ca.stop();
+
+    const res = try h.runTurnCall(
+        \\{"model":"fake-1","system":"you are a test","max_steps":4,
+        \\ "provider_function":"zygos::provider::fake::messages",
+        \\ "approval_function":"zygos::approvals::request",
+        \\ "messages":[{"role":"user","content":"go"}],
+        \\ "tools":[{"name":"runner","function_id":"test::tool::run","requires_approval":true}]}
+    );
+    defer res.deinit(testing.allocator);
+    try testing.expect(res == .ok);
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    ca.mutex.lock();
+    defer ca.mutex.unlock();
+    const root = try json.parseFromSliceLeaky(json.Value, arena_state.allocator(), ca.last_request orelse return error.NoRequest, .{});
+    try testing.expectEqualStrings("tool requires approval", try reqStr(root, "reason"));
+    // The turn had no step_id and no trace_path: neither key rides the request.
+    try testing.expect(root.object.get("step_id") == null);
+    try testing.expect(root.object.get("trace_path") == null);
+
+    h.tool.mutex.lock();
+    defer h.tool.mutex.unlock();
+    try testing.expectEqual(@as(usize, 1), h.tool.calls);
+}
+
+test "only outcome allowed_once dispatches (approved:true with outcome rejected does not)" {
+    // Positive control: the full reply the worker sends.
+    try testing.expectEqual(@as(usize, 1), try dispatchesAfterApproverReply(
+        "{\"approved\":true,\"id\":\"a-1\",\"outcome\":\"allowed_once\",\"resolved\":true}",
+    ));
+    // The other three outcomes, and approved:true cannot override them.
+    inline for (.{ "rejected", "cancelled", "unavailable" }) |outcome| {
+        try testing.expectEqual(@as(usize, 0), try dispatchesAfterApproverReply(
+            "{\"approved\":true,\"id\":\"a-1\",\"outcome\":\"" ++ outcome ++ "\",\"resolved\":true}",
+        ));
+        try testing.expectEqual(@as(usize, 0), try dispatchesAfterApproverReply(
+            "{\"approved\":false,\"id\":\"a-1\",\"outcome\":\"" ++ outcome ++ "\",\"resolved\":false}",
+        ));
+    }
+}
+
+test "missing, unknown, non-string or contradictory outcome denies" {
+    const denied = [_][]const u8{
+        "{\"approved\":true}", // an approver that predates `outcome`
+        "{\"approved\":true,\"id\":\"a-1\",\"resolved\":true}",
+        "{\"approved\":true,\"outcome\":\"allow\"}", // outside the closed set
+        "{\"approved\":true,\"outcome\":\"ALLOWED_ONCE\"}",
+        "{\"approved\":true,\"outcome\":true}", // non-string
+        "{\"approved\":true,\"outcome\":1}",
+        "{\"approved\":true,\"outcome\":null}",
+        "{\"approved\":true,\"outcome\":[\"allowed_once\"]}",
+        "{\"approved\":false,\"outcome\":\"allowed_once\"}", // contradiction
+        "{\"outcome\":\"allowed_once\"}", // no approved at all
+        "{\"approved\":\"true\",\"outcome\":\"allowed_once\"}", // non-bool approved
+    };
+    for (denied) |reply| {
+        try testing.expectEqual(@as(usize, 0), try dispatchesAfterApproverReply(reply));
+    }
+}
+
+test "unparseable approval reply denies" {
+    // The bus only carries valid JSON in `result`, so "unparseable" here is
+    // every JSON value that is not a reply object.
+    const denied = [_][]const u8{ "[]", "\"allowed_once\"", "null", "42", "true" };
+    for (denied) |reply| {
+        try testing.expectEqual(@as(usize, 0), try dispatchesAfterApproverReply(reply));
+    }
+    // A handler error and an unregistered approver are denials too.
+    try testing.expectEqual(@as(usize, 0), try dispatchesAfterApproverReply(null));
 }
 
 test "policy function unreachable denies (fail closed)" {

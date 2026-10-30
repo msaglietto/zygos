@@ -129,9 +129,19 @@ New optional request fields — every one absent ⇒ exact M1 behavior:
   verdict ⇒ treated as deny. Without it, only `requires_approval` gates.
 - **Approval.** On `ask` (or `requires_approval:true`): `needs_approval` →
   awaiting_approval; with `approval_function` the driver blocks on the real
-  bus call — `{"approved":true}` ⇒ `approved`, anything else (incl. bus
-  error: fail closed) ⇒ `denied` ⇒ is_error tool_result `approval_denied`.
-  Without `approval_function`, M1 auto-approve is preserved (tested legacy).
+  bus call. The request is `{"tool","input","reason"}` plus `"step_id"` when
+  the turn has a non-empty one and `"trace_path"` when it has one. `reason`
+  names the gate: `policy ask: <policy reason>` (the policy worker's reason is
+  `rule: <pattern>`), `policy ask` when the verdict carried no reason, and
+  `tool requires approval` for a route's `requires_approval` with no `ask`
+  verdict. The tool dispatches only when the reply's `outcome` is
+  `"allowed_once"` AND `approved` is `true` ⇒ `approved`; anything else
+  (`rejected`, `cancelled`, `unavailable`, a missing / non-string / unknown
+  `outcome`, a contradiction, an unparseable reply, a handler error, bus
+  error: fail closed) ⇒ `denied` ⇒ is_error tool_result `approval_denied`
+  (text unchanged). Without `approval_function`, M1 auto-approve is preserved
+  (tested legacy). The audit pair is the approval worker's to emit
+  (approval.md, "Audit trail"), not the turn's.
 - **Routing.** With `router_function`, provisioning resolves
   `{step_id, attempt}` → `{provider_function, model}` (request-level
   `provider_function`/`model` become fallbacks). A provider bus error then
@@ -162,6 +172,13 @@ route_exhausted`, 21 `budget exhausted stops the turn before the next step`,
 22 `budget check unreachable ⇒ stops (fail closed)`, 23 `usage recorded to
 the budget scope`, 24 `abort between steps stops with "aborted"`, 25 `steer
 text lands in the next step's messages`.
+
+Approval-request contract additions (RED first; the worker side is approval.md
+12-27): 23 `approval request carries input, step_id, trace_path and the policy
+reason`, 24 `requires_approval without an ask verdict asks with reason "tool
+requires approval"`, 25 `only outcome allowed_once dispatches (approved:true
+with outcome rejected does not)`, 26 `missing, unknown, non-string or
+contradictory outcome denies`, 27 `unparseable approval reply denies`.
 
 ## Test contract (RED first)
 

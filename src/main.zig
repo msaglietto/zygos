@@ -270,5 +270,6 @@ test {
     std.testing.refAllDecls(@import("cli/mission/req.zig"));
     std.testing.refAllDecls(@import("cli/mission/view.zig"));
     std.testing.refAllDecls(@import("cli/mission/steps.zig"));
+    std.testing.refAllDecls(@import("cli/mission/approval_prompt.zig"));
     std.testing.refAllDecls(@import("cli/task.zig"));
 }

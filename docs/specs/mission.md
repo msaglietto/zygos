@@ -311,6 +311,13 @@ and blocks on the reply:
   `gate_failed`.** A mission can never reach `done` without a real,
   reachable gate saying yes.
 
+Since 5.2.0 the approval worker's reply also carries `outcome`
+(`docs/specs/approval.md`). The gate still reads `approved` and `resolved`
+only: `allowed_once` arrives as `approved:true`, `rejected` as a denial,
+and `unavailable` and `cancelled` as `resolved:false` (park). The gate
+request carries no `trace_path`, so gate asks are not in the trace's
+approval pair; the `mission` events record the gate.
+
 The gate call is not a step turn and does not count against
 `max_role_turns`.
 

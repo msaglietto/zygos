@@ -10,7 +10,7 @@ Zygos has no accounts, roles in a token, or database row policies. Scope is the 
 | Loopback peer | TCP to `127.0.0.1:port` | Register and invoke functions on a bare kernel after Origin admission and optional `ZYGOS_TOKEN` authentication. |
 | Mission model | Provider HTTP, routed by `step_id` | Emit text and tool calls. Tools run only after policy (and approval, if `ask`). |
 | Policy worker | In-process, rules from `zygos.zon` `.policy` when present, else `policySeed`, or a caller-supplied list | Return allow / deny / ask. Default when nothing matches is deny. |
-| Approver | TUI key, stdin line, or timeout | Approve or deny a parked ask or the completion gate. Timeout denies. |
+| Approver | TUI key, stdin line, or timeout | Approve or deny a parked ask or the completion gate. The prompt shows the tool, the step and the input (capped with a marker, terminal escapes stripped). Only `allowed_once` dispatches, and it approves that one call. Timeout replies `unavailable`, SIGINT `cancelled`; both deny. |
 | MCP stdio client | Parent process of `mcp-gateway` | Call registered tessera tools. |
 | External MCP server | `zygos.zon` `.mcp_servers` argv | Its own tools, registered as `zygos::mcp::<server>::<tool>`, under the same policy rules: the seed allows them, and a configured `.policy` must name them or they are denied. |
 | Cron | The crontab user | Same as the operator, non-interactively. |
@@ -25,7 +25,7 @@ Zygos has no accounts, roles in a token, or database row policies. Scope is the 
 | Trigger binding | register / GC | Registrant | Connection-owned bindings die with the connection. Durable bindings survive. |
 | Channel | take | Holder of the access key | Single consumer. Wrong key does not take. |
 | Workspace file | read / write | `zygos::tools::{read_file,write_file}` | Absolute path, empty path, or lexical `..` escape → `PathEscapesWorkspace`. Symlink to an outside target is not rejected. |
-| Shell | execute | `zygos::tools::bash` when policy allows | Policy deny or ask-timeout; local two-minute process-group deadline. Child env contains PATH/HOME/TZ/LANG/TERM/LC_* only; stdin is `/dev/null`, and its output pipe is close-on-exec and forked under the process-wide fork lock, so no concurrent command or MCP server holds it open. No path jail inside the command. |
+| Shell | execute | `zygos::tools::bash` when policy allows | Policy deny, or an ask whose outcome is not `allowed_once` (rejected, timeout `unavailable`, SIGINT `cancelled`, or a reply without a known outcome); local two-minute process-group deadline. Child env contains PATH/HOME/TZ/LANG/TERM/LC_* only; stdin is `/dev/null`, and its output pipe is close-on-exec and forked under the process-wide fork lock, so no concurrent command or MCP server holds it open. No path jail inside the command. |
 | URL | fetch | `zygos::tools::web_fetch` when policy allows | Non-http(s), missing host, non-2xx, oversize, non-text. The host, every resolved address, and every redirect hop are screened; private, loopback, link-local, reserved, and localhost destinations refuse `PrivateHost` (also `InvalidRedirect`, `TooManyRedirects`, `ResolveFailed`) unless `ZYGOS_FETCH_ALLOW_PRIVATE=1`. |
 | Search | query | `zygos::tools::web_search` when policy allows and an engine is configured | Unknown engine, missing searxng endpoint, missing brave key, malformed upstream JSON. |
 | Mission | start | CLI caller | Bad brief, unknown provider slug, existing substrate without resume or run-stamp, malformed `.policy`, vault checkpoint failure, or unavailable planning-root lock. |
@@ -42,6 +42,8 @@ Every check above is in process code. There is no database and no row-level secu
 Policy match is exact or prefix (`trailing *`) on `tool` or `function_id` (`policy.zig` `matches`). First match wins. Without a `.policy` key in `zygos.zon`, the mission CLI seeds allow rules (`policySeed`) and ships no deny rule for bash.
 
 With a `.policy` key, the operator's ordered list is the whole policy: it replaces the seed, nothing is prepended or appended, and a tool no rule matches is denied. A rule may be scoped to a pipeline step. The CLI validates the list at boot and refuses a malformed one, a step pattern that matches no configured step, or a tool pattern that matches no offered tool. Every run of the loop writes the effective list to the trace as a `policy` event. The contract is `docs/specs/policy-config.md`.
+
+Every decision is in the trace. A `deny` verdict is the `policy_denied: <reason>` error tool result. An `ask` writes `approval_asked` (id, tool, step, input) when it parks and `approval_decided` (id, outcome) when it is answered, times out, or is cancelled. The approval worker writes both, so a foreign approver registered on `zygos::approvals::request` writes neither. The contract is `docs/specs/approval.md`.
 
 `deny` holds against the executor. `ask` does not: a same-user shell can append an approval to the control file (see below).
 
