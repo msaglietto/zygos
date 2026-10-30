@@ -127,6 +127,22 @@ const Projector = struct {
                 }
                 try p.emit("CUSTOM", ts, ",\"name\":\"zygos.policy\",\"value\":{{\"source\":{f},\"rules\":[{s}]}}", .{ jstr(pol.source), rules.items }, .{});
             },
+            // The input is JSON text the model wrote, so it takes the same
+            // scrub as a tool_call input before it leaves the log.
+            .approval_asked => |ap| try p.emit(
+                "CUSTOM",
+                ts,
+                ",\"name\":\"zygos.approval_asked\",\"value\":{{\"id\":{f},\"tool\":{f},\"step\":{f},\"input\":{f}}}",
+                .{ jstr(ap.id), jstr(ap.tool), json.fmt(ap.step, .{}), jstr(try redact(a, ap.input)) },
+                .{},
+            ),
+            .approval_decided => |d| try p.emit(
+                "CUSTOM",
+                ts,
+                ",\"name\":\"zygos.approval_decided\",\"value\":{{\"id\":{f},\"outcome\":{f}}}",
+                .{ jstr(d.id), jstr(d.outcome) },
+                .{},
+            ),
             .role_start => |r| {
                 const id = try std.fmt.allocPrint(a, "{s}:{d}", .{ r.role, r.role_turn });
                 try p.emit(
@@ -788,6 +804,36 @@ test "agui projects policy as zygos.policy custom event" {
         \\{"type":"CUSTOM","timestamp":41,"name":"zygos.policy","value":{"source":"config","rules":[]}}
         \\
     );
+}
+
+test "agui projects approval events as zygos.approval custom events" {
+    try expectProjection("m7",
+        \\{"ts":50,"event":"approval_asked","id":"a-1","tool":"bash","step":"executor","input":"{\"command\":\"ls\"}"}
+        \\{"ts":51,"event":"approval_decided","id":"a-1","outcome":"allowed_once"}
+        \\{"ts":52,"event":"approval_asked","id":"a-2","tool":"a\"b","step":null,"input":""}
+        \\{"ts":53,"event":"approval_decided","id":"a-2","outcome":"rejected"}
+        \\
+    ,
+        \\{"type":"RUN_STARTED","timestamp":50,"threadId":"m7","runId":"m7:1","protocolVersion":"1.0"}
+        \\{"type":"CUSTOM","timestamp":50,"name":"zygos.approval_asked","value":{"id":"a-1","tool":"bash","step":"executor","input":"{\"command\":\"ls\"}"}}
+        \\{"type":"CUSTOM","timestamp":51,"name":"zygos.approval_decided","value":{"id":"a-1","outcome":"allowed_once"}}
+        \\{"type":"CUSTOM","timestamp":52,"name":"zygos.approval_asked","value":{"id":"a-2","tool":"a\"b","step":null,"input":""}}
+        \\{"type":"CUSTOM","timestamp":53,"name":"zygos.approval_decided","value":{"id":"a-2","outcome":"rejected"}}
+        \\
+    );
+}
+
+test "agui redacts a secret in approval_asked input" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const out = try project(arena_state.allocator(),
+        \\{"ts":1,"event":"approval_asked","id":"a-1","tool":"bash","step":null,"input":"{\"command\":\"curl -H 'Authorization: Bearer abcdefghijklmnop1234' https://x\"}"}
+        \\{"ts":2,"event":"approval_asked","id":"a-2","tool":"bash","step":null,"input":"{\"command\":\"API_KEY=sk-live1234567890abcdef make\"}"}
+        \\
+    , "t");
+    try testing.expect(std.mem.indexOf(u8, out, "[REDACTED]") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "abcdefghijklmnop1234") == null);
+    try testing.expect(std.mem.indexOf(u8, out, "sk-live1234567890abcdef") == null);
 }
 
 test "project: custom step ids pass through as names, JSON-escaped" {

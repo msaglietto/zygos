@@ -351,6 +351,9 @@ pub const Model = struct {
             // The effective policy is a trace/AG-UI record; the TUI has no
             // panel for it and changes no state.
             .policy => {},
+            // The approval band is driven by polling `pending`, not by the
+            // audit pair; neither event changes TUI state.
+            .approval_asked, .approval_decided => {},
             .role_start => |r| {
                 try self.replaceOwned(&self.role, r.role);
                 self.role_turn = r.role_turn;
@@ -702,6 +705,22 @@ test "pipeline step ids are scrubbed before they reach the terminal" {
     const view = try renderJoined(&m, arena_state.allocator());
     try testing.expect(std.mem.indexOfScalar(u8, view, 0x07) == null);
     try testing.expect(std.mem.indexOf(u8, view, "]52;") == null);
+}
+
+test "approval events leave the model unchanged" {
+    var m = Model.init(testing.allocator, 0);
+    defer m.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const before = try renderJoined(&m, arena_state.allocator());
+    m.onEvent(
+        \\{"ts":0,"event":"approval_asked","id":"a-1","tool":"bash","step":"executor","input":"{\"command\":\"ls\"}"}
+    );
+    m.onEvent(
+        \\{"ts":1,"event":"approval_decided","id":"a-1","outcome":"allowed_once"}
+    );
+    const after = try renderJoined(&m, arena_state.allocator());
+    try testing.expectEqualStrings(before, after);
 }
 
 test "policy event leaves the model unchanged" {
