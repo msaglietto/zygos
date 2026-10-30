@@ -206,12 +206,16 @@ pub const Worker = struct {
             self.q_not_empty.broadcast();
         }
         self.router.join();
-        {
-            self.hb_mutex.lock();
-            defer self.hb_mutex.unlock();
-            while (self.handlers_live > 0) self.hb_done.wait(&self.hb_mutex);
-        }
+        self.waitHandlersIdle();
         self.destroy();
+    }
+
+    /// Returns once no handler thread is running; handlers that start later
+    /// are not waited for.
+    pub fn waitHandlersIdle(self: *Worker) void {
+        self.hb_mutex.lock();
+        defer self.hb_mutex.unlock();
+        while (self.handlers_live > 0) self.hb_done.wait(&self.hb_mutex);
     }
 
     fn destroy(self: *Worker) void {

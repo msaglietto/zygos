@@ -110,12 +110,7 @@ pub const ApprovalWorker = struct {
         // `worker_disconnected`. Let the woken handlers finish (the reply is
         // posted before a handler counts as done) so their callers receive the
         // `cancelled` reply instead of a transport error.
-        {
-            const w = self.worker;
-            w.hb_mutex.lock();
-            defer w.hb_mutex.unlock();
-            while (w.handlers_live > 0) w.hb_done.wait(&w.hb_mutex);
-        }
+        self.worker.waitHandlersIdle();
         self.worker.stop();
         std.debug.assert(self.pending.count() == 0);
         self.pending.deinit();
