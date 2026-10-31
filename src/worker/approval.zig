@@ -139,6 +139,11 @@ pub const ApprovalWorker = struct {
             }
         } else |_| {}
 
+        // Allocated before the entry is parked: once parked, every exit must go
+        // through the wait below or `removeEntry`, and an `OutOfMemory` here
+        // would otherwise leave `pending` pointing into a dead frame.
+        const clipped_input = try trace_mod.clip(arena, input);
+
         // Park. The Pending lives on this handler thread's frame; the id must
         // be a stable map key, so it is duped on gpa. Everything else is
         // arena-owned and outlives the entry (removed before this returns).
@@ -174,7 +179,7 @@ pub const ApprovalWorker = struct {
             .id = entry.id,
             .tool = tool,
             .step = step_id,
-            .input = try trace_mod.clip(arena, input),
+            .input = clipped_input,
         } }) catch |err| {
             if (self.mode == .manual) self.removeEntry(entry.id);
             return err;
@@ -561,7 +566,7 @@ test "no leaks under park/resolve loops" {
     }
 }
 
-// -- Outcomes, cancel, pending input and the audit pair (spec items 12-22) ----
+// -- Outcomes, cancel, pending input and the audit pair (spec items 12-23) ----
 
 const trace_mod_test = @import("trace.zig");
 
@@ -1042,4 +1047,175 @@ test "trace: approval_asked input is clipped like tool_call input" {
     try testing.expect(clipped.len < input.len);
     // No step on the request: null, not an empty string.
     try testing.expect(asked.object.get("step").? == .null);
+}
+
+// -- Failure paths and first-decision-wins (spec items 24-28) -----------------
+
+/// A worker with no bus behind it, for driving the handlers directly. The
+/// handlers touch only `gpa`, `mode`, `mutex`, `next_id`, `stopping` and
+/// `pending`, never `worker`.
+fn bareWorker(mode: Mode) ApprovalWorker {
+    return .{
+        .gpa = testing.allocator,
+        .worker = undefined,
+        .mode = mode,
+        .pending = std.StringHashMap(*Pending).init(testing.allocator),
+    };
+}
+
+fn deinitBare(self: *ApprovalWorker) void {
+    self.pending.deinit();
+    self.mutex.deinit();
+}
+
+test "request: an allocation failure never leaves a parked entry behind" {
+    var self = bareWorker(.{ .manual = .{} });
+    defer deinitBare(&self);
+    // `stopping` makes the success path return `cancelled` at once instead of
+    // parking, so every iteration finishes and `pending` can be inspected.
+    self.stopping = true;
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    // Over the trace clip limit, so `trace.clip` allocates its marker text.
+    const big = try arena_state.allocator().alloc(u8, trace_mod.max_field_bytes + 100);
+    @memset(big, 'x');
+    const input = try std.fmt.allocPrint(arena_state.allocator(), "{{\"command\":\"{s}\"}}", .{big});
+    const payload = try buildRequest(arena_state.allocator(), input, "executor", null);
+
+    var saw_oom = false;
+    var fail_index: usize = 0;
+    while (fail_index < 256) : (fail_index += 1) {
+        // The handler gets the failing allocator itself (an arena in front of
+        // it would batch small requests into one backing allocation and hide
+        // most failure points); the scratch arena only reclaims what it frees.
+        var scratch = std.heap.ArenaAllocator.init(testing.allocator);
+        defer scratch.deinit();
+        var failing = testing.FailingAllocator.init(scratch.allocator(), .{ .fail_index = fail_index });
+        const result = ApprovalWorker.requestHandler(&self, failing.allocator(), payload);
+        // Whatever failed, nothing may stay parked: the entry lives on the
+        // handler's frame and the map key is freed on return.
+        try testing.expectEqual(@as(usize, 0), self.pending.count());
+        if (result) |reply| {
+            try testing.expect(std.mem.indexOf(u8, reply, "\"outcome\":\"cancelled\"") != null);
+            // Allocation number `fail_index` was never reached: all paths covered.
+            if (!failing.has_induced_failure) break;
+        } else |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+            saw_oom = true;
+        }
+    } else return error.NeverCompleted;
+    try testing.expect(saw_oom);
+}
+
+test "resolve: the first decision wins and a later resolve or cancel cannot flip it" {
+    var self = bareWorker(.{ .manual = .{} });
+    defer deinitBare(&self);
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Recorded but not yet woken: no handler thread is waiting on `p`, which
+    // is exactly the window between `event.set()` and the handler waking.
+    var p: Pending = .{ .id = "a-1", .tool = "bash", .reason = "", .input = "null", .step_id = null };
+    defer p.event.deinit();
+    try self.pending.put(p.id, &p);
+
+    const first = try ApprovalWorker.resolveHandler(&self, arena, "{\"id\":\"a-1\",\"approved\":true}");
+    try testing.expectEqualStrings("{\"resolved\":true}", first);
+    const flip = try ApprovalWorker.resolveHandler(&self, arena, "{\"id\":\"a-1\",\"approved\":false}");
+    try testing.expectEqualStrings("{\"resolved\":false}", flip);
+    try testing.expect(p.approved);
+    try testing.expect(p.resolved);
+    // A cancel after the decision wakes nothing either.
+    const late_cancel = try ApprovalWorker.cancelHandler(&self, arena, "{}");
+    try testing.expectEqualStrings("{\"cancelled\":0}", late_cancel);
+    try testing.expect(!p.cancelled);
+}
+
+test "resolve after cancel replies resolved:false and cannot revive the request" {
+    var self = bareWorker(.{ .manual = .{} });
+    defer deinitBare(&self);
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var p: Pending = .{ .id = "a-1", .tool = "bash", .reason = "", .input = "null", .step_id = null };
+    defer p.event.deinit();
+    try self.pending.put(p.id, &p);
+
+    const cancelled = try ApprovalWorker.cancelHandler(&self, arena, "{\"id\":\"a-1\"}");
+    try testing.expectEqualStrings("{\"cancelled\":1}", cancelled);
+    const late = try ApprovalWorker.resolveHandler(&self, arena, "{\"id\":\"a-1\",\"approved\":true}");
+    try testing.expectEqualStrings("{\"resolved\":false}", late);
+    try testing.expect(p.cancelled);
+    try testing.expect(!p.resolved);
+    try testing.expect(!p.approved);
+}
+
+test "trace: cancel while parked records approval_decided cancelled" {
+    const gpa = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try tmpTracePath(&tmp, &path_buf);
+
+    var h = try Harness.init(gpa);
+    defer h.deinit();
+    const aw = try ApprovalWorker.start(gpa, &h.actor, &h.registry, .{ .manual = .{} });
+    defer aw.stop();
+    const requester = try inproc.Worker.spawn(gpa, &h.actor, &h.registry, "requester");
+    defer requester.stop();
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const payload = try buildRequest(arena, "{\"command\":\"ls\"}", "executor", path);
+    var areq: AsyncRequest = .{ .worker = requester, .payload = payload };
+    defer areq.deinit();
+    const rt = try std.Thread.spawn(.{}, AsyncRequest.run, .{&areq});
+    gpa.free(try awaitParked(h.caller, 1));
+    const cancelled = try callOk(h.caller, "zygos::approvals::cancel", "{}");
+    gpa.free(cancelled);
+    rt.join();
+
+    const reply = areq.reply orelse return error.NoReply;
+    try testing.expectEqualStrings("cancelled", try outcomeOf(arena, reply));
+
+    const text = trace_mod_test.readFile(gpa, path) orelse return error.NoTrace;
+    defer gpa.free(text);
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, text, "\n"), '\n');
+    const asked = try json.parseFromSliceLeaky(json.Value, arena, lines.next() orelse return error.NoAsked, .{});
+    const decided = try json.parseFromSliceLeaky(json.Value, arena, lines.next() orelse return error.NoDecided, .{});
+    try testing.expect(lines.next() == null);
+    try testing.expectEqualStrings("approval_asked", asked.object.get("event").?.string);
+    try testing.expectEqualStrings("approval_decided", decided.object.get("event").?.string);
+    try testing.expectEqualStrings(asked.object.get("id").?.string, decided.object.get("id").?.string);
+    try testing.expectEqualStrings("cancelled", decided.object.get("outcome").?.string);
+}
+
+test "a request that arrives while the worker is stopping replies cancelled and parks nothing" {
+    const gpa = testing.allocator;
+    var h = try Harness.init(gpa);
+    defer h.deinit();
+    const aw = try ApprovalWorker.start(gpa, &h.actor, &h.registry, .{ .manual = .{} });
+    defer aw.stop();
+
+    // `stop` sets this under the mutex after its wake sweep; the handler is
+    // still registered until `inproc.Worker.stop`, so a request can land here.
+    {
+        aw.mutex.lock();
+        defer aw.mutex.unlock();
+        aw.stopping = true;
+    }
+    const res = try h.caller.call("zygos::approvals::request", req_bash);
+    defer res.deinit(gpa);
+    try testing.expect(res == .ok);
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    try testing.expectEqualStrings("cancelled", try outcomeOf(arena_state.allocator(), res.ok));
+    try testing.expect(!try approvedOf(res.ok));
+    try testing.expect(std.mem.indexOf(u8, res.ok, "\"resolved\":false") != null);
+    try testing.expectEqual(@as(usize, 0), aw.pending.count());
 }
