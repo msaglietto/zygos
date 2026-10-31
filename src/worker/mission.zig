@@ -1161,6 +1161,14 @@ fn gate(self: *MissionOrchestrator, arena: std.mem.Allocator, cfg: RunConfig, m:
             if (approved_val != .bool) return gateFail(m, "malformed gate reply");
 
             if (approved_val.bool) {
+                // An approval carrying an `outcome` must say `allowed_once`:
+                // `{"approved":true,"outcome":"rejected"}` contradicts itself,
+                // and a contradiction never completes a mission. No `outcome`
+                // field (an approver that predates it) is accepted as before.
+                if (parsed.object.get("outcome")) |ov| {
+                    if (ov != .string or !std.mem.eql(u8, ov.string, "allowed_once"))
+                        return gateFail(m, "malformed gate reply");
+                }
                 journal(self, cfg, "accept", m.objective);
                 m.stop = .completed;
                 m.detail = "";
@@ -1920,6 +1928,46 @@ test "gate deny with resolved:true reworks like a plain deny (a human said no)" 
     try testing.expect(res == .ok);
     try expectTerminal(res.ok, "done", "completed");
     try testing.expectEqual(@as(usize, 2), gate_worker.calls);
+}
+
+/// One gate reply, then the mission's terminal state. A fresh harness per
+/// reply, so no state carries over between cases.
+fn gateReplyTerminal(reply: []const u8, want_state: []const u8, want_stop: []const u8) !void {
+    var h = try Harness.init(testing.allocator, &.{ po_ok, plan1, exec_ok, verify_pass });
+    defer h.deinit();
+    const gate_worker = try FakeGate.start(testing.allocator, &h.actor, &h.registry, &.{reply});
+    defer gate_worker.stop();
+
+    const req = try h.startReq(
+        testing.allocator,
+        ",\"objective\":\"seed: gizmo\",\"gate_function\":\"test::gate::request\"",
+    );
+    defer testing.allocator.free(req);
+    const res = try h.caller.call("zygos::missions::start", req);
+    defer res.deinit(testing.allocator);
+    try testing.expect(res == .ok);
+    try expectTerminal(res.ok, want_state, want_stop);
+    if (std.mem.eql(u8, want_stop, "gate_failed")) {
+        try testing.expect(std.mem.indexOf(u8, res.ok, "malformed gate reply") != null);
+    }
+}
+
+test "gate: approved:true contradicted by a non-allowed_once outcome is a malformed reply" {
+    try gateReplyTerminal("{\"approved\":true,\"outcome\":\"rejected\"}", "failed", "gate_failed");
+    try gateReplyTerminal("{\"approved\":true,\"outcome\":\"cancelled\"}", "failed", "gate_failed");
+    try gateReplyTerminal("{\"approved\":true,\"outcome\":\"unavailable\"}", "failed", "gate_failed");
+    try gateReplyTerminal("{\"approved\":true,\"outcome\":\"bogus\"}", "failed", "gate_failed");
+}
+
+test "gate: approved:true with a non-string outcome is a malformed reply" {
+    try gateReplyTerminal("{\"approved\":true,\"outcome\":42}", "failed", "gate_failed");
+    try gateReplyTerminal("{\"approved\":true,\"outcome\":null}", "failed", "gate_failed");
+    try gateReplyTerminal("{\"approved\":true,\"outcome\":true}", "failed", "gate_failed");
+}
+
+test "gate: approved:true with outcome allowed_once completes; a reply with no outcome still does" {
+    try gateReplyTerminal("{\"approved\":true,\"outcome\":\"allowed_once\",\"resolved\":true}", "done", "completed");
+    try gateReplyTerminal("{\"approved\":true}", "done", "completed");
 }
 
 test "carried M3: no gate function ⇒ failed, never done" {
