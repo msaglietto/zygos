@@ -658,6 +658,7 @@ fn httpGet(
         return error.HttpFailed;
     };
     defer http_req.deinit();
+    http_req.accept_encoding = accepted_encodings;
 
     http_req.sendBodiless() catch return error.HttpFailed;
 
@@ -687,24 +688,94 @@ fn httpGet(
     const ct = gpa.dupe(u8, ct_raw) catch return error.OutOfMemory;
     errdefer gpa.free(ct);
 
+    // Decode what the server sent: `reader` would hand back gzip bytes as text.
+    // The window buffer exists only for a compressed body.
+    const window = switch (response.head.content_encoding) {
+        .identity => try gpa.alloc(u8, 0),
+        .gzip, .deflate => try gpa.alloc(u8, std.compress.flate.max_window_len),
+        // `accepted_encodings` never offers these and std refuses them in
+        // `receiveHead`; stay closed if that ever changes.
+        .zstd, .compress => return error.HttpFailed,
+    };
+    defer gpa.free(window);
+    var transfer_buf: [16 * 1024]u8 = undefined;
+    var decompress: std.http.Decompress = undefined;
+    const reader = response.readerDecompressing(&transfer_buf, &decompress, window);
+
+    const read = try readCapped(gpa, reader, request.max_bytes);
+    errdefer gpa.free(read.bytes);
+    // std's inflater reads the gzip CRC32 / zlib Adler-32 trailer but never
+    // checks it, so a corrupted body that still inflates would pass. Check it
+    // here when the whole body was read. A body cut at the cap is not checked.
+    if (read.complete and !trailerMatches(&decompress, response.head.content_encoding, read.bytes))
+        return error.HttpFailed;
+
+    return .{ .bytes = read.bytes, .content_type = ct };
+}
+
+/// Does the checksum trailer `decompress` read match the decoded `bytes`?
+/// gzip: CRC32 and length mod 2^32. deflate (zlib): Adler-32. Valid only after
+/// the inflater consumed the whole stream.
+fn trailerMatches(
+    decompress: *const std.http.Decompress,
+    encoding: std.http.ContentEncoding,
+    bytes: []const u8,
+) bool {
+    return switch (encoding) {
+        .gzip => blk: {
+            const m = decompress.flate.container_metadata.gzip;
+            break :blk m.crc == std.hash.Crc32.hash(bytes) and m.count == @as(u32, @truncate(bytes.len));
+        },
+        .deflate => decompress.flate.container_metadata.zlib.adler == std.hash.Adler32.hash(bytes),
+        else => true,
+    };
+}
+
+/// The content codings `httpGet` advertises and decodes. Anything else a
+/// server sends is refused by std in `receiveHead`.
+const accepted_encodings: @TypeOf(std.http.Client.Request.default_accept_encoding) = b: {
+    var set: @TypeOf(std.http.Client.Request.default_accept_encoding) = @splat(false);
+    set[@intFromEnum(std.http.ContentEncoding.gzip)] = true;
+    set[@intFromEnum(std.http.ContentEncoding.deflate)] = true;
+    set[@intFromEnum(std.http.ContentEncoding.identity)] = true;
+    break :b set;
+};
+
+const CappedRead = struct {
+    bytes: []u8,
+    /// The reader hit its end before the cap, so `bytes` is the whole body.
+    complete: bool,
+};
+
+/// Reads `reader` to its end, keeping at most `max_bytes`. `reader` yields
+/// decoded bytes, so the cap bounds the decoded output: reading stops at the
+/// cap and a small compressed body cannot expand past it. A failed read
+/// (corrupt or truncated compressed data, broken transport) is
+/// `error.HttpFailed`; the bytes read so far are never returned.
+fn readCapped(
+    gpa: std.mem.Allocator,
+    reader: *std.Io.Reader,
+    max_bytes: usize,
+) error{ OutOfMemory, HttpFailed }!CappedRead {
     var list: std.ArrayList(u8) = .empty;
     errdefer list.deinit(gpa);
-    var transfer_buf: [16 * 1024]u8 = undefined;
-    const reader = response.reader(&transfer_buf);
     var chunk: [8 * 1024]u8 = undefined;
+    var complete = true;
     while (true) {
         const n = reader.readSliceShort(&chunk) catch return error.HttpFailed;
         if (n == 0) break;
-        const take = @min(n, request.max_bytes -| list.items.len);
+        const take = @min(n, max_bytes -| list.items.len);
         if (take > 0) list.appendSlice(gpa, chunk[0..take]) catch return error.OutOfMemory;
         // Past the cap we stop reading further bytes into the buffer; the
         // connection is dropped on req.deinit.
-        if (list.items.len >= request.max_bytes) break;
+        if (list.items.len >= max_bytes) {
+            complete = false;
+            break;
+        }
     }
-
     return .{
         .bytes = list.toOwnedSlice(gpa) catch return error.OutOfMemory,
-        .content_type = ct,
+        .complete = complete,
     };
 }
 
@@ -1760,4 +1831,258 @@ test "defaultResolver: an address literal resolves through the concurrent lookup
     try testing.expectEqual(@as(usize, 1), n);
     try testing.expectEqualSlices(u8, &.{ 127, 0, 0, 1 }, &out[0].ip4.bytes);
     try testing.expectEqual(@as(u16, 8080), out[0].ip4.port);
+}
+
+// ---------------------------------------------------------------------------
+// Real transport over loopback (issue #23): `httpGet` against a one-shot
+// listener on 127.0.0.1 that sends canned bytes. This is the only code path
+// that reads `Content-Encoding`; the transport seam above bypasses it.
+// ---------------------------------------------------------------------------
+
+const gz_hello_html = "<html><body><p>Hello gzip world</p></body></html>";
+const gz_hello = "\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff\xb3\xc9\x28\xc9\xcd\xb1\xb3\x49\xca\x4f\xa9\xb4\xb3\x29\xb0\xf3\x48\xcd\xc9\xc9\x57\x48\xaf\xca\x2c\x50\x28\xcf\x2f\xca\x49\xb1\xd1\x2f\xb0\xb3\xd1\x87\xc8\xea\x83\x95\x02\x00\x2e\xeb\x8a\x82\x31\x00\x00\x00";
+/// zlib (`deflate`) wrapping of `gz_hello_html`.
+const zlib_hello = "\x78\xda\xb3\xc9\x28\xc9\xcd\xb1\xb3\x49\xca\x4f\xa9\xb4\xb3\x29\xb0\xf3\x48\xcd\xc9\xc9\x57\x48\xaf\xca\x2c\x50\x28\xcf\x2f\xca\x49\xb1\xd1\x2f\xb0\xb3\xd1\x87\xc8\xea\x83\x95\x02\x00\xb1\xdf\x11\x26";
+/// 333 bytes that decode to `gz_zeros_len` zero bytes.
+const gz_zeros_len = 300 * 1024;
+const gz_zeros = "\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff\xed\xc1\x01\x0d\x00\x00\x00\xc2\xa0\xf7\x4f\x6d\x0e\x37\xa0" ++
+    ("\x00" ** 297) ++ "\xe0\xcf\x00\x96\xc0\xec\x82\x00\xb0\x04\x00";
+
+const LoopbackServer = struct {
+    io: std.Io,
+    server: std.Io.net.Server,
+    response: []const u8,
+    thread: std.Thread = undefined,
+    request: [2048]u8 = undefined,
+    request_len: usize = 0,
+
+    fn start(gpa: std.mem.Allocator, io: std.Io, response: []const u8) !*LoopbackServer {
+        const self = try gpa.create(LoopbackServer);
+        errdefer gpa.destroy(self);
+        var addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+        self.* = .{ .io = io, .server = try addr.listen(io, .{}), .response = response };
+        errdefer self.server.deinit(io);
+        self.thread = try std.Thread.spawn(.{}, serve, .{self});
+        return self;
+    }
+
+    fn finish(self: *LoopbackServer, gpa: std.mem.Allocator) void {
+        self.thread.join();
+        self.server.deinit(self.io);
+        gpa.destroy(self);
+    }
+
+    fn url(self: *const LoopbackServer, buf: []u8) []const u8 {
+        return std.fmt.bufPrint(buf, "http://127.0.0.1:{d}/", .{self.server.socket.address.getPort()}) catch unreachable;
+    }
+
+    fn requestText(self: *const LoopbackServer) []const u8 {
+        return self.request[0..self.request_len];
+    }
+
+    fn serve(self: *LoopbackServer) void {
+        const stream = self.server.accept(self.io) catch return;
+        defer stream.close(self.io);
+        var rbuf: [1024]u8 = undefined;
+        var sr = stream.reader(self.io, &rbuf);
+        while (true) {
+            const line = sr.interface.takeDelimiterInclusive('\n') catch break;
+            const room = self.request.len - self.request_len;
+            const n = @min(line.len, room);
+            @memcpy(self.request[self.request_len..][0..n], line[0..n]);
+            self.request_len += n;
+            if (line.len <= 2) break; // blank line: end of the request head
+        }
+        var wbuf: [1024]u8 = undefined;
+        var sw = stream.writer(self.io, &wbuf);
+        sw.interface.writeAll(self.response) catch return;
+        sw.interface.flush() catch return;
+    }
+};
+
+fn flipped(comptime bytes: []const u8, comptime at: []const usize) []const u8 {
+    var out: [bytes.len]u8 = undefined;
+    @memcpy(&out, bytes);
+    for (at) |i| out[i] ^= 0xff;
+    const final = out;
+    return &final;
+}
+
+/// `Connection: close` response with a `Content-Length` body.
+fn cannedResponse(comptime encoding: ?[]const u8, comptime body: []const u8) []const u8 {
+    return "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n" ++
+        (if (encoding) |e| "Content-Encoding: " ++ e ++ "\r\n" else "") ++
+        std.fmt.comptimePrint("Content-Length: {d}\r\nConnection: close\r\n\r\n", .{body.len}) ++ body;
+}
+
+fn loopbackGet(
+    gpa: std.mem.Allocator,
+    response: []const u8,
+    headers: []const std.http.Header,
+    max_bytes: usize,
+    request_out: ?*[2048]u8,
+) HttpGetError!HttpBody {
+    var backing = std.Io.Threaded.init(gpa, .{});
+    defer backing.deinit();
+    const io = backing.io();
+    const srv = LoopbackServer.start(gpa, io, response) catch return error.HttpFailed;
+    defer srv.finish(gpa);
+    var url_buf: [64]u8 = undefined;
+    const result = httpGet(gpa, io, .{ .url = srv.url(&url_buf), .headers = headers, .max_bytes = max_bytes });
+    if (request_out) |out| out.* = srv.request;
+    return result;
+}
+
+fn expectBody(result: HttpGetError!HttpBody, expected: []const u8) !void {
+    const body = try result;
+    defer {
+        testing.allocator.free(body.bytes);
+        testing.allocator.free(body.content_type);
+    }
+    try testing.expectEqualStrings(expected, body.bytes);
+}
+
+test "httpGet decodes a gzip body to the caller's text (#23)" {
+    try expectBody(loopbackGet(testing.allocator, cannedResponse("gzip", gz_hello), &.{}, 1 << 20, null), gz_hello_html);
+}
+
+test "httpGet decodes an x-gzip body" {
+    try expectBody(loopbackGet(testing.allocator, cannedResponse("x-gzip", gz_hello), &.{}, 1 << 20, null), gz_hello_html);
+}
+
+test "httpGet decodes a deflate body" {
+    try expectBody(loopbackGet(testing.allocator, cannedResponse("deflate", zlib_hello), &.{}, 1 << 20, null), gz_hello_html);
+}
+
+test "httpGet decodes a chunked gzip body" {
+    const chunked = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Encoding: gzip\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n" ++
+        "10\r\n" ++ gz_hello[0..16] ++ "\r\n" ++
+        std.fmt.comptimePrint("{x}\r\n", .{gz_hello.len - 16}) ++ gz_hello[16..] ++ "\r\n0\r\n\r\n";
+    try expectBody(loopbackGet(testing.allocator, chunked, &.{}, 1 << 20, null), gz_hello_html);
+}
+
+test "httpGet decodes a gzip body that ends with the connection" {
+    const until_close = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Encoding: gzip\r\nConnection: close\r\n\r\n" ++ gz_hello;
+    try expectBody(loopbackGet(testing.allocator, until_close, &.{}, 1 << 20, null), gz_hello_html);
+}
+
+test "httpGet leaves an identity body unchanged" {
+    try expectBody(loopbackGet(testing.allocator, cannedResponse(null, gz_hello_html), &.{}, 1 << 20, null), gz_hello_html);
+    try expectBody(loopbackGet(testing.allocator, cannedResponse("identity", gz_hello_html), &.{}, 1 << 20, null), gz_hello_html);
+}
+
+test "httpGet caps the decoded gzip output at max_bytes" {
+    const body = try loopbackGet(testing.allocator, cannedResponse("gzip", gz_zeros), &.{}, 1000, null);
+    defer {
+        testing.allocator.free(body.bytes);
+        testing.allocator.free(body.content_type);
+    }
+    try testing.expectEqual(@as(usize, 1000), body.bytes.len);
+    for (body.bytes) |b| try testing.expectEqual(@as(u8, 0), b);
+}
+
+test "httpGet returns the whole decoded body when it fits under max_bytes" {
+    const body = try loopbackGet(testing.allocator, cannedResponse("gzip", gz_zeros), &.{}, gz_zeros_len + 1, null);
+    defer {
+        testing.allocator.free(body.bytes);
+        testing.allocator.free(body.content_type);
+    }
+    try testing.expectEqual(@as(usize, gz_zeros_len), body.bytes.len);
+}
+
+test "httpGet errors on a corrupt gzip body instead of returning raw bytes" {
+    // Bit-flips inside the deflate stream: invalid block / bad CRC.
+    const corrupt = comptime flipped(gz_hello, &.{ 14, 20 });
+    try testing.expectError(error.HttpFailed, loopbackGet(testing.allocator, cannedResponse("gzip", corrupt), &.{}, 1 << 20, null));
+}
+
+test "httpGet errors on a gzip body whose checksum does not match" {
+    const bad_crc = comptime flipped(gz_hello, &.{gz_hello.len - 8}); // CRC32 field of the trailer
+    try testing.expectError(error.HttpFailed, loopbackGet(testing.allocator, cannedResponse("gzip", bad_crc), &.{}, 1 << 20, null));
+}
+
+test "httpGet errors on a body labelled gzip that is not gzip" {
+    try testing.expectError(error.HttpFailed, loopbackGet(testing.allocator, cannedResponse("gzip", gz_hello_html), &.{}, 1 << 20, null));
+}
+
+test "httpGet errors on a truncated gzip stream" {
+    // Whole HTTP framing, but the gzip data stops before the end of the deflate stream.
+    try testing.expectError(error.HttpFailed, loopbackGet(testing.allocator, cannedResponse("gzip", gz_hello[0 .. gz_hello.len / 2]), &.{}, 1 << 20, null));
+}
+
+test "httpGet errors on a gzip stream missing its trailer" {
+    try testing.expectError(error.HttpFailed, loopbackGet(testing.allocator, cannedResponse("gzip", gz_hello[0 .. gz_hello.len - 8]), &.{}, 1 << 20, null));
+}
+
+test "httpGet errors on an encoding it cannot decode" {
+    try testing.expectError(error.HttpFailed, loopbackGet(testing.allocator, cannedResponse("br", gz_hello), &.{}, 1 << 20, null));
+    try testing.expectError(error.HttpFailed, loopbackGet(testing.allocator, cannedResponse("zstd", gz_hello), &.{}, 1 << 20, null));
+    try testing.expectError(error.HttpFailed, loopbackGet(testing.allocator, cannedResponse("compress", gz_hello), &.{}, 1 << 20, null));
+    try testing.expectError(error.HttpFailed, loopbackGet(testing.allocator, cannedResponse("gzip, br", gz_hello), &.{}, 1 << 20, null));
+}
+
+test "httpGet advertises only the encodings it decodes" {
+    var req: [2048]u8 = undefined;
+    try expectBody(loopbackGet(testing.allocator, cannedResponse("gzip", gz_hello), &.{}, 1 << 20, &req), gz_hello_html);
+    const head = std.mem.sliceTo(&req, 0);
+    var it = std.mem.splitSequence(u8, head, "\r\n");
+    var seen = false;
+    while (it.next()) |line| {
+        if (!std.ascii.startsWithIgnoreCase(line, "accept-encoding:")) continue;
+        seen = true;
+        try testing.expect(std.ascii.indexOfIgnoreCase(line, "gzip") != null);
+        try testing.expect(std.ascii.indexOfIgnoreCase(line, "deflate") != null);
+        try testing.expect(std.ascii.indexOfIgnoreCase(line, "zstd") == null);
+        try testing.expect(std.ascii.indexOfIgnoreCase(line, "br") == null);
+    }
+    try testing.expect(seen);
+}
+
+test "httpGet with a caller Accept-Encoding never returns a compressed body as text" {
+    const hdrs = [_]std.http.Header{.{ .name = "Accept-Encoding", .value = "zstd, br, gzip" }};
+    // A server that honours the caller's header and sends zstd or br: refuse.
+    try testing.expectError(error.HttpFailed, loopbackGet(testing.allocator, cannedResponse("zstd", gz_hello), &hdrs, 1 << 20, null));
+    try testing.expectError(error.HttpFailed, loopbackGet(testing.allocator, cannedResponse("br", gz_hello), &hdrs, 1 << 20, null));
+    // gzip is still decoded.
+    try expectBody(loopbackGet(testing.allocator, cannedResponse("gzip", gz_hello), &hdrs, 1 << 20, null), gz_hello_html);
+}
+
+test "httpGet errors on a gzip body whose length field does not match" {
+    const bad_len = comptime flipped(gz_hello, &.{gz_hello.len - 4}); // ISIZE field of the trailer
+    try testing.expectError(error.HttpFailed, loopbackGet(testing.allocator, cannedResponse("gzip", bad_len), &.{}, 1 << 20, null));
+}
+
+test "httpGet errors on a deflate body whose Adler-32 does not match" {
+    const bad_adler = comptime flipped(zlib_hello, &.{zlib_hello.len - 1});
+    try testing.expectError(error.HttpFailed, loopbackGet(testing.allocator, cannedResponse("deflate", bad_adler), &.{}, 1 << 20, null));
+}
+
+test "readCapped stops reading and allocating at the cap of a highly compressible body" {
+    var src: std.Io.Reader = .fixed(gz_zeros);
+    var window: [std.compress.flate.max_window_len]u8 = undefined;
+    var inflate: std.compress.flate.Decompress = .init(&src, .gzip, &window);
+    // 300 KiB of output, but the allocator only has room for the cap.
+    var fba_buf: [8 * 1024]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&fba_buf);
+    const read = try readCapped(fba.allocator(), &inflate.reader, 1000);
+    try testing.expectEqual(@as(usize, 1000), read.bytes.len);
+    try testing.expect(!read.complete);
+    for (read.bytes) |b| try testing.expectEqual(@as(u8, 0), b);
+}
+
+test "readCapped marks a body read to its end complete" {
+    var src: std.Io.Reader = .fixed(gz_hello);
+    var window: [std.compress.flate.max_window_len]u8 = undefined;
+    var inflate: std.compress.flate.Decompress = .init(&src, .gzip, &window);
+    const read = try readCapped(testing.allocator, &inflate.reader, 1 << 20);
+    defer testing.allocator.free(read.bytes);
+    try testing.expect(read.complete);
+    try testing.expectEqualStrings(gz_hello_html, read.bytes);
+}
+
+test "readCapped fails on a truncated gzip stream" {
+    var src: std.Io.Reader = .fixed(gz_hello[0 .. gz_hello.len - 8]);
+    var window: [std.compress.flate.max_window_len]u8 = undefined;
+    var inflate: std.compress.flate.Decompress = .init(&src, .gzip, &window);
+    try testing.expectError(error.HttpFailed, readCapped(testing.allocator, &inflate.reader, 1 << 20));
 }
