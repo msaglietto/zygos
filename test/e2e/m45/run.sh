@@ -8,7 +8,11 @@
 # whose spawn leaves a marker proves it was never spawned), a `.policy` rule
 # naming no offered tool exits 2 after the handshake (same marker proves the
 # MCP server WAS spawned) but before the mission store is written, and a valid
-# `.policy` lands in the trace as a `policy` event right after `pipeline`.
+# `.policy` lands in the trace as a `policy` event right after `pipeline`;
+# (9) a `.policy` ask on `bash` answered y then n over piped stdin leaves two
+# approval_asked/approval_decided pairs (allowed_once, rejected) in the trace,
+# the console prompt shows each input, and the rejected call's tool_result is
+# `approval_denied`.
 # No real network: the stub binds 127.0.0.1. Exits 0 only if all legs pass.
 set -euo pipefail
 cd "$(dirname "$0")/../../.."
@@ -300,6 +304,63 @@ esac
 # A mission with no .policy (leg 1) traces no policy event.
 ! grep -q '"event":"policy"' "$TMP/planning/events.jsonl" || { echo "M45 E2E FAIL leg8c: absent .policy traced a policy event"; exit 1; }
 
+# ---- Leg 9 (approval outcomes): a policy ask approved once, rejected once ----
+# `bash` is `.ask`; the scripted executor calls bash twice. Piped stdin answers
+# the console prompts in order: y (first ask), n (second ask), y (completion
+# gate). Policy asks and the gate share stdin (docs/specs/policy-config.md,
+# "Known limits"), so the answer count is part of the contract.
+cat > "$TMP/zygos-policy-ask.zon" <<EOF
+.{
+    .default = .{ .{ .provider_function = "zygos::providers::stub-one", .model = "stub-model-a" } },
+    .policy = .{
+        .{ .tool = "bash", .verdict = .ask },
+    },
+}
+EOF
+mkdir -p "$TMP/ws9"
+set +e
+( cd "$TMP/ws9" && printf 'y\nn\ny\n' | ZYGOS_CONFIG="$TMP/zygos-policy-ask.zon" "$BIN" mission start "$TMP/brief.md" --planning "$TMP/planning12" > "$TMP/out12.json" 2> "$TMP/err12.log" )
+CODE=$?
+set -e
+[ "$CODE" = "0" ] || { echo "M45 E2E FAIL leg9: expected exit 0, got $CODE"; cat "$TMP/out12.json"; cat "$TMP/err12.log"; exit 1; }
+grep -q '"state":"done"' "$TMP/out12.json" || { echo "M45 E2E FAIL leg9: mission not done: $(cat "$TMP/out12.json")"; cat "$TMP/err12.log"; exit 1; }
+grep -qF 'approve bash [step executor] {"command":"echo approved-run"}' "$TMP/err12.log" \
+  || { echo "M45 E2E FAIL leg9: no console prompt with the first input"; cat "$TMP/err12.log"; exit 1; }
+grep -qF 'approve bash [step executor] {"command":"echo rejected-run"}' "$TMP/err12.log" \
+  || { echo "M45 E2E FAIL leg9: no console prompt with the second input"; cat "$TMP/err12.log"; exit 1; }
+cat > "$TMP/leg9-check.js" <<'EOF'
+const fs = require('fs');
+const ev = fs.readFileSync(process.argv[2], 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
+const fail = (m) => { console.error('M45 E2E FAIL leg9: ' + m); process.exit(1); };
+const asked = ev.map((e, i) => [e, i]).filter(([e]) => e.event === 'approval_asked');
+const decided = ev.map((e, i) => [e, i]).filter(([e]) => e.event === 'approval_decided');
+if (asked.length !== 2 || decided.length !== 2) fail('want 2 asked + 2 decided, got ' + asked.length + '/' + decided.length);
+const want = [['echo approved-run', 'allowed_once', false], ['echo rejected-run', 'rejected', true]];
+want.forEach(([cmd, outcome, isErr], n) => {
+  const [a, ai] = asked[n];
+  const [d, di] = decided[n];
+  if (!a.input.includes(cmd)) fail('asked[' + n + '] input lacks ' + cmd + ': ' + a.input);
+  if (d.id !== a.id) fail('decided[' + n + '] id ' + d.id + ' != asked id ' + a.id);
+  if (d.outcome !== outcome) fail('decided[' + n + '] outcome ' + d.outcome + ' != ' + outcome);
+  if (!(ai < di)) fail('asked[' + n + '] does not precede its decided');
+  const tr = ev.slice(di + 1).find((e) => e.event === 'tool_result');
+  if (!tr) fail('no tool_result after decided[' + n + ']');
+  if (tr.is_error !== isErr) fail('tool_result[' + n + '] is_error ' + tr.is_error + ' != ' + isErr);
+  if (isErr) {
+    if (tr.output !== 'approval_denied') fail('rejected tool_result output ' + JSON.stringify(tr.output));
+  } else if (!tr.output.includes('approved-run')) fail('approved tool_result lacks approved-run: ' + JSON.stringify(tr.output));
+});
+EOF
+node "$TMP/leg9-check.js" "$TMP/planning12/events.jsonl" || { cat "$TMP/planning12/events.jsonl"; exit 1; }
+"$BIN" mission trace "$TMP/planning12" > "$TMP/trace12.txt"
+grep -qE '\? approval a-' "$TMP/trace12.txt" || { echo "M45 E2E FAIL leg9: trace has no '? approval a-' line"; cat "$TMP/trace12.txt"; exit 1; }
+grep -qE '✓ approval' "$TMP/trace12.txt" || { echo "M45 E2E FAIL leg9: trace has no approved decision line"; cat "$TMP/trace12.txt"; exit 1; }
+grep -qE '✗ approval .*rejected' "$TMP/trace12.txt" || { echo "M45 E2E FAIL leg9: trace has no rejected decision line"; cat "$TMP/trace12.txt"; exit 1; }
+echo "--- leg 9 prompts (stderr) ---"
+grep -F 'approve bash' "$TMP/err12.log" || true
+echo "--- leg 9 trace approval lines ---"
+grep -E 'approval' "$TMP/trace12.txt"
+
 echo "--- LEDGER.md (leg 1, from the real binary) ---"
 cat "$TMP/planning/LEDGER.md"
-echo "M45 E2E OK: start→done, seeded resume→done, unknown-slug boot refusal, rerun refusal, vault checkpoint, trace, mcp, ledger compression, invalid .policy refusals, valid .policy traced"
+echo "M45 E2E OK: start→done, seeded resume→done, unknown-slug boot refusal, rerun refusal, vault checkpoint, trace, mcp, ledger compression, invalid .policy refusals, valid .policy traced, policy ask approved once and rejected once"

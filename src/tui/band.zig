@@ -148,17 +148,12 @@ pub fn build(
     // Live answer text: last N lines, full color — this is the payload.
     try appendTail(arena, &bottom, view.live, live_tail_lines, "");
 
-    // Approval ask — keys first: the summary can exceed the terminal
-    // width and rows clip right, so a trailing hint would be the part
-    // that vanishes (a gated mission then looks hung). The summary is
-    // model-authored (a bash command): no escape may restyle the gate.
-    if (view.approval) |ask| {
-        const safe_ask = try scrub.scrub(arena, ask);
-        try bottom.append(arena, try std.fmt.allocPrint(arena, "{s}{s}  [y/N] approve?{s} {s}{s}{s}", .{
-            theme.bold, theme.fg(&color, theme.Color.err), theme.reset,
-            theme.dim,  safe_ask,                          theme.reset,
-        }));
-    }
+    // Approval ask — keys first, then the whole summary wrapped over as many
+    // rows as it needs. Rows clip right, so a single-row summary would lose
+    // the end of the command, the clip marker and the reason while the
+    // operator can still press y. The summary is model-authored (a bash
+    // command): no escape may restyle the gate.
+    if (view.approval) |ask| try appendApproval(arena, &bottom, ask, cols);
 
     // Steer input line (M6 intervention): the operator's message composing
     // live; sent on Enter, discarded on Esc.
@@ -172,6 +167,58 @@ pub fn build(
     try bottom.append(arena, try statusLine(view, arena, cols, now_ms));
 
     return bottom.items;
+}
+
+/// Visible text of the approval keys, and the cells the keys take in front
+/// of an inline summary (one separating space included).
+const approval_keys = "  [y/N] approve?";
+const approval_indent = "    ";
+/// An inline first row needs at least this many cells left for the summary;
+/// narrower terminals put the keys on a row of their own.
+const approval_min_inline_cells: usize = 8;
+
+/// The approval ask: the keys first (red, bold), then the scrubbed summary,
+/// word-wrapped on display width (never splitting a UTF-8 sequence; a token
+/// wider than the row is hard-split). A newline in the summary starts a new
+/// row. A short ask shares the keys' row.
+fn appendApproval(
+    arena: std.mem.Allocator,
+    bottom: *std.ArrayList([]const u8),
+    ask: []const u8,
+    cols: usize,
+) error{OutOfMemory}!void {
+    var color: [24]u8 = undefined;
+    const keys_sgr = try std.fmt.allocPrint(arena, "{s}{s}{s}{s}", .{
+        theme.bold, theme.fg(&color, theme.Color.err), approval_keys, theme.reset,
+    });
+    const safe_ask = try scrub.scrub(arena, ask);
+    const inline_keys = cols >= approval_keys.len + 1 + approval_min_inline_cells;
+
+    var first = true;
+    if (!inline_keys) {
+        try bottom.append(arena, keys_sgr);
+        first = false;
+    }
+    var segments = std.mem.splitScalar(u8, safe_ask, '\n');
+    while (segments.next()) |segment| {
+        const logical = if (first)
+            try std.fmt.allocPrint(arena, "{s} {s}", .{ approval_keys, segment })
+        else
+            try std.fmt.allocPrint(arena, "{s}{s}", .{ approval_indent, segment });
+        for (try width.wrapToWidth(arena, logical, cols, approval_indent)) |row| {
+            // The first row begins with the keys: width >= keys + 1 + 8 means
+            // the wrapper cannot have broken inside them.
+            if (first and std.mem.startsWith(u8, row, approval_keys)) {
+                first = false;
+                try bottom.append(arena, try std.fmt.allocPrint(arena, "{s}{s}{s}{s}", .{
+                    keys_sgr, theme.dim, row[approval_keys.len..], theme.reset,
+                }));
+            } else {
+                first = false;
+                try bottom.append(arena, try std.fmt.allocPrint(arena, "{s}{s}{s}", .{ theme.dim, row, theme.reset }));
+            }
+        }
+    }
 }
 
 /// "⠹ Responding… · 4.2s        1m13s · 12.4k↑ 3.1k↓ · ⇣NB" — spinner +
@@ -408,4 +455,140 @@ test "live tool entry high-water mark never shrinks mid-stream" {
         if (std.mem.indexOf(u8, r, entries.heavy_rail) != null) rail_rows += 1;
     }
     try testing.expectEqual(@as(usize, 4), rail_rows);
+}
+
+// -- Approval ask: the whole summary stays visible (wrapped, never clipped) ----
+
+/// The band rows strictly between the header and the status line, with SGR
+/// and CSI sequences removed.
+fn plainAskRows(arena: std.mem.Allocator, rows: []const []const u8) ![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    for (rows[1 .. rows.len - 1]) |row| {
+        var buf: std.ArrayList(u8) = .empty;
+        var i: usize = 0;
+        while (i < row.len) {
+            if (row[i] == 0x1b) {
+                i += 1;
+                if (i < row.len and row[i] == '[') i += 1;
+                while (i < row.len and !(row[i] >= 0x40 and row[i] <= 0x7e)) i += 1;
+                i += 1;
+                continue;
+            }
+            try buf.append(arena, row[i]);
+            i += 1;
+        }
+        try out.append(arena, buf.items);
+    }
+    return out.items;
+}
+
+/// Every non-space byte of `rows`, in order: what an operator can read.
+fn visibleLetters(arena: std.mem.Allocator, rows: []const []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    for (rows) |row| {
+        for (row) |b| if (b != ' ') try out.append(arena, b);
+    }
+    return out.items;
+}
+
+const long_ask = "bash [step executor] {\"command\":\"cd build && make clean && " ++
+    "make -j8 all && ./run-the-whole-suite --verbose --retries 3 && " ++
+    "tar czf /tmp/out.tgz ./dist ./build ./docs ./src ./test ./eval && " ++
+    "rm -rf ~/x\"}…[612 bytes total] (policy ask: rule: bash)";
+
+fn expectAskFullyVisible(cols: usize) !void {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var high: usize = 0;
+    var view = emptyView(&high);
+    view.approval = long_ask;
+    const rows = try build(view, arena, cols, 0);
+    const ask_rows = try plainAskRows(arena, rows);
+
+    // The keys lead; the summary follows on the same row or the rows below.
+    try testing.expect(ask_rows.len >= 2);
+    try testing.expect(std.mem.indexOf(u8, ask_rows[0], "[y/N] approve?") != null);
+    // The keys alone are 16 cells; a terminal narrower than that clips them
+    // (the frame does), every other row still fits.
+    for (ask_rows, 0..) |r, i| {
+        if (i == 0 and cols < approval_keys.len) continue;
+        try testing.expect(width.visibleWidth(r) <= cols);
+    }
+    // Nothing is lost: the tail of the command, the clip marker and the
+    // reason are all on screen, and so is every other byte, in order.
+    const letters = try visibleLetters(arena, ask_rows);
+    const want = try visibleLetters(arena, &.{ "[y/N]approve?", long_ask });
+    try testing.expectEqualStrings(want, letters);
+    for ([_][]const u8{ "rm -rf ~/x", "…[612 bytes total]", "(policy ask: rule: bash)" }) |needle| {
+        const squashed = try visibleLetters(arena, &.{needle});
+        try testing.expect(std.mem.indexOf(u8, letters, squashed) != null);
+    }
+}
+
+test "approval ask wraps across rows at 80 columns: tail, marker and reason stay visible" {
+    try expectAskFullyVisible(80);
+}
+
+test "approval ask wraps across rows at a narrow width" {
+    try expectAskFullyVisible(40);
+    try expectAskFullyVisible(24);
+}
+
+test "approval ask keeps the keys visible when the terminal is tiny" {
+    try expectAskFullyVisible(12);
+}
+
+test "approval ask hard-splits an unbroken token and never splits a UTF-8 sequence" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var high: usize = 0;
+    var view = emptyView(&high);
+    // No spaces at all, wide runes included: 2 cells each.
+    view.approval = "bash:" ++ "日本語のコマンド" ** 6 ++ "{\"command\":\"" ++ "x" ** 90 ++ "\"}";
+    const rows = try build(view, arena, 30, 0);
+    const ask_rows = try plainAskRows(arena, rows);
+    for (ask_rows) |r| {
+        try testing.expect(width.visibleWidth(r) <= 30);
+        try testing.expect(std.unicode.utf8ValidateSlice(r));
+    }
+    const letters = try visibleLetters(arena, ask_rows);
+    try testing.expect(std.mem.endsWith(u8, letters, "\"}"));
+    try testing.expect(std.mem.indexOf(u8, letters, "日本語のコマンド") != null);
+}
+
+test "a short approval ask stays on one row after the keys" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var high: usize = 0;
+    var view = emptyView(&high);
+    view.approval = "bash: rm -rf ./build";
+    const rows = try build(view, arena, 80, 0);
+    const ask_rows = try plainAskRows(arena, rows);
+    try testing.expectEqual(@as(usize, 1), ask_rows.len);
+    const keys_at = std.mem.indexOf(u8, ask_rows[0], "[y/N] approve?").?;
+    const ask_at = std.mem.indexOf(u8, ask_rows[0], "bash: rm -rf ./build").?;
+    try testing.expect(keys_at < ask_at);
+}
+
+test "an approval ask cannot restyle the band or break rows with escapes and newlines" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var high: usize = 0;
+    var view = emptyView(&high);
+    view.approval = "bash \x1b[2J\x1b]52;c;ZXZpbA==\x07 line one\nline two";
+    const rows = try build(view, arena, 80, 0);
+    for (rows) |r| {
+        try testing.expect(std.mem.indexOf(u8, r, "\x1b[2J") == null);
+        try testing.expect(std.mem.indexOf(u8, r, "\x1b]52") == null);
+        try testing.expect(std.mem.indexOfScalar(u8, r, '\n') == null);
+    }
+    const ask_rows = try plainAskRows(arena, rows);
+    try testing.expect(ask_rows.len >= 2); // the newline starts a new row
+    const letters = try visibleLetters(arena, ask_rows);
+    try testing.expect(std.mem.indexOf(u8, letters, "lineone") != null);
+    try testing.expect(std.mem.indexOf(u8, letters, "linetwo") != null);
 }

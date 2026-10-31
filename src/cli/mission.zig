@@ -13,6 +13,7 @@ const zygos = @import("zygos");
 const req_mod = @import("mission/req.zig");
 const view_mod = @import("mission/view.zig");
 const steps_mod = @import("mission/steps.zig");
+const approval_prompt = @import("mission/approval_prompt.zig");
 
 const StartParams = req_mod.StartParams;
 const buildStartRequest = req_mod.buildStartRequest;
@@ -588,17 +589,32 @@ fn installSigint() void {
     _ = signal(2, &onSigint); // SIGINT
 }
 
-/// Detached: waits for the flag, aborts the mission over the bus once.
+/// Detached: waits for the flag, aborts the mission over the bus once, then
+/// keeps cancelling approval asks until the process exits.
 fn sigintWatch(gpa: std.mem.Allocator, worker: *zygos.inproc.Worker, mission_id: []const u8) void {
-    while (sigint_hits.load(.acquire) == 0) {
-        var interval: std.c.timespec = .{ .sec = 0, .nsec = 200 * std.time.ns_per_ms };
-        var rem: std.c.timespec = undefined;
-        _ = std.c.nanosleep(&interval, &rem);
-    }
+    while (sigint_hits.load(.acquire) == 0) sleepWatch();
     const req = std.fmt.allocPrint(gpa, "{{\"mission_id\":{f}}}", .{json.fmt(mission_id, .{})}) catch return;
     defer gpa.free(req);
     const res = worker.call("zygos::missions::abort", req) catch return;
     res.deinit(gpa);
+    // A tool ask parked in the approval worker would otherwise hold the
+    // aborted run until the approval timeout; wake it as outcome cancelled.
+    // The abort only lands at the next role boundary, so the in-flight turn
+    // may raise more asks first: keep cancelling for the rest of the process.
+    // Best effort: only a failed call (the bus shut down) ends the loop. An
+    // `.err` reply such as function_not_found arrives as a result, not through
+    // `catch`, and is ignored: the loop keeps polling until the process exits.
+    while (true) {
+        const cancelled = worker.call("zygos::approvals::cancel", "{}") catch return;
+        cancelled.deinit(gpa);
+        sleepWatch();
+    }
+}
+
+fn sleepWatch() void {
+    var interval: std.c.timespec = .{ .sec = 0, .nsec = 200 * std.time.ns_per_ms };
+    var rem: std.c.timespec = undefined;
+    _ = std.c.nanosleep(&interval, &rem);
 }
 
 fn usage() u8 {
@@ -870,9 +886,9 @@ fn consoleLoop(gpa: std.mem.Allocator, worker: *zygos.inproc.Worker) void {
             if (item != .object) continue;
             const id = strOf(item.object.get("id")) orelse continue;
             if (handled.contains(id)) continue;
-            const tool = strOf(item.object.get("tool")) orelse "?";
-            const reason = strOf(item.object.get("reason")) orelse "";
-            eprint("approve {s}: {s}? [y/N] ", .{ tool, reason });
+            const text = approval_prompt.display(gpa, item.object) catch return;
+            defer gpa.free(text);
+            eprint("approve {s}? [y/N] ", .{text});
 
             var line_buf: [64]u8 = undefined;
             const line = readStdinLine(&line_buf) orelse return; // EOF: fail closed
@@ -980,7 +996,7 @@ fn tuiApprovalLoop(
                 const pid = strOf(item.object.get("id")) orelse continue;
                 if (std.mem.eql(u8, pid, id)) still_pending = true;
             }
-            if (!still_pending) { // timed out server-side: denied
+            if (!still_pending) { // timed out or cancelled server-side: denied
                 ui.model.setPendingApproval(null);
                 handled.put(id, {}) catch return;
                 current_id = null;
@@ -990,9 +1006,7 @@ fn tuiApprovalLoop(
             if (item != .object) continue;
             const id = strOf(item.object.get("id")) orelse continue;
             if (handled.contains(id)) continue;
-            const tool = strOf(item.object.get("tool")) orelse "?";
-            const reason = strOf(item.object.get("reason")) orelse "";
-            const summary = std.fmt.allocPrint(gpa, "{s}: {s}", .{ tool, reason }) catch return;
+            const summary = approval_prompt.display(gpa, item.object) catch return;
             defer gpa.free(summary);
             ui.model.setPendingApproval(summary);
             current_id = gpa.dupe(u8, id) catch return;

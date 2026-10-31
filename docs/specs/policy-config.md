@@ -166,17 +166,20 @@ visible because every run of the loop traces its effective list (below).
 ## The `ask` verdict
 
 `ask` goes down the existing approval path unchanged: the turn driver calls
-`zygos::approvals::request`, blocks in `awaiting_approval`, and dispatches
-only on `{"approved":true}`. Anything else yields the `approval_denied`
-tool result and the turn continues (U1, U2).
+`zygos::approvals::request` with the tool input, the step id and the
+reason `policy ask: rule: <pattern>`, blocks in `awaiting_approval`, and
+dispatches only on outcome `allowed_once` (with `approved:true`). Anything
+else yields the `approval_denied` tool result and the turn continues (U1,
+U2; outcomes in `docs/specs/approval.md`).
 
 - **Console runs.** The mission CLI starts the approval worker `.manual`
   with `ZYGOS_APPROVAL_TIMEOUT_MS` (CLI default 300 s; timeout ⇒
-  `approved:false`). The console or TUI prompts;
+  outcome `unavailable`, `approved:false`). The console or TUI prompts;
   stdin EOF stops prompting, and every later ask times out to deny.
 - **Headless and campaign runs stay non-interactive.** The Harbor adapter
   provides no console and sets `ZYGOS_APPROVAL_TIMEOUT_MS=1000`, so each
-  configured `ask` is denied (`resolved:false`) after one second. It never
+  configured `ask` is denied (`outcome:"unavailable"`, `resolved:false`)
+  after one second. It never
   blocks past the timeout and never self-approves. In a campaign an `ask`
   behaves as a slower `deny`.
 - **`ask` is not an independent boundary.** A same-user executor shell can
@@ -193,9 +196,10 @@ Known limits, out of scope here:
 - Each headless `ask` costs `ZYGOS_APPROVAL_TIMEOUT_MS` of wall clock and
   one tool step before the denial. A step that keeps asking spends its
   `role_max_steps` and the mission timeout.
-- The prompt reads `approve <tool>: turn tool dispatch? [y/N]`; it does not
-  show the step or the matched rule. Forwarding the policy reason is a
-  `turn.zig` change to `requestApproval` and is not part of this issue.
+- Since 5.2.0 the prompt reads
+  `approve bash [step executor] {"command":"ls"} (policy ask: rule: bash)? [y/N]`:
+  the tool, the step, the input (capped with a marker) and the matched
+  rule's pattern. The policy reply names the pattern, not the rule's index.
 
 ## `zygos task --config`
 

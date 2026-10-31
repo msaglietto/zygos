@@ -8,8 +8,8 @@ role boundaries, provider steps, tool calls/results, usage, task edges.
 `TraceEvent` is a tagged union shared by emitters (mission/turn drivers via
 `trace.emit`) and consumers (JSONL renderer, TUI model): adding a variant
 breaks every exhaustive switch at compile time instead of silently dropping.
-Variants: `mission`, `pipeline`, `policy`, `role_start`, `role_end`, `task_start`,
-`task_done`, `step`, `tool_call`, `tool_result`, `usage`, `turn_end`, `steer`.
+Variants: `mission`, `pipeline`, `policy`, `approval_asked`, `approval_decided`,
+`role_start`, `role_end`, `task_start`, `task_done`, `step`, `tool_call`, `tool_result`, `usage`, `turn_end`, `steer`.
 
 ### Mission events
 
@@ -24,6 +24,17 @@ Variants: `mission`, `pipeline`, `policy`, `role_start`, `role_end`, `task_start
   `step` is null for a rule that matches every step. Absent event ⇒ the
   built-in seed governed, as in every pre-#12 trace. Parsed tolerantly like
   `pipeline` (`docs/specs/policy-config.md`, "Visibility").
+- Approval events. The approval worker emits the pair around a parked
+  `zygos::approvals::request` (`docs/specs/approval.md`, "Audit trail"):
+  `{"ts":<ms>,"event":"approval_asked","id":"a-1","tool":"bash","step":"executor","input":"{\"command\":\"ls\"}"}`
+  and `{"ts":<ms>,"event":"approval_decided","id":"a-1","outcome":"rejected"}`.
+  `step` is the pipeline step id string, null when the request had none (not
+  the `tool_call` step counter). `input` is the input's JSON text, clipped
+  like a `tool_call` input. `outcome` stays a string, so an outcome outside
+  the worker's closed set from a foreign line still renders. Both parse
+  tolerantly (missing fields read `?`, `""` or null). Policy `deny`
+  verdicts stay visible as the `policy_denied: <reason>` `tool_result`;
+  there is no separate event for them.
 - `mission` carries the state names `running`, `gating`, `done`, `failed`
   in `from` and `to`, plus the cursor after the transition: `step` (the
   step id; null at `gating` and `done`) and `step_index`. The driver emits
@@ -59,7 +70,10 @@ Variants: `mission`, `pipeline`, `policy`, `role_start`, `role_end`, `task_start
   (`[step - #4]` at gating), the `pipeline` line lists
   `id[+tools][@hash8]` per step, and the `policy` line reads
   `policy (config, 3 rules): bash=deny@architect bash=allow web_*=ask@research*`
-  (`tool=verdict[@step]` per rule, in order).
+  (`tool=verdict[@step]` per rule, in order). The approval pair renders as
+  `? approval a-1: bash [step executor] {"command":"ls"}` (the ` [step ...]`
+  part is omitted when `step` is null) and `✓ approval a-1: allowed_once`,
+  or `✗ approval a-1: <outcome>` for any other outcome.
 
 ## AG-UI projection (`agui.zig`)
 
@@ -82,7 +96,10 @@ exhaustive `switch` over `TraceEvent` in `Projector.apply`.
   `step_index`, counters). A `planner` step starting clears the shown plan.
   The `pipeline` event becomes `CUSTOM` `zygos.pipeline` with
   `value.steps` (`id`, `definition_sha256`, `tools`). The `policy` event
-  becomes `CUSTOM` `zygos.policy` with `value` `{"source","rules"}`. Logs
+  becomes `CUSTOM` `zygos.policy` with `value` `{"source","rules"}`. The
+  approval pair becomes `CUSTOM` `zygos.approval_asked` (`value`
+  `{"id","tool","step","input"}`, `input` redacted like a tool input) and
+  `zygos.approval_decided` (`value` `{"id","outcome"}`). Logs
   that predate the cursor fall back to one step per state name.
 - Lines `parse()` rejects are skipped. A mission log ends in `RUN_FINISHED`
   only at `done` and `RUN_ERROR` only at `failed`. A task log ends on its
@@ -93,7 +110,7 @@ exhaustive `switch` over `TraceEvent` in `Projector.apply`.
   and `approval_denied` error results carry `metadata.zygos.denied`.
 - Redaction. `redact()` scrubs every free-text field copied out of the log
   (role content, tool input and output, task text, steer text, failure
-  reasons). A name rule replaces the value of a `*KEY*`, `*SECRET*`,
+  reasons, approval input). A name rule replaces the value of a `*KEY*`, `*SECRET*`,
   `*TOKEN*`, `*PASSWORD*`, `*PASSWD*` or `*CREDENTIAL*` assignment when the
   value is at least 8 bytes and not all digits, so `max_tokens=4096`
   survives. A shape rule replaces `Bearer` tokens, `sk-`, `ghp_`, `gho_`,

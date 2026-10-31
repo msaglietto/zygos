@@ -298,7 +298,12 @@ The new counters default to 0, as `exec_fail_count` does.
 `{"turn_id":"<mission_id>","tool":"mission::complete","reason":"<objective>","summary":"<objective>"}`
 and blocks on the reply:
 
-- `{"approved":true}` ⇒ `gate_approved` → done, stop `completed`.
+- `{"approved":true}` ⇒ `gate_approved` → done, stop `completed`. A reply
+  with no `outcome` field is accepted as-is. If `outcome` is present it must
+  be the string `allowed_once`: `{"approved":true,"outcome":"rejected"}`
+  (any other string) and `{"approved":true,"outcome":42}` (a non-string)
+  contradict themselves and count as a malformed reply (below). Completion
+  needs an affirmative gate, never a contradictory one.
 - `{"approved":false,"resolved":false, ...}` ⇒ **unanswered** (approval
   timeout or EOF, not a human refusal). The mission parks at `gating` with
   no transition and a non-terminal `"paused":true` reply. `resume` asks the
@@ -307,9 +312,19 @@ and blocks on the reply:
   denial: `gate_denials += 1`. If `gate_denials >= gate_threshold` it fires
   `gate_failed`; otherwise `gate_denied` → running, at the rework target
   with the denial reason as a fix task.
-- **No `gate_function` in the request, a bus error, or a malformed reply ⇒
-  `gate_failed`.** A mission can never reach `done` without a real,
+- **No `gate_function` in the request, a bus error, or a malformed reply
+  (unparseable, not an object, `approved` missing or not a boolean, or
+  `approved:true` with an `outcome` other than `allowed_once`) ⇒
+  `gate_failed`** with detail `malformed gate reply`. A mission can never reach `done` without a real,
   reachable gate saying yes.
+
+Since 5.2.0 the approval worker's reply also carries `outcome`
+(`docs/specs/approval.md`). The gate reads `approved` and `resolved`, and
+`outcome` only to reject a contradiction on an approval: `allowed_once`
+arrives as `approved:true`, `rejected` as a denial,
+and `unavailable` and `cancelled` as `resolved:false` (park). The gate
+request carries no `trace_path`, so gate asks are not in the trace's
+approval pair; the `mission` events record the gate.
 
 The gate call is not a step turn and does not count against
 `max_role_turns`.

@@ -198,6 +198,16 @@ fn renderLine(
                 if (r.step) |st| try appendFmt(gpa, &w, "@{s}", .{st});
             }
         },
+        .approval_asked => |ap| {
+            try appendFmt(gpa, &w, "    ? approval {s}: {s}", .{ ap.id, ap.tool });
+            if (ap.step) |st| try appendFmt(gpa, &w, " [step {s}]", .{st});
+            try appendFmt(gpa, &w, " {s}", .{ap.input});
+        },
+        .approval_decided => |d| try appendFmt(gpa, &w, "    {s} approval {s}: {s}", .{
+            if (std.mem.eql(u8, d.outcome, "allowed_once")) "✓" else "✗",
+            d.id,
+            d.outcome,
+        }),
         .role_start => |r| try appendFmt(gpa, &w, "── role {s} (turn {d}, tools {s})", .{
             r.role, r.role_turn, if (r.tools) "on" else "off",
         }),
@@ -305,6 +315,8 @@ test "render pretty-prints every event kind and passes unknown lines through raw
         \\{"ts":1752200002000,"event":"step","turn_id":"","step":1,"provider":"zygos::providers::glm-5-2","model":"glm-5.2","attempt":0}
         \\{"ts":1752200003000,"event":"tool_call","turn_id":"","step":1,"tool":"web_search","input":"{\"query\":\"zig allocators\"}"}
         \\{"ts":1752200004000,"event":"tool_result","step":1,"tool":"web_search","is_error":false,"bytes":5120,"output":"[{\"title\":\"Zig\"}]"}
+        \\{"ts":1752200004200,"event":"approval_asked","id":"a-1","tool":"bash","step":"executor","input":"{\"command\":\"ls\"}"}
+        \\{"ts":1752200004300,"event":"approval_decided","id":"a-1","outcome":"allowed_once"}
         \\{"ts":1752200004500,"event":"usage","turn_id":"","step":1,"input_tokens":12400,"output_tokens":3100}
         \\{"ts":1752200005000,"event":"turn_end","turn_id":"","stop":"max_steps","steps":24}
         \\{"ts":1752200006000,"event":"role_end","role":"executor","outcome":"failed","reason":"executor turn stopped: max_steps"}
@@ -322,6 +334,8 @@ test "render pretty-prints every event kind and passes unknown lines through raw
     try testing.expect(std.mem.indexOf(u8, out, "web_search") != null);
     try testing.expect(std.mem.indexOf(u8, out, "zig allocators") != null); // tool input visible
     try testing.expect(std.mem.indexOf(u8, out, "5120B") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "? approval a-1: bash [step executor]") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "✓ approval a-1: allowed_once") != null);
     try testing.expect(std.mem.indexOf(u8, out, "12400↑ 3100↓") != null);
     try testing.expect(std.mem.indexOf(u8, out, "title") != null); // tool output visible
     try testing.expect(std.mem.indexOf(u8, out, "max_steps") != null);
@@ -343,6 +357,24 @@ test "trace text renders the policy line" {
     defer testing.allocator.free(out);
     try testing.expect(std.mem.indexOf(u8, out, "policy (config, 3 rules): bash=deny@architect bash=allow web_*=ask@research*\n") != null);
     try testing.expect(std.mem.indexOf(u8, out, "policy (config, 0 rules):\n") != null);
+}
+
+test "render shows both approval lines" {
+    const jsonl =
+        \\{"ts":1752200000000,"event":"approval_asked","id":"a-1","tool":"bash","step":"executor","input":"{\"command\":\"ls\"}"}
+        \\{"ts":1752200001000,"event":"approval_decided","id":"a-1","outcome":"allowed_once"}
+        \\{"ts":1752200002000,"event":"approval_asked","id":"a-2","tool":"web_fetch","step":null,"input":"{\"url\":\"https://x\"}"}
+        \\{"ts":1752200003000,"event":"approval_decided","id":"a-2","outcome":"rejected"}
+        \\{"ts":1752200004000,"event":"approval_decided","id":"a-3","outcome":"unavailable"}
+        \\
+    ;
+    const out = try render(testing.allocator, jsonl);
+    defer testing.allocator.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "    ? approval a-1: bash [step executor] {\"command\":\"ls\"}\n") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "    ✓ approval a-1: allowed_once\n") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "    ? approval a-2: web_fetch {\"url\":\"https://x\"}\n") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "    ✗ approval a-2: rejected\n") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "    ✗ approval a-3: unavailable\n") != null);
 }
 
 const SinkCapture = struct {

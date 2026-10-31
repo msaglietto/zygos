@@ -105,7 +105,7 @@ Bus functions a new reader should be able to name:
 | `turn.zig` | `zygos::turns::{run,abort,steer}` |
 | `tools.zig` | `zygos::tools::{bash,read_file,write_file}` |
 | `policy.zig` | `zygos::policy::check` |
-| `approval.zig` | `zygos::approvals::{request,resolve,pending}` |
+| `approval.zig` | `zygos::approvals::{request,resolve,pending,cancel}` |
 | `budget.zig` | `zygos::budget::{configure,record,check}` |
 | `router.zig` | `zygos::models::resolve` |
 | `trim.zig` | `zygos::output::{compress,stats}` |

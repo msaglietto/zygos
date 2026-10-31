@@ -14,6 +14,8 @@ pub const TraceEvent = union(enum) {
     mission: Mission,
     pipeline: Pipeline,
     policy: Policy,
+    approval_asked: ApprovalAsked,
+    approval_decided: ApprovalDecided,
     role_start: RoleStart,
     role_end: RoleEnd,
     task_start: Task,
@@ -66,6 +68,22 @@ pub const TraceEvent = union(enum) {
         tool: []const u8 = "?",
         verdict: []const u8 = "?",
         step: ?[]const u8 = null,
+    };
+    /// Emitted by the approval worker when it parks a request, before the
+    /// reply (docs/specs/approval.md, "Audit trail"). `step` is the pipeline
+    /// step id (null when the request had none), not the `tool_call` counter;
+    /// `input` is the input's JSON text, clipped like `ToolCall.input`.
+    pub const ApprovalAsked = struct {
+        id: []const u8 = "?",
+        tool: []const u8 = "?",
+        step: ?[]const u8 = null,
+        input: []const u8 = "",
+    };
+    /// `outcome` stays a string for the same reason as `PolicyRule.verdict`: an
+    /// outcome outside the worker's closed set from a foreign line still renders.
+    pub const ApprovalDecided = struct {
+        id: []const u8 = "?",
+        outcome: []const u8 = "?",
     };
     pub const RoleStart = struct {
         role: []const u8 = "?",
@@ -125,6 +143,16 @@ pub fn body(arena: std.mem.Allocator, ev: TraceEvent) error{OutOfMemory}![]const
         .mission => |m| missionBody(arena, m),
         .pipeline => |p| pipelineBody(arena, p),
         .policy => |p| policyBody(arena, p),
+        .approval_asked => |a| std.fmt.allocPrint(
+            arena,
+            "\"event\":\"approval_asked\",\"id\":{f},\"tool\":{f},\"step\":{f},\"input\":{f}",
+            .{ json.fmt(a.id, .{}), json.fmt(a.tool, .{}), json.fmt(a.step, .{}), json.fmt(a.input, .{}) },
+        ),
+        .approval_decided => |d| std.fmt.allocPrint(
+            arena,
+            "\"event\":\"approval_decided\",\"id\":{f},\"outcome\":{f}",
+            .{ json.fmt(d.id, .{}), json.fmt(d.outcome, .{}) },
+        ),
         .role_start => |r| std.fmt.allocPrint(
             arena,
             "\"event\":\"role_start\",\"role\":{f},\"role_turn\":{d},\"tools\":{},\"content\":{f}",
@@ -259,6 +287,14 @@ pub fn parse(arena: std.mem.Allocator, line: []const u8) ?Parsed {
     } } else if (std.mem.eql(u8, name, "policy")) .{ .policy = .{
         .source = str(obj, "source") orelse "config",
         .rules = parsePolicyRules(arena, obj),
+    } } else if (std.mem.eql(u8, name, "approval_asked")) .{ .approval_asked = .{
+        .id = str(obj, "id") orelse "?",
+        .tool = str(obj, "tool") orelse "?",
+        .step = str(obj, "step"),
+        .input = str(obj, "input") orelse "",
+    } } else if (std.mem.eql(u8, name, "approval_decided")) .{ .approval_decided = .{
+        .id = str(obj, "id") orelse "?",
+        .outcome = str(obj, "outcome") orelse "?",
     } } else if (std.mem.eql(u8, name, "role_start")) .{ .role_start = .{
         .role = str(obj, "role") orelse "?",
         .role_turn = int(obj, "role_turn"),
@@ -409,6 +445,15 @@ test "body: every variant serializes byte-identical to the legacy emitters" {
         \\"event":"policy","source":"config","rules":[]
     , .{ .policy = .{} });
     try expectBody(
+        \\"event":"approval_asked","id":"a-1","tool":"bash","step":"executor","input":"{\"command\":\"ls\"}"
+    , .{ .approval_asked = .{ .id = "a-1", .tool = "bash", .step = "executor", .input = "{\"command\":\"ls\"}" } });
+    try expectBody(
+        \\"event":"approval_asked","id":"a-2","tool":"web_fetch","step":null,"input":""
+    , .{ .approval_asked = .{ .id = "a-2", .tool = "web_fetch" } });
+    try expectBody(
+        \\"event":"approval_decided","id":"a-1","outcome":"rejected"
+    , .{ .approval_decided = .{ .id = "a-1", .outcome = "rejected" } });
+    try expectBody(
         \\"event":"role_start","role":"executor","role_turn":3,"tools":true,"content":"Objective: ship"
     , .{ .role_start = .{ .role = "executor", .role_turn = 3, .tools = true, .content = "Objective: ship" } });
     try expectBody(
@@ -462,6 +507,9 @@ test "parse: body round-trips through a full line for every variant" {
             .{ .tool = "web_*", .verdict = "ask", .step = null },
         } } },
         .{ .policy = .{} },
+        .{ .approval_asked = .{ .id = "a-1", .tool = "bash", .step = "executor", .input = "{\"command\":\"ls\"}" } },
+        .{ .approval_asked = .{ .id = "a-2", .tool = "bash" } },
+        .{ .approval_decided = .{ .id = "a-1", .outcome = "allowed_once" } },
         .{ .role_start = .{ .role = "planner", .role_turn = 1, .tools = false, .content = "hi" } },
         .{ .role_end = .{ .role = "planner", .outcome = "failed", .reason = "why" } },
         .{ .task_start = .{ .index = 1, .total = 2, .desc = "d" } },
@@ -548,4 +596,43 @@ test "parse: a malformed policy event reads tolerant defaults" {
     try testing.expectEqualStrings("x", odd.event.policy.rules[1].tool);
     try testing.expectEqualStrings("?", odd.event.policy.rules[1].verdict);
     try testing.expect(odd.event.policy.rules[1].step == null);
+}
+
+test "approval events round-trip through trace_event" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const asked: TraceEvent = .{ .approval_asked = .{
+        .id = "a-7",
+        .tool = "a\"b",
+        .step = "research*",
+        .input = "{\"command\":\"echo \\\"hi\\\"\"}",
+    } };
+    const decided: TraceEvent = .{ .approval_decided = .{ .id = "a-7", .outcome = "unavailable" } };
+    for ([_]TraceEvent{ asked, decided }) |ev| {
+        const line = try std.fmt.allocPrint(arena, "{{\"ts\":7,{s}}}", .{try body(arena, ev)});
+        const parsed = parse(arena, line) orelse return error.ParseFailed;
+        try testing.expectEqual(@as(i64, 7), parsed.ts);
+        try testing.expectEqualDeep(ev, parsed.event);
+    }
+    const bare = try std.fmt.allocPrint(arena, "{{\"ts\":8,{s}}}", .{try body(arena, .{ .approval_asked = .{} })});
+    const parsed = parse(arena, bare) orelse return error.ParseFailed;
+    try testing.expect(parsed.event.approval_asked.step == null);
+}
+
+test "parse: malformed approval events read tolerant defaults" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const asked = parse(arena, "{\"event\":\"approval_asked\",\"step\":3,\"input\":7}") orelse return error.ParseFailed;
+    try testing.expectEqualStrings("?", asked.event.approval_asked.id);
+    try testing.expectEqualStrings("?", asked.event.approval_asked.tool);
+    try testing.expect(asked.event.approval_asked.step == null);
+    try testing.expectEqualStrings("", asked.event.approval_asked.input);
+    // An outcome outside the closed set still parses: a trace line is a record.
+    const decided = parse(arena, "{\"event\":\"approval_decided\",\"outcome\":\"novel\"}") orelse return error.ParseFailed;
+    try testing.expectEqualStrings("?", decided.event.approval_decided.id);
+    try testing.expectEqualStrings("novel", decided.event.approval_decided.outcome);
+    const none = parse(arena, "{\"event\":\"approval_decided\"}") orelse return error.ParseFailed;
+    try testing.expectEqualStrings("?", none.event.approval_decided.outcome);
 }
