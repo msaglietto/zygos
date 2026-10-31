@@ -1729,8 +1729,28 @@ test "unparseable approval reply denies" {
     for (denied) |reply| {
         try testing.expectEqual(@as(usize, 0), try dispatchesAfterApproverReply(reply));
     }
-    // A handler error and an unregistered approver are denials too.
+    // A handler error is a denial too (an unregistered approver has its own test).
     try testing.expectEqual(@as(usize, 0), try dispatchesAfterApproverReply(null));
+}
+
+test "an unregistered approval function denies (function_not_found on the bus)" {
+    var h = try Harness.init(testing.allocator, &.{ tool_use_msg, end_turn_msg });
+    defer h.deinit();
+    const pw = try policy_mod.PolicyWorker.start(testing.allocator, &h.actor, &h.registry, &.{
+        .{ .tool = "runner", .verdict = .ask },
+    });
+    defer pw.stop();
+    // No approver is registered at all: the ask hits `function_not_found`.
+
+    const res = try h.runTurnCall(requestWith(ask_runner_req));
+    defer res.deinit(testing.allocator);
+    try testing.expect(res == .ok);
+    try testing.expect(std.mem.indexOf(u8, res.ok, "\"stop\":\"end_turn\"") != null);
+    try testing.expect(std.mem.indexOf(u8, res.ok, "approval_denied") != null);
+
+    h.tool.mutex.lock();
+    defer h.tool.mutex.unlock();
+    try testing.expectEqual(@as(usize, 0), h.tool.calls);
 }
 
 test "policy function unreachable denies (fail closed)" {
