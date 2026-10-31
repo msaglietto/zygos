@@ -30,7 +30,12 @@ test thread) answers via `zygos::approvals::resolve`.
 - `zygos::approvals::resolve` — `{"id":"a-1","approved":true}` →
   `{"resolved":true}`; unknown id → `{"resolved":false}`. The first decision
   wins: a resolve for a request already resolved or cancelled (but not yet
-  woken) also replies `{"resolved":false}` and changes nothing.
+  woken) also replies `{"resolved":false}` and changes nothing, and a
+  `cancel` for a request already resolved wakes nothing (`{"cancelled":0}`).
+  The one exception is worker `stop`: it cancels every parked request,
+  including one that was resolved but has not woken yet, so such a request
+  replies `cancelled`. Stopping is the fail-closed direction, and the code
+  keeps it that way.
 - `zygos::approvals::pending` — `{}` →
 
   ```json
@@ -99,7 +104,15 @@ its `approval_decided`.
 - `input` is the input's JSON text clipped by `trace.clip`, the same path a
   `tool_call` input takes. AG-UI redacts it like `tool_call` input.
 - Every reply the worker sends has its `approval_decided`, auto modes
-  included. A request parked when the worker stops records `cancelled`.
+  included. A request parked when the worker stops, or cancelled by
+  `zygos::approvals::cancel`, records `cancelled`.
+- The trace stays advisory, like every other event (README: "If the file
+  cannot be written, the mission still runs"). `trace.emit` swallows an
+  unwritable file, so the lines are lost and the decision is unchanged: the
+  reply, `approved` and `outcome` do not depend on the trace being written.
+  The `input` is clipped (and the clip allocated) before the request is
+  parked, so an out-of-memory error there cannot leave an entry in
+  `pending`.
 - Policy `deny` verdicts are already in the trace as a
   `policy_denied: <reason>` is_error `tool_result`; there is no separate
   event for them.
@@ -132,48 +145,85 @@ present), the input and the reason. The input's JSON text is capped at
 the TUI's terminal scrubber first: the input is model-controlled and must
 not carry escape sequences to the operator's terminal.
 
+The console prints the summary on one line. The TUI band cannot: it clips
+every row at the terminal width, which would hide the end of a long command,
+the cap marker and the reason while the operator can still press `y`. So the
+band renders the `  [y/N] approve?` keys first (red, bold), then the whole
+summary, word-wrapped on display width (`tui/width.zig` `wrapToWidth`: wide
+runes count 2, no UTF-8 sequence is split, a token wider than a row is
+hard-split) over as many rows as it needs, continuation rows indented four
+cells and dim. A summary that fits shares the keys' row. In a terminal too
+narrow for an inline summary (under 25 cells) the keys take a row of their
+own. A newline in the summary (the scrubber keeps `\n`) starts a new row. The
+summary is bounded (400 input bytes plus marker and reason), so the rows are
+too; nothing in `frame.zig` drops bottom rows.
+
 ## Test contract (RED first)
+
+Worker (`approval.zig`):
 
 1. `auto_approve replies approved`
 2. `auto_deny replies denied`
-3. `manual: request parks until resolve(approved:true) → approved`
-4. `manual: resolve(approved:false) → denied`
-5. `manual: pending lists the parked request; empty after resolve`
-6. `manual with timeout_ms: unresolved request denies after deadline`
-7. `resolve with unknown id → resolved:false`
+3. `manual: request parks until resolve approves it`
+4. `manual: resolve(approved:false) denies`
+5. `manual: pending is empty after resolution`
+6. `manual with timeout_ms denies unresolved requests`
+7. `resolve with unknown id reports resolved:false`
 8. `no leaks under park/resolve loops`
 9. `timeout deny replies resolved:false (unanswered, not refused)`
-10. `explicit resolve deny replies resolved:true`
+10. `explicit resolve deny replies resolved:true (a human said no)`
 11. `auto modes reply resolved:true (a configured decision, not silence)`
 12. `resolve(approved:true) replies outcome allowed_once`
 13. `resolve(approved:false) replies outcome rejected`
 14. `timeout replies outcome unavailable with resolved:false`
 15. `cancel wakes a parked request as outcome cancelled; cancel with nothing parked reports 0`
-16. `stop while parked replies outcome cancelled`
-17. `auto modes reply allowed_once / rejected with sequential ids`
-18. `pending carries the request's input (the command text) and step_id`
-19. `pending omits step_id when the request has none and shows input null when absent`
-20. `trace: approve, reject and timeout each write approval_asked then approval_decided with the same id and the matching outcome`
-21. `trace: stop while parked records approval_decided cancelled`
-22. `trace: approval_asked input is clipped like tool_call input`
+16. `cancel by id wakes only that request`
+17. `stop while parked replies outcome cancelled`
+18. `auto modes reply allowed_once / rejected with sequential ids`
+19. `pending carries the request's input (the command text) and step_id`
+20. `pending omits step_id when the request has none and shows input null when absent`
+21. `trace: approve, reject and timeout each write approval_asked then approval_decided with the same id and the matching outcome`
+22. `trace: stop while parked records approval_decided cancelled`
+23. `trace: approval_asked input is clipped like tool_call input`
+24. `request: an allocation failure never leaves a parked entry behind` (drives the handler with a failing allocator at every allocation point)
+25. `resolve: the first decision wins and a later resolve or cancel cannot flip it` (handlers driven directly on a hand-parked entry: the window between the decision and the wake)
+26. `resolve after cancel replies resolved:false and cannot revive the request`
+27. `trace: cancel while parked records approval_decided cancelled`
+28. `a request that arrives while the worker is stopping replies cancelled and parks nothing`
 
 Turn side (`turn.zig`):
 
-23. `approval request carries input, step_id, trace_path and the policy reason`
-24. `requires_approval without an ask verdict asks with reason "tool requires approval"`
-25. `only outcome allowed_once dispatches (approved:true with outcome rejected does not)`
-26. `missing, unknown, non-string or contradictory outcome denies`
-27. `unparseable approval reply denies` (wrong-shape replies `[]`, `"x"`, `null`, `42`, `true` and a handler error: the bus rejects a non-JSON result frame before the turn sees it)
+29. `approval request carries input, step_id, trace_path and the policy reason`
+30. `requires_approval without an ask verdict asks with reason "tool requires approval"`
+31. `only outcome allowed_once dispatches (approved:true with outcome rejected does not)`
+32. `missing, unknown, non-string or contradictory outcome denies`
+33. `unparseable approval reply denies` (wrong-shape replies `[]`, `"x"`, `null`, `42`, `true` and a handler error: the bus rejects a non-JSON result frame before the turn sees it)
+34. `an unregistered approval function denies (function_not_found on the bus)`
+
+Mission gate (`mission.zig`):
+
+35. `gate: approved:true contradicted by a non-allowed_once outcome is a malformed reply`
+36. `gate: approved:true with a non-string outcome is a malformed reply`
+37. `gate: approved:true with outcome allowed_once completes; a reply with no outcome still does`
 
 Trace, AG-UI and CLI (`trace_event.zig`, `trace.zig`, `agui.zig`, `src/cli`):
 
-28. `approval events round-trip through trace_event` (and `parse: malformed approval events read tolerant defaults`)
-29. `render shows both approval lines`
-30. `agui projects approval events as zygos.approval custom events` (golden)
-31. `agui redacts a secret in approval_asked input`
-32. `console prompt renders tool, step and input`
-33. `console prompt caps a long input with a marker`
-34. `console prompt strips escape sequences from the input`
+38. `approval events round-trip through trace_event` (and `parse: malformed approval events read tolerant defaults`)
+39. `render shows both approval lines`
+40. `agui projects approval events as zygos.approval custom events` (golden)
+41. `agui redacts a secret in approval_asked input`
+42. `console prompt renders tool, step and input`
+43. `console prompt caps a long input with a marker`
+44. `console prompt strips escape sequences from the input`
+
+TUI band (`tui/band.zig`):
+
+45. `approval ask wraps across rows at 80 columns: tail, marker and reason stay visible`
+46. `approval ask wraps across rows at a narrow width`
+47. `approval ask keeps the keys visible when the terminal is tiny`
+48. `approval ask hard-splits an unbroken token and never splits a UTF-8 sequence`
+49. `a short approval ask stays on one row after the keys`
+50. `an approval ask cannot restyle the band or break rows with escapes and newlines`
 
 e2e (`test/e2e/m45/run.sh`): a mission with `.policy` `{bash ask}` on the
 scripted path, one ask approved and one rejected over piped stdin, shows

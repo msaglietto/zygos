@@ -81,7 +81,10 @@ The input's JSON text is capped at 400 bytes on a UTF-8 boundary with a
 `…[<n> bytes total]` marker (never cut silently), and every field passes
 the TUI scrubber first (escape sequences and C0/C1 controls dropped, any
 surviving newline becomes a space) because the input is model-controlled.
-The TUI approval band uses the same text (`cli/mission/approval_prompt.zig`).
+The TUI approval band uses the same text (`cli/mission/approval_prompt.zig`),
+but not on one row: the `[y/N] approve?` keys come first and the summary
+wraps across as many band rows as it needs, so a long command is never cut
+off at the terminal edge (see `docs/specs/approval.md`, "Display").
 
 SIGINT aborts the mission and then calls `zygos::approvals::cancel` every
 200 ms until the process exits, so an ask parked at that moment replies

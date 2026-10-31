@@ -204,7 +204,7 @@ zygos mission dashboard <dir>
 
 `dashboard <dir>` prints one status line per mission substrate under that directory.
 
-`trace` renders `events.jsonl`. The file is the record: mission transitions, which provider and model handled each step, and every tool call. When the config has `.policy`, the effective rule list is written as a `policy` event right after the pipeline, so a run shows which rules governed it. No `policy` event means the default allow list did. If the file cannot be written, the mission still runs.
+`trace` renders `events.jsonl`. The file is the record: mission transitions, which provider and model handled each step, every tool call, and each tool approval ask with how it was decided (an `approval_asked` and `approval_decided` pair). When the config has `.policy`, the effective rule list is written as a `policy` event right after the pipeline, so a run shows which rules governed it. No `policy` event means the default allow list did. If the file cannot be written, the mission still runs.
 
 ```bash
 zygos mission trace .planning

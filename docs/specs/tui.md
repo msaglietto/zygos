@@ -24,7 +24,12 @@ answers.
   Teardown: callers `stop()` the Tui, which joins the render thread.
 - `band.zig` — bottom band (header/spinner, step line, running tools, live
   tool box, thinking block, answer tail, approval ask, status). Pure over a
-  read-only model snapshot taken under the mutex.
+  read-only model snapshot taken under the mutex. The approval ask is the
+  `[y/N] approve?` keys first, then the whole scrubbed summary word-wrapped
+  on display width over as many rows as it needs (see
+  `docs/specs/approval.md`, "Display"); rows are never clipped on the right
+  there, so the end of a command, the clip marker and the reason stay
+  visible while the operator can answer.
 - `chatlog.zig` — committed history; lines only grow into native terminal
   scrollback. Owns collapse/promote of live buffers into history.
 - `entries.zig` — the entry-lifecycle grammar: in-flight work renders under

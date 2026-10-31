@@ -601,7 +601,9 @@ fn sigintWatch(gpa: std.mem.Allocator, worker: *zygos.inproc.Worker, mission_id:
     // aborted run until the approval timeout; wake it as outcome cancelled.
     // The abort only lands at the next role boundary, so the in-flight turn
     // may raise more asks first: keep cancelling for the rest of the process.
-    // Best effort: a missing function or a bus error ends the loop.
+    // Best effort: only a failed call (the bus shut down) ends the loop. An
+    // `.err` reply such as function_not_found arrives as a result, not through
+    // `catch`, and is ignored: the loop keeps polling until the process exits.
     while (true) {
         const cancelled = worker.call("zygos::approvals::cancel", "{}") catch return;
         cancelled.deinit(gpa);
@@ -994,7 +996,7 @@ fn tuiApprovalLoop(
                 const pid = strOf(item.object.get("id")) orelse continue;
                 if (std.mem.eql(u8, pid, id)) still_pending = true;
             }
-            if (!still_pending) { // timed out server-side: denied
+            if (!still_pending) { // timed out or cancelled server-side: denied
                 ui.model.setPendingApproval(null);
                 handled.put(id, {}) catch return;
                 current_id = null;
