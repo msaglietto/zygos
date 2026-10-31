@@ -45,7 +45,7 @@ Actors: **operator** (the OS user), **kernel** (bus), **model** (a provider work
 ## 5. Web fetch and search
 
 - **Precondition.** Policy allowed the call. Search requires `ZYGOS_SEARCH_ENGINE`.
-- **Sequence.** `validateUrl` rejects non-http(s) and URLs with no host. Fetch reads up to `max_fetch_bytes`, strips tags, caps text. Non-2xx, oversize, or non-text is a structured error. Search: brave resolves `key` at boot from `ZYGOS_SEARCH_KEY_ENV` or `BRAVE_API_KEY` (`searchConfigFromEnv`). A null key returns `MissingSearchKey` naming the variable. One retry on HTTP 429 only. searxng needs `ZYGOS_SEARCH_ENDPOINT` and no key.
+- **Sequence.** `validateUrl` rejects non-http(s) and URLs with no host. Fetch decodes gzip and deflate bodies (a corrupt body or any other `Content-Encoding` is `HttpFailed`), reads up to `max_fetch_bytes` of decoded bytes, strips tags, caps text. Non-2xx, oversize, or non-text is a structured error. Search: brave resolves `key` at boot from `ZYGOS_SEARCH_KEY_ENV` or `BRAVE_API_KEY` (`searchConfigFromEnv`). A null key returns `MissingSearchKey` naming the variable. One retry on HTTP 429 only. searxng needs `ZYGOS_SEARCH_ENDPOINT` and no key.
 - **Authz.** Policy on the way in. No host allow-list on the way out.
 - **Side effects.** Outbound HTTP. Bytes may be trimmed and copied into the next model prompt and into `events.jsonl`.
 

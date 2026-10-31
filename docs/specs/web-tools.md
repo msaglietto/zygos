@@ -15,8 +15,9 @@ Request `{"url":"https://..."}`; reply `{"url":..., "text":..., "truncated":bool
 - Response body → readable text (boilerplate-stripping extraction, tuned for
   token cost — see "HTML compression" below). Non-text content types ⇒ error
   reply.
-- Size caps: read at most `max_fetch_bytes` (option, default 512 KiB) off the
-  wire; emit at most `max_text_bytes` (default 64 KiB) with `truncated:true`.
+- Size caps: read at most `max_fetch_bytes` (option, default 512 KiB) of the
+  decoded body (see "Content coding"); emit at most `max_text_bytes` (default
+  64 KiB) with `truncated:true`.
 - Non-2xx ⇒ error reply naming the status.
 - Redirects: std.http does not follow them. `web_fetch` follows up to
   `max_redirects` (option, default 3) by hand, and screens every hop (see
@@ -24,6 +25,29 @@ Request `{"url":"https://..."}`; reply `{"url":..., "text":..., "truncated":bool
 - Host refusals and redirect refusals are tool-result errors of the shape
   `{"error":"<Name>"}`: `PrivateHost`, `InvalidRedirect`, `TooManyRedirects`,
   `ResolveFailed`.
+
+### Content coding
+
+The real transport (`httpGet`) advertises `Accept-Encoding: gzip, deflate` and
+decodes the body before anything else sees it. `gzip` (and `x-gzip`) and
+`deflate` (zlib) are decoded; `identity` and a missing header pass through.
+`zstd`, `br` and `compress` are not advertised and not decoded.
+
+- `max_bytes` (`max_fetch_bytes`) caps the decoded output. Reading stops at the
+  cap and nothing is allocated past it, so a small compressed body cannot
+  expand past the cap. An over-cap body is cut at the cap, as for an identity
+  body; it is not an error.
+- A body that fails to inflate (bad block, bad data, a stream that ends before
+  its end marker or its trailer) is `HttpFailed`. The gzip CRC32 and length, or
+  the zlib Adler-32, are checked when the whole body fits under the cap, since
+  std's inflater reads those fields without checking them. A body cut at the
+  cap is not checked. Raw compressed bytes are never returned as text.
+- A response with a `Content-Encoding` the transport did not advertise or does
+  not know (`zstd`, `br`, `compress`, anything else, or a stacked coding such
+  as `gzip, br`) is `HttpFailed`, whatever `Accept-Encoding` a caller put in
+  `TransportRequest.headers`. Neither `web_fetch` nor `web_search` sets one.
+- The pure part is `readCapped(gpa, reader, max_bytes)`: it reads a decoded
+  reader to its end or the cap and reports whether it reached the end.
 
 ### SSRF screen
 
@@ -163,7 +187,7 @@ Pure layer (pub, fixture-tested): `htmlToText(arena, bytes, max_out)
 (the literal screen applied to the original URL and each hop), `addressBlocked(addr)`
 (class check on a resolved address, including embedded IPv4).
 
-## Test contract (RED first; no sockets)
+## Test contract (RED first; no external network)
 
 1. `htmlToText: tags/script/style stripped, entities decoded, blank runs collapsed`
 2. `htmlToText: max_text_bytes cap sets truncated`
@@ -203,6 +227,29 @@ Pure layer (pub, fixture-tested): `htmlToText(arena, bytes, max_out)
 30. `addressBlocked: 0000::/8, local-use NAT64, discard and benchmark ranges blocked`
 31. `defaultResolver: an Io without concurrency refuses ResolveFailed instead of looking up inline`
 32. `defaultResolver: an address literal resolves through the concurrent lookup`
+
+33. `httpGet` over a loopback listener (the only tests that cross the real
+    transport; 127.0.0.1, one connection, no external network):
+    `httpGet decodes a gzip body to the caller's text (#23)`,
+    `httpGet decodes an x-gzip body`, `httpGet decodes a deflate body`,
+    `httpGet decodes a chunked gzip body`,
+    `httpGet decodes a gzip body that ends with the connection`,
+    `httpGet leaves an identity body unchanged`,
+    `httpGet caps the decoded gzip output at max_bytes`,
+    `httpGet returns the whole decoded body when it fits under max_bytes`,
+    `httpGet errors on a corrupt gzip body instead of returning raw bytes`,
+    `httpGet errors on a gzip body whose checksum does not match`,
+    `httpGet errors on a gzip body whose length field does not match`,
+    `httpGet errors on a deflate body whose Adler-32 does not match`,
+    `httpGet errors on a body labelled gzip that is not gzip`,
+    `httpGet errors on a truncated gzip stream`,
+    `httpGet errors on a gzip stream missing its trailer`,
+    `httpGet errors on an encoding it cannot decode`,
+    `httpGet advertises only the encodings it decodes`,
+    `httpGet with a caller Accept-Encoding never returns a compressed body as text`
+34. `readCapped stops reading and allocating at the cap of a highly compressible body`,
+    `readCapped marks a body read to its end complete`,
+    `readCapped fails on a truncated gzip stream`
 
 Y2 (in `worker/turn.zig`-level tests or here): a scripted turn dispatching
 `web_fetch` consults policy with the URL riding the policy request's

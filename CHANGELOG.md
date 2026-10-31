@@ -6,6 +6,12 @@ Reconstructed from git history on 2026-09-30. A commit that only added a library
 
 The agent that next changes operator-visible behavior adds the new heading in that same commit.
 
+## [5.2.1] - 2026-10-31
+
+### Fixed
+
+- `web_fetch` returns the text of a gzip or deflate response instead of the compressed bytes. Before, a server that honoured the default `Accept-Encoding` (example.com does) gave the model `"text":[31,139,…]`. The transport now advertises `gzip, deflate` only and decodes them (`zstd` and `br` are neither advertised nor decoded). `max_fetch_bytes` caps the decoded output, so a small compressed body cannot expand past it. A corrupt or truncated body, a gzip CRC32 or length that does not match, a zlib Adler-32 that does not match, or a response in a coding the tool cannot decode fails with `HttpFailed` instead of returning raw bytes. The checksum is checked when the whole body fits under the cap, not when the body is cut at it. `web_search` shares the transport and decodes the same way.
+
 ## [5.2.0] - 2026-10-30
 
 ### Added
