@@ -26,7 +26,7 @@ jobs:
           - os: ubuntu-24.04
             zig_platform: x86_64-linux
             zig_checksum: 70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00
-          - os: macos-14
+          - os: macos-15
             zig_platform: aarch64-macos
             zig_checksum: b23d70deaa879b5c2d486ed3316f7eaa53e84acf6fc9cc747de152450d401489
     runs-on: ${{ matrix.os }}
