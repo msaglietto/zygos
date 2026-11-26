@@ -26,7 +26,7 @@ listener is required.
   its own bus. A dead bus ends the loop (the process is exiting).
 - **`zygos mission attach <planning-dir>`**: tails `events.jsonl` and
   prints each new event through the trace renderer (typed-event schema,
-  raw passthrough for foreign lines), while stdin lines drive the channel:
+  foreign lines pass through, all scrubbed of terminal controls), while stdin lines drive the channel:
   `steer <text>` | `pause` | `resume` | `approve <id> y|n`. Ctrl-D
   detaches. Unattended runs become inspectable without being interactive.
 

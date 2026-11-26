@@ -6,6 +6,12 @@ Reconstructed from git history on 2026-09-30. A commit that only added a library
 
 The agent that next changes operator-visible behavior adds the new heading in that same commit.
 
+## [5.2.2] - 2026-11-26
+
+### Fixed
+
+- `zygos mission trace` (text format) and `zygos mission attach` strip terminal control sequences from every event field before printing. A fetched page or bash output that held an escape (OSC-52 clipboard write, title or alt-screen change, CSI, BEL, a bare `\r`) used to reach the operator's terminal verbatim, because the JSON decoder turned `\u001b` back into a real ESC byte. The TUI scrubber now runs over tool inputs and outputs, approval inputs, steer text, task descriptions, role and turn error reasons, and the ids, names and nested pipeline and policy fields. An unparseable line is scrubbed too before it prints raw. A newline inside a field no longer starts a new output line that looks like an event: each continuation line is prefixed with `      │ ` instead of a clock. `events.jsonl` is unchanged, and `--format agui` and `--format html` are unaffected.
+
 ## [5.2.1] - 2026-10-31
 
 ### Fixed
