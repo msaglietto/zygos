@@ -39,6 +39,14 @@ ride the same policy/trim/budget gates as native tools.
   `tools_ops.bash` takes), so the transport's ends never leak into a bash
   command and a bash pipe never leaks into the server. A zygos started with
   fd 0 or 1 closed still gives the server working stdin and stdout.
+- The command is resolved in the parent before fork, with `execvp` rules: a
+  name containing `/` is the only candidate, otherwise each `PATH` entry
+  gives `dir/name` (an empty entry is the current directory), and an unset
+  `PATH` means `/usr/bin:/bin`. The child only calls `execve` on each
+  prepared candidate (continuing on ENOENT, ENOTDIR, EACCES), then `_exit(127)`,
+  so it uses async-signal-safe calls only. The environment passes through
+  unchanged. The `/bin/sh` fallback for scripts without a shebang is not
+  emulated.
 
 E2E leg 2 of `test/e2e/m4/run.sh` drives a real client against
 `zygos mcp-gateway` over stdio (zygos talking to zygos).

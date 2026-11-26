@@ -10,6 +10,7 @@
 const std = @import("std");
 const c = std.c;
 const sync = @import("../kernel/sync.zig");
+const clock = @import("../kernel/clock.zig");
 
 extern "c" fn fork() c.pid_t;
 extern "c" fn pipe(fds: *[2]c.fd_t) c_int;
@@ -19,12 +20,6 @@ extern "c" fn waitpid(pid: c.pid_t, status: *c_int, options: c_int) c.pid_t;
 extern "c" fn _exit(code: c_int) noreturn;
 
 const fd_cloexec: c_int = c.FD_CLOEXEC;
-
-fn monotonicMs() i64 {
-    var ts: c.timespec = undefined;
-    if (c.clock_gettime(.MONOTONIC, &ts) != 0) return 0;
-    return @as(i64, @intCast(ts.sec)) * 1000 + @divTrunc(@as(i64, @intCast(ts.nsec)), std.time.ns_per_ms);
-}
 
 /// Process-wide. Held from pipe creation through `fork()` by every fork site
 /// in the process, and released by the parent right after fork returns. macOS
@@ -76,13 +71,13 @@ pub fn runInChildWithClosed(closed: []const c.fd_t, body: *const fn () bool) boo
         for (closed) |fd| _ = close(fd);
         _exit(if (body()) 0 else 1);
     }
-    const deadline = monotonicMs() + 5000;
+    const deadline = clock.monotonicMs() + 5000;
     var status: c_int = 0;
     while (true) {
         const got = waitpid(pid, &status, 1); // WNOHANG
         if (got == pid) break;
         const failed = got < 0 and c._errno().* != @intFromEnum(c.E.INTR);
-        if (failed or monotonicMs() >= deadline) {
+        if (failed or clock.monotonicMs() >= deadline) {
             _ = c.kill(pid, c.SIG.KILL);
             while (waitpid(pid, &status, 0) < 0 and c._errno().* == @intFromEnum(c.E.INTR)) {}
             return false;

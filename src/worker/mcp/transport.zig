@@ -6,6 +6,7 @@
 const std = @import("std");
 const c = std.c;
 const sync = @import("../../kernel/sync.zig");
+const clock = @import("../../kernel/clock.zig");
 const fork_guard = @import("../fork_guard.zig");
 
 pub const TransportError = error{ Io, OutOfMemory };
@@ -30,7 +31,8 @@ pub const Transport = struct {
 };
 
 extern "c" fn fork() c.pid_t;
-extern "c" fn execvp(file: [*:0]const u8, argv: [*:null]const ?[*:0]const u8) c_int;
+extern "c" fn execve(path: [*:0]const u8, argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*:0]const u8) c_int;
+extern "c" var environ: [*:null]?[*:0]const u8;
 extern "c" fn waitpid(pid: c.pid_t, status: ?*c_int, options: c_int) c.pid_t;
 extern "c" fn kill(pid: c.pid_t, sig: c_int) c_int;
 extern "c" fn fdopen(fd: c_int, mode: [*:0]const u8) ?*c.FILE;
@@ -41,10 +43,42 @@ extern "c" fn fileno(stream: *c.FILE) c_int;
 
 const SIGTERM: c_int = @intFromEnum(c.SIG.TERM);
 
-fn monotonicMs() i64 {
-    var ts: c.timespec = undefined;
-    if (c.clock_gettime(.MONOTONIC, &ts) != 0) return 0;
-    return @as(i64, @intCast(ts.sec)) * 1000 + @divTrunc(@as(i64, @intCast(ts.nsec)), std.time.ns_per_ms);
+/// `execvp` fallback when PATH is unset: the macOS and glibc default
+/// (`confstr(_CS_PATH)` is `/usr/bin:/bin` on both), a literal so the lookup
+/// needs no libc call.
+const default_path = "/usr/bin:/bin";
+
+/// Parent-side PATH search with `execvp` semantics, resolved before fork. A
+/// name containing '/' is the only candidate. Otherwise each PATH entry gives
+/// `dir/argv0`, and an empty entry means the current directory (`./argv0`).
+/// An empty name has no candidates. Each string is NUL-terminated and
+/// gpa-owned, as is the slice: release both with `freeExecCandidates`.
+pub fn execCandidates(
+    gpa: std.mem.Allocator,
+    argv0: []const u8,
+    path_env: ?[]const u8,
+) error{OutOfMemory}![]const [*:0]const u8 {
+    var list: std.ArrayList([*:0]const u8) = .empty;
+    errdefer freeExecCandidates(gpa, list.items);
+    if (argv0.len == 0) return try list.toOwnedSlice(gpa);
+    if (std.mem.indexOfScalar(u8, argv0, '/') != null) {
+        const one = try gpa.dupeZ(u8, argv0);
+        errdefer gpa.free(one);
+        try list.append(gpa, one.ptr);
+        return try list.toOwnedSlice(gpa);
+    }
+    var dirs = std.mem.splitScalar(u8, path_env orelse default_path, ':');
+    while (dirs.next()) |dir| {
+        const path = try std.fmt.allocPrintSentinel(gpa, "{s}/{s}", .{ if (dir.len == 0) "." else dir, argv0 }, 0);
+        errdefer gpa.free(path);
+        try list.append(gpa, path.ptr);
+    }
+    return try list.toOwnedSlice(gpa);
+}
+
+pub fn freeExecCandidates(gpa: std.mem.Allocator, candidates: []const [*:0]const u8) void {
+    for (candidates) |cand| gpa.free(std.mem.span(cand));
+    gpa.free(candidates);
 }
 
 pub const ChildProcess = struct {
@@ -59,7 +93,12 @@ pub const ChildProcess = struct {
     read_end: usize = 0,
 
     /// Spawn `argv` with its stdin/stdout piped here; stderr passes through
-    /// to ours (server logs stay visible).
+    /// to ours (server logs stay visible). The command is looked up like
+    /// `execvp` does (see `execCandidates`), but in the parent: the child only
+    /// runs `execve` over the prepared candidates, because libc `execvp` is not
+    /// async-signal-safe and handler threads may hold libc locks at fork time.
+    /// The ENOEXEC `/bin/sh` fallback of `execvp` is not emulated: shebang
+    /// scripts run through `execve`; a script with no shebang fails (exit 127).
     pub fn spawn(gpa: std.mem.Allocator, argv: []const []const u8) error{ OutOfMemory, SpawnFailed }!*ChildProcess {
         std.debug.assert(argv.len > 0);
         const argz = try gpa.alloc(?[*:0]const u8, argv.len + 1);
@@ -71,6 +110,11 @@ pub const ChildProcess = struct {
             owned += 1;
         }
         argz[argv.len] = null;
+        // Everything the child touches is built here: no unwrap, no
+        // allocation after fork.
+        const candidates = try execCandidates(gpa, argv[0], if (std.c.getenv("PATH")) |p| std.mem.span(p) else null);
+        defer freeExecCandidates(gpa, candidates);
+        const child_argv: [*:null]const ?[*:0]const u8 = @ptrCast(argz.ptr);
 
         // Both pipes are close-on-exec and created and forked under the
         // process-wide fork lock: our ends never leak into a bash command or
@@ -106,7 +150,17 @@ pub const ChildProcess = struct {
             // the stream just installed.
             if (!fork_guard.moveFd(in_pipe[0], 0)) _exit(127);
             if (!fork_guard.moveFd(out_pipe[1], 1)) _exit(127);
-            _ = execvp(argz[0].?, @ptrCast(argz.ptr));
+            // The whole post-fork path: execve, errno read, _exit (plus
+            // moveFd above: fcntl, dup2). No allocation, unwrap, formatting
+            // or std.debug. Keep it that way; this list is the audit.
+            // Like execvp: keep going on ENOENT, ENOTDIR and EACCES; any other
+            // error stops the search. Exit 127 (not found / not runnable)
+            // throughout; 126 is not used, so the parent sees one code.
+            for (candidates) |cand| {
+                _ = execve(cand, child_argv, environ);
+                const err = c._errno().*;
+                if (err != @intFromEnum(c.E.NOENT) and err != @intFromEnum(c.E.NOTDIR) and err != @intFromEnum(c.E.ACCES)) break;
+            }
             _exit(127);
         }
         fork_guard.lock.unlock();
@@ -139,11 +193,11 @@ pub const ChildProcess = struct {
         _ = c.fclose(self.to_child);
         _ = c.fclose(self.from_child);
         _ = kill(self.pid, SIGTERM);
-        const deadline = monotonicMs() + 250;
+        const deadline = clock.monotonicMs() + 250;
         while (true) {
             const reaped = waitpid(self.pid, null, 1); // WNOHANG
             if (reaped == self.pid or (reaped < 0 and c._errno().* == @intFromEnum(c.E.CHILD))) break;
-            if (monotonicMs() >= deadline) {
+            if (clock.monotonicMs() >= deadline) {
                 _ = kill(self.pid, @intFromEnum(c.SIG.KILL));
                 while (waitpid(self.pid, null, 0) < 0 and c._errno().* == @intFromEnum(c.E.INTR)) {}
                 break;
@@ -173,10 +227,10 @@ pub const ChildProcess = struct {
         const self: *ChildProcess = @ptrCast(@alignCast(ctx));
         var buf: std.ArrayList(u8) = .empty;
         errdefer buf.deinit(gpa);
-        const deadline = monotonicMs() + self.read_timeout_ms;
+        const deadline = clock.monotonicMs() + self.read_timeout_ms;
         while (true) {
             if (self.read_pos == self.read_end) {
-                const left = deadline - monotonicMs();
+                const left = deadline - clock.monotonicMs();
                 if (left <= 0) return error.Io;
                 var fds = [_]c.pollfd{.{ .fd = fileno(self.from_child), .events = c.POLL.IN, .revents = 0 }};
                 const ready = c.poll(&fds, 1, @intCast(@min(left, std.math.maxInt(c_int))));
@@ -292,4 +346,50 @@ fn stdinOnFdZeroBody() bool {
 
 test "child-process transport: stdin pipe landing on fd 0 survives into the child" {
     try testing.expect(fork_guard.runInChildWithClosed(&.{ 0, 1 }, &stdinOnFdZeroBody));
+}
+
+fn expectCandidates(argv0: []const u8, path_env: ?[]const u8, want: []const []const u8) !void {
+    const got = try execCandidates(testing.allocator, argv0, path_env);
+    defer freeExecCandidates(testing.allocator, got);
+    try testing.expectEqual(want.len, got.len);
+    for (want, got) |w, g| try testing.expectEqualStrings(w, std.mem.span(g));
+}
+
+test "execCandidates: a name with a slash is the only candidate, PATH ignored" {
+    try expectCandidates("/usr/bin/env", "/a:/b", &.{"/usr/bin/env"});
+    try expectCandidates("./tools/srv", "/a:/b", &.{"./tools/srv"});
+    try expectCandidates("sub/srv", null, &.{"sub/srv"});
+}
+
+test "execCandidates: a bare name tries each PATH entry in order" {
+    try expectCandidates("npx", "/opt/bin:/usr/bin:/bin", &.{ "/opt/bin/npx", "/usr/bin/npx", "/bin/npx" });
+}
+
+test "execCandidates: an empty PATH entry means the current directory" {
+    try expectCandidates("uvx", ":/usr/bin", &.{ "./uvx", "/usr/bin/uvx" });
+    try expectCandidates("uvx", "/usr/bin::/bin", &.{ "/usr/bin/uvx", "./uvx", "/bin/uvx" });
+    try expectCandidates("uvx", "/usr/bin:", &.{ "/usr/bin/uvx", "./uvx" });
+    try expectCandidates("uvx", "", &.{"./uvx"});
+}
+
+test "execCandidates: unset PATH falls back to the default search path" {
+    try expectCandidates("cat", null, &.{ "/usr/bin/cat", "/bin/cat" });
+}
+
+test "execCandidates: an empty name has no candidate" {
+    try expectCandidates("", "/usr/bin", &.{});
+}
+
+test "child-process transport: a bare name resolves through PATH, a missing one exits 127" {
+    const child = try ChildProcess.spawn(testing.allocator, &.{ "cat", "-u" });
+    defer child.stop();
+    const t = child.transport();
+    try t.writeLine("via path");
+    const line = (try t.readLine(testing.allocator)).?;
+    defer testing.allocator.free(line);
+    try testing.expectEqualStrings("via path", line);
+
+    const missing = try ChildProcess.spawn(testing.allocator, &.{"zygos-no-such-mcp-server"});
+    defer missing.stop();
+    try testing.expectEqual(@as(?[]u8, null), try missing.transport().readLine(testing.allocator));
 }

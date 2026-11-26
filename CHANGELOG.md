@@ -6,6 +6,12 @@ Reconstructed from git history on 2026-09-30. A commit that only added a library
 
 The agent that next changes operator-visible behavior adds the new heading in that same commit.
 
+## [5.2.5] - 2026-11-26
+
+### Fixed
+
+- An MCP server started by bare command name (`npx`, `uvx`) no longer risks a deadlocked child. Zygos used to call `execvp` in the forked child, which searches `PATH` with libc calls that are not safe between fork and exec and can hang when another thread held a libc lock at fork time. It now resolves the command against `PATH` before fork (same rules as `execvp`; an unset `PATH` means `/usr/bin:/bin`) and the child only calls `execve` on the prepared paths. A script with no shebang line is no longer retried through `/bin/sh`.
+
 ## [5.2.4] - 2026-11-26
 
 ### Fixed

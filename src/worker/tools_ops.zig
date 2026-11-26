@@ -13,6 +13,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const c = std.c;
 const fork_guard = @import("fork_guard.zig");
+const clock = @import("../kernel/clock.zig");
 
 // popen is not used: bash needs an env-scrubbed child (secrets stay out of
 // model-reachable output), and popen offers no env control. libc-backed
@@ -180,12 +181,6 @@ pub fn writeFile(gpa: std.mem.Allocator, ws: Workspace, rel_path: []const u8, co
     }
 }
 
-pub fn monotonicMs() i64 {
-    var ts: c.timespec = undefined;
-    if (c.clock_gettime(.MONOTONIC, &ts) != 0) return 0;
-    return @as(i64, @intCast(ts.sec)) * 1000 + @divTrunc(@as(i64, @intCast(ts.nsec)), std.time.ns_per_ms);
-}
-
 /// Test-only seam, one-shot: `bash` runs and clears it in the parent right
 /// after a successful fork, before closing its pipe write end. Always null in
 /// release builds (the call is compiled out).
@@ -279,13 +274,13 @@ pub fn bash(gpa: std.mem.Allocator, ws: Workspace, command: []const u8) OpsError
             while (waitpid(pid, &ignored, 0) < 0 and c._errno().* == @intFromEnum(c.E.INTR)) {}
         }
     }
-    const deadline = monotonicMs() + ws.shell_timeout_ms;
+    const deadline = clock.monotonicMs() + ws.shell_timeout_ms;
 
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(gpa);
     var chunk: [16 * 1024]u8 = undefined;
     while (true) {
-        const left = deadline - monotonicMs();
+        const left = deadline - clock.monotonicMs();
         if (left <= 0) return error.ExecFailed;
         var poll_fds = [_]c.pollfd{.{ .fd = fds[0], .events = c.POLL.IN, .revents = 0 }};
         const ready = c.poll(&poll_fds, 1, @intCast(@min(left, std.math.maxInt(c_int))));
@@ -309,7 +304,7 @@ pub fn bash(gpa: std.mem.Allocator, ws: Workspace, command: []const u8) OpsError
             break;
         }
         if (got < 0 and c._errno().* != @intFromEnum(c.E.INTR)) return error.ExecFailed;
-        if (monotonicMs() >= deadline) return error.ExecFailed;
+        if (clock.monotonicMs() >= deadline) return error.ExecFailed;
         var no_fds: [0]c.pollfd = .{};
         _ = c.poll(&no_fds, 0, 5);
     }
@@ -597,8 +592,8 @@ fn concHook() void {
     conc_thread = std.Thread.spawn(.{}, concBashB, .{}) catch return;
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = std.fmt.bufPrintZ(&buf, "{s}/b-started", .{conc_ws.root}) catch return;
-    const give_up = monotonicMs() + 5000;
-    while (monotonicMs() < give_up) {
+    const give_up = clock.monotonicMs() + 5000;
+    while (clock.monotonicMs() < give_up) {
         const fd = c.open(path, .{ .ACCMODE = .RDONLY });
         if (fd >= 0) {
             _ = close(fd);
@@ -608,7 +603,7 @@ fn concHook() void {
         var no_fds: [0]c.pollfd = .{};
         _ = c.poll(&no_fds, 0, 5);
     }
-    conc_t0 = monotonicMs();
+    conc_t0 = clock.monotonicMs();
 }
 
 test "bash: a concurrent call's child does not hold a short call's output pipe open" {
@@ -622,7 +617,7 @@ test "bash: a concurrent call's child does not hold a short call's output pipe o
     after_fork_hook.store(&concHook, .release);
 
     const a = try bash(testing.allocator, conc_ws, "echo ok");
-    const returned_at = monotonicMs();
+    const returned_at = clock.monotonicMs();
     defer testing.allocator.free(a.output);
 
     // Release B whatever happens next, so the join below cannot wait out its cap.

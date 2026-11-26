@@ -17,6 +17,7 @@ const json = std.json;
 const actor_mod = @import("../kernel/actor.zig");
 const inproc = @import("../kernel/inproc.zig");
 const sync = @import("../kernel/sync.zig");
+const clock = @import("../kernel/clock.zig");
 const channel_mod = @import("../kernel/channel.zig");
 const trace_mod = @import("trace.zig");
 const approval_mod = @import("approval.zig");
@@ -417,7 +418,7 @@ fn runTurn(self: *TurnOrchestrator, arena: std.mem.Allocator, request_json: []co
     const system = q.system;
     const max_steps = q.max_steps;
     const wall_clock_ms = q.wall_clock_ms;
-    const started_ms = monotonicMs();
+    const started_ms = clock.monotonicMs();
     const static_provider = q.static_provider;
     const router_fn = q.router_fn;
     const step_id = q.step_id;
@@ -748,14 +749,8 @@ fn runTurn(self: *TurnOrchestrator, arena: std.mem.Allocator, request_json: []co
     );
 }
 
-fn monotonicMs() i64 {
-    var ts: std.c.timespec = undefined;
-    if (std.c.clock_gettime(.MONOTONIC, &ts) != 0) return 0;
-    return @as(i64, @intCast(ts.sec)) * 1000 + @divTrunc(@as(i64, @intCast(ts.nsec)), std.time.ns_per_ms);
-}
-
 fn elapsedMs(started_ms: i64) u64 {
-    const now = monotonicMs();
+    const now = clock.monotonicMs();
     return if (now > started_ms) @intCast(now - started_ms) else 0;
 }
 

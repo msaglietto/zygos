@@ -12,6 +12,7 @@
 
 const std = @import("std");
 const sync = @import("../kernel/sync.zig");
+const clock = @import("../kernel/clock.zig");
 
 pub const capacity = 64;
 
@@ -170,12 +171,6 @@ const RecSink = struct {
     }
 };
 
-fn monotonicMs() i64 {
-    var ts: std.c.timespec = undefined;
-    if (std.c.clock_gettime(.MONOTONIC, &ts) != 0) @panic("clock_gettime(MONOTONIC) failed");
-    return @as(i64, @intCast(ts.sec)) * 1000 + @divTrunc(@as(i64, @intCast(ts.nsec)), std.time.ns_per_ms);
-}
-
 const wait_deadline_ms = 5000;
 
 // The sink is slower than any count-based wait, so these tests exercise a late writer every run.
@@ -186,9 +181,9 @@ const slow_sink_ms = 100;
 /// the writer thread is scheduled. On timeout it reports `what` and returns;
 /// the caller's assertions then fail.
 fn waitFor(ctx: anytype, comptime done: fn (@TypeOf(ctx)) bool, what: []const u8) void {
-    const deadline = monotonicMs() + wait_deadline_ms;
+    const deadline = clock.monotonicMs() + wait_deadline_ms;
     while (!done(ctx)) {
-        if (monotonicMs() >= deadline) {
+        if (clock.monotonicMs() >= deadline) {
             std.debug.print("writer_queue test: {s} not seen within {d} ms\n", .{ what, wait_deadline_ms });
             return;
         }
