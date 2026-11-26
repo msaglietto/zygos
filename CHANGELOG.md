@@ -6,6 +6,12 @@ Reconstructed from git history on 2026-09-30. A commit that only added a library
 
 The agent that next changes operator-visible behavior adds the new heading in that same commit.
 
+## [5.2.4] - 2026-11-26
+
+### Fixed
+
+- The mission completion gate is traced. `approval_asked` (tool `mission::complete`, input `{"summary":"<objective>"}`, no step) is written before the gate parks and `approval_decided` (`allowed_once`, `rejected`, `unavailable` on timeout, or `cancelled`) after it, with the same id, so `zygos mission trace` and `attach` show what was asked at completion and how it was answered, and `approve <id> y|n` can see the gate's id. A mission resumed at `gating` asks again with a fresh id. Before, the gate request had no `trace_path`, so the approval worker wrote nothing for it. The gate's decision logic is unchanged, and a gate function other than the approval worker ignores the extra fields.
+
 ## [5.2.3] - 2026-11-26
 
 ### Fixed

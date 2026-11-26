@@ -295,8 +295,13 @@ The new counters default to 0, as `exec_fail_count` does.
 **Every pipeline ends at the gate**, with or without a verifier. At
 `gating` the driver calls the request's `gate_function` (normally
 `zygos::approvals::request`) with
-`{"turn_id":"<mission_id>","tool":"mission::complete","reason":"<objective>","summary":"<objective>"}`
-and blocks on the reply:
+`{"turn_id":"<mission_id>","tool":"mission::complete","reason":"<objective>","summary":"<objective>","input":{"summary":"<objective>"}}`
+and blocks on the reply. When the run has a `trace_path` the request also
+carries it, so the approval worker records the ask as `approval_asked`
+(`tool` `mission::complete`, no `step`) and the answer as `approval_decided`
+(`allowed_once`, `rejected`, `unavailable` or `cancelled`), each ask with its
+own id, on every resume too. A gate function that is not the approval worker
+ignores the extra fields. Tracing never changes the decision below:
 
 - `{"approved":true}` ⇒ `gate_approved` → done, stop `completed`. A reply
   with no `outcome` field is accepted as-is. If `outcome` is present it must

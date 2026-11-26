@@ -32,7 +32,11 @@ Variants: `mission`, `pipeline`, `policy`, `approval_asked`, `approval_decided`,
   the `tool_call` step counter). `input` is the input's JSON text, clipped
   like a `tool_call` input. `outcome` stays a string, so an outcome outside
   the worker's closed set from a foreign line still renders. Both parse
-  tolerantly (missing fields read `?`, `""` or null). Policy `deny`
+  tolerantly (missing fields read `?`, `""` or null). The mission completion
+  gate is traced the same way: `tool` is `mission::complete`, `step` is null
+  (the gate is not a pipeline step) and `input` is `{"summary":"<objective>"}`,
+  when the gate function is the approval worker and the run has a trace path.
+  Policy `deny`
   verdicts stay visible as the `policy_denied: <reason>` `tool_result`;
   there is no separate event for them.
 - `mission` carries the state names `running`, `gating`, `done`, `failed`
