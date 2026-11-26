@@ -87,11 +87,19 @@ pub fn main(init: std.process.Init) !void {
     defer seam.deinit();
 
     // max_exit: git diff exits 1 when the patch is non-empty. Every other
-    // command must exit 0; a fatal (128 from a missing HEAD~1) is not a sample.
+    // command must exit 0; a fatal (128 from a missing pinned revision, as in a
+    // shallow clone) is not a sample.
+    //
+    // The git cases are pinned to fixed revisions so the ratio measures the
+    // filters, not the commit under test (on a PR, HEAD~1 is the PR's whole
+    // diff). 5cfff2e is an ordinary code change to worker/filter/guard.zig,
+    // the regression the floor was added to catch; 9d092cc..5cfff2e is the
+    // diff. b2b270c, the commit that introduced the 45% floor, is the tip for
+    // `git log -20`.
     const cases = [_]struct { cmd: [:0]const u8, label: []const u8, max_exit: u8 }{
         .{ .cmd = "git status 2>&1", .label = "git status", .max_exit = 0 },
-        .{ .cmd = "git log -20 2>&1", .label = "git log -20", .max_exit = 0 },
-        .{ .cmd = "git diff HEAD~1 2>&1", .label = "git diff HEAD~1", .max_exit = 1 },
+        .{ .cmd = "git log -20 b2b270c 2>&1", .label = "git log -20 b2b270c", .max_exit = 0 },
+        .{ .cmd = "git diff 9d092cc 5cfff2e 2>&1", .label = "git diff 9d092cc 5cfff2e", .max_exit = 1 },
         .{ .cmd = "ls -la src/worker 2>&1", .label = "ls -la src/worker", .max_exit = 0 },
         .{ .cmd = "find src -name '*.zig' 2>&1", .label = "find src -name *.zig", .max_exit = 0 },
         .{ .cmd = "zig build test 2>&1", .label = "zig build test", .max_exit = 0 },
