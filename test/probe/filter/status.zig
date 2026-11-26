@@ -2,7 +2,7 @@
 //!
 //! `pclose` returns a wait(2) status, not an exit code. `git diff` exits 1
 //! when the patch is non-empty and 128 when the revision does not exist
-//! (a depth-1 checkout has no `HEAD~1`). Only an accepted exit may be scored.
+//! (a shallow checkout lacks the pinned revisions). Only an accepted exit may be scored.
 
 const std = @import("std");
 

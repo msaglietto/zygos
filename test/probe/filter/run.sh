@@ -11,8 +11,12 @@
 # every test still green. A ratio nobody re-measures is a ratio that rots.
 #
 # The probe also exits non-zero when a measured command did not produce its
-# output. `git diff` may exit 1 for a non-empty patch; exit 128 (a depth-1
-# clone has no HEAD~1) is git's fatal text and must not enter the ratio.
+# output. `git diff` may exit 1 for a non-empty patch; exit 128 (a shallow
+# clone lacks the pinned revisions) is git's fatal text and must not enter the
+# ratio.
+#
+# The git commands use pinned revisions (see main.zig), not HEAD or HEAD~1, so
+# the ratio does not depend on the commit under test. CI needs fetch-depth: 0.
 set -uo pipefail
 cd "$(dirname "$0")/../../.."
 
