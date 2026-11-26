@@ -61,6 +61,21 @@ mutate "turn: raw:true bypasses the seam" "$U" \
 mutate "turn: seam carries the tool name" "$U" \
   "s/json\.fmt\(tool_name, \.\{\}\), try rawJson\(arena, input\)/json.fmt(\x22\x22, .{}), try rawJson(arena, input)/"
 
+D=src/worker/filter/dispatch.zig
+C=src/worker/filter/cache.zig
+
+mutate "dispatch: mutation check sees through a cd prefix" "$D" \
+  "s/    while \(true\) \{\n        const split = splitCd\(cmd\);.*?\n    \}\n//s"
+
+mutate "cache: dedup key carries the full original command" "$C" \
+  "s/    if \(command\) \|c\| h\.update\(c\);\n//"
+
+mutate "dispatch: only a whitespace-separated trailing 2>&1 is stripped" "$D" \
+  "s/ and \(t\[t\.len - 5\] == ' ' or t\[t\.len - 5\] == '\x5ct'\)//"
+
+mutate "dispatch: what follows a cd prefix still fails open on shell syntax" "$D" \
+  "s/ or hasShellMeta\(rest\)//"
+
 if [ "$fail" -ne 0 ]; then
   echo
   echo "MUTATION CHECK FAILED: at least one invariant is unpinned."

@@ -40,9 +40,9 @@ Fixed key order so two offline runs match byte for byte. Cache keys are omitted 
 - `source_lines_read` from successful `read_file` only
 - `input_tokens`, `output_tokens`
 - `cache_read_tokens`, `cache_creation_tokens` when present
-- `trim`: `calls`, `filtered`, `deduped`, `raw_bytes`, `sent_bytes`, `reduction`
+- `trim`: `calls`, `matched`, `filtered`, `deduped`, `raw_bytes`, `sent_bytes`, `reduction`
 
-`reduction` is `(raw - sent) * 100 / raw` when `raw > 0` and `sent < raw`, else 0. The git sha is the Zygos build, not the task workspace. A dirty worktree, a missing git checkout, or a hash that is not 40 or 64 hex characters embeds `unknown`, and the task command then refuses to write a trial. `optimize` is the build mode name (`Debug`, `ReleaseSafe`, `ReleaseFast`, `ReleaseSmall`).
+`matched` counts calls where dispatch selected a filter; `filtered` counts those whose filter also rewrote the output, so the difference is "matched but declined". A record without `matched` (written before it existed) reads as 0; a present non-integer `matched` is `MalformedTrial`. `reduction` is `(raw - sent) * 100 / raw` when `raw > 0` and `sent < raw`, else 0. The git sha is the Zygos build, not the task workspace. A dirty worktree, a missing git checkout, or a hash that is not 40 or 64 hex characters embeds `unknown`, and the task command then refuses to write a trial. `optimize` is the build mode name (`Debug`, `ReleaseSafe`, `ReleaseFast`, `ReleaseSmall`).
 
 The trace file given to `--events` stays the usage line from `trace_event.zig`: `input_tokens` and `output_tokens`. Cache counts are not added there.
 

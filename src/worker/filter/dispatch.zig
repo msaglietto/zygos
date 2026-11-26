@@ -43,7 +43,14 @@ pub const Selection = struct {
 /// result (S8.4). Correctness over hit rate: one mutation clears the cache.
 pub fn isMutating(tool: []const u8, command: ?[]const u8) bool {
     if (std.mem.eql(u8, tool, "write_file")) return true;
-    const cmd = command orelse return false;
+    var cmd = command orelse return false;
+    // A `cd DIR &&` prefix hides the real verb from the head check; peel
+    // every one (the safe direction here: over-invalidating only costs hits).
+    while (true) {
+        const split = splitCd(cmd);
+        if (split.dir == null) break;
+        cmd = split.rest;
+    }
     var argv = tokenize(cmd);
     const head = argv.next() orelse return false;
     const exe = basename(head);
@@ -66,8 +73,10 @@ pub fn isMutating(tool: []const u8, command: ?[]const u8) bool {
 /// command, or a shell pipeline (whose output is not the named command's).
 pub fn select(tool: []const u8, command: ?[]const u8) ?Selection {
     if (!std.mem.eql(u8, tool, "bash")) return null;
-    const cmd = command orelse return null;
-    if (hasShellMeta(cmd)) return null;
+    const raw_cmd = command orelse return null;
+    const cmd = (stripWrappers(raw_cmd) orelse return null).command;
+
+    if (isPythonPytest(cmd)) return .{ .family = .testrun, .filter = &testrun.run };
 
     var argv = tokenize(cmd);
     const head = argv.next() orelse return null;
@@ -134,6 +143,70 @@ pub fn select(tool: []const u8, command: ?[]const u8) ?Selection {
         if (std.mem.eql(u8, exe, t)) return .{ .family = .buildlint, .filter = &buildlint.run };
     }
     return null;
+}
+
+/// A command with the two benign wrappers agents add by habit removed:
+/// a single leading `cd DIR &&` and a trailing ` 2>&1`.
+pub const Wrapped = struct {
+    dir: ?[]const u8,
+    command: []const u8,
+};
+
+const CdSplit = struct {
+    dir: ?[]const u8,
+    rest: []const u8,
+};
+
+/// Splits one leading `cd DIR && ` off `cmd`. DIR is a single token: bare
+/// (no shell syntax) or wrapped in one pair of matching quotes with plain
+/// text inside. Anything else is not a cd prefix and `rest` is the whole
+/// command. `rest` is NOT checked for shell syntax here.
+fn splitCd(cmd: []const u8) CdSplit {
+    const whole: CdSplit = .{ .dir = null, .rest = cmd };
+    const t = std.mem.trim(u8, cmd, " \t");
+    if (!std.mem.startsWith(u8, t, "cd") or t.len < 3 or (t[2] != ' ' and t[2] != '\t')) return whole;
+    const after = std.mem.trimStart(u8, t[2..], " \t");
+    const end = std.mem.indexOfAny(u8, after, " \t") orelse return whole;
+    const token = after[0..end];
+    const tail = std.mem.trimStart(u8, after[end..], " \t");
+    if (!std.mem.startsWith(u8, tail, "&&")) return whole;
+    const rest = tail[2..];
+    // `&&` must stand alone as an operator, not open `&&&` or `&&;`.
+    if (rest.len == 0 or (rest[0] != ' ' and rest[0] != '\t')) return whole;
+
+    var dir = token;
+    if (dir.len >= 2 and (dir[0] == '\'' or dir[0] == '"') and dir[dir.len - 1] == dir[0])
+        dir = dir[1 .. dir.len - 1];
+    if (dir.len == 0 or dir[0] == '-') return whole;
+    for (dir) |c| {
+        if (std.mem.indexOfScalar(u8, "|&;`<>$()\\\"'*?!#{}[]\n\r", c) != null) return whole;
+    }
+    return .{ .dir = dir, .rest = std.mem.trim(u8, rest, " \t") };
+}
+
+/// Null when what remains still carries shell syntax (a pipeline, a second
+/// command, any other redirect, a second `cd`) or is empty.
+fn stripWrappers(cmd: []const u8) ?Wrapped {
+    var t = std.mem.trim(u8, cmd, " \t");
+    // Only a whitespace-separated trailing `2>&1`: `2>file`, `&>`, and a
+    // `2>&1` mid-command all keep their metacharacters and fail open.
+    if (std.mem.endsWith(u8, t, "2>&1") and t.len > 4 and (t[t.len - 5] == ' ' or t[t.len - 5] == '\t'))
+        t = std.mem.trimEnd(u8, t[0 .. t.len - 4], " \t");
+    const split = splitCd(t);
+    const rest = std.mem.trim(u8, split.rest, " \t");
+    if (rest.len == 0 or hasShellMeta(rest)) return null;
+    return .{ .dir = split.dir, .command = rest };
+}
+
+/// `python -m pytest ...` / `python3 -m pytest ...` (also `python3.11`).
+fn isPythonPytest(cmd: []const u8) bool {
+    var it = tokenize(cmd);
+    const exe = basename(it.next() orelse return false);
+    if (!std.mem.eql(u8, exe, "python") and !std.mem.startsWith(u8, exe, "python3")) return false;
+    const m = it.next() orelse return false;
+    if (!std.mem.eql(u8, m, "-m")) return false;
+    const mod = it.next() orelse return false;
+    return std.mem.eql(u8, mod, "pytest");
 }
 
 /// Shell metacharacters mean the output belongs to a pipeline, not to
@@ -239,4 +312,57 @@ test "S8.2: mutating commands are recognized" {
     try testing.expect(!isMutating("bash", "git status"));
     try testing.expect(!isMutating("bash", "ls -la"));
     try testing.expect(!isMutating("read_file", "whatever"));
+}
+
+test "S8.4: a cd-prefixed mutating command is still mutating" {
+    try testing.expect(isMutating("bash", "cd /app && rm -rf build"));
+    try testing.expect(isMutating("bash", "cd /app && git add -A"));
+    try testing.expect(isMutating("bash", "cd \"/app\" && touch x"));
+    try testing.expect(isMutating("bash", "cd a && cd b && mv x y"));
+    try testing.expect(!isMutating("bash", "cd /app && git status"));
+    try testing.expect(!isMutating("bash", "cd /app && pytest -q"));
+}
+
+test "S8.2: benign shell wrappers still select" {
+    try testing.expectEqual(Family.testrun, select("bash", "pytest -q 2>&1").?.family);
+    try testing.expectEqual(Family.testrun, select("bash", "python -m pytest -q").?.family);
+    try testing.expectEqual(Family.testrun, select("bash", "python3 -m pytest tests/ -v").?.family);
+    try testing.expectEqual(Family.testrun, select("bash", "cd /app && pytest -q").?.family);
+    try testing.expectEqual(Family.git_status, select("bash", "cd /app && git status").?.family);
+    try testing.expectEqual(Family.git_diff, select("bash", "git diff 2>&1").?.family);
+    try testing.expectEqual(Family.git_diff, select("bash", "cd /app && git diff 2>&1").?.family);
+    // A quoted DIR is accepted only when it is a single plain token.
+    try testing.expectEqual(Family.testrun, select("bash", "cd \"/app\" && pytest -q").?.family);
+    try testing.expectEqual(Family.testrun, select("bash", "cd '/app' && pytest -q").?.family);
+
+    try testing.expect(select("bash", "pytest -q | tail -30") == null);
+    try testing.expect(select("bash", "pytest; rm x") == null);
+    try testing.expect(select("bash", "pytest > out.txt") == null);
+    try testing.expect(select("bash", "cd a && cd b && pytest") == null);
+    try testing.expect(select("bash", "cd a && pytest && rm x") == null);
+    try testing.expect(select("bash", "pytest 2>&1 | tail") == null);
+    try testing.expect(select("bash", "cd $(pwd) && pytest") == null);
+    try testing.expect(select("bash", "pytest 2>&1 -q") == null);
+    try testing.expect(select("bash", "pytest 2>file") == null);
+    try testing.expect(select("bash", "pytest &> out") == null);
+    try testing.expect(select("bash", "pytest < in") == null);
+    try testing.expect(select("bash", "pytest 2>&1 2>&1") == null);
+    try testing.expect(select("bash", "pytest2>&1") == null);
+    try testing.expect(select("bash", "cd a b && pytest") == null);
+    try testing.expect(select("bash", "cd 'a b' && pytest") == null);
+    try testing.expect(select("bash", "cd && pytest") == null);
+    try testing.expect(select("bash", "cd a && ") == null);
+    try testing.expect(select("bash", "cd a;b && pytest") == null);
+    try testing.expect(select("bash", "python -m pip install x") == null);
+    try testing.expect(select("bash", "python -m pytest | tail") == null);
+}
+
+test "S8.2: stripWrappers separates the directory from the command" {
+    const w = stripWrappers("cd /app && pytest -q 2>&1").?;
+    try testing.expectEqualStrings("/app", w.dir.?);
+    try testing.expectEqualStrings("pytest -q", w.command);
+    const bare = stripWrappers("git status").?;
+    try testing.expect(bare.dir == null);
+    try testing.expectEqualStrings("git status", bare.command);
+    try testing.expect(stripWrappers("cd a && cd b && x") == null);
 }

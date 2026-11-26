@@ -44,6 +44,10 @@ pub const TrimWorker = struct {
     /// rather than asserted.
     pub const Stats = struct {
         calls: usize = 0,
+        /// `dispatch.select` returned a filter. `filtered` is the subset
+        /// whose filter also rewrote the output; the gap is "matched but
+        /// declined", distinct from "never matched".
+        matched: usize = 0,
         filtered: usize = 0,
         deduped: usize = 0,
         raw_bytes: usize = 0,
@@ -272,6 +276,7 @@ pub const TrimWorker = struct {
 
         self.mutex.lock();
         self.stats.calls += 1;
+        if (selection != null) self.stats.matched += 1;
         self.stats.raw_bytes += raw.len;
         // The cache is consulted for anything we can classify; a mutating
         // command invalidates it even when no filter applies.
@@ -329,8 +334,8 @@ pub const TrimWorker = struct {
         self.mutex.unlock();
         return std.fmt.allocPrint(
             arena,
-            "{{\"calls\":{d},\"filtered\":{d},\"deduped\":{d},\"raw_bytes\":{d},\"sent_bytes\":{d}}}",
-            .{ s.calls, s.filtered, s.deduped, s.raw_bytes, s.sent_bytes },
+            "{{\"calls\":{d},\"matched\":{d},\"filtered\":{d},\"deduped\":{d},\"raw_bytes\":{d},\"sent_bytes\":{d}}}",
+            .{ s.calls, s.matched, s.filtered, s.deduped, s.raw_bytes, s.sent_bytes },
         );
     }
 };
@@ -1178,4 +1183,84 @@ test "M8: stats counters are mutex-guarded against concurrent handlers" {
     const expected = iterations * thread_count;
     try testing.expectEqual(expected, s.filtered);
     try testing.expectEqual(expected, s.sent_bytes);
+}
+
+fn unchangedAfter(h: *Harness, first_cmd: []const u8, second_cmd: []const u8, out: []const u8) !bool {
+    const r1q = try compressReq(testing.allocator, out, "bash", first_cmd);
+    defer testing.allocator.free(r1q);
+    const r1 = try h.caller.call("zygos::output::compress", r1q);
+    defer r1.deinit(testing.allocator);
+    const r2q = try compressReq(testing.allocator, out, "bash", second_cmd);
+    defer testing.allocator.free(r2q);
+    const r2 = try h.caller.call("zygos::output::compress", r2q);
+    defer r2.deinit(testing.allocator);
+    return std.mem.indexOf(u8, r2.ok, "output unchanged since") != null;
+}
+
+const status_fixture = "On branch master\n  modified:   a.zig\n  modified:   b.zig\n" ++
+    "  modified:   c.zig\n  modified:   d.zig\nno changes added to commit\n";
+
+test "S8.4: dedup never confuses the directory a command ran in" {
+    var h = try Harness.init(testing.allocator);
+    defer h.deinit();
+    const tw = try TrimWorker.start(testing.allocator, &h.actor, &h.registry, .{}, null);
+    defer tw.stop();
+
+    // Identical output from three different working directories.
+    try testing.expect(!try unchangedAfter(h, "cd e && git status", "cd b && git status", status_fixture));
+    try testing.expect(!try unchangedAfter(h, "git status", "cd d && git status", status_fixture));
+    // The same command in the same directory still dedups.
+    try testing.expect(try unchangedAfter(h, "cd e && git status", "cd e && git status", status_fixture));
+}
+
+fn compressOnce(h: *Harness, cmd: []const u8, out: []const u8) !bool {
+    const req = try compressReq(testing.allocator, out, "bash", cmd);
+    defer testing.allocator.free(req);
+    const res = try h.caller.call("zygos::output::compress", req);
+    defer res.deinit(testing.allocator);
+    return std.mem.indexOf(u8, res.ok, "output unchanged since") != null;
+}
+
+test "S8.4: a cd-prefixed mutating command invalidates the dedup cache" {
+    var h = try Harness.init(testing.allocator);
+    defer h.deinit();
+    const tw = try TrimWorker.start(testing.allocator, &h.actor, &h.registry, .{}, null);
+    defer tw.stop();
+
+    const status = "cd /app && git status";
+    try testing.expect(!try compressOnce(h, status, status_fixture));
+    try testing.expect(try compressOnce(h, status, status_fixture));
+    // The mutation names its verb only after the `cd`: the full original
+    // command must reach the mutation check.
+    _ = try compressOnce(h, "cd /app && rm f", "");
+    try testing.expect(!try compressOnce(h, status, status_fixture));
+    try testing.expect(try compressOnce(h, status, status_fixture));
+    _ = try compressOnce(h, "cd /app && git add -A", "");
+    try testing.expect(!try compressOnce(h, status, status_fixture));
+}
+
+test "S8.5: matched counts selected calls, not unselected ones" {
+    var h = try Harness.init(testing.allocator);
+    defer h.deinit();
+    const tw = try TrimWorker.start(testing.allocator, &h.actor, &h.registry, .{}, null);
+    defer tw.stop();
+
+    _ = try compressOnce(h, "git status", status_fixture);
+    _ = try compressOnce(h, "cd /app && pytest -q 2>&1", status_fixture);
+    _ = try compressOnce(h, "python -m pytest -q", status_fixture);
+    // Not selected: a pipeline, a second command, another redirect, unknown.
+    _ = try compressOnce(h, "cd /app && pytest -q | tail", status_fixture);
+    _ = try compressOnce(h, "pytest; rm x", status_fixture);
+    _ = try compressOnce(h, "pytest > out", status_fixture);
+    _ = try compressOnce(h, "echo hi", status_fixture);
+
+    tw.mutex.lock();
+    const s = tw.stats;
+    tw.mutex.unlock();
+    try testing.expectEqual(@as(usize, 7), s.calls);
+    try testing.expectEqual(@as(usize, 3), s.matched);
+
+    const res = try h.caller.call("zygos::output::stats", "{}");
+    defer res.deinit(testing.allocator);
+    try testing.expect(std.mem.indexOf(u8, res.ok, "\"matched\":3") != null);
 }
