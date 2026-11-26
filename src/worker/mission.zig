@@ -1137,10 +1137,18 @@ fn gate(self: *MissionOrchestrator, arena: std.mem.Allocator, cfg: RunConfig, m:
     const gate_fn = cfg.gate_function orelse
         return gateFail(m, "no gate_function: a mission cannot complete ungated");
 
+    // `input` and `trace_path` let the approval worker record the ask
+    // (`approval_asked` / `approval_decided`); a foreign gate ignores both.
+    // No step_id: the gate is not a pipeline step. Tracing never changes the
+    // decision below.
+    const trace_field = if (cfg.trace_path) |tp|
+        try std.fmt.allocPrint(arena, ",\"trace_path\":{f}", .{json.fmt(tp, .{})})
+    else
+        "";
     const req = try std.fmt.allocPrint(
         arena,
-        "{{\"turn_id\":{f},\"tool\":\"mission::complete\",\"reason\":{f},\"summary\":{f}}}",
-        .{ json.fmt(m.mission_id, .{}), json.fmt(m.objective, .{}), json.fmt(m.objective, .{}) },
+        "{{\"turn_id\":{f},\"tool\":\"mission::complete\",\"reason\":{f},\"summary\":{f},\"input\":{{\"summary\":{f}}}{s}}}",
+        .{ json.fmt(m.mission_id, .{}), json.fmt(m.objective, .{}), json.fmt(m.objective, .{}), json.fmt(m.objective, .{}), trace_field },
     );
     const res = self.worker.call(gate_fn, req) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -3044,6 +3052,146 @@ fn runTraced(h: *Harness, extra: []const u8) !Traced {
     errdefer res.deinit(testing.allocator);
     const trace = trace_mod.readFile(testing.allocator, tpath) orelse return error.ReadFailed;
     return .{ .res = res, .trace = trace, .tpath = tpath };
+}
+
+/// Index of the first trace line whose `event` is `ev` (and, when `field` is
+/// non-empty, whose `field` equals `want`); null when absent.
+fn traceLineIndex(arena: std.mem.Allocator, text: []const u8, ev: []const u8, field: []const u8, want: []const u8) !?usize {
+    var idx: usize = 0;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| : (idx += 1) {
+        if (line.len == 0) continue;
+        const v = try json.parseFromSliceLeaky(json.Value, arena, line, .{});
+        if (v != .object) continue;
+        const e = v.object.get("event") orelse continue;
+        if (e != .string or !std.mem.eql(u8, e.string, ev)) continue;
+        if (field.len == 0) return idx;
+        const f = v.object.get(field) orelse continue;
+        if (f == .string and std.mem.eql(u8, f.string, want)) return idx;
+    }
+    return null;
+}
+
+/// The gate's asked/decided pair, checked against one mission trace.
+fn expectGatePair(trace: []const u8, outcome: []const u8) !void {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try expectSeq(&.{"mission::complete"}, try traceField(arena, trace, "approval_asked", "tool"));
+    const inputs = try traceField(arena, trace, "approval_asked", "input");
+    try testing.expectEqual(@as(usize, 1), inputs.len);
+    // The summary the gate sends (the mission objective, here "Ship the gizmo").
+    try testing.expectEqualStrings("{\"summary\":\"Ship the gizmo\"}", inputs[0]);
+    const asked_ids = try traceField(arena, trace, "approval_asked", "id");
+    const decided_ids = try traceField(arena, trace, "approval_decided", "id");
+    try expectSeq(asked_ids, decided_ids);
+    try expectSeq(&.{outcome}, try traceField(arena, trace, "approval_decided", "outcome"));
+    const asked_at = (try traceLineIndex(arena, trace, "approval_asked", "", "")).?;
+    const decided_at = (try traceLineIndex(arena, trace, "approval_decided", "", "")).?;
+    try testing.expect(asked_at < decided_at);
+}
+
+test "gate ask is traced: approved completion writes approval_asked then approval_decided allowed_once before done" {
+    var h = try Harness.init(testing.allocator, &.{ po_ok, plan1, exec_ok, verify_pass });
+    defer h.deinit();
+    const approvals = try approval_mod.ApprovalWorker.start(testing.allocator, &h.actor, &h.registry, .auto_approve);
+    defer approvals.stop();
+
+    var tr = try runTraced(h, seed_and_gate);
+    defer tr.deinit();
+    try expectTerminal(tr.res.ok, "done", "completed");
+    try expectGatePair(tr.trace, "allowed_once");
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const decided_at = (try traceLineIndex(arena, tr.trace, "approval_decided", "", "")).?;
+    const done_at = (try traceLineIndex(arena, tr.trace, "mission", "to", "done")).?;
+    try testing.expect(decided_at < done_at);
+    // The gate is not a pipeline step: no step on the ask.
+    try expectSeq(&.{"null"}, try traceField(arena, tr.trace, "approval_asked", "step"));
+}
+
+test "gate ask is traced: a denied completion writes outcome rejected" {
+    var h = try Harness.init(testing.allocator, &.{ po_ok, plan1, exec_ok, verify_pass });
+    defer h.deinit();
+    const approvals = try approval_mod.ApprovalWorker.start(testing.allocator, &h.actor, &h.registry, .auto_deny);
+    defer approvals.stop();
+
+    var tr = try runTraced(h, seed_and_gate ++ ",\"gate_threshold\":1");
+    defer tr.deinit();
+    try expectTerminal(tr.res.ok, "failed", "gate_failed");
+    try expectGatePair(tr.trace, "rejected");
+}
+
+test "gate ask is traced: an unanswered completion writes outcome unavailable and parks at gating" {
+    var h = try Harness.init(testing.allocator, &.{ po_ok, plan1, exec_ok, verify_pass });
+    defer h.deinit();
+    const approvals = try approval_mod.ApprovalWorker.start(testing.allocator, &h.actor, &h.registry, .{ .manual = .{ .timeout_ms = 20 } });
+    defer approvals.stop();
+
+    var tr = try runTraced(h, seed_and_gate);
+    defer tr.deinit();
+    try testing.expect(std.mem.indexOf(u8, tr.res.ok, "\"paused\":true") != null);
+    try testing.expect(std.mem.indexOf(u8, tr.res.ok, "\"state\":\"gating\"") != null);
+    try expectGatePair(tr.trace, "unavailable");
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    try testing.expect((try traceLineIndex(arena_state.allocator(), tr.trace, "mission", "to", "done")) == null);
+}
+
+test "gate ask is traced: a resumed gating mission re-asks with a fresh id and its own pair" {
+    var h = try Harness.init(testing.allocator, &.{ po_ok, plan1, exec_ok, verify_pass });
+    defer h.deinit();
+    const approvals = try approval_mod.ApprovalWorker.start(testing.allocator, &h.actor, &h.registry, .{ .manual = .{ .timeout_ms = 20 } });
+    defer approvals.stop();
+
+    var first = try runTraced(h, seed_and_gate);
+    defer first.deinit();
+    try testing.expect(std.mem.indexOf(u8, first.res.ok, "\"state\":\"gating\"") != null);
+    // The second run appends to the same events.jsonl: two asks in all.
+    var second = try runTraced(h, seed_and_gate ++ ",\"resume\":true");
+    defer second.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const asked = try traceField(arena, second.trace, "approval_asked", "id");
+    const decided = try traceField(arena, second.trace, "approval_decided", "id");
+    try testing.expectEqual(@as(usize, 2), asked.len);
+    try expectSeq(asked, decided);
+    try testing.expect(!std.mem.eql(u8, asked[0], asked[1]));
+    try expectSeq(&.{ "unavailable", "unavailable" }, try traceField(arena, second.trace, "approval_decided", "outcome"));
+}
+
+test "gate ask: a gate handler error (what a failed approval_asked emit returns) is gate_failed, never completion" {
+    var h = try Harness.init(testing.allocator, &.{ po_ok, plan1, exec_ok, verify_pass });
+    defer h.deinit();
+    // An empty script makes the stub's handler fail, like the approval worker
+    // when `trace.emit` returns OutOfMemory before it parks or decides.
+    const gate_worker = try FakeGate.start(testing.allocator, &h.actor, &h.registry, &.{});
+    defer gate_worker.stop();
+
+    var tr = try runTraced(h, ",\"objective\":\"seed: gizmo\",\"gate_function\":\"test::gate::request\"");
+    defer tr.deinit();
+    try expectTerminal(tr.res.ok, "failed", "gate_failed");
+    try testing.expect(std.mem.indexOf(u8, tr.res.ok, "gate unreachable") != null);
+}
+
+test "gate ask without a trace_path writes no file and still completes" {
+    var h = try Harness.init(testing.allocator, &.{ po_ok, plan1, exec_ok, verify_pass });
+    defer h.deinit();
+    const approvals = try approval_mod.ApprovalWorker.start(testing.allocator, &h.actor, &h.registry, .auto_approve);
+    defer approvals.stop();
+
+    const req = try h.startReq(testing.allocator, seed_and_gate);
+    defer testing.allocator.free(req);
+    const res = try h.caller.call("zygos::missions::start", req);
+    defer res.deinit(testing.allocator);
+    try expectTerminal(res.ok, "done", "completed");
+    const tpath = try std.fmt.allocPrint(testing.allocator, "{s}/events.jsonl", .{h.root});
+    defer testing.allocator.free(tpath);
+    try testing.expect(trace_mod.readFile(testing.allocator, tpath) == null);
 }
 
 test "default pipeline: same turn order and step_ids as M3; states read running → gating → done" {

@@ -38,7 +38,7 @@ Actors: **operator** (the OS user), **kernel** (bus), **model** (a provider work
 ## 4. Completion gate
 
 - **Precondition.** Verifier passed and the mission is in `gating`.
-- **Sequence.** Orchestrator calls the gate through `approvals::request`. Only an explicit approval moves to `done`. Missing gate function, unreachable gate, or malformed reply cannot complete. A deny with `resolved:true` (or no `resolved` field) feeds back into rework (the mission returns to `running` at the last executor step), bounded by `gate_threshold`. A deny with `resolved:false` (manual timeout, including closed stdin) parks in `gating` with `paused:true`. `mission resume` re-asks.
+- **Sequence.** Orchestrator calls the gate through `approvals::request`. Only an explicit approval moves to `done`. Missing gate function, unreachable gate, or malformed reply cannot complete. A deny with `resolved:true` (or no `resolved` field) feeds back into rework (the mission returns to `running` at the last executor step), bounded by `gate_threshold`. A deny with `resolved:false` (manual timeout, including closed stdin) parks in `gating` with `paused:true`. `mission resume` re-asks. When the gate is the approval worker and the run has a trace path, each ask is traced as `approval_asked` (tool `mission::complete`, input `{"summary":…}`) and `approval_decided`, so `mission trace` and `attach` show what was asked and how it was answered.
 - **Authz.** The approver is the operator at the TUI/console, the timeout, or any writer of `<planning>/control.jsonl` (the attach channel, including the executor's shell). EOF does not approve. A line in that file can.
 - **Side effects.** State file updated. Parked missions do not return to rework and do not mark `done`.
 

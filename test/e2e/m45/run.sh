@@ -332,8 +332,20 @@ cat > "$TMP/leg9-check.js" <<'EOF'
 const fs = require('fs');
 const ev = fs.readFileSync(process.argv[2], 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
 const fail = (m) => { console.error('M45 E2E FAIL leg9: ' + m); process.exit(1); };
-const asked = ev.map((e, i) => [e, i]).filter(([e]) => e.event === 'approval_asked');
-const decided = ev.map((e, i) => [e, i]).filter(([e]) => e.event === 'approval_decided');
+const allAsked = ev.map((e, i) => [e, i]).filter(([e]) => e.event === 'approval_asked');
+const allDecided = ev.map((e, i) => [e, i]).filter(([e]) => e.event === 'approval_decided');
+// The completion gate is traced too (tool mission::complete): last ask, answered y.
+const gateAsked = allAsked.filter(([e]) => e.tool === 'mission::complete');
+if (gateAsked.length !== 1) fail('want 1 gate ask, got ' + gateAsked.length);
+const gateDecided = allDecided.find(([e]) => e.id === gateAsked[0][0].id);
+if (!gateDecided) fail('gate ask has no decided');
+if (gateDecided[0].outcome !== 'allowed_once') fail('gate outcome ' + gateDecided[0].outcome);
+if (!(gateAsked[0][1] < gateDecided[1])) fail('gate asked does not precede decided');
+const doneAt = ev.findIndex((e) => e.event === 'mission' && e.to === 'done');
+if (!(gateDecided[1] < doneAt)) fail('gate decided does not precede the done transition');
+if (!gateAsked[0][0].input.includes('Ship the gizmo')) fail('gate input lacks the summary: ' + gateAsked[0][0].input);
+const asked = allAsked.filter(([e]) => e.tool !== 'mission::complete');
+const decided = allDecided.filter(([e]) => e.id !== gateAsked[0][0].id);
 if (asked.length !== 2 || decided.length !== 2) fail('want 2 asked + 2 decided, got ' + asked.length + '/' + decided.length);
 const want = [['echo approved-run', 'allowed_once', false], ['echo rejected-run', 'rejected', true]];
 want.forEach(([cmd, outcome, isErr], n) => {

@@ -103,6 +103,14 @@ its `approval_decided`.
   meaning as a `policy` rule's `step` — not the `tool_call` step counter.
 - `input` is the input's JSON text clipped by `trace.clip`, the same path a
   `tool_call` input takes. AG-UI redacts it like `tool_call` input.
+- The mission completion gate is traced like a tool ask. Its request carries
+  `trace_path` (the mission's, when it has one) and
+  `input` `{"summary":"<objective>"}`, with no `step_id`, so the pair has
+  `tool` `mission::complete` and `step` null. A resumed `gating` mission asks
+  again and gets a fresh id and its own pair. The gate reads only `approved`,
+  `outcome` and `resolved` from the reply, as before; if the worker fails (for
+  instance `trace.emit` out of memory before parking) the handler error is a
+  bus error to the gate, which is `gate_failed`, never completion.
 - Every reply the worker sends has its `approval_decided`, auto modes
   included. A request parked when the worker stops, or cancelled by
   `zygos::approvals::cancel`, records `cancelled`.
@@ -205,6 +213,7 @@ Mission gate (`mission.zig`):
 35. `gate: approved:true contradicted by a non-allowed_once outcome is a malformed reply`
 36. `gate: approved:true with a non-string outcome is a malformed reply`
 37. `gate: approved:true with outcome allowed_once completes; a reply with no outcome still does`
+38a. `gate ask is traced: approved, denied, unanswered and resumed completions each write their asked/decided pair` (five `gate ask` tests in `mission.zig`, including the no-trace-path and handler-error cases)
 
 Trace, AG-UI and CLI (`trace_event.zig`, `trace.zig`, `agui.zig`, `src/cli`):
 
