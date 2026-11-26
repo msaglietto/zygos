@@ -244,6 +244,7 @@ pub fn run(gpa: std.mem.Allocator, cfg: Config) TaskError!RunResult {
 fn zeroSnap() ?trial_mod.TrimSnap {
     return .{
         .calls = 0,
+        .matched = 0,
         .filtered = 0,
         .deduped = 0,
         .raw_bytes = 0,
@@ -270,12 +271,14 @@ fn readTrim(gpa: std.mem.Allocator, caller: *inproc.Worker) TaskError!?trial_mod
     const root = json.parseFromSliceLeaky(json.Value, arena, payload, .{}) catch return null;
     if (root != .object) return null;
     const calls = jsonx.uintField(root.object, "calls") orelse return null;
+    const matched = jsonx.uintField(root.object, "matched") orelse return null;
     const filtered = jsonx.uintField(root.object, "filtered") orelse return null;
     const deduped = jsonx.uintField(root.object, "deduped") orelse return null;
     const raw_bytes = jsonx.uintField(root.object, "raw_bytes") orelse return null;
     const sent_bytes = jsonx.uintField(root.object, "sent_bytes") orelse return null;
     return .{
         .calls = calls,
+        .matched = matched,
         .filtered = filtered,
         .deduped = deduped,
         .raw_bytes = raw_bytes,

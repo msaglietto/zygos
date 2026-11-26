@@ -6,6 +6,17 @@ Reconstructed from git history on 2026-09-30. A commit that only added a library
 
 The agent that next changes operator-visible behavior adds the new heading in that same commit.
 
+## [5.3.0] - 2026-11-26
+
+### Changed
+
+- Output compression now recognises the commands agents actually write. A trailing ` 2>&1`, `python -m pytest` / `python3 -m pytest`, and a single leading `cd DIR &&` no longer make `select` return null, so `pytest -q 2>&1`, `python3 -m pytest tests/ -v` and `cd /app && git status` reach their filters and the dedup cache. Every other redirect, a pipe, `;`, a second `&&` or a second `cd` still fails open. The dedup cache keys on the full original command, so the same output from two directories is never reported as unchanged, and `cd x && rm f` invalidates the cache like `rm f`.
+- The pytest filter drops `-v` pass lines that end `PASSED [ 50%]` and the `=== test session starts ===` banner. FAILED and ERROR lines, `E` assertion lines and the tally stay byte-for-byte.
+
+### Added
+
+- `zygos::output::stats` and the trial's `trim` record carry `matched`, the number of calls where a command-aware filter was selected. `filtered` is the subset that rewrote the output. Records without `matched` still parse and read it as 0; `reduction` and the `TrimOnZeroReduction` refusal are unchanged.
+
 ## [5.2.5] - 2026-11-26
 
 ### Fixed

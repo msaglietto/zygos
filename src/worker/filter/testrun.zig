@@ -65,7 +65,7 @@ fn isNoise(line: []const u8) bool {
     if (std.mem.startsWith(u8, t, "--- PASS")) return true;
     if (std.mem.startsWith(u8, t, "=== RUN")) return true;
     if (std.mem.startsWith(u8, t, "ok  ")) return true;
-    if (std.mem.endsWith(u8, t, "PASSED")) return true;
+    if (std.mem.endsWith(u8, t, "PASSED") or endsWithPassedProgress(t)) return true;
     if (std.mem.startsWith(u8, t, "✓") or std.mem.startsWith(u8, t, "√")) return true;
     if (std.mem.startsWith(u8, t, "PASS ")) return true;
 
@@ -75,11 +75,24 @@ fn isNoise(line: []const u8) bool {
     }
     // Separator rules and platform banners.
     if (t.len >= 8 and allSame(t)) return true;
+    if (std.mem.startsWith(u8, t, "====") and std.mem.endsWith(u8, t, "=") and
+        std.mem.indexOf(u8, t, " test session starts ") != null) return true;
     if (std.mem.startsWith(u8, t, "platform ") or std.mem.startsWith(u8, t, "rootdir:") or
         std.mem.startsWith(u8, t, "collected ") or std.mem.startsWith(u8, t, "cachedir:") or
         std.mem.startsWith(u8, t, "plugins:")) return true;
 
     return false;
+}
+
+/// pytest -v: `path::test PASSED      [ 50%]`. Only a PASSED word directly
+/// before a bracketed percent counts; FAILED/ERROR lines never match.
+fn endsWithPassedProgress(t: []const u8) bool {
+    if (t.len < 3 or t[t.len - 1] != ']') return false;
+    const open = std.mem.lastIndexOfScalar(u8, t, '[') orelse return false;
+    const inner = std.mem.trim(u8, t[open + 1 .. t.len - 1], " ");
+    if (inner.len < 2 or inner[inner.len - 1] != '%') return false;
+    for (inner[0 .. inner.len - 1]) |c| if (!std.ascii.isDigit(c)) return false;
+    return std.mem.endsWith(u8, std.mem.trimEnd(u8, t[0..open], " \t"), " PASSED");
 }
 
 fn allSame(t: []const u8) bool {
@@ -308,4 +321,54 @@ test "S8.3 testrun: a REAL zig compile failure survives intact" {
     try testing.expect(std.mem.indexOf(u8, body, "pub const min_bytes: usize = \"eighty\";") != null);
     try testing.expect(std.mem.indexOf(u8, body, "^~~~~~~~") != null);
     try testing.expect(std.mem.indexOf(u8, body, "error: 1 compilation errors") != null);
+}
+
+const pytest_v_red =
+    \\============================= test session starts ==============================
+    \\platform linux -- Python 3.11.9, pytest-8.3.2, pluggy-1.5.0
+    \\rootdir: /app
+    \\collected 6 items
+    \\
+    \\tests/test_outputs.py::test_file_exists PASSED                          [ 16%]
+    \\tests/test_outputs.py::test_imports PASSED                              [ 33%]
+    \\tests/test_outputs.py::test_basic PASSED                                [ 50%]
+    \\tests/test_outputs.py::test_edge FAILED                                 [ 66%]
+    \\tests/test_outputs.py::test_large PASSED                                [ 83%]
+    \\tests/test_outputs.py::test_unicode PASSED                              [100%]
+    \\
+    \\=================================== FAILURES ===================================
+    \\__________________________________ test_edge ___________________________________
+    \\
+    \\    def test_edge():
+    \\>       assert solve([]) == 0
+    \\E       assert None == 0
+    \\E        +  where None = solve([])
+    \\
+    \\tests/test_outputs.py:22: AssertionError
+    \\=========================== short test summary info ============================
+    \\FAILED tests/test_outputs.py::test_edge - assert None == 0
+    \\========================= 1 failed, 5 passed in 0.12s ==========================
+    \\
+;
+
+test "S8.3 testrun: pytest -v pass lines with progress percent are noise" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const got = (try run(arena, pytest_v_red)).?;
+    try testing.expect(std.mem.indexOf(u8, got, "test_file_exists") == null);
+    try testing.expect(std.mem.indexOf(u8, got, "test_unicode") == null);
+    try testing.expect(std.mem.indexOf(u8, got, "PASSED") == null);
+    // Failure evidence stays byte-for-byte.
+    inline for (.{
+        "tests/test_outputs.py::test_edge FAILED                                 [ 66%]\n",
+        "E       assert None == 0\n",
+        "E        +  where None = solve([])\n",
+        ">       assert solve([]) == 0\n",
+        "tests/test_outputs.py:22: AssertionError\n",
+        "FAILED tests/test_outputs.py::test_edge - assert None == 0\n",
+        "========================= 1 failed, 5 passed in 0.12s ==========================\n",
+    }) |keep| try testing.expect(std.mem.indexOf(u8, got, keep) != null);
+    try testing.expect(got.len * 100 < pytest_v_red.len * 60);
 }

@@ -127,8 +127,25 @@ Rules, in order:
    lesson — an agent must not dodge compression by spelling a full path).
 3. Match argv[0] (+ argv[1] where it disambiguates: `git diff` vs `git log`)
    against the filter table.
-4. Shell metacharacters (`|`, `&&`, `;`, `` ` ``, `$(`) in the command ⇒ null.
-   A pipeline's output is not the named command's output. Fail open.
+4. Shell metacharacters (`|`, `&`, `;`, `` ` ``, `<`, `>`, a newline, `$(`) in the
+   command ⇒ null. A pipeline's output is not the named command's output.
+   Fail open. Three benign wrappers are removed first, so they do not count:
+   1. **Trailing `2>&1`.** A command ending in exactly ` 2>&1` (separated by
+      whitespace) is matched as if the suffix were absent. Every other
+      redirect (`>`, `2>file`, `<`, `&>`, a `2>&1` in the middle or doubled)
+      still fails open.
+   2. **`python -m pytest`.** `python` or `python3[.N]` followed by `-m pytest`
+      selects the testrun filter, like bare `pytest`.
+   3. **One `cd DIR &&` prefix.** A single leading `cd DIR && ` is stripped.
+      DIR is one token: bare, or in one pair of matching quotes, with no
+      whitespace, no shell metacharacters or quotes inside, and not starting
+      with `-`. What remains must pass the checks above, so `cd a && cd b && x`,
+      `cd a && x && y` and `cd a && x | y` are all null.
+
+   The dedup cache keys on the full original command, so the directory is part
+   of the key: `cd a && git status` and `cd b && git status` never dedup into
+   each other. The mutating-command check also peels `cd DIR &&` prefixes, so
+   `cd x && rm f` invalidates the cache like `rm f`.
 
 **Composition:** filter output is then run through the existing generic
 `trim()` as a backstop, so a filter that under-compresses still can't blow the
@@ -141,6 +158,13 @@ today's; nothing regresses.
 3. `unknown command ⇒ null ⇒ generic trim`
 4. `piped command ⇒ null (fail open)`
 5. `non-bash tool ⇒ null`
+6. `benign shell wrappers still select`: selects `pytest -q 2>&1`,
+   `python -m pytest -q`, `python3 -m pytest tests/ -v`, `cd /app && pytest -q`,
+   `cd /app && git status`, `git diff 2>&1`; stays null for `pytest -q | tail -30`,
+   `pytest; rm x`, `pytest > out.txt`, `cd a && cd b && pytest`,
+   `cd a && pytest && rm x`, `pytest 2>&1 | tail`, `cd $(pwd) && pytest`.
+7. `cd-prefixed mutating command invalidates` and `dedup never confuses the
+   directory a command ran in` (worker level, `trim.zig`).
 
 ---
 
@@ -189,7 +213,7 @@ one full output and two one-liners.
 
 `src/worker/filter/cache.zig`, owned by `TrimWorker` (no new bus function):
 
-- Key: `hash(tool ++ command)`. Value: `hash(raw output)` + timestamp.
+- Key: `hash(tool ++ full original command)`, so `cd a && git status` and `git status` are different keys. Value: `hash(raw output)` + timestamp.
 - Repeat call, same key, same output hash, within TTL ⇒ reply
   `[... zygos: unchanged since <N>s ago; see the earlier result ...]`.
 - Output differs ⇒ full filtered output, cache updated.

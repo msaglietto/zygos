@@ -31,6 +31,9 @@ pub const ScoreError = error{
 
 pub const TrimSnap = struct {
     calls: u64,
+    /// Calls where dispatch selected a filter. Absent in records written
+    /// before the counter existed; reads as 0.
+    matched: u64 = 0,
     filtered: u64,
     deduped: u64,
     raw_bytes: u64,
@@ -132,8 +135,8 @@ pub fn write(allocator: std.mem.Allocator, trial: Trial) error{OutOfMemory}![]u8
     if (trial.cache_creation_tokens) |n| try out.print(allocator, ",\"cache_creation_tokens\":{d}", .{n});
     if (trial.trim) |t| {
         try out.print(allocator,
-            \\,"trim":{{"calls":{d},"filtered":{d},"deduped":{d},"raw_bytes":{d},"sent_bytes":{d},"reduction":{d}}}
-        , .{ t.calls, t.filtered, t.deduped, t.raw_bytes, t.sent_bytes, t.reduction });
+            \\,"trim":{{"calls":{d},"matched":{d},"filtered":{d},"deduped":{d},"raw_bytes":{d},"sent_bytes":{d},"reduction":{d}}}
+        , .{ t.calls, t.matched, t.filtered, t.deduped, t.raw_bytes, t.sent_bytes, t.reduction });
     }
     try out.append(allocator, '}');
     return out.toOwnedSlice(allocator);
@@ -193,6 +196,7 @@ fn parseTrim(o: json.ObjectMap) ParseError!?TrimSnap {
     const t = v.object;
     return .{
         .calls = uintReq(t, "calls") orelse return error.MalformedTrial,
+        .matched = if (t.get("matched") == null) 0 else (uintReq(t, "matched") orelse return error.MalformedTrial),
         .filtered = uintReq(t, "filtered") orelse return error.MalformedTrial,
         .deduped = uintReq(t, "deduped") orelse return error.MalformedTrial,
         .raw_bytes = uintReq(t, "raw_bytes") orelse return error.MalformedTrial,
@@ -357,6 +361,28 @@ test "trial round-trip keeps build identity, trim snapshot, and cache counts" {
     try testing.expect(std.mem.indexOf(u8, raw, "\"cache_read_tokens\":9") != null);
 }
 
+test "trim matched counter round-trips and a record without it reads as zero" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var t = baseTrial();
+    t.trim.?.matched = 2;
+    const raw = try write(testing.allocator, t);
+    defer testing.allocator.free(raw);
+    try testing.expect(std.mem.indexOf(u8, raw, "\"matched\":2") != null);
+    try testing.expectEqual(@as(u64, 2), (try parse(arena, raw)).trim.?.matched);
+
+    // Records written before the counter existed stay readable.
+    const legacy = try std.mem.replaceOwned(u8, testing.allocator, raw, "\"matched\":2,", "");
+    defer testing.allocator.free(legacy);
+    try testing.expectEqual(@as(u64, 0), (try parse(arena, legacy)).trim.?.matched);
+
+    // A present-but-malformed counter is not silently zeroed.
+    const bad = try std.mem.replaceOwned(u8, testing.allocator, raw, "\"matched\":2", "\"matched\":\"x\"");
+    defer testing.allocator.free(bad);
+    try testing.expectError(error.MalformedTrial, parse(arena, bad));
+}
+
 test "config sha is omitted when absent, round-trips when present, and must be 64 hex" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
@@ -461,7 +487,7 @@ test "score: a present trim-off snapshot must be the all-zero control" {
     inflated.trim.?.reduction = 500;
     try testing.expectError(error.MalformedTrial, score(inflated, &fixture_prices));
 
-    inline for (.{ "calls", "filtered", "deduped", "raw_bytes", "sent_bytes", "reduction" }) |field| {
+    inline for (.{ "calls", "matched", "filtered", "deduped", "raw_bytes", "sent_bytes", "reduction" }) |field| {
         var one = zeroOff();
         @field(one.trim.?, field) = 1;
         try testing.expectError(error.MalformedTrial, score(one, &fixture_prices));
