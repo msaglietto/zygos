@@ -699,36 +699,76 @@ fn httpGet(
     };
     defer gpa.free(window);
     var transfer_buf: [16 * 1024]u8 = undefined;
-    var decompress: std.http.Decompress = undefined;
-    const reader = response.readerDecompressing(&transfer_buf, &decompress, window);
+    // The raw (still compressed) body: std's inflater reads one member or
+    // stream and stops, so the decoding below is ours to drive.
+    const raw = response.reader(&transfer_buf);
 
-    const read = try readCapped(gpa, reader, request.max_bytes);
-    errdefer gpa.free(read.bytes);
-    // std's inflater reads the gzip CRC32 / zlib Adler-32 trailer but never
-    // checks it, so a corrupted body that still inflates would pass. Check it
-    // here when the whole body was read. A body cut at the cap is not checked.
-    if (read.complete and !trailerMatches(&decompress, response.head.content_encoding, read.bytes))
-        return error.HttpFailed;
+    const read = switch (response.head.content_encoding) {
+        .identity => try readCapped(gpa, raw, request.max_bytes),
+        .gzip => try readGzipMembers(gpa, raw, window, request.max_bytes),
+        .deflate => try readZlibStream(gpa, raw, window, request.max_bytes),
+        .zstd, .compress => return error.HttpFailed,
+    };
 
     return .{ .bytes = read.bytes, .content_type = ct };
 }
 
-/// Does the checksum trailer `decompress` read match the decoded `bytes`?
-/// gzip: CRC32 and length mod 2^32. deflate (zlib): Adler-32. Valid only after
-/// the inflater consumed the whole stream.
-fn trailerMatches(
-    decompress: *const std.http.Decompress,
-    encoding: std.http.ContentEncoding,
-    bytes: []const u8,
-) bool {
-    return switch (encoding) {
-        .gzip => blk: {
-            const m = decompress.flate.container_metadata.gzip;
-            break :blk m.crc == std.hash.Crc32.hash(bytes) and m.count == @as(u32, @truncate(bytes.len));
-        },
-        .deflate => decompress.flate.container_metadata.zlib.adler == std.hash.Adler32.hash(bytes),
-        else => true,
+/// Decodes a gzip body of one or more concatenated members (RFC 1952 section
+/// 2.2) and returns the concatenation of their payloads. std's inflater reads
+/// the CRC32 / ISIZE trailer but never checks it, so each member's trailer is
+/// checked here against that member's own output. The cap applies to the
+/// combined output. Bytes after a member that do not start another valid
+/// member are an error (never silently dropped). When the cap cuts the body
+/// short, the cut member and the members after it are not checked.
+/// `window` must hold `flate.max_window_len` bytes.
+fn readGzipMembers(
+    gpa: std.mem.Allocator,
+    raw: *std.Io.Reader,
+    window: []u8,
+    max_bytes: usize,
+) error{ OutOfMemory, HttpFailed }!CappedRead {
+    var list: std.ArrayList(u8) = .empty;
+    errdefer list.deinit(gpa);
+    while (true) {
+        const start = list.items.len;
+        var inflate: std.compress.flate.Decompress = .init(raw, .gzip, window);
+        if (!try appendCapped(gpa, &list, &inflate.reader, max_bytes)) break;
+        const member = list.items[start..];
+        const meta = inflate.container_metadata.gzip;
+        if (meta.crc != std.hash.Crc32.hash(member) or meta.count != @as(u32, @truncate(member.len)))
+            return error.HttpFailed;
+        // Another member, or the end of the body. Anything else fails in the
+        // next member's header (bad magic) or a short read.
+        if (try rawAtEnd(raw)) return .{ .bytes = list.toOwnedSlice(gpa) catch return error.OutOfMemory, .complete = true };
+    }
+    return .{ .bytes = list.toOwnedSlice(gpa) catch return error.OutOfMemory, .complete = false };
+}
+
+/// Decodes a zlib (`deflate`) body: exactly one stream, whose Adler-32 is
+/// checked here (std reads it without checking). Bytes after the stream are an
+/// error. A body cut at the cap is not checked.
+fn readZlibStream(
+    gpa: std.mem.Allocator,
+    raw: *std.Io.Reader,
+    window: []u8,
+    max_bytes: usize,
+) error{ OutOfMemory, HttpFailed }!CappedRead {
+    var inflate: std.compress.flate.Decompress = .init(raw, .zlib, window);
+    const read = try readCapped(gpa, &inflate.reader, max_bytes);
+    errdefer gpa.free(read.bytes);
+    if (read.complete and
+        (inflate.container_metadata.zlib.adler != std.hash.Adler32.hash(read.bytes) or !try rawAtEnd(raw)))
+        return error.HttpFailed;
+    return read;
+}
+
+/// True when the raw body has no more bytes. A transport failure is `HttpFailed`.
+fn rawAtEnd(raw: *std.Io.Reader) error{HttpFailed}!bool {
+    _ = raw.peekByte() catch |err| switch (err) {
+        error.EndOfStream => return true,
+        error.ReadFailed => return error.HttpFailed,
     };
+    return false;
 }
 
 /// The content codings `httpGet` advertises and decodes. Anything else a
@@ -759,24 +799,31 @@ fn readCapped(
 ) error{ OutOfMemory, HttpFailed }!CappedRead {
     var list: std.ArrayList(u8) = .empty;
     errdefer list.deinit(gpa);
-    var chunk: [8 * 1024]u8 = undefined;
-    var complete = true;
-    while (true) {
-        const n = reader.readSliceShort(&chunk) catch return error.HttpFailed;
-        if (n == 0) break;
-        const take = @min(n, max_bytes -| list.items.len);
-        if (take > 0) list.appendSlice(gpa, chunk[0..take]) catch return error.OutOfMemory;
-        // Past the cap we stop reading further bytes into the buffer; the
-        // connection is dropped on req.deinit.
-        if (list.items.len >= max_bytes) {
-            complete = false;
-            break;
-        }
-    }
+    const complete = try appendCapped(gpa, &list, reader, max_bytes);
     return .{
         .bytes = list.toOwnedSlice(gpa) catch return error.OutOfMemory,
         .complete = complete,
     };
+}
+
+/// Appends `reader` to `list` until its end or until `list` holds `max_bytes`.
+/// Returns true when the reader reached its end before the cap.
+fn appendCapped(
+    gpa: std.mem.Allocator,
+    list: *std.ArrayList(u8),
+    reader: *std.Io.Reader,
+    max_bytes: usize,
+) error{ OutOfMemory, HttpFailed }!bool {
+    var chunk: [8 * 1024]u8 = undefined;
+    while (true) {
+        const n = reader.readSliceShort(&chunk) catch return error.HttpFailed;
+        if (n == 0) return true;
+        const take = @min(n, max_bytes -| list.items.len);
+        if (take > 0) list.appendSlice(gpa, chunk[0..take]) catch return error.OutOfMemory;
+        // Past the cap we stop reading further bytes into the buffer; the
+        // connection is dropped on req.deinit.
+        if (list.items.len >= max_bytes) return false;
+    }
 }
 
 /// Opens the connection to the first of `dial` that accepts. std.http would
@@ -2055,6 +2102,59 @@ test "httpGet errors on a gzip body whose length field does not match" {
 test "httpGet errors on a deflate body whose Adler-32 does not match" {
     const bad_adler = comptime flipped(zlib_hello, &.{zlib_hello.len - 1});
     try testing.expectError(error.HttpFailed, loopbackGet(testing.allocator, cannedResponse("deflate", bad_adler), &.{}, 1 << 20, null));
+}
+
+// Members below are the literal output of `printf '<text>' | gzip -n` (gzip 1.x
+// on macOS), one member per string; concatenated they are a multi-member file
+// (RFC 1952 section 2.2).
+const gz_m_hello = "\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03\xf3\x48\xcd\xc9\xc9\x57\x00\x00\xc0\xfc\x2d\xea\x06\x00\x00\x00"; // "Hello "
+const gz_m_gzip = "\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03\x4b\xaf\xca\x2c\x50\x00\x00\x29\xb5\xe5\xba\x05\x00\x00\x00"; // "gzip "
+const gz_m_world = "\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03\x2b\xcf\x2f\xca\x49\x01\x00\x43\x11\x77\x3a\x05\x00\x00\x00"; // "world"
+
+test "httpGet decodes every member of a two-member gzip body" {
+    try expectBody(loopbackGet(testing.allocator, cannedResponse("gzip", gz_m_hello ++ gz_m_gzip), &.{}, 1 << 20, null), "Hello gzip ");
+}
+
+test "httpGet decodes every member of a three-member x-gzip body" {
+    try expectBody(loopbackGet(testing.allocator, cannedResponse("x-gzip", gz_m_hello ++ gz_m_gzip ++ gz_m_world), &.{}, 1 << 20, null), "Hello gzip world");
+}
+
+test "httpGet errors when a later gzip member has a bad checksum" {
+    const body = comptime flipped(gz_m_hello ++ gz_m_gzip, &.{gz_m_hello.len + gz_m_gzip.len - 8}); // CRC32 of member 2
+    try testing.expectError(error.HttpFailed, loopbackGet(testing.allocator, cannedResponse("gzip", body), &.{}, 1 << 20, null));
+}
+
+test "httpGet errors when a later gzip member has a bad length field" {
+    const body = comptime flipped(gz_m_hello ++ gz_m_gzip, &.{gz_m_hello.len + gz_m_gzip.len - 4}); // ISIZE of member 2
+    try testing.expectError(error.HttpFailed, loopbackGet(testing.allocator, cannedResponse("gzip", body), &.{}, 1 << 20, null));
+}
+
+test "httpGet errors on trailing bytes after a valid gzip member" {
+    try testing.expectError(error.HttpFailed, loopbackGet(testing.allocator, cannedResponse("gzip", gz_m_hello ++ "trailing garbage that is not gzip"), &.{}, 1 << 20, null));
+    try testing.expectError(error.HttpFailed, loopbackGet(testing.allocator, cannedResponse("gzip", gz_m_hello ++ "\x00\x00\x00\x00"), &.{}, 1 << 20, null));
+}
+
+test "httpGet caps the combined output of all gzip members at max_bytes" {
+    // Each member is 300 KiB, under the 400 KiB cap; together they are over it.
+    const body = try loopbackGet(testing.allocator, cannedResponse("gzip", gz_zeros ++ gz_zeros), &.{}, 400 * 1024, null);
+    defer {
+        testing.allocator.free(body.bytes);
+        testing.allocator.free(body.content_type);
+    }
+    try testing.expectEqual(@as(usize, 400 * 1024), body.bytes.len);
+}
+
+test "httpGet returns both gzip members when together they fit under max_bytes" {
+    const body = try loopbackGet(testing.allocator, cannedResponse("gzip", gz_zeros ++ gz_zeros), &.{}, 2 * gz_zeros_len + 1, null);
+    defer {
+        testing.allocator.free(body.bytes);
+        testing.allocator.free(body.content_type);
+    }
+    try testing.expectEqual(@as(usize, 2 * gz_zeros_len), body.bytes.len);
+}
+
+test "httpGet errors on trailing bytes after a zlib stream" {
+    try testing.expectError(error.HttpFailed, loopbackGet(testing.allocator, cannedResponse("deflate", zlib_hello ++ "extra"), &.{}, 1 << 20, null));
 }
 
 test "readCapped stops reading and allocating at the cap of a highly compressible body" {

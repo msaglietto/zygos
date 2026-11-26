@@ -42,6 +42,20 @@ decodes the body before anything else sees it. `gzip` (and `x-gzip`) and
   the zlib Adler-32, are checked when the whole body fits under the cap, since
   std's inflater reads those fields without checking them. A body cut at the
   cap is not checked. Raw compressed bytes are never returned as text.
+- A gzip body may hold several concatenated members (RFC 1952 section 2.2).
+  `httpGet` decodes all of them and returns the concatenation of their
+  payloads, checking each member's own CRC32 and length; a bad trailer on any
+  member is `HttpFailed`, as for a single member. The cap applies to the
+  combined output of all members, not to each member, and a body cut at the cap
+  is cut as for one member (its later members are not decoded or checked).
+  std's inflater stops after one member, so `readGzipMembers` restarts it on
+  the raw body until the body ends.
+- Bytes after a gzip member that do not start another valid member (bad magic,
+  a short header, zero padding) are `HttpFailed`. gzip(1) warns and ignores
+  trailing garbage; this transport refuses it instead, so a corrupt or
+  truncated tail never reaches the model as a clean page. The same holds for
+  bytes after a zlib (`deflate`) stream, which is a single stream by
+  definition: they are `HttpFailed` (before this, they were silently dropped).
 - A response with a `Content-Encoding` the transport did not advertise or does
   not know (`zstd`, `br`, `compress`, anything else, or a stacked coding such
   as `gzip, br`) is `HttpFailed`, whatever `Accept-Encoding` a caller put in
@@ -244,6 +258,14 @@ Pure layer (pub, fixture-tested): `htmlToText(arena, bytes, max_out)
     `httpGet errors on a body labelled gzip that is not gzip`,
     `httpGet errors on a truncated gzip stream`,
     `httpGet errors on a gzip stream missing its trailer`,
+    `httpGet decodes every member of a two-member gzip body`,
+    `httpGet decodes every member of a three-member x-gzip body`,
+    `httpGet errors when a later gzip member has a bad checksum`,
+    `httpGet errors when a later gzip member has a bad length field`,
+    `httpGet errors on trailing bytes after a valid gzip member`,
+    `httpGet caps the combined output of all gzip members at max_bytes`,
+    `httpGet returns both gzip members when together they fit under max_bytes`,
+    `httpGet errors on trailing bytes after a zlib stream`,
     `httpGet errors on an encoding it cannot decode`,
     `httpGet advertises only the encodings it decodes`,
     `httpGet with a caller Accept-Encoding never returns a compressed body as text`

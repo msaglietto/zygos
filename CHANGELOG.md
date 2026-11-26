@@ -6,6 +6,12 @@ Reconstructed from git history on 2026-09-30. A commit that only added a library
 
 The agent that next changes operator-visible behavior adds the new heading in that same commit.
 
+## [5.2.3] - 2026-11-26
+
+### Fixed
+
+- `web_fetch` and `web_search` decode every member of a gzip response. A gzip body may be several members back to back (RFC 1952); before, only the first was decoded and the rest dropped without an error, so the model got a truncated page. Each member's CRC32 and length are checked, and a bad trailer on any member fails with `HttpFailed`. `max_fetch_bytes` caps the combined output of all members. Bytes after a gzip member that do not start another member, and bytes after a zlib (`deflate`) stream, now fail with `HttpFailed` instead of being ignored.
+
 ## [5.2.2] - 2026-11-26
 
 ### Fixed
