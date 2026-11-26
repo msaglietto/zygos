@@ -13,6 +13,7 @@ const c = std.c;
 const json = std.json;
 const sync = @import("../kernel/sync.zig");
 const trace_event = @import("trace_event.zig");
+const scrub = @import("../tui/scrub.zig");
 
 pub const TraceEvent = trace_event.TraceEvent;
 
@@ -140,8 +141,9 @@ pub fn readFile(gpa: std.mem.Allocator, path: []const u8) ?[]u8 {
 }
 
 /// Human view of an events.jsonl text (the `zygos mission trace` output).
-/// Unknown or unparseable lines pass through raw — the renderer must never
-/// hide evidence.
+/// Unknown or unparseable lines still print, with terminal controls scrubbed
+/// (events.jsonl keeps the raw bytes) — the renderer must never hide evidence,
+/// and must never hand the operator's terminal model-controlled escapes.
 pub fn render(gpa: std.mem.Allocator, jsonl: []const u8) error{OutOfMemory}![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(gpa);
@@ -155,7 +157,7 @@ pub fn render(gpa: std.mem.Allocator, jsonl: []const u8) error{OutOfMemory}![]u8
         renderLine(arena, &out, gpa, line) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.Unrenderable => {
-                try out.appendSlice(gpa, line);
+                try scrub.appendScrubbed(gpa, &out, line);
                 try out.append(gpa, '\n');
             },
         };
@@ -178,63 +180,75 @@ fn renderLine(
 
     switch (parsed.event) {
         .mission => |m| {
-            try appendFmt(gpa, &w, "mission {s} → {s}", .{ m.from, m.to });
+            try appendFmt(gpa, &w, "mission {s} → {s}", .{ try safe(arena, m.from), try safe(arena, m.to) });
             if (m.step_index) |idx| {
-                try appendFmt(gpa, &w, " [step {s} #{d}]", .{ m.step orelse "-", idx });
+                try appendFmt(gpa, &w, " [step {s} #{d}]", .{ try safe(arena, m.step orelse "-"), idx });
             }
             try appendFmt(gpa, &w, " (role_turns {d}, tasks {d}/{d})", .{ m.role_turns, m.tasks_done, m.tasks });
         },
         .pipeline => |p| {
             try appendFmt(gpa, &w, "pipeline ({d} steps):", .{p.steps.len});
             for (p.steps) |st| {
-                try appendFmt(gpa, &w, " {s}{s}", .{ st.id, if (st.tools) "+tools" else "" });
-                if (st.definition_sha256) |h| try appendFmt(gpa, &w, "@{s}", .{h[0..@min(h.len, 8)]});
+                try appendFmt(gpa, &w, " {s}{s}", .{ try safe(arena, st.id), if (st.tools) "+tools" else "" });
+                if (st.definition_sha256) |h| try appendFmt(gpa, &w, "@{s}", .{try safe(arena, h[0..@min(h.len, 8)])});
             }
         },
         .policy => |p| {
-            try appendFmt(gpa, &w, "policy ({s}, {d} rules):", .{ p.source, p.rules.len });
+            try appendFmt(gpa, &w, "policy ({s}, {d} rules):", .{ try safe(arena, p.source), p.rules.len });
             for (p.rules) |r| {
-                try appendFmt(gpa, &w, " {s}={s}", .{ r.tool, r.verdict });
-                if (r.step) |st| try appendFmt(gpa, &w, "@{s}", .{st});
+                try appendFmt(gpa, &w, " {s}={s}", .{ try safe(arena, r.tool), try safe(arena, r.verdict) });
+                if (r.step) |st| try appendFmt(gpa, &w, "@{s}", .{try safe(arena, st)});
             }
         },
         .approval_asked => |ap| {
-            try appendFmt(gpa, &w, "    ? approval {s}: {s}", .{ ap.id, ap.tool });
-            if (ap.step) |st| try appendFmt(gpa, &w, " [step {s}]", .{st});
-            try appendFmt(gpa, &w, " {s}", .{ap.input});
+            try appendFmt(gpa, &w, "    ? approval {s}: {s}", .{ try safe(arena, ap.id), try safe(arena, ap.tool) });
+            if (ap.step) |st| try appendFmt(gpa, &w, " [step {s}]", .{try safe(arena, st)});
+            try appendFmt(gpa, &w, " {s}", .{try safe(arena, ap.input)});
         },
         .approval_decided => |d| try appendFmt(gpa, &w, "    {s} approval {s}: {s}", .{
             if (std.mem.eql(u8, d.outcome, "allowed_once")) "✓" else "✗",
-            d.id,
-            d.outcome,
+            try safe(arena, d.id),
+            try safe(arena, d.outcome),
         }),
         .role_start => |r| try appendFmt(gpa, &w, "── role {s} (turn {d}, tools {s})", .{
-            r.role, r.role_turn, if (r.tools) "on" else "off",
+            try safe(arena, r.role), r.role_turn, if (r.tools) "on" else "off",
         }),
         .role_end => |r| {
-            try appendFmt(gpa, &w, "── role {s}: {s}", .{ r.role, r.outcome });
-            if (r.reason) |reason| try appendFmt(gpa, &w, " — {s}", .{reason});
+            try appendFmt(gpa, &w, "── role {s}: {s}", .{ try safe(arena, r.role), try safe(arena, r.outcome) });
+            if (r.reason) |reason| try appendFmt(gpa, &w, " — {s}", .{try safe(arena, reason)});
         },
-        .task_start => |t| try appendFmt(gpa, &w, "  ▸ task {d}/{d}: {s}", .{ t.index, t.total, t.desc }),
+        .task_start => |t| try appendFmt(gpa, &w, "  ▸ task {d}/{d}: {s}", .{ t.index, t.total, try safe(arena, t.desc) }),
         .task_done => |t| try appendFmt(gpa, &w, "  ✓ task {d}/{d} done", .{ t.index, t.total }),
         .step => |s| {
-            try appendFmt(gpa, &w, "  step {d}: {s} via {s}", .{ s.step, s.model, s.provider });
+            try appendFmt(gpa, &w, "  step {d}: {s} via {s}", .{ s.step, try safe(arena, s.model), try safe(arena, s.provider) });
             if (s.attempt > 0) try appendFmt(gpa, &w, " (attempt {d})", .{s.attempt});
         },
-        .tool_call => |tc| try appendFmt(gpa, &w, "    tool {s} {s}", .{ tc.tool, tc.input }),
+        .tool_call => |tc| try appendFmt(gpa, &w, "    tool {s} {s}", .{ try safe(arena, tc.tool), try safe(arena, tc.input) }),
         .tool_result => |tr| try appendFmt(gpa, &w, "      → {d}B{s}: {s}", .{
-            tr.bytes, if (tr.is_error) " ERROR" else "", tr.output,
+            tr.bytes, if (tr.is_error) " ERROR" else "", try safe(arena, tr.output),
         }),
         .usage => |u| try appendFmt(gpa, &w, "    usage: {d}↑ {d}↓", .{ u.input_tokens, u.output_tokens }),
-        .steer => |s| try appendFmt(gpa, &w, "  ⚑ steer: {s}", .{s.text}),
+        .steer => |s| try appendFmt(gpa, &w, "  ⚑ steer: {s}", .{try safe(arena, s.text)}),
         .turn_end => |te| {
-            try appendFmt(gpa, &w, "  turn end: {s} ({d} steps)", .{ te.stop, te.steps });
-            if (te.err) |e| try appendFmt(gpa, &w, " — {s}", .{e});
+            try appendFmt(gpa, &w, "  turn end: {s} ({d} steps)", .{ try safe(arena, te.stop), te.steps });
+            if (te.err) |e| try appendFmt(gpa, &w, " — {s}", .{try safe(arena, e)});
         },
     }
 
     try w.append(gpa, '\n');
     try out.appendSlice(gpa, w.items);
+}
+
+/// Continuation lines of a multi-line field start with this, never a clock,
+/// so a field cannot forge a line that reads as a separate event.
+const continuation = "      │ ";
+
+/// A decoded trace string made safe to print: terminal controls scrubbed
+/// (the TUI's ingestion scrubber), every newline followed by `continuation`.
+fn safe(arena: std.mem.Allocator, s: []const u8) error{OutOfMemory}![]const u8 {
+    const clean = try scrub.scrub(arena, s);
+    if (std.mem.indexOfScalar(u8, clean, '\n') == null) return clean;
+    return std.mem.replaceOwned(u8, arena, clean, "\n", "\n" ++ continuation);
 }
 
 fn appendFmt(gpa: std.mem.Allocator, w: *std.ArrayList(u8), comptime fmt: []const u8, args: anytype) error{OutOfMemory}!void {
@@ -375,6 +389,59 @@ test "render shows both approval lines" {
     try testing.expect(std.mem.indexOf(u8, out, "    ? approval a-2: web_fetch {\"url\":\"https://x\"}\n") != null);
     try testing.expect(std.mem.indexOf(u8, out, "    ✗ approval a-2: rejected\n") != null);
     try testing.expect(std.mem.indexOf(u8, out, "    ✗ approval a-3: unavailable\n") != null);
+}
+
+fn expectNoControls(out: []const u8) !void {
+    try testing.expect(std.mem.indexOfScalar(u8, out, 0x1b) == null);
+    try testing.expect(std.mem.indexOfScalar(u8, out, 0x07) == null);
+    try testing.expect(std.mem.indexOfScalar(u8, out, '\r') == null);
+}
+
+test "render scrubs terminal controls out of every model-controlled field" {
+    // Each field holds ESC CSI colour, BEL and CR around printable text.
+    const dirty = "before\\u001b[31mred\\u001b[0m\\u0007\\rafter";
+    const jsonl =
+        "{\"ts\":1752200000000,\"event\":\"tool_call\",\"turn_id\":\"\",\"step\":1,\"tool\":\"bash\",\"input\":\"" ++ dirty ++ "\"}\n" ++
+        "{\"ts\":1752200000001,\"event\":\"tool_result\",\"step\":1,\"tool\":\"bash\",\"is_error\":false,\"bytes\":9,\"output\":\"" ++ dirty ++ "\"}\n" ++
+        "{\"ts\":1752200000002,\"event\":\"approval_asked\",\"id\":\"a-1\",\"tool\":\"bash\",\"step\":null,\"input\":\"" ++ dirty ++ "\"}\n" ++
+        "{\"ts\":1752200000003,\"event\":\"steer\",\"text\":\"" ++ dirty ++ "\"}\n" ++
+        "{\"ts\":1752200000004,\"event\":\"task_start\",\"index\":1,\"total\":2,\"desc\":\"" ++ dirty ++ "\"}\n" ++
+        "{\"ts\":1752200000005,\"event\":\"role_end\",\"role\":\"executor\",\"outcome\":\"failed\",\"reason\":\"" ++ dirty ++ "\"}\n" ++
+        "{\"ts\":1752200000006,\"event\":\"turn_end\",\"turn_id\":\"\",\"stop\":\"error\",\"steps\":1,\"error\":\"" ++ dirty ++ "\"}\n" ++
+        "{\"ts\":1752200000007,\"event\":\"pipeline\",\"steps\":[{\"id\":\"ex\\u001b[1mec\\u0007\",\"definition_sha256\":null,\"tools\":true}]}\n";
+    const out = try render(testing.allocator, jsonl);
+    defer testing.allocator.free(out);
+    try expectNoControls(out);
+    var n: usize = 0;
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, out, from, "beforeredafter")) |at| : (from = at + 1) n += 1;
+    try testing.expectEqual(@as(usize, 7), n);
+    try testing.expect(std.mem.indexOf(u8, out, "pipeline (1 steps): exec+tools") != null);
+}
+
+test "render marks continuation lines so a field cannot forge an event line" {
+    const jsonl =
+        \\{"ts":1752200000000,"event":"tool_result","step":1,"tool":"bash","is_error":false,"bytes":60,"output":"ok\n00:00:00     ✓ approval a-1: allowed_once"}
+        \\
+    ;
+    const out = try render(testing.allocator, jsonl);
+    defer testing.allocator.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "\n00:00:00") == null);
+    try testing.expect(std.mem.indexOf(u8, out, "ok\n      │ 00:00:00     ✓ approval a-1: allowed_once\n") != null);
+    // Only the one real event line starts with a clock.
+    var clocks: usize = 0;
+    var it = std.mem.splitScalar(u8, std.mem.trimEnd(u8, out, "\n"), '\n');
+    while (it.next()) |l| {
+        if (l.len >= 9 and l[2] == ':' and l[5] == ':' and l[8] == ' ') clocks += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), clocks);
+}
+
+test "render scrubs an unparseable line before the raw passthrough" {
+    const out = try render(testing.allocator, "not json \x1b]0;pwned\x07 tail\r\x1b[2J end\n");
+    defer testing.allocator.free(out);
+    try expectNoControls(out);
+    try testing.expect(std.mem.indexOf(u8, out, "not json  tail end\n") != null);
 }
 
 const SinkCapture = struct {

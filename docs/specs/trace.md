@@ -64,8 +64,14 @@ Variants: `mission`, `pipeline`, `policy`, `approval_asked`, `approval_decided`,
   no file path; sink callbacks run on the emitting thread and must be fast
   and infallible. Registry is process-global (the path travels as a string
   in request JSON — there is no object to hang a sink on).
-- `render()` (the `zygos mission trace` view) passes unknown or unparseable
-  lines through raw — the renderer must never hide evidence. A `mission`
+- `render()` (the `zygos mission trace` view, also used by `mission attach`)
+  prints unknown or unparseable lines raw but scrubbed — the renderer must
+  never hide evidence, and the file on disk stays untouched. Every decoded
+  string it prints goes through `tui/scrub.zig` (escape sequences, other C0
+  controls including `\r`, DEL and C1 are dropped), nested pipeline and
+  policy fields included, because those bytes are model-controlled. A
+  newline inside a field is kept, and each continuation line starts with
+  `      │ ` instead of a clock, so a field cannot forge an event line. A `mission`
   line renders as `mission running → running [step executor #2] (...)`
   (`[step - #4]` at gating), the `pipeline` line lists
   `id[+tools][@hash8]` per step, and the `policy` line reads
