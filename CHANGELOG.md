@@ -6,6 +6,12 @@ Reconstructed from git history on 2026-09-30. A commit that only added a library
 
 The agent that next changes operator-visible behavior adds the new heading in that same commit.
 
+## [5.4.0] - 2026-11-26
+
+### Added
+
+- The mission `LEDGER.md` "Tool-output compression" section now prints `matched:` right after `calls:`. It is the number of bash calls a filter selected, so you can see how often filters fire on real commands. `filtered:` is still the subset that rewrote the output. The section is still left out when no trim worker is registered or nothing was compressed.
+
 ## [5.3.0] - 2026-11-26
 
 ### Changed

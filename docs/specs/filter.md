@@ -241,9 +241,9 @@ worker (which does not exist).
 Z-09 said "savings report to `budget::record` (`rtk gain` for free)". The trim
 worker already casts `saved_bytes`. M8 adds:
 
-- `zygos::output::stats` → `{"calls":N,"raw_bytes":B,"sent_bytes":b,"by_filter":{...}}`
+- `zygos::output::stats` → `{"calls":N,"matched":M,"filtered":F,"deduped":D,"raw_bytes":B,"sent_bytes":b}`
   so a mission's compression ratio is inspectable, and the mission-level budget
-  ledger (M7) can print it at terminal state.
+  ledger (M7) prints these at terminal state.
 - A `test/e2e/m8/` script running a scripted turn whose tool outputs are the
   golden fixtures, asserting the end-to-end ratio clears a floor (**≥60%** on
   the fixture corpus — deliberately below ztk's 90% headline, which is measured

@@ -611,11 +611,12 @@ fn compressionSection(self: *MissionOrchestrator, arena: std.mem.Allocator) []co
     const sent = int(p.object, "sent_bytes");
     return std.fmt.allocPrint(
         arena,
-        "\n## Tool-output compression\n\ncalls: {d}\nfiltered: {d}\ndeduped: {d}\n" ++
+        "\n## Tool-output compression\n\ncalls: {d}\nmatched: {d}\nfiltered: {d}\ndeduped: {d}\n" ++
             "raw_bytes: {d}\nsent_bytes: {d}\nreduction: {d}%\n",
         .{
-            int(p.object, "calls"), int(p.object, "filtered"), int(p.object, "deduped"),
-            raw,                    sent,                      @divTrunc((raw - sent) * 100, raw),
+            int(p.object, "calls"),             int(p.object, "matched"), int(p.object, "filtered"),
+            int(p.object, "deduped"),           raw,                      sent,
+            @divTrunc((raw - sent) * 100, raw),
         },
     ) catch "";
 }
@@ -2524,6 +2525,12 @@ test "M8: the ledger reports the compression ratio when a trim worker rides the 
     defer testing.allocator.free(creq);
     const cres = try h.caller.call("zygos::output::compress", creq);
     cres.deinit(testing.allocator);
+    // A command no filter selects: it counts as a call but not as matched.
+    const ures = try h.caller.call(
+        "zygos::output::compress",
+        "{\"content\":\"hi\\n\",\"tool\":\"bash\",\"input\":{\"command\":\"echo hi\"}}",
+    );
+    ures.deinit(testing.allocator);
 
     const req = try h.startReq(testing.allocator, seed_and_gate ++ ",\"budget_scope\":\"m-1\"");
     defer testing.allocator.free(req);
@@ -2534,6 +2541,8 @@ test "M8: the ledger reports the compression ratio when a trim worker rides the 
     const text = try h.store().readArtifact(testing.allocator, "LEDGER.md");
     defer testing.allocator.free(text);
     try testing.expect(std.mem.indexOf(u8, text, "Tool-output compression") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "calls: 2\n") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "matched: 1\n") != null);
     try testing.expect(std.mem.indexOf(u8, text, "filtered: 1") != null);
     // The ratio is a real percentage, not a placeholder.
     try testing.expect(std.mem.indexOf(u8, text, "reduction: 0%") == null);
