@@ -100,6 +100,7 @@ src/
   kernel/
     protocol.zig         wire types + parse/serialize   (S1)
     types.zig            shared WorkerId/Uuid identity types
+    clock.zig            the one monotonic millisecond clock
     sync.zig             pthread mutex/condvar/event (Zig 0.16 has no
                          std.Thread primitives; std.Io ones barred by Z-02)
     catalog.zig          function registry, owner CAS   (S2)

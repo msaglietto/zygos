@@ -6,6 +6,7 @@
 const std = @import("std");
 const c = std.c;
 const sync = @import("../../kernel/sync.zig");
+const clock = @import("../../kernel/clock.zig");
 const fork_guard = @import("../fork_guard.zig");
 
 pub const TransportError = error{ Io, OutOfMemory };
@@ -41,12 +42,6 @@ extern "c" fn fflush(stream: *c.FILE) c_int;
 extern "c" fn fileno(stream: *c.FILE) c_int;
 
 const SIGTERM: c_int = @intFromEnum(c.SIG.TERM);
-
-fn monotonicMs() i64 {
-    var ts: c.timespec = undefined;
-    if (c.clock_gettime(.MONOTONIC, &ts) != 0) return 0;
-    return @as(i64, @intCast(ts.sec)) * 1000 + @divTrunc(@as(i64, @intCast(ts.nsec)), std.time.ns_per_ms);
-}
 
 /// `execvp` fallback when PATH is unset: the macOS and glibc default
 /// (`confstr(_CS_PATH)` is `/usr/bin:/bin` on both), a literal so the lookup
@@ -198,11 +193,11 @@ pub const ChildProcess = struct {
         _ = c.fclose(self.to_child);
         _ = c.fclose(self.from_child);
         _ = kill(self.pid, SIGTERM);
-        const deadline = monotonicMs() + 250;
+        const deadline = clock.monotonicMs() + 250;
         while (true) {
             const reaped = waitpid(self.pid, null, 1); // WNOHANG
             if (reaped == self.pid or (reaped < 0 and c._errno().* == @intFromEnum(c.E.CHILD))) break;
-            if (monotonicMs() >= deadline) {
+            if (clock.monotonicMs() >= deadline) {
                 _ = kill(self.pid, @intFromEnum(c.SIG.KILL));
                 while (waitpid(self.pid, null, 0) < 0 and c._errno().* == @intFromEnum(c.E.INTR)) {}
                 break;
@@ -232,10 +227,10 @@ pub const ChildProcess = struct {
         const self: *ChildProcess = @ptrCast(@alignCast(ctx));
         var buf: std.ArrayList(u8) = .empty;
         errdefer buf.deinit(gpa);
-        const deadline = monotonicMs() + self.read_timeout_ms;
+        const deadline = clock.monotonicMs() + self.read_timeout_ms;
         while (true) {
             if (self.read_pos == self.read_end) {
-                const left = deadline - monotonicMs();
+                const left = deadline - clock.monotonicMs();
                 if (left <= 0) return error.Io;
                 var fds = [_]c.pollfd{.{ .fd = fileno(self.from_child), .events = c.POLL.IN, .revents = 0 }};
                 const ready = c.poll(&fds, 1, @intCast(@min(left, std.math.maxInt(c_int))));

@@ -8,6 +8,7 @@ const json = std.json;
 const actor_mod = @import("../kernel/actor.zig");
 const inproc = @import("../kernel/inproc.zig");
 const sync = @import("../kernel/sync.zig");
+const clock = @import("../kernel/clock.zig");
 const ops = @import("tools_ops.zig");
 
 pub const Config = struct {
@@ -525,10 +526,10 @@ test "a git call past its deadline fails the handler (fail closed)" {
     defer testing.allocator.free(chmod.output);
     try testing.expectEqual(@as(i32, 0), chmod.exit_code);
 
-    const started = ops.monotonicMs();
+    const started = clock.monotonicMs();
     const second = try h.checkpoint("{}");
     defer second.deinit(testing.allocator);
-    const elapsed_ms = ops.monotonicMs() - started;
+    const elapsed_ms = clock.monotonicMs() - started;
 
     try testing.expect(second == .err);
     try testing.expectEqualStrings("handler_failed", second.err);
