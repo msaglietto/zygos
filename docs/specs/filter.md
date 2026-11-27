@@ -101,9 +101,10 @@ that. Extend it, additively:
   `; "raw":true for all` just before its closing ` ...]` (`TrimWorker.hinted`,
   inserted in `trim.zig`, counted in `sent_bytes`). Later markers are unchanged,
   and replies with no marker do not spend it. No hint is added when the tool's
-  own output already contains a zygos marker (the tool's bytes are never
-  rewritten), or when adding it would not keep the reply shorter than the
-  input (or, for entry cuts, within `max_bytes`); it waits for a later marker.
+  output mentions "zygos" in any case (compression can turn tool text into
+  marker shape, and the tool's bytes are never rewritten), or when adding it
+  would not keep the reply, as serialized, shorter than the input (or, for
+  entry cuts, within `max_bytes`); it waits for a later marker.
 - Reply shape is unchanged: `{"content": <str>}`.
 
 Not a `docs/PROTOCOL.md` change — `output::compress` is a Zygos function on the
