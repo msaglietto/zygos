@@ -102,12 +102,20 @@ that. Extend it, additively:
   inserted in `trim.zig`, counted in `sent_bytes`). Later markers are unchanged,
   and replies with no marker do not spend it. No hint is added when the tool's
   output mentions "zygos" in any case, contains terminal escape codes (ESC),
-  or contains JSON `\u` escapes (stripping ANSI joins split words and JSON
-  re-serialization decodes escapes, so either can turn tool text into marker
-  shape; the tool's bytes are never rewritten), or when adding it would not
+  or, on the entry-cut (JSON array) path only, contains JSON `\u` escapes
+  (stripping ANSI joins split words and JSON decoding turns escapes into
+  characters, so either can turn tool text into marker shape). Envelopes are
+  guarded on their decoded text instead: an escape such as `\u007aygos` or
+  `\u001b` in the wire form is already decoded there and caught by the
+  "zygos" and ESC guards, so a literal `\u` in a source file is just text and
+  never defers the hint (the tool's bytes are never
+  rewritten), or when adding it would not
   keep the reply shorter than the input (on the envelope path: both as decoded
   and as sent; for entry cuts: also within `max_bytes`); it waits for a later
-  marker.
+  marker. An allocation failure while building the hint falls back to the
+  unhinted compressed reply and leaves the hint unspent.
+- The MCP bridge drops a top-level `"raw"` from the arguments it forwards,
+  unless the tool's schema declares its own `raw` property.
 - Reply shape is unchanged: `{"content": <str>}`.
 
 Not a `docs/PROTOCOL.md` change — `output::compress` is a Zygos function on the

@@ -341,12 +341,20 @@ pub const McpClientWorker = struct {
         return refs;
     }
 
-    /// Bus request JSON = MCP tool arguments, verbatim. Failures follow the
+    /// Bus request JSON = MCP tool arguments, verbatim except for zygos's own
+    /// `"raw"` escape (S8.1): the turn driver reads it from the model's input to
+    /// skip trimming, and a strict server (`additionalProperties:false`) would
+    /// reject it, so it is dropped unless the tool's schema declares its own
+    /// top-level `raw` property. Anything else (non-object, unparseable, no
+    /// `raw`) is forwarded byte-for-byte. Failures follow the
     /// web_tools convention: structured `{"error":...}` payloads the model
     /// can read, never a silent drop.
     fn callHandler(ctx: ?*anyopaque, arena: std.mem.Allocator, request_json: []const u8) error{ Failed, OutOfMemory }![]const u8 {
         const b: *Binding = @ptrCast(@alignCast(ctx.?));
-        const args = if (std.mem.trim(u8, request_json, " \t\r\n").len == 0) "{}" else request_json;
+        const args = if (std.mem.trim(u8, request_json, " \t\r\n").len == 0)
+            "{}"
+        else
+            try withoutRaw(arena, request_json, b.schema_json);
         const out = b.client.callTool(arena, b.tool, args) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.Io => return errorReply(arena, "McpServerUnavailable"),
@@ -362,6 +370,37 @@ pub const McpClientWorker = struct {
         return std.fmt.allocPrint(arena, "{{\"content\":{f}}}", .{json.fmt(out.text, .{})});
     }
 };
+
+/// `request_json` minus a top-level `"raw"` key, unless `schema_json`
+/// declares `raw` in its top-level `properties`. The input slice itself when
+/// nothing is removed.
+///
+/// The key is dropped whatever its value: `raw` is zygos's key, and turn.zig
+/// only honours boolean true (C22). Only the schema's top-level `properties`
+/// is consulted (see `schemaDeclares`).
+fn withoutRaw(arena: std.mem.Allocator, request_json: []const u8, schema_json: []const u8) error{OutOfMemory}![]const u8 {
+    var root = json.parseFromSliceLeaky(json.Value, arena, request_json, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return request_json,
+    };
+    if (root != .object or !root.object.contains("raw")) return request_json;
+    if (try schemaDeclares(arena, schema_json, "raw")) return request_json;
+    _ = root.object.orderedRemove("raw");
+    return std.fmt.allocPrint(arena, "{f}", .{json.fmt(root, .{})});
+}
+
+/// Only the schema's top-level `properties` is consulted (C21): a `raw`
+/// declared solely through `$ref`, `allOf` or `anyOf` is not seen, so the key
+/// is still dropped for such a tool.
+fn schemaDeclares(arena: std.mem.Allocator, schema_json: []const u8, key: []const u8) error{OutOfMemory}!bool {
+    const schema = json.parseFromSliceLeaky(json.Value, arena, schema_json, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return false,
+    };
+    if (schema != .object) return false;
+    const props = schema.object.get("properties") orelse return false;
+    return props == .object and props.object.contains(key);
+}
 
 fn errorReply(arena: std.mem.Allocator, name: []const u8) error{OutOfMemory}![]const u8 {
     return std.fmt.allocPrint(arena, "{{\"error\":{f}}}", .{json.fmt(name, .{})});
@@ -559,6 +598,62 @@ test "worker registers zygos::mcp::<server>::<tool> and bridges tools/call over 
     try testing.expect(std.mem.indexOf(u8, entries, "\"description\":\"web search\"") != null);
     try testing.expect(std.mem.indexOf(u8, entries, "\"input_schema\":{") != null);
     try testing.expect(std.mem.indexOf(u8, entries, "\"required\":[\"q\"]") != null);
+}
+
+test "worker drops \"raw\" from MCP arguments unless the tool's schema declares it" {
+    var h = try WorkerHarness.init(testing.allocator);
+    defer h.deinit();
+
+    const list2 =
+        \\{"jsonrpc":"2.0","id":2,"result":{"tools":[
+        \\ {"name":"strict","inputSchema":{"type":"object","properties":{"q":{"type":"string"}},"additionalProperties":false}},
+        \\ {"name":"owns","inputSchema":{"type":"object","properties":{"q":{"type":"string"},"raw":{"type":"boolean"}}}}]}}
+    ;
+    const reply3 =
+        \\{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"a"}],"isError":false}}
+    ;
+    const reply4 =
+        \\{"jsonrpc":"2.0","id":4,"result":{"content":[{"type":"text","text":"b"}],"isError":false}}
+    ;
+    const reply5 =
+        \\{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text":"c"}],"isError":false}}
+    ;
+    var ft: FakeTransport = .{ .gpa = testing.allocator, .script = &.{ init_reply, list2, reply3, reply4, reply5 } };
+    defer ft.deinit();
+    var client = Client.init(testing.allocator, ft.transport());
+    defer client.deinit();
+
+    const mcp = try McpClientWorker.start(testing.allocator, &h.actor, &h.registry, &.{
+        .{ .name = "stub", .client = &client },
+    });
+    defer mcp.stop();
+
+    // Schema without "raw": the escape never reaches the server.
+    const r1 = try h.caller.call("zygos::mcp::stub::strict", "{\"q\":\"x\",\"raw\":true}");
+    defer r1.deinit(testing.allocator);
+    try testing.expect(r1 == .ok);
+    const w1 = ft.written.items[ft.written.items.len - 1];
+    try testing.expect(std.mem.indexOf(u8, w1, "\"q\":\"x\"") != null);
+    try testing.expect(std.mem.indexOf(u8, w1, "raw") == null);
+
+    // Schema declares "raw": it is the tool's own parameter, forwarded as is.
+    const r2 = try h.caller.call("zygos::mcp::stub::owns", "{\"q\":\"x\",\"raw\":true}");
+    defer r2.deinit(testing.allocator);
+    try testing.expect(r2 == .ok);
+    const w2 = ft.written.items[ft.written.items.len - 1];
+    try testing.expect(std.mem.indexOf(u8, w2, "\"arguments\":{\"q\":\"x\",\"raw\":true}") != null);
+
+    // Nothing to remove: the very same bytes come back, never re-serialized
+    // (the bus itself normalizes JSON, so this is checked on the function).
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const strict_schema = "{\"properties\":{\"q\":{}}}";
+    for ([_][]const u8{ "{ \"q\" :  \"a\\/b\" }", "[1, \"raw\"]", "not json", "{\"q\":{\"raw\":true}}" }) |req| {
+        const out = try withoutRaw(arena, req, strict_schema);
+        try testing.expectEqual(req.ptr, out.ptr);
+        try testing.expectEqual(req.len, out.len);
+    }
 }
 
 test "toolRefs pairs each model-facing name with its bus function id" {
