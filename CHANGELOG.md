@@ -12,13 +12,13 @@ The agent that next changes operator-visible behavior adds the new heading in th
 
 - External MCP servers no longer receive the `"raw": true` escape as a tool argument. A server whose tool schema forbids extra properties used to reject the call; the escape still skips trimming on the zygos side. If the tool's own schema declares a top-level `raw` property, the argument is forwarded untouched. Requests without `raw` are forwarded byte-for-byte as before.
 - The `; "raw":true for all` hint is no longer withheld because plain-text tool output contains a literal `\u` sequence (a source file, say). The `\u` guard now applies only to the entry-cut (JSON array) path, where the raw JSON is the only thing checked. Envelopes (bash, read_file and MCP replies) are guarded on their decoded text, so a source file with a literal `\u` still gets the hint while an escaped `zygos` or ESC is still caught. The "zygos" and terminal-escape guards are unchanged.
-- If memory runs out while the hint is being built, the reply is the compressed output without the hint instead of the original untrimmed output. The hint stays unspent and its bytes are not counted in `sent_bytes`.
+- An allocation failure while the hint is being built no longer fails the whole reply: the compressed output goes out without the hint, which stays unspent, and its bytes are not counted in `sent_bytes`. If memory stays exhausted through the final reply serialization, the turn still falls back to the untrimmed output, as before.
 
 ## [5.5.0] - 2026-11-26
 
 ### Added
 
-- The first time a run's tool output is trimmed, filtered, cut by entries or collapsed to an "unchanged" line, the model now sees a short hint at the end of that first note: `; "raw":true for all`. It tells the model that adding `"raw": true` to a tool call returns the full output untrimmed. The hint appears once per run, in the first note only, and its bytes count in the `sent_bytes` compression stat. Output that was not trimmed does not use it up. The hint is not added when the tool's output mentions "zygos", contains terminal escape codes, or (on the entry-cut path) contains JSON `\u` escapes, or when adding it would not keep the reply shorter than the input (on the envelope path: both as decoded and as sent); it waits for a later marker.
+- The first time a run's tool output is trimmed, filtered, cut by entries or collapsed to an "unchanged" line, the model now sees a short hint at the end of that first note: `; "raw":true for all`. It tells the model that adding `"raw": true` to a tool call returns the full output untrimmed. The hint appears once per run, in the first note only, and its bytes count in the `sent_bytes` compression stat. Output that was not trimmed does not use it up. The hint is not added when the tool's output mentions "zygos", contains terminal escape codes, or contains JSON `\u` escapes, or when adding it would not keep the reply shorter than the input (on the envelope path: both as decoded and as sent); it waits for a later marker.
 
 ## [5.4.0] - 2026-11-26
 
