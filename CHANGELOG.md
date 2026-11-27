@@ -10,7 +10,7 @@ The agent that next changes operator-visible behavior adds the new heading in th
 
 ### Added
 
-- The first time a run's tool output is trimmed, filtered, cut by entries or collapsed to an "unchanged" line, the model now sees a short hint at the end of that first note: `; "raw":true for all`. It tells the model that adding `"raw": true` to a tool call returns the full output untrimmed. The hint appears once per run, in the first note only, and its bytes count in the `sent_bytes` compression stat. Output that was not trimmed does not use it up. The hint is not added when the tool's output mentions "zygos", or when adding it would not keep the reply shorter than the input; it waits for a later marker.
+- The first time a run's tool output is trimmed, filtered, cut by entries or collapsed to an "unchanged" line, the model now sees a short hint at the end of that first note: `; "raw":true for all`. It tells the model that adding `"raw": true` to a tool call returns the full output untrimmed. The hint appears once per run, in the first note only, and its bytes count in the `sent_bytes` compression stat. Output that was not trimmed does not use it up. The hint is not added when the tool's output mentions "zygos", contains terminal escape codes, or contains JSON `\u` escapes, or when adding it would not keep the reply shorter than the input (on the envelope path: both as decoded and as sent); it waits for a later marker.
 
 ## [5.4.0] - 2026-11-26
 

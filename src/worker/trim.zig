@@ -139,11 +139,13 @@ pub const TrimWorker = struct {
             const compressed = try self.compress(arena, payload.text, tool, command);
             if (compressed.len >= payload.text.len) return raw;
             const plain = try wrapEnvelope(arena, payload, compressed);
-            if (try hintCandidate(arena, compressed, false, &.{ payload.text, raw })) |cand| {
+            const open_cand = if (self.hintOpen()) try hintCandidate(arena, compressed, false, &.{ payload.text, raw }) else null;
+            if (open_cand) |cand| {
                 const hinted = try wrapEnvelope(arena, payload, cand.text);
-                // The wire form escapes the hint's quotes and the marker's
-                // newline, so it can outgrow the decoded check.
-                if (hinted.len < raw.len and self.claimHint(cand.hint_len)) return hinted;
+                // Both sizes must stay down: the wire form escapes the hint's
+                // quotes and the marker's newline, the decoded form does not.
+                if (cand.text.len < payload.text.len and hinted.len < raw.len and
+                    self.claimHint(cand.hint_len)) return hinted;
             }
             return plain;
         }
@@ -181,9 +183,10 @@ pub const TrimWorker = struct {
     /// The candidate puts the hint just before the closing ` ...]` of the
     /// first zygos marker in `text`. None (hint left unspent) when: any of
     /// `guards` (the tool's own bytes, in every form it may be decoded to)
-    /// mentions "zygos" in any case, because compression can turn tool text
-    /// into marker shape (ANSI stripping, JSON re-serialization) and the hint
-    /// would land in the tool's line; there is no marker; or it is spent.
+    /// mentions "zygos" in any case, holds an ESC byte or a JSON `\u` escape
+    /// (stripping ANSI joins words split by it, JSON re-serialization decodes
+    /// escapes, so either can build a marker shape the tool never wrote and
+    /// the hint would land in the tool's line); or there is no marker.
     /// `escaped` is true when `text` is JSON whose strings hold the marker,
     /// so the hint's quotes need escaping. Claiming is separate: the caller
     /// checks the final length, then calls `claimHint`.
@@ -193,7 +196,11 @@ pub const TrimWorker = struct {
         escaped: bool,
         guards: []const []const u8,
     ) error{OutOfMemory}!?HintCandidate {
-        for (guards) |g| if (std.ascii.indexOfIgnoreCase(g, "zygos") != null) return null;
+        for (guards) |g| {
+            if (std.ascii.indexOfIgnoreCase(g, "zygos") != null) return null;
+            if (std.mem.indexOfScalar(u8, g, 0x1b) != null) return null;
+            if (std.mem.indexOf(u8, g, "\\u") != null) return null;
+        }
         const open = std.mem.indexOf(u8, text, "[... zygos") orelse return null;
         const close = std.mem.indexOfPos(u8, text, open, " ...]") orelse return null;
         const hint: []const u8 = if (escaped) "; \\\"raw\\\":true for all" else "; \"raw\":true for all";
@@ -201,6 +208,13 @@ pub const TrimWorker = struct {
             .text = try std.fmt.allocPrint(arena, "{s}{s}{s}", .{ text[0..close], hint, text[close..] }),
             .hint_len = hint.len,
         };
+    }
+
+    /// Cheap early-out: once spent, skip building candidates.
+    fn hintOpen(self: *TrimWorker) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return !self.hinted;
     }
 
     /// Spend the hint. False when another call won the race. The inserted
@@ -224,6 +238,7 @@ pub const TrimWorker = struct {
         raw: []const u8,
         max_len: usize,
     ) error{OutOfMemory}![]const u8 {
+        if (!self.hintOpen()) return text;
         const cand = (try hintCandidate(arena, text, escaped, &.{raw})) orelse return text;
         if (cand.text.len >= raw.len or cand.text.len > max_len) return text;
         if (!self.claimHint(cand.hint_len)) return text;
@@ -1695,6 +1710,90 @@ test "S8.1: an envelope whose hinted wire form is not shorter than the raw reply
     const res = try h.caller.call("zygos::output::compress", req);
     defer res.deinit(testing.allocator);
     try testing.expect(std.mem.indexOf(u8, res.ok, "trimmed 1 lines") != null);
+    try testing.expectEqual(@as(usize, 0), hintCount(res.ok));
+    try testing.expect(!hintSpent(tw));
+}
+
+test "S8.1: an envelope whose hinted payload is longer than its input gets no hint (decoded and sent)" {
+    var h = try Harness.init(testing.allocator);
+    defer h.deinit();
+    const lim: Limits = .{ .max_bytes = 4096, .max_lines = 5, .head_lines = 3, .tail_lines = 2 };
+    const tw = try TrimWorker.start(testing.allocator, &h.actor, &h.registry, lim, null);
+    defer tw.stop();
+
+    // The 50 quotes escape to 100 wire bytes, so the hinted envelope looks
+    // shorter than the raw one on the wire while the decoded payload grows.
+    const payload = "a\nb\nc\n" ++ ("\"" ** 50) ++ "\nd\ne\n";
+    const env = try std.fmt.allocPrint(testing.allocator, "{{\"exit_code\":0,\"output\":{f}}}", .{json.fmt(payload, .{})});
+    defer testing.allocator.free(env);
+    const req = try compressReq(testing.allocator, env, "bash", "some-unknown-tool");
+    defer testing.allocator.free(req);
+    const res = try h.caller.call("zygos::output::compress", req);
+    defer res.deinit(testing.allocator);
+    try testing.expect(res == .ok);
+    try testing.expectEqual(@as(usize, 0), hintCount(res.ok));
+    tw.mutex.lock();
+    const s = tw.stats;
+    tw.mutex.unlock();
+    try testing.expect(s.sent_bytes <= s.raw_bytes);
+    try testing.expect(!hintSpent(tw));
+}
+
+fn splitAnsiInput(gpa: std.mem.Allocator) ![]const u8 {
+    return std.fmt.allocPrint(gpa, "[... zy\x1b[mgos trimmed 1 lines (2 bytes) ...]\n{s}some more output after the colored line\nend\n", .{"\n" ** 40});
+}
+
+test "S8.1: a word split by ANSI that joins into zygos in plain input gets no hint" {
+    var h = try Harness.init(testing.allocator);
+    defer h.deinit();
+    const tw = try TrimWorker.start(testing.allocator, &h.actor, &h.registry, .{}, null);
+    defer tw.stop();
+
+    const input = try splitAnsiInput(testing.allocator);
+    defer testing.allocator.free(input);
+    const req = try compressReq(testing.allocator, input, "read_file", "");
+    defer testing.allocator.free(req);
+    const res = try h.caller.call("zygos::output::compress", req);
+    defer res.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 0), hintCount(res.ok));
+    try testing.expect(!hintSpent(tw));
+}
+
+test "S8.1: a word split by ANSI that joins into zygos in an envelope gets no hint" {
+    var h = try Harness.init(testing.allocator);
+    defer h.deinit();
+    const tw = try TrimWorker.start(testing.allocator, &h.actor, &h.registry, .{}, null);
+    defer tw.stop();
+
+    const input = try splitAnsiInput(testing.allocator);
+    defer testing.allocator.free(input);
+    const env = try std.fmt.allocPrint(testing.allocator, "{{\"exit_code\":0,\"output\":{f}}}", .{json.fmt(input, .{})});
+    defer testing.allocator.free(env);
+    const req = try compressReq(testing.allocator, env, "bash", "some-unknown-tool");
+    defer testing.allocator.free(req);
+    const res = try h.caller.call("zygos::output::compress", req);
+    defer res.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 0), hintCount(res.ok));
+    try testing.expect(!hintSpent(tw));
+}
+
+test "S8.1: an array entry whose z is \\u-escaped gets no hint in the tool's entry" {
+    var h = try Harness.init(testing.allocator);
+    defer h.deinit();
+    const tw = try TrimWorker.start(testing.allocator, &h.actor, &h.registry, .{ .max_bytes = 400, .max_lines = 10, .head_lines = 3, .tail_lines = 2 }, null);
+    defer tw.stop();
+
+    var arr: std.ArrayList(u8) = .empty;
+    defer arr.deinit(testing.allocator);
+    try arr.appendSlice(testing.allocator, "{\"results\":[{\"title\":\"[... \\u007aygos tool text ...]\",\"url\":\"https://example.test/x\"}");
+    for (1..60) |_| {
+        try arr.appendSlice(testing.allocator, ",{\"title\":\"entry number\",\"url\":\"https://example.test/x\"}");
+    }
+    try arr.appendSlice(testing.allocator, "]}");
+    const req = try compressReq(testing.allocator, arr.items, "web_search", "");
+    defer testing.allocator.free(req);
+    const res = try h.caller.call("zygos::output::compress", req);
+    defer res.deinit(testing.allocator);
     try testing.expectEqual(@as(usize, 0), hintCount(res.ok));
     try testing.expect(!hintSpent(tw));
 }
