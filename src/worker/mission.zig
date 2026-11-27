@@ -2531,6 +2531,13 @@ test "M8: the ledger reports the compression ratio when a trim worker rides the 
         "{\"content\":\"hi\\n\",\"tool\":\"bash\",\"input\":{\"command\":\"echo hi\"}}",
     );
     ures.deinit(testing.allocator);
+    // A command a filter selects but leaves alone (no hint lines to drop, so
+    // git.status returns null): matched but not filtered.
+    const sres = try h.caller.call(
+        "zygos::output::compress",
+        "{\"content\":\"On branch main\\n M a.c\\n\",\"tool\":\"bash\",\"input\":{\"command\":\"git status\"}}",
+    );
+    sres.deinit(testing.allocator);
 
     const req = try h.startReq(testing.allocator, seed_and_gate ++ ",\"budget_scope\":\"m-1\"");
     defer testing.allocator.free(req);
@@ -2541,9 +2548,7 @@ test "M8: the ledger reports the compression ratio when a trim worker rides the 
     const text = try h.store().readArtifact(testing.allocator, "LEDGER.md");
     defer testing.allocator.free(text);
     try testing.expect(std.mem.indexOf(u8, text, "Tool-output compression") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "calls: 2\n") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "matched: 1\n") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "filtered: 1") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "calls: 3\nmatched: 2\nfiltered: 1\n") != null);
     // The ratio is a real percentage, not a placeholder.
     try testing.expect(std.mem.indexOf(u8, text, "reduction: 0%") == null);
     try testing.expect(std.mem.indexOf(u8, text, "reduction: ") != null);

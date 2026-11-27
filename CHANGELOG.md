@@ -10,7 +10,7 @@ The agent that next changes operator-visible behavior adds the new heading in th
 
 ### Added
 
-- The mission `LEDGER.md` "Tool-output compression" section now prints `matched:` right after `calls:`. It is the number of bash calls a filter selected, so you can see how often filters fire on real commands. `filtered:` is still the subset that rewrote the output. The section is still left out when no trim worker is registered or nothing was compressed.
+- The mission `LEDGER.md` "Tool-output compression" section now prints `matched:` right after `calls:`. It is the number of bash calls a filter selected, so you can see how often filters fire on real commands. `filtered:` is still the subset that rewrote the output. The section is still left out when no trim worker answers `zygos::output::stats` or no output passed through trim.
 
 ## [5.3.0] - 2026-11-26
 
