@@ -138,7 +138,7 @@ pub const TrimWorker = struct {
         if (envelopePayload(arena, raw)) |payload| {
             const compressed = try self.compress(arena, payload.text, tool, command);
             if (compressed.len >= payload.text.len) return raw;
-            const hinted = try self.hintFirstMarker(arena, compressed, false);
+            const hinted = try self.hintFirstMarker(arena, compressed, false, payload.text, raw, std.math.maxInt(usize));
             return std.fmt.allocPrint(arena, "{{{s}{f}:{f}}}", .{
                 payload.prefix,
                 json.fmt(payload.key, .{}),
@@ -156,33 +156,54 @@ pub const TrimWorker = struct {
                 self.stats.calls += 1;
                 self.stats.raw_bytes += raw.len;
                 self.mutex.unlock();
-                return self.hintFirstMarker(arena, shorter, true);
+                return self.hintFirstMarker(arena, shorter, true, raw, raw, self.limits.max_bytes);
             }
         }
         const compressed = try self.compress(arena, raw, tool, command);
         // Unchanged output is the tool's own text, not our marker: leave it.
         if (std.mem.eql(u8, compressed, raw)) return compressed;
-        return self.hintFirstMarker(arena, compressed, false);
+        return self.hintFirstMarker(arena, compressed, false, raw, raw, std.math.maxInt(usize));
     }
 
     /// S8.1: tell the model once per run that `"raw":true` skips trimming.
     /// The hint goes just before the closing ` ...]` of the first zygos
-    /// marker in `text`; outputs with no marker leave it unspent. `escaped`
+    /// marker in `text`. It is skipped, leaving the hint unspent, when: the
+    /// tool's own output (`compare_to`, `also_scan`) already holds a zygos
+    /// marker (so any marker in `text` that we would touch might be the
+    /// tool's bytes); there is no marker; or the hinted result would not stay
+    /// strictly shorter than `compare_to` or would exceed `max_len`. `escaped`
     /// is true when `text` is JSON whose strings hold the marker, so the
     /// hint's quotes need escaping. The inserted bytes count as sent.
-    fn hintFirstMarker(self: *TrimWorker, arena: std.mem.Allocator, text: []const u8, escaped: bool) error{OutOfMemory}![]const u8 {
-        const open = std.mem.indexOf(u8, text, "[... zygos") orelse return text;
+    fn hintFirstMarker(
+        self: *TrimWorker,
+        arena: std.mem.Allocator,
+        text: []const u8,
+        escaped: bool,
+        compare_to: []const u8,
+        also_scan: []const u8,
+        max_len: usize,
+    ) error{OutOfMemory}![]const u8 {
+        const needle = "[... zygos";
+        if (std.mem.indexOf(u8, compare_to, needle) != null) return text;
+        if (std.mem.indexOf(u8, also_scan, needle) != null) return text;
+        const open = std.mem.indexOf(u8, text, needle) orelse return text;
         const close = std.mem.indexOfPos(u8, text, open, " ...]") orelse return text;
         const hint: []const u8 = if (escaped) "; \\\"raw\\\":true for all" else "; \"raw\":true for all";
+        if (text.len + hint.len >= compare_to.len or text.len + hint.len > max_len) return text;
 
         self.mutex.lock();
-        const first = !self.hinted;
-        self.hinted = true;
-        if (first) self.stats.sent_bytes += hint.len;
+        const already = self.hinted;
         self.mutex.unlock();
-        if (!first) return text;
+        if (already) return text;
 
-        return std.fmt.allocPrint(arena, "{s}{s}{s}", .{ text[0..close], hint, text[close..] });
+        const hinted = try std.fmt.allocPrint(arena, "{s}{s}{s}", .{ text[0..close], hint, text[close..] });
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.hinted) return text;
+        self.hinted = true;
+        self.stats.sent_bytes += hint.len;
+        return hinted;
     }
 
     /// Shrink `{"key":[...]}` by dropping trailing array elements until it
@@ -1421,5 +1442,191 @@ test "S8.1: the hint keeps envelope and array replies valid JSON" {
         const items = inner.value.object.get("results").?.array.items;
         const last = items[items.len - 1].string;
         try testing.expect(std.mem.indexOf(u8, last, "more entries; \"raw\":true for all ...]") != null);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// S8.1 raw hint: never touches the tool's own bytes, never lengthens a reply
+// past its input.
+// ---------------------------------------------------------------------------
+
+fn replyContent(res: []const u8) !std.json.Parsed(json.Value) {
+    return json.parseFromSlice(json.Value, testing.allocator, res, .{});
+}
+
+fn hintSpent(tw: *TrimWorker) bool {
+    tw.mutex.lock();
+    defer tw.mutex.unlock();
+    return tw.hinted;
+}
+
+test "S8.1: a marker already in the tool's output is left alone and the hint stays unspent" {
+    var h = try Harness.init(testing.allocator);
+    defer h.deinit();
+    const tw = try TrimWorker.start(testing.allocator, &h.actor, &h.registry, tiny, null);
+    defer tw.stop();
+
+    const src_line = "const m = \"[... zygos trimmed ...]\";\n";
+    const big = try longOutput(testing.allocator);
+    defer testing.allocator.free(big);
+    const input = try std.fmt.allocPrint(testing.allocator, "{s}{s}", .{ src_line, big });
+    defer testing.allocator.free(input);
+
+    const req = try compressReq(testing.allocator, input, "read_file", "");
+    defer testing.allocator.free(req);
+    const res = try h.caller.call("zygos::output::compress", req);
+    defer res.deinit(testing.allocator);
+    const parsed = try replyContent(res.ok);
+    defer parsed.deinit();
+    const text = parsed.value.object.get("content").?.string;
+    try testing.expectEqual(@as(usize, 0), hintCount(res.ok));
+    try testing.expect(std.mem.startsWith(u8, text, src_line));
+    try testing.expect(!hintSpent(tw));
+
+    // A later clean marker call still gets the hint.
+    try testing.expectEqual(@as(usize, 1), try callHint(h, "read_file", "", big));
+}
+
+test "S8.1: a marker quoted in plain input is not rewritten and the hint is not spent" {
+    var h = try Harness.init(testing.allocator);
+    defer h.deinit();
+    const tw = try TrimWorker.start(testing.allocator, &h.actor, &h.registry, .{}, null);
+    defer tw.stop();
+
+    const input = "see [... zygos trimmed 3 lines (9 bytes) ...]\n\n\n\n\nend\n";
+    const req = try compressReq(testing.allocator, input, "read_file", "");
+    defer testing.allocator.free(req);
+    const res = try h.caller.call("zygos::output::compress", req);
+    defer res.deinit(testing.allocator);
+    const parsed = try replyContent(res.ok);
+    defer parsed.deinit();
+    const text = parsed.value.object.get("content").?.string;
+    try testing.expect(std.mem.indexOf(u8, text, "raw") == null);
+    try testing.expect(std.mem.startsWith(u8, text, "see [... zygos trimmed 3 lines (9 bytes) ...]\n"));
+    try testing.expect(!hintSpent(tw));
+}
+
+test "S8.1: a marker inside a JSON string of plain input is not rewritten" {
+    var h = try Harness.init(testing.allocator);
+    defer h.deinit();
+    const tw = try TrimWorker.start(testing.allocator, &h.actor, &h.registry, .{}, null);
+    defer tw.stop();
+
+    const input = "{\"note\":\"[... zygos example ...]\",\n\n\n\n\"value\":1}";
+    const req = try compressReq(testing.allocator, input, "read_file", "");
+    defer testing.allocator.free(req);
+    const res = try h.caller.call("zygos::output::compress", req);
+    defer res.deinit(testing.allocator);
+    const parsed = try replyContent(res.ok);
+    defer parsed.deinit();
+    const text = parsed.value.object.get("content").?.string;
+    try testing.expect(std.mem.indexOf(u8, text, "raw") == null);
+    try testing.expect(std.mem.indexOf(u8, text, "\"note\":\"[... zygos example ...]\"") != null);
+    try testing.expect(!hintSpent(tw));
+}
+
+test "S8.1: a hint that would not keep the reply shorter than the input is skipped" {
+    var h = try Harness.init(testing.allocator);
+    defer h.deinit();
+    const tw = try TrimWorker.start(testing.allocator, &h.actor, &h.registry, .{}, null);
+    defer tw.stop();
+
+    // 85 bytes: the dedup marker (73) fits, marker plus hint (94) does not.
+    const small_status = "On branch master\n  modified:   a.zig\n  modified:   b.zig\n\nno changes added to commit\n";
+    try testing.expectEqual(@as(usize, 85), small_status.len);
+    _ = try compressOnce(h, "git status", small_status);
+    try testing.expect(try compressOnce(h, "git status", small_status));
+
+    tw.mutex.lock();
+    const s = tw.stats;
+    tw.mutex.unlock();
+    try testing.expect(s.sent_bytes <= s.raw_bytes);
+    try testing.expect(!hintSpent(tw));
+}
+
+test "S8.1: two markers in one reply get the hint in the first only" {
+    var h = try Harness.init(testing.allocator);
+    defer h.deinit();
+    const tw = try TrimWorker.start(testing.allocator, &h.actor, &h.registry, .{}, null);
+    defer tw.stop();
+
+    // Two oversized diff hunks of the same file give two zygos markers.
+    try testing.expectEqual(@as(usize, 1), try callHint(h, "bash", "git diff HEAD~1", e2e_diff));
+    const req = try compressReq(testing.allocator, e2e_diff, "bash", "git diff HEAD~3");
+    defer testing.allocator.free(req);
+    const res = try h.caller.call("zygos::output::compress", req);
+    defer res.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 0), hintCount(res.ok));
+}
+
+test "S8.1: a dedup unchanged marker as the first marker carries the hint" {
+    var h = try Harness.init(testing.allocator);
+    defer h.deinit();
+    const tw = try TrimWorker.start(testing.allocator, &h.actor, &h.registry, .{}, null);
+    defer tw.stop();
+
+    _ = try compressOnce(h, "git status", status_fixture);
+    try testing.expect(!hintSpent(tw));
+    const req = try compressReq(testing.allocator, status_fixture, "bash", "git status");
+    defer testing.allocator.free(req);
+    const res = try h.caller.call("zygos::output::compress", req);
+    defer res.deinit(testing.allocator);
+    try testing.expect(std.mem.indexOf(u8, res.ok, "output unchanged since") != null);
+    try testing.expectEqual(@as(usize, 1), hintCount(res.ok));
+    try testing.expect(hintSpent(tw));
+}
+
+test "S8.1: sent_bytes matches the bytes sent on the envelope and array paths" {
+    // Envelope: the basis is the payload text, unescaped.
+    {
+        var h = try Harness.init(testing.allocator);
+        defer h.deinit();
+        const tw = try TrimWorker.start(testing.allocator, &h.actor, &h.registry, tiny, null);
+        defer tw.stop();
+        const big = try longOutput(testing.allocator);
+        defer testing.allocator.free(big);
+        const env = try std.fmt.allocPrint(testing.allocator, "{{\"exit_code\":0,\"output\":{f}}}", .{json.fmt(big, .{})});
+        defer testing.allocator.free(env);
+        const req = try compressReq(testing.allocator, env, "bash", "some-unknown-tool");
+        defer testing.allocator.free(req);
+        const res = try h.caller.call("zygos::output::compress", req);
+        defer res.deinit(testing.allocator);
+        const outer = try replyContent(res.ok);
+        defer outer.deinit();
+        const inner = try json.parseFromSlice(json.Value, testing.allocator, outer.value.object.get("content").?.string, .{});
+        defer inner.deinit();
+        const text = inner.value.object.get("output").?.string;
+        try testing.expect(std.mem.indexOf(u8, text, "; \"raw\":true for all ...]") != null);
+        tw.mutex.lock();
+        const s = tw.stats;
+        tw.mutex.unlock();
+        try testing.expectEqual(text.len, s.sent_bytes);
+    }
+    // Array: the basis is the content string itself, hint included.
+    {
+        var h = try Harness.init(testing.allocator);
+        defer h.deinit();
+        const tw = try TrimWorker.start(testing.allocator, &h.actor, &h.registry, tiny, null);
+        defer tw.stop();
+        var arr: std.ArrayList(u8) = .empty;
+        defer arr.deinit(testing.allocator);
+        try arr.appendSlice(testing.allocator, "{\"results\":[");
+        for (0..60) |i| {
+            if (i > 0) try arr.append(testing.allocator, ',');
+            try arr.appendSlice(testing.allocator, "{\"title\":\"entry number\",\"url\":\"https://example.test/x\"}");
+        }
+        try arr.appendSlice(testing.allocator, "]}");
+        const req = try compressReq(testing.allocator, arr.items, "web_search", "");
+        defer testing.allocator.free(req);
+        const res = try h.caller.call("zygos::output::compress", req);
+        defer res.deinit(testing.allocator);
+        const outer = try replyContent(res.ok);
+        defer outer.deinit();
+        const content = outer.value.object.get("content").?.string;
+        try testing.expect(content.len <= tiny.max_bytes);
+        tw.mutex.lock();
+        const s = tw.stats;
+        tw.mutex.unlock();
+        try testing.expectEqual(content.len, s.sent_bytes);
     }
 }
