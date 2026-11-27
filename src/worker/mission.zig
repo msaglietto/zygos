@@ -2531,8 +2531,8 @@ test "M8: the ledger reports the compression ratio when a trim worker rides the 
         "{\"content\":\"hi\\n\",\"tool\":\"bash\",\"input\":{\"command\":\"echo hi\"}}",
     );
     ures.deinit(testing.allocator);
-    // A command a filter selects but leaves alone (no hint lines to drop, so
-    // git.status returns null): matched but not filtered.
+    // A command a filter selects but leaves alone (the 22-byte output is under
+    // guard.min_bytes, so git.status returns null): matched but not filtered.
     const sres = try h.caller.call(
         "zygos::output::compress",
         "{\"content\":\"On branch main\\n M a.c\\n\",\"tool\":\"bash\",\"input\":{\"command\":\"git status\"}}",
