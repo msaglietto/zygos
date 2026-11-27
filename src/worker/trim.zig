@@ -174,7 +174,13 @@ pub const TrimWorker = struct {
         raw: []const u8,
         compressed: []const u8,
     ) ?[]const u8 {
-        const cand = (hintCandidate(arena, compressed, false, true, &.{ payload.text, raw }) catch return null) orelse return null;
+        // json_decoded = false: the guards include the JSON-decoded payload
+        // text, so an escape such as `\u007aygos` or `\u001b` in the wire form
+        // is already decoded there and caught by the "zygos" and ESC guards.
+        // A literal `\u...` left in the decoded text is plain text, and the
+        // re-serialized envelope escapes its backslash, so the model sees it
+        // as plain text too (a source file must not defer the hint).
+        const cand = (hintCandidate(arena, compressed, false, false, &.{ payload.text, raw }) catch return null) orelse return null;
         const hinted = wrapEnvelope(arena, payload, cand.text) catch return null;
         // Both sizes must stay down: the wire form escapes the hint's
         // quotes and the marker's newline, the decoded form does not.
@@ -198,8 +204,8 @@ pub const TrimWorker = struct {
     /// first zygos marker in `text`. None (hint left unspent) when: any of
     /// `guards` (the tool's own bytes, in every form it may be decoded to)
     /// mentions "zygos" in any case, holds an ESC byte (stripping ANSI joins
-    /// words split by it), or, when `json_decoded` (the guards were JSON-decoded
-    /// or `text` is re-serialized JSON: envelope and array paths), a `\u`
+    /// words split by it), or, when `json_decoded` (the entry-cut JSON array
+    /// path only: its sole guard is the raw JSON), a `\u`
     /// escape (decoding builds a marker shape the tool never wrote, so the
     /// hint would land in the tool's line); or there is no marker. A literal
     /// `\u` in plain text is just text. `escaped` is true when `text` is JSON
@@ -1643,6 +1649,67 @@ test "S8.1: a literal backslash-u in plain text output does not defer the hint" 
     for (0..40) |_| try buf.appendSlice(testing.allocator, "const e = '\\u00e9'; // plain line\n");
     try testing.expectEqual(@as(usize, 1), try callHint(h, "bash", "some-unknown-tool", buf.items));
     try testing.expect(hintSpent(tw));
+}
+
+fn sourceWithBackslashU(gpa: std.mem.Allocator) ![]const u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(gpa);
+    for (0..40) |_| try buf.appendSlice(gpa, "const e = '\\u00e9'; // plain line\n");
+    return buf.toOwnedSlice(gpa);
+}
+
+fn envelopeHintCount(h: *Harness, key: []const u8, prefix: []const u8, tool: []const u8, cmd: []const u8, text: []const u8) !usize {
+    const env = try std.fmt.allocPrint(testing.allocator, "{{{s}\"{s}\":{f}}}", .{ prefix, key, json.fmt(text, .{}) });
+    defer testing.allocator.free(env);
+    const req = try compressReq(testing.allocator, env, tool, cmd);
+    defer testing.allocator.free(req);
+    const res = try h.caller.call("zygos::output::compress", req);
+    defer res.deinit(testing.allocator);
+    try testing.expect(res == .ok);
+    // The reply's `content` is the envelope JSON; its payload string holds the hint.
+    const outer = try replyContent(res.ok);
+    defer outer.deinit();
+    return hintCount(outer.value.object.get("content").?.string);
+}
+
+test "S8.1: a source file with a literal backslash-u in a bash envelope still gets the hint" {
+    var h = try Harness.init(testing.allocator);
+    defer h.deinit();
+    const tw = try TrimWorker.start(testing.allocator, &h.actor, &h.registry, tiny, null);
+    defer tw.stop();
+
+    const src = try sourceWithBackslashU(testing.allocator);
+    defer testing.allocator.free(src);
+    try testing.expectEqual(@as(usize, 1), try envelopeHintCount(h, "output", "\"exit_code\":0,", "bash", "cat src/x.js", src));
+    try testing.expect(hintSpent(tw));
+}
+
+test "S8.1: a source file with a literal backslash-u in a read_file envelope still gets the hint" {
+    var h = try Harness.init(testing.allocator);
+    defer h.deinit();
+    const tw = try TrimWorker.start(testing.allocator, &h.actor, &h.registry, tiny, null);
+    defer tw.stop();
+
+    const src = try sourceWithBackslashU(testing.allocator);
+    defer testing.allocator.free(src);
+    try testing.expectEqual(@as(usize, 1), try envelopeHintCount(h, "content", "", "read_file", "", src));
+    try testing.expect(hintSpent(tw));
+}
+
+test "S8.1: a wire-form \\u001b that splits zygos in an envelope gets no hint" {
+    var h = try Harness.init(testing.allocator);
+    defer h.deinit();
+    const tw = try TrimWorker.start(testing.allocator, &h.actor, &h.registry, tiny, null);
+    defer tw.stop();
+
+    // Raw wire bytes: the ESC and the split word exist only as JSON escapes.
+    var env: std.ArrayList(u8) = .empty;
+    defer env.deinit(testing.allocator);
+    try env.appendSlice(testing.allocator, "{\"exit_code\":0,\"output\":\"zy\\u001b[mgos\\n");
+    for (0..40) |_| try env.appendSlice(testing.allocator, "unrecognized output line\\n");
+    try env.appendSlice(testing.allocator, "\"}");
+    try testing.expectEqual(@as(usize, 0), try callHint(h, "bash", "some-unknown-tool", env.items));
+    try testing.expect(!hintSpent(tw));
 }
 
 const hint_plain = "; \"raw\":true for all";

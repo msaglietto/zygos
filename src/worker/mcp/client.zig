@@ -374,6 +374,10 @@ pub const McpClientWorker = struct {
 /// `request_json` minus a top-level `"raw"` key, unless `schema_json`
 /// declares `raw` in its top-level `properties`. The input slice itself when
 /// nothing is removed.
+///
+/// The key is dropped whatever its value: `raw` is zygos's key, and turn.zig
+/// only honours boolean true (C22). Only the schema's top-level `properties`
+/// is consulted (see `schemaDeclares`).
 fn withoutRaw(arena: std.mem.Allocator, request_json: []const u8, schema_json: []const u8) error{OutOfMemory}![]const u8 {
     var root = json.parseFromSliceLeaky(json.Value, arena, request_json, .{}) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -385,6 +389,9 @@ fn withoutRaw(arena: std.mem.Allocator, request_json: []const u8, schema_json: [
     return std.fmt.allocPrint(arena, "{f}", .{json.fmt(root, .{})});
 }
 
+/// Only the schema's top-level `properties` is consulted (C21): a `raw`
+/// declared solely through `$ref`, `allOf` or `anyOf` is not seen, so the key
+/// is still dropped for such a tool.
 fn schemaDeclares(arena: std.mem.Allocator, schema_json: []const u8, key: []const u8) error{OutOfMemory}!bool {
     const schema = json.parseFromSliceLeaky(json.Value, arena, schema_json, .{}) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,

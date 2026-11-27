@@ -102,10 +102,13 @@ that. Extend it, additively:
   inserted in `trim.zig`, counted in `sent_bytes`). Later markers are unchanged,
   and replies with no marker do not spend it. No hint is added when the tool's
   output mentions "zygos" in any case, contains terminal escape codes (ESC),
-  or, on the envelope and entry-cut paths only, contains JSON `\u` escapes
-  (stripping ANSI joins split words and JSON decoding/re-serialization turns
-  escapes into characters, so either can turn tool text into marker shape; a
-  literal `\u` in plain text is just text; the tool's bytes are never
+  or, on the entry-cut (JSON array) path only, contains JSON `\u` escapes
+  (stripping ANSI joins split words and JSON decoding turns escapes into
+  characters, so either can turn tool text into marker shape). Envelopes are
+  guarded on their decoded text instead: an escape such as `\u007aygos` or
+  `\u001b` in the wire form is already decoded there and caught by the
+  "zygos" and ESC guards, so a literal `\u` in a source file is just text and
+  never defers the hint (the tool's bytes are never
   rewritten), or when adding it would not
   keep the reply shorter than the input (on the envelope path: both as decoded
   and as sent; for entry cuts: also within `max_bytes`); it waits for a later
