@@ -97,6 +97,10 @@ that. Extend it, additively:
   called from the `.ok` arm where `tool_name` and `input` are in scope).
 - **Raw escape hatch:** if the model's tool input carries `"raw": true`, the
   driver skips the seam entirely. An agent that needs exact bytes says so.
+  The model is told once per run: the first zygos marker in any reply carries
+  `; "raw":true for all` just before its closing ` ...]` (`TrimWorker.hinted`,
+  inserted in `trim.zig`, counted in `sent_bytes`). Later markers are unchanged,
+  and replies with no marker do not spend it.
 - Reply shape is unchanged: `{"content": <str>}`.
 
 Not a `docs/PROTOCOL.md` change — `output::compress` is a Zygos function on the
@@ -215,7 +219,7 @@ one full output and two one-liners.
 
 - Key: `hash(tool ++ full original command)`, so `cd a && git status` and `git status` are different keys. Value: `hash(raw output)` + timestamp.
 - Repeat call, same key, same output hash, within TTL ⇒ reply
-  `[... zygos: unchanged since <N>s ago; see the earlier result ...]`.
+  `[... zygos: output unchanged since <N>s ago; see the earlier result ...]`.
 - Output differs ⇒ full filtered output, cache updated.
 - TTL by command class: volatile (`git status`, `ls`) 30s; medium (test
   runners) 120s; slow (`git log`) 300s.

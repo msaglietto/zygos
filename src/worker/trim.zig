@@ -39,6 +39,9 @@ pub const TrimWorker = struct {
     mutex: sync.Mutex = .{},
     cache: cache_mod.Cache = .{},
     stats: Stats = .{},
+    /// S8.1: the raw-escape hint rides the first marker of the run, once.
+    /// Guarded by `mutex`.
+    hinted: bool = false,
 
     /// S8.5: compression evidence, so a mission's ratio is inspectable
     /// rather than asserted.
@@ -135,10 +138,11 @@ pub const TrimWorker = struct {
         if (envelopePayload(arena, raw)) |payload| {
             const compressed = try self.compress(arena, payload.text, tool, command);
             if (compressed.len >= payload.text.len) return raw;
+            const hinted = try self.hintFirstMarker(arena, compressed, false);
             return std.fmt.allocPrint(arena, "{{{s}{f}:{f}}}", .{
                 payload.prefix,
                 json.fmt(payload.key, .{}),
-                json.fmt(compressed, .{}),
+                json.fmt(hinted, .{}),
             });
         }
         // Structured data with no text payload (e.g. web_search's
@@ -152,10 +156,33 @@ pub const TrimWorker = struct {
                 self.stats.calls += 1;
                 self.stats.raw_bytes += raw.len;
                 self.mutex.unlock();
-                return shorter;
+                return self.hintFirstMarker(arena, shorter, true);
             }
         }
-        return self.compress(arena, raw, tool, command);
+        const compressed = try self.compress(arena, raw, tool, command);
+        // Unchanged output is the tool's own text, not our marker: leave it.
+        if (std.mem.eql(u8, compressed, raw)) return compressed;
+        return self.hintFirstMarker(arena, compressed, false);
+    }
+
+    /// S8.1: tell the model once per run that `"raw":true` skips trimming.
+    /// The hint goes just before the closing ` ...]` of the first zygos
+    /// marker in `text`; outputs with no marker leave it unspent. `escaped`
+    /// is true when `text` is JSON whose strings hold the marker, so the
+    /// hint's quotes need escaping. The inserted bytes count as sent.
+    fn hintFirstMarker(self: *TrimWorker, arena: std.mem.Allocator, text: []const u8, escaped: bool) error{OutOfMemory}![]const u8 {
+        const open = std.mem.indexOf(u8, text, "[... zygos") orelse return text;
+        const close = std.mem.indexOfPos(u8, text, open, " ...]") orelse return text;
+        const hint: []const u8 = if (escaped) "; \\\"raw\\\":true for all" else "; \"raw\":true for all";
+
+        self.mutex.lock();
+        const first = !self.hinted;
+        self.hinted = true;
+        if (first) self.stats.sent_bytes += hint.len;
+        self.mutex.unlock();
+        if (!first) return text;
+
+        return std.fmt.allocPrint(arena, "{s}{s}{s}", .{ text[0..close], hint, text[close..] });
     }
 
     /// Shrink `{"key":[...]}` by dropping trailing array elements until it
@@ -1263,4 +1290,136 @@ test "S8.5: matched counts selected calls, not unselected ones" {
     const res = try h.caller.call("zygos::output::stats", "{}");
     defer res.deinit(testing.allocator);
     try testing.expect(std.mem.indexOf(u8, res.ok, "\"matched\":3") != null);
+}
+
+// ---------------------------------------------------------------------------
+// S8.1 raw hint: the first marker of a run says how to opt out.
+// ---------------------------------------------------------------------------
+
+const hint_needle = "; \\\"raw\\\":true for all ...]"; // as it appears in the JSON-escaped reply
+
+fn hintCount(reply: []const u8) usize {
+    return std.mem.count(u8, reply, hint_needle);
+}
+
+fn callHint(h: *Harness, tool: []const u8, cmd: []const u8, out: []const u8) !usize {
+    const req = try compressReq(testing.allocator, out, tool, cmd);
+    defer testing.allocator.free(req);
+    const res = try h.caller.call("zygos::output::compress", req);
+    defer res.deinit(testing.allocator);
+    try testing.expect(res == .ok);
+    return hintCount(res.ok);
+}
+
+fn longOutput(gpa: std.mem.Allocator) ![]const u8 {
+    var big: std.ArrayList(u8) = .empty;
+    for (0..40) |_| try big.appendSlice(gpa, "unrecognized output line\n");
+    return big.toOwnedSlice(gpa);
+}
+
+test "S8.1: the first marker of a run carries the raw hint, once, in that marker only" {
+    var h = try Harness.init(testing.allocator);
+    defer h.deinit();
+    const tw = try TrimWorker.start(testing.allocator, &h.actor, &h.registry, .{}, null);
+    defer tw.stop();
+
+    const req = try compressReq(testing.allocator, e2e_diff, "bash", "git diff HEAD~1");
+    defer testing.allocator.free(req);
+    const res = try h.caller.call("zygos::output::compress", req);
+    defer res.deinit(testing.allocator);
+    try testing.expect(res == .ok);
+    try testing.expectEqual(@as(usize, 1), hintCount(res.ok));
+    // The marker keeps its prefix; the hint sits right before the closer.
+    try testing.expect(std.mem.indexOf(u8, res.ok, "[... zygos diff: dropped ") != null);
+
+    // Honest accounting: sent_bytes is what was sent, hint included.
+    const parsed = try json.parseFromSlice(json.Value, testing.allocator, res.ok, .{});
+    defer parsed.deinit();
+    const sent = parsed.value.object.get("content").?.string.len;
+    tw.mutex.lock();
+    const s = tw.stats;
+    tw.mutex.unlock();
+    try testing.expectEqual(sent, s.sent_bytes);
+}
+
+test "S8.1: a second marker-carrying call gets no hint" {
+    var h = try Harness.init(testing.allocator);
+    defer h.deinit();
+    const tw = try TrimWorker.start(testing.allocator, &h.actor, &h.registry, .{}, null);
+    defer tw.stop();
+
+    try testing.expectEqual(@as(usize, 1), try callHint(h, "bash", "git diff HEAD~1", e2e_diff));
+    try testing.expectEqual(@as(usize, 0), try callHint(h, "bash", "git diff HEAD~2", e2e_diff));
+}
+
+test "S8.1: an output with no marker does not consume the hint" {
+    var h = try Harness.init(testing.allocator);
+    defer h.deinit();
+    const tw = try TrimWorker.start(testing.allocator, &h.actor, &h.registry, .{}, null);
+    defer tw.stop();
+
+    try testing.expectEqual(@as(usize, 0), try callHint(h, "bash", "echo hi", "hi\n"));
+    try testing.expectEqual(@as(usize, 1), try callHint(h, "bash", "git diff HEAD~1", e2e_diff));
+}
+
+test "S8.1: a generic-trim marker (non-filter tool) carries the hint" {
+    var h = try Harness.init(testing.allocator);
+    defer h.deinit();
+    const tw = try TrimWorker.start(testing.allocator, &h.actor, &h.registry, tiny, null);
+    defer tw.stop();
+
+    const big = try longOutput(testing.allocator);
+    defer testing.allocator.free(big);
+    try testing.expectEqual(@as(usize, 1), try callHint(h, "read_file", "", big));
+    try testing.expectEqual(@as(usize, 0), try callHint(h, "read_file", "", big));
+}
+
+test "S8.1: the hint keeps envelope and array replies valid JSON" {
+    // Envelope: bash's {"exit_code":N,"output":"..."} reply.
+    {
+        var h = try Harness.init(testing.allocator);
+        defer h.deinit();
+        const tw = try TrimWorker.start(testing.allocator, &h.actor, &h.registry, tiny, null);
+        defer tw.stop();
+        const big = try longOutput(testing.allocator);
+        defer testing.allocator.free(big);
+        const env = try std.fmt.allocPrint(testing.allocator, "{{\"exit_code\":0,\"output\":{f}}}", .{json.fmt(big, .{})});
+        defer testing.allocator.free(env);
+        const req = try compressReq(testing.allocator, env, "bash", "some-unknown-tool");
+        defer testing.allocator.free(req);
+        const res = try h.caller.call("zygos::output::compress", req);
+        defer res.deinit(testing.allocator);
+        const outer = try json.parseFromSlice(json.Value, testing.allocator, res.ok, .{});
+        defer outer.deinit();
+        const inner = try json.parseFromSlice(json.Value, testing.allocator, outer.value.object.get("content").?.string, .{});
+        defer inner.deinit();
+        const text = inner.value.object.get("output").?.string;
+        try testing.expect(std.mem.indexOf(u8, text, "; \"raw\":true for all ...]") != null);
+    }
+    // Array: web_search-style {"results":[...]} cut by whole entries.
+    {
+        var h = try Harness.init(testing.allocator);
+        defer h.deinit();
+        const tw = try TrimWorker.start(testing.allocator, &h.actor, &h.registry, tiny, null);
+        defer tw.stop();
+        var arr: std.ArrayList(u8) = .empty;
+        defer arr.deinit(testing.allocator);
+        try arr.appendSlice(testing.allocator, "{\"results\":[");
+        for (0..60) |i| {
+            if (i > 0) try arr.append(testing.allocator, ',');
+            try arr.appendSlice(testing.allocator, "{\"title\":\"entry number\",\"url\":\"https://example.test/x\"}");
+        }
+        try arr.appendSlice(testing.allocator, "]}");
+        const req = try compressReq(testing.allocator, arr.items, "web_search", "");
+        defer testing.allocator.free(req);
+        const res = try h.caller.call("zygos::output::compress", req);
+        defer res.deinit(testing.allocator);
+        const outer = try json.parseFromSlice(json.Value, testing.allocator, res.ok, .{});
+        defer outer.deinit();
+        const inner = try json.parseFromSlice(json.Value, testing.allocator, outer.value.object.get("content").?.string, .{});
+        defer inner.deinit();
+        const items = inner.value.object.get("results").?.array.items;
+        const last = items[items.len - 1].string;
+        try testing.expect(std.mem.indexOf(u8, last, "more entries; \"raw\":true for all ...]") != null);
+    }
 }
