@@ -6,6 +6,14 @@ Reconstructed from git history on 2026-09-30. A commit that only added a library
 
 The agent that next changes operator-visible behavior adds the new heading in that same commit.
 
+## [5.5.1] - 2026-11-27
+
+### Fixed
+
+- External MCP servers no longer receive the `"raw": true` escape as a tool argument. A server whose tool schema forbids extra properties used to reject the call; the escape still skips trimming on the zygos side. If the tool's own schema declares a top-level `raw` property, the argument is forwarded untouched. Requests without `raw` are forwarded byte-for-byte as before.
+- The `; "raw":true for all` hint is no longer withheld because plain-text tool output contains a literal `\u` sequence (a source file, say). The `\u` guard now applies only where JSON is decoded or re-serialized: the envelope and entry-cut paths. The "zygos" and terminal-escape guards are unchanged.
+- If memory runs out while the hint is being built, the reply is the compressed output without the hint instead of the original untrimmed output. The hint stays unspent and its bytes are not counted in `sent_bytes`.
+
 ## [5.5.0] - 2026-11-26
 
 ### Added

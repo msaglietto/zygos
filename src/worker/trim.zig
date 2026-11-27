@@ -139,13 +139,8 @@ pub const TrimWorker = struct {
             const compressed = try self.compress(arena, payload.text, tool, command);
             if (compressed.len >= payload.text.len) return raw;
             const plain = try wrapEnvelope(arena, payload, compressed);
-            const open_cand = if (self.hintOpen()) try hintCandidate(arena, compressed, false, &.{ payload.text, raw }) else null;
-            if (open_cand) |cand| {
-                const hinted = try wrapEnvelope(arena, payload, cand.text);
-                // Both sizes must stay down: the wire form escapes the hint's
-                // quotes and the marker's newline, the decoded form does not.
-                if (cand.text.len < payload.text.len and hinted.len < raw.len and
-                    self.claimHint(cand.hint_len)) return hinted;
+            if (self.hintOpen()) {
+                if (self.hintEnvelope(arena, payload, raw, compressed)) |hinted| return hinted;
             }
             return plain;
         }
@@ -169,6 +164,25 @@ pub const TrimWorker = struct {
         return self.hintWhole(arena, compressed, false, raw, std.math.maxInt(usize));
     }
 
+    /// The hinted envelope, or null to send the plain one. Allocation failure
+    /// here costs only the hint, never the compression; the hint is claimed
+    /// last, after every fallible step has succeeded.
+    fn hintEnvelope(
+        self: *TrimWorker,
+        arena: std.mem.Allocator,
+        payload: Envelope,
+        raw: []const u8,
+        compressed: []const u8,
+    ) ?[]const u8 {
+        const cand = (hintCandidate(arena, compressed, false, true, &.{ payload.text, raw }) catch return null) orelse return null;
+        const hinted = wrapEnvelope(arena, payload, cand.text) catch return null;
+        // Both sizes must stay down: the wire form escapes the hint's
+        // quotes and the marker's newline, the decoded form does not.
+        if (cand.text.len < payload.text.len and hinted.len < raw.len and
+            self.claimHint(cand.hint_len)) return hinted;
+        return null;
+    }
+
     fn wrapEnvelope(arena: std.mem.Allocator, payload: Envelope, text: []const u8) error{OutOfMemory}![]const u8 {
         return std.fmt.allocPrint(arena, "{{{s}{f}:{f}}}", .{
             payload.prefix,
@@ -183,23 +197,25 @@ pub const TrimWorker = struct {
     /// The candidate puts the hint just before the closing ` ...]` of the
     /// first zygos marker in `text`. None (hint left unspent) when: any of
     /// `guards` (the tool's own bytes, in every form it may be decoded to)
-    /// mentions "zygos" in any case, holds an ESC byte or a JSON `\u` escape
-    /// (stripping ANSI joins words split by it, JSON re-serialization decodes
-    /// escapes, so either can build a marker shape the tool never wrote and
-    /// the hint would land in the tool's line); or there is no marker.
-    /// `escaped` is true when `text` is JSON whose strings hold the marker,
-    /// so the hint's quotes need escaping. Claiming is separate: the caller
+    /// mentions "zygos" in any case, holds an ESC byte (stripping ANSI joins
+    /// words split by it), or, when `json_decoded` (the guards were JSON-decoded
+    /// or `text` is re-serialized JSON: envelope and array paths), a `\u`
+    /// escape (decoding builds a marker shape the tool never wrote, so the
+    /// hint would land in the tool's line); or there is no marker. A literal
+    /// `\u` in plain text is just text. `escaped` is true when `text` is JSON
+    /// whose strings hold the marker, so the hint's quotes need escaping. Claiming is separate: the caller
     /// checks the final length, then calls `claimHint`.
     fn hintCandidate(
         arena: std.mem.Allocator,
         text: []const u8,
         escaped: bool,
+        json_decoded: bool,
         guards: []const []const u8,
     ) error{OutOfMemory}!?HintCandidate {
         for (guards) |g| {
             if (std.ascii.indexOfIgnoreCase(g, "zygos") != null) return null;
             if (std.mem.indexOfScalar(u8, g, 0x1b) != null) return null;
-            if (std.mem.indexOf(u8, g, "\\u") != null) return null;
+            if (json_decoded and std.mem.indexOf(u8, g, "\\u") != null) return null;
         }
         const open = std.mem.indexOf(u8, text, "[... zygos") orelse return null;
         const close = std.mem.indexOfPos(u8, text, open, " ...]") orelse return null;
@@ -237,9 +253,11 @@ pub const TrimWorker = struct {
         escaped: bool,
         raw: []const u8,
         max_len: usize,
-    ) error{OutOfMemory}![]const u8 {
+    ) []const u8 {
         if (!self.hintOpen()) return text;
-        const cand = (try hintCandidate(arena, text, escaped, &.{raw})) orelse return text;
+        // Plain text is never JSON-decoded, so only the array path (`escaped`)
+        // needs the `\u` guard. An allocation failure costs only the hint.
+        const cand = (hintCandidate(arena, text, escaped, escaped, &.{raw}) catch return text) orelse return text;
         if (cand.text.len >= raw.len or cand.text.len > max_len) return text;
         if (!self.claimHint(cand.hint_len)) return text;
         return cand.text;
@@ -1604,13 +1622,122 @@ test "S8.1: two markers in one reply get the hint in the first only" {
     const first = std.mem.indexOf(u8, res.ok, "[... zygos 7 more identical lines") orelse return error.TestUnexpectedResult;
     const second = std.mem.indexOf(u8, res.ok, "[... zygos tests: dropped ") orelse return error.TestUnexpectedResult;
     try testing.expect(first < second);
-    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, res.ok, "[... zygos "[0..9]) - 1);
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, res.ok, "[... zygos "));
     try testing.expectEqual(@as(usize, 1), hintCount(res.ok));
     const hint_at = std.mem.indexOf(u8, res.ok, hint_needle).?;
     try testing.expect(hint_at > first and hint_at < second);
     // The second marker is byte-identical to what the filter emits.
     try testing.expect(std.mem.indexOf(u8, res.ok, "[... zygos tests: dropped 13 passing/progress/repeated lines ...]") != null);
     try testing.expect(hintSpent(tw));
+}
+
+test "S8.1: a literal backslash-u in plain text output does not defer the hint" {
+    var h = try Harness.init(testing.allocator);
+    defer h.deinit();
+    const tw = try TrimWorker.start(testing.allocator, &h.actor, &h.registry, tiny, null);
+    defer tw.stop();
+
+    // A source file read: nothing on the plain path decodes JSON escapes.
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    for (0..40) |_| try buf.appendSlice(testing.allocator, "const e = '\\u00e9'; // plain line\n");
+    try testing.expectEqual(@as(usize, 1), try callHint(h, "bash", "some-unknown-tool", buf.items));
+    try testing.expect(hintSpent(tw));
+}
+
+const hint_plain = "; \"raw\":true for all";
+
+/// Fails exactly the `fail_at`-th allocation and no other (unlike
+/// `std.testing.FailingAllocator`, which fails every one from then on), so
+/// the handler's own later allocations still succeed.
+const FailOnce = struct {
+    child: std.mem.Allocator,
+    fail_at: usize,
+    count: usize = 0,
+
+    fn allocator(self: *FailOnce) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, a: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *FailOnce = @ptrCast(@alignCast(ctx));
+        defer self.count += 1;
+        if (self.count == self.fail_at) return null;
+        return self.child.rawAlloc(len, a, ra);
+    }
+    fn resize(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, n: usize, ra: usize) bool {
+        const self: *FailOnce = @ptrCast(@alignCast(ctx));
+        return self.child.rawResize(m, a, n, ra);
+    }
+    fn remap(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, n: usize, ra: usize) ?[*]u8 {
+        const self: *FailOnce = @ptrCast(@alignCast(ctx));
+        return self.child.rawRemap(m, a, n, ra);
+    }
+    fn free(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, ra: usize) void {
+        const self: *FailOnce = @ptrCast(@alignCast(ctx));
+        self.child.rawFree(m, a, ra);
+    }
+};
+
+fn resetTw(tw: *TrimWorker) void {
+    tw.mutex.lock();
+    defer tw.mutex.unlock();
+    tw.hinted = false;
+    tw.stats = .{};
+    tw.cache.reset();
+}
+
+fn sentBytes(tw: *TrimWorker) usize {
+    tw.mutex.lock();
+    defer tw.mutex.unlock();
+    return tw.stats.sent_bytes;
+}
+
+test "S8.1: an allocation failure while building the hint falls back to the unhinted reply" {
+    var h = try Harness.init(testing.allocator);
+    defer h.deinit();
+    const tw = try TrimWorker.start(testing.allocator, &h.actor, &h.registry, tiny, null);
+    defer tw.stop();
+
+    const big = try longOutput(testing.allocator);
+    defer testing.allocator.free(big);
+    const env = try std.fmt.allocPrint(testing.allocator, "{{\"exit_code\":0,\"output\":{f}}}", .{json.fmt(big, .{})});
+    defer testing.allocator.free(env);
+    const reqs = [_][]const u8{
+        try compressReq(testing.allocator, big, "bash", "some-unknown-tool"), // plain path
+        try compressReq(testing.allocator, env, "bash", "some-unknown-tool"), // envelope path
+    };
+    defer for (reqs) |r| testing.allocator.free(r);
+
+    for (reqs) |req| {
+        resetTw(tw);
+        var base_arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer base_arena.deinit();
+        var base_fa: FailOnce = .{ .child = base_arena.allocator(), .fail_at = std.math.maxInt(usize) };
+        const base = try TrimWorker.handler(tw, base_fa.allocator(), req);
+        try testing.expect(std.mem.indexOf(u8, base, "raw") != null);
+        const total = base_fa.count;
+        const hinted_sent = sentBytes(tw);
+
+        var saw_unhinted = false;
+        for (0..total) |fail_at| {
+            resetTw(tw);
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            var fa: FailOnce = .{ .child = arena.allocator(), .fail_at = fail_at };
+            const reply = TrimWorker.handler(tw, fa.allocator(), req) catch continue;
+            if (std.mem.indexOf(u8, reply, "raw") != null) continue;
+            saw_unhinted = true;
+            try testing.expect(!hintSpent(tw));
+            try testing.expectEqual(hinted_sent - hint_plain.len, sentBytes(tw));
+            // The hint was not spent: a later call still gets it.
+            var arena2 = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena2.deinit();
+            const later = try TrimWorker.handler(tw, arena2.allocator(), req);
+            try testing.expect(std.mem.indexOf(u8, later, "raw") != null);
+        }
+        try testing.expect(saw_unhinted);
+    }
 }
 
 fn ansiMarkerLine() []const u8 {
