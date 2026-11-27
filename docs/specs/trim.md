@@ -12,6 +12,8 @@ Applied in order:
 3. If the result exceeds `max_bytes` **or** `max_lines`: keep the first
    `head_lines` and last `tail_lines` lines with a marker line between:
    `[... zygos trimmed K lines (B bytes) ...]`.
+   The first marker a run emits also carries the hint `; "raw":true for all`
+   before its ` ...]` (once per worker, in `trim.zig`; see filter.md S8.1).
 
 Under the limits ⇒ byte-identical pass-through (after 1–2, which only fire
 when escapes/blank-runs exist). Trimming never splits a UTF-8 sequence
